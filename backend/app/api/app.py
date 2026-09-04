@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import shutil
 from collections.abc import Iterator
 from datetime import datetime
 from typing import Protocol
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Response, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -21,18 +22,20 @@ from app.db.session import create_session_factory
 from app.models import ProcessingJob, SourceVideo
 from app.services.health import CheckStatus, HealthService
 from app.services.source_adapters import SourceValidationError, normalize_source_url
-from app.services.storage import StorageService
+from app.services.storage import StorageCategory, StorageService
+
+UPLOAD_CHUNK_BYTES = 1024 * 1024
 
 
 class Dispatcher(Protocol):
-    def dispatch(self, job_id: UUID) -> None: ...
+    def dispatch(self, source_id: UUID, job_id: UUID) -> None: ...
 
 
 class CeleryDispatcher:
-    def dispatch(self, job_id: UUID) -> None:
+    def dispatch(self, source_id: UUID, job_id: UUID) -> None:
         from app.workers.tasks import run_pipeline_stage
 
-        run_pipeline_stage.delay("", PipelineStage.INGEST.value, str(job_id))
+        run_pipeline_stage.delay(str(source_id), PipelineStage.INGEST.value, str(job_id))
 
 
 class SourceURLRequest(BaseModel):
@@ -114,34 +117,51 @@ def create_app(
         database: Session = Depends(session),
     ) -> SourceResponse:
         filename = _safe_filename(file.filename)
-        content = file.file.read(upload_limit + 1)
-        if not content:
-            raise HTTPException(status_code=422, detail="upload must not be empty")
-        if len(content) > upload_limit:
-            raise HTTPException(status_code=413, detail="upload exceeds configured size limit")
-        digest = hashlib.sha256(content).hexdigest()
-        existing = database.scalar(select(SourceVideo).where(SourceVideo.content_hash == digest))
-        if existing is not None:
-            response.status_code = status.HTTP_200_OK
-            return _duplicate_response(existing)
-        source = SourceVideo(
-            source_uri="",
-            original_filename=filename,
-            content_hash=digest,
-            rights_status=rights_status,
+        temporary_path = storage_service.resolve(
+            StorageCategory.TEMPORARY, f"upload-{uuid4()}.tmp"
         )
-        database.add(source)
-        database.flush()
-        destination = storage_service.source_directory(source.id) / filename
-        storage_service.ensure_capacity(len(content))
-        storage_service.atomic_write(destination, iter((content,)))
-        source.source_uri = str(destination)
-        job = _new_job(source.id)
-        database.add(job)
-        database.commit()
-        database.refresh(source)
-        task_dispatcher.dispatch(job.id)
-        return SourceResponse.model_validate(source)
+        digest = hashlib.sha256()
+        bytes_written = 0
+
+        def chunks() -> Iterator[bytes]:
+            nonlocal bytes_written
+            while chunk := file.file.read(UPLOAD_CHUNK_BYTES):
+                bytes_written += len(chunk)
+                if bytes_written > upload_limit:
+                    raise HTTPException(status_code=413, detail="upload exceeds configured size limit")
+                storage_service.ensure_capacity(len(chunk))
+                digest.update(chunk)
+                yield chunk
+
+        try:
+            storage_service.atomic_write(temporary_path, chunks())
+            if bytes_written == 0:
+                raise HTTPException(status_code=422, detail="upload must not be empty")
+            existing = database.scalar(
+                select(SourceVideo).where(SourceVideo.content_hash == digest.hexdigest())
+            )
+            if existing is not None:
+                response.status_code = status.HTTP_200_OK
+                return _duplicate_response(existing)
+            source = SourceVideo(
+                source_uri="",
+                original_filename=filename,
+                content_hash=digest.hexdigest(),
+                rights_status=rights_status,
+            )
+            database.add(source)
+            database.flush()
+            destination = storage_service.source_directory(source.id) / filename
+            os.replace(temporary_path, destination)
+            source.source_uri = str(destination)
+            job = _new_job(source.id)
+            database.add(job)
+            database.commit()
+            database.refresh(source)
+            task_dispatcher.dispatch(source.id, job.id)
+            return SourceResponse.model_validate(source)
+        finally:
+            temporary_path.unlink(missing_ok=True)
 
     @app.post("/sources/url", response_model=SourceResponse, status_code=status.HTTP_202_ACCEPTED)
     def create_url_source(
@@ -162,7 +182,7 @@ def create_app(
         database.add(job)
         database.commit()
         database.refresh(source)
-        task_dispatcher.dispatch(job.id)
+        task_dispatcher.dispatch(source.id, job.id)
         return SourceResponse.model_validate(source)
 
     @app.get("/sources", response_model=list[SourceResponse])
@@ -201,7 +221,7 @@ def create_app(
         database.add(job)
         database.commit()
         database.refresh(job)
-        task_dispatcher.dispatch(job.id)
+        task_dispatcher.dispatch(source_id, job.id)
         return JobResponse.model_validate(job)
 
     @app.post(
@@ -223,7 +243,7 @@ def create_app(
         latest.error_message = None
         database.commit()
         database.refresh(latest)
-        task_dispatcher.dispatch(latest.id)
+        task_dispatcher.dispatch(source_id, latest.id)
         return JobResponse.model_validate(latest)
 
     @app.get("/jobs", response_model=list[JobResponse])

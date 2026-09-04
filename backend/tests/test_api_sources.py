@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from types import SimpleNamespace
 from pathlib import Path
 from uuid import UUID
 
 import pytest
+from fastapi import Response
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from app.api.app import create_app
+from app.api.app import CeleryDispatcher, create_app
+from app.core.enums import PipelineStage, RightsStatus
 from app.db.base import Base
 from app.services.storage import StorageService
 
@@ -18,7 +21,8 @@ class RecordingDispatcher:
     def __init__(self) -> None:
         self.job_ids: list[UUID] = []
 
-    def dispatch(self, job_id: UUID) -> None:
+    def dispatch(self, source_id: UUID, job_id: UUID) -> None:
+        del source_id
         self.job_ids.append(job_id)
 
 
@@ -27,11 +31,13 @@ def client(tmp_path: Path) -> Iterator[tuple[TestClient, RecordingDispatcher]]:
     engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'api.sqlite3'}")
     Base.metadata.create_all(engine)
     dispatcher = RecordingDispatcher()
+    factory = sessionmaker(engine, expire_on_commit=False)
     app = create_app(
-        session_factory=sessionmaker(engine, expire_on_commit=False),
+        session_factory=factory,
         storage=StorageService(tmp_path / "storage"),
         dispatcher=dispatcher,
     )
+    app.state.session_factory = factory
     with TestClient(app) as test_client:
         yield test_client, dispatcher
     engine.dispose()
@@ -75,6 +81,56 @@ def test_upload_creates_source_and_schedules_job_without_executing_it(
     assert body["original_filename"] == "clip.mp4"
     assert body["lifecycle_state"] == "INGEST"
     assert len(dispatcher.job_ids) == 1
+
+
+def test_celery_dispatcher_sends_the_source_id_to_the_worker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[object, ...]] = []
+    source_id = UUID("0d9f0117-739f-4f34-b0cf-b3d0f1f5ebd1")
+    job_id = UUID("5c2a9a34-4d2c-4e01-8ca1-5090cfb4906c")
+
+    monkeypatch.setattr(
+        "app.workers.tasks.run_pipeline_stage.delay", lambda *args: calls.append(args)
+    )
+
+    CeleryDispatcher().dispatch(source_id, job_id)
+
+    assert calls == [(str(source_id), PipelineStage.INGEST.value, str(job_id))]
+
+
+def test_upload_reads_the_request_file_in_bounded_chunks(
+    client: tuple[TestClient, RecordingDispatcher],
+) -> None:
+    test_client, _ = client
+    route = next(route for route in test_client.app.routes if getattr(route, "path", None) == "/sources/upload")
+    reader = _BoundedReader(b"video-data")
+    fake_upload = SimpleNamespace(filename="streamed.mp4", file=reader)
+    session_factory = test_client.app.state.session_factory
+
+    with session_factory() as database:
+        response = route.endpoint(  # type: ignore[union-attr]
+            Response(), fake_upload, RightsStatus.OWNED, database
+        )
+
+    assert response.rights_status is RightsStatus.OWNED
+    assert reader.read_sizes
+    assert all(size <= 1024 * 1024 for size in reader.read_sizes)
+
+
+class _BoundedReader:
+    def __init__(self, content: bytes) -> None:
+        self._content = content
+        self._offset = 0
+        self.read_sizes: list[int] = []
+
+    def read(self, size: int = -1) -> bytes:
+        if size <= 0 or size > 1024 * 1024:
+            raise AssertionError("uploads must be read in bounded chunks")
+        self.read_sizes.append(size)
+        chunk = self._content[self._offset : self._offset + size]
+        self._offset += len(chunk)
+        return chunk
 
 
 def test_duplicate_upload_returns_existing_source_without_scheduling_again(

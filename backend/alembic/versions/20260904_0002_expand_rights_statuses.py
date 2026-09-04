@@ -25,6 +25,7 @@ def _rights_status(values: tuple[str, ...]) -> sa.Enum:
 
 
 def upgrade() -> None:
+    _normalize_legacy_authorized_rows()
     with op.batch_alter_table("source_videos") as batch:
         batch.alter_column(
             "rights_status",
@@ -32,6 +33,12 @@ def upgrade() -> None:
             type_=_rights_status(_EXPANDED),
             existing_nullable=False,
         )
+
+
+def _normalize_legacy_authorized_rows() -> None:
+    op.execute(
+        "UPDATE source_videos SET rights_status = 'PERMISSION' WHERE rights_status = 'AUTHORIZED'"
+    )
 
 
 def downgrade() -> None:
