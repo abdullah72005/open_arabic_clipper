@@ -47,6 +47,25 @@ def test_source_media_returns_stored_local_upload(
     assert media.headers["content-type"].startswith("video/mp4")
 
 
+def test_source_media_uses_configured_storage_when_not_injected(tmp_path: Path) -> None:
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'default-storage.sqlite3'}")
+    Base.metadata.create_all(engine)
+    app = create_app(
+        session_factory=sessionmaker(engine, expire_on_commit=False),
+        dispatcher=RecordingDispatcher(),
+    )
+
+    with TestClient(app) as test_client:
+        created = test_client.post(
+            "/sources/upload",
+            files={"file": ("owned-video.mp4", b"owned media", "video/mp4")},
+        )
+        media = test_client.get(f"/api/sources/{created.json()['id']}/media")
+
+    engine.dispose()
+    assert media.status_code == 200, media.text
+
+
 @pytest.fixture
 def client(tmp_path: Path) -> Iterator[tuple[TestClient, RecordingDispatcher]]:
     engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'api.sqlite3'}")

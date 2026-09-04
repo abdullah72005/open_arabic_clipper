@@ -229,7 +229,7 @@ def create_app(
         """Serve only the storage-owned local original for timestamp playback."""
         source = _source_or_404(database, source_id)
         source_path = Path(source.source_uri)
-        source_directory = storage.source_directory(source.id).resolve()
+        source_directory = storage_service.source_directory(source.id).resolve()
         try:
             source_path.resolve().relative_to(source_directory)
         except (OSError, ValueError):
