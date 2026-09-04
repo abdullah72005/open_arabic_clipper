@@ -4,9 +4,12 @@ from enum import Enum
 class RightsStatus(str, Enum):
     """The operator's declared authorization for a source."""
 
-    OWNED = "OWNED"
-    AUTHORIZED = "AUTHORIZED"
     UNKNOWN = "UNKNOWN"
+    OWNED = "OWNED"
+    LICENSED = "LICENSED"
+    PERMISSION = "PERMISSION"
+    PUBLIC_DOMAIN = "PUBLIC_DOMAIN"
+    OTHER_ALLOWED = "OTHER_ALLOWED"
 
 
 class PipelineStage(str, Enum):

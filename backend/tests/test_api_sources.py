@@ -58,9 +58,7 @@ def test_upload_rejects_content_over_configured_limit(tmp_path: Path) -> None:
         max_upload_bytes=4,
     )
     with TestClient(app) as test_client:
-        response = test_client.post(
-            "/sources/upload", files={"file": ("large.mp4", b"video")}
-        )
+        response = test_client.post("/sources/upload", files={"file": ("large.mp4", b"video")})
     engine.dispose()
 
     assert response.status_code == 413
@@ -96,6 +94,35 @@ def test_url_requires_valid_public_http_url(client: tuple[TestClient, RecordingD
     test_client, _ = client
     response = test_client.post("/sources/url", json={"url": "file:///private/video.mp4"})
     assert response.status_code == 422
+
+
+def test_upload_persists_operator_selected_rights_status(
+    client: tuple[TestClient, RecordingDispatcher],
+) -> None:
+    test_client, _ = client
+
+    response = test_client.post(
+        "/sources/upload",
+        data={"rights_status": "LICENSED"},
+        files={"file": ("licensed.mp4", b"video")},
+    )
+
+    assert response.status_code == 201
+    assert response.json()["rights_status"] == "LICENSED"
+
+
+def test_url_accepts_all_declared_operator_rights_statuses(
+    client: tuple[TestClient, RecordingDispatcher],
+) -> None:
+    test_client, _ = client
+
+    response = test_client.post(
+        "/sources/url",
+        json={"url": "https://example.com/licensed-video", "rights_status": "OTHER_ALLOWED"},
+    )
+
+    assert response.status_code == 202
+    assert response.json()["rights_status"] == "OTHER_ALLOWED"
 
 
 def test_delete_rejects_sources_with_active_jobs(

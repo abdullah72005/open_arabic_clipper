@@ -1,4 +1,10 @@
-export type RightsStatus = "UNKNOWN" | "OWNED" | "LICENSED" | "PUBLIC_DOMAIN";
+export type RightsStatus =
+  | "UNKNOWN"
+  | "OWNED"
+  | "LICENSED"
+  | "PERMISSION"
+  | "PUBLIC_DOMAIN"
+  | "OTHER_ALLOWED";
 export type PipelineStage = "INGEST" | "PROBE" | "READY_FOR_TRANSCRIPTION" | "FAILED";
 export type JobStatus = "QUEUED" | "RUNNING" | "SUCCEEDED" | "FAILED" | "CANCELLED";
 
@@ -66,9 +72,10 @@ export function createApiClient(baseUrl: string, fetcher: Fetcher = fetch) {
           })
         )
       ),
-    upload: (file: File) => {
+    upload: (file: File, rights_status: RightsStatus = "UNKNOWN") => {
       const body = new FormData();
       body.append("file", file);
+      body.append("rights_status", rights_status);
       return request<Source>("/sources/upload", { method: "POST", body });
     },
     deleteSource: (id: string) => request<void>(`/sources/${encodeURIComponent(id)}`, { method: "DELETE" }),

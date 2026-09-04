@@ -68,9 +68,7 @@ def test_cleanup_removes_only_expired_temporary_files(tmp_path: Path) -> None:
 
 def test_cleanup_does_not_recursively_traverse_temporary_directories(tmp_path: Path) -> None:
     storage = StorageService(tmp_path)
-    nested_temporary_file = (
-        storage.category_root(StorageCategory.TEMPORARY) / "nested" / "old.tmp"
-    )
+    nested_temporary_file = storage.category_root(StorageCategory.TEMPORARY) / "nested" / "old.tmp"
     nested_temporary_file.parent.mkdir()
     nested_temporary_file.write_bytes(b"data")
     old_timestamp = time.time() - 120

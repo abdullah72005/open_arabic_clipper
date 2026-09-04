@@ -34,4 +34,28 @@ describe("API client", () => {
       expect.objectContaining<ApiError>({ status: 404, message: "not found" })
     );
   });
+
+  it("includes the selected rights status with a local-file upload", async () => {
+    const fetcher = async (_input: RequestInfo | URL, init?: RequestInit) => {
+      expect(init?.method).toBe("POST");
+      expect(init?.body).toBeInstanceOf(FormData);
+      expect((init?.body as FormData).get("rights_status")).toBe("LICENSED");
+      return new Response(
+        JSON.stringify({
+          id: "0d9f0117-739f-4f34-b0cf-b3d0f1f5ebd1",
+          source_uri: "/storage/sources/example/licensed.mp4",
+          original_filename: "licensed.mp4",
+          rights_status: "LICENSED",
+          lifecycle_state: "INGEST",
+          created_at: "2026-09-04T00:00:00Z"
+        }),
+        { status: 201, headers: { "content-type": "application/json" } }
+      );
+    };
+
+    const client = createApiClient("http://api.test", fetcher);
+    await expect(client.upload(new File(["video"], "licensed.mp4"), "LICENSED")).resolves.toMatchObject({
+      rights_status: "LICENSED"
+    });
+  });
 });

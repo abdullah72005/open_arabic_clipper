@@ -24,12 +24,16 @@ under `./storage`.
 
 ## Development checks
 
+GitHub Actions runs these quality gates on every push and pull request: backend
+tests with a coverage report, Ruff format/lint checks, frontend tests/lint/build,
+and Docker Compose configuration validation.
+
 ```bash
 docker compose config
-docker compose run --rm backend pytest
-docker compose run --rm backend ruff check app tests
-docker compose run --rm frontend npm test
-docker compose run --rm frontend npm run build
+docker compose run --rm --no-deps -v "$(pwd)/backend:/app" backend sh -c \
+  "python -m pip install pytest pytest-asyncio httpx coverage ruff && \
+   coverage run --source=app -m pytest && ruff format --check app tests && ruff check app tests"
+(cd frontend && npm ci && npm test && npm run lint && npm run build)
 ```
 
 The frontend image is built for the browser API base URL configured by

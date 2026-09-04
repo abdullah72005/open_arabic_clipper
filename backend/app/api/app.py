@@ -9,7 +9,7 @@ from datetime import datetime
 from typing import Protocol
 from uuid import UUID
 
-from fastapi import Depends, FastAPI, File, HTTPException, Response, UploadFile, status
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Response, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy import select
@@ -108,7 +108,10 @@ def create_app(
 
     @app.post("/sources/upload", response_model=SourceResponse, status_code=status.HTTP_201_CREATED)
     def upload_source(
-        response: Response, file: UploadFile = File(...), database: Session = Depends(session)
+        response: Response,
+        file: UploadFile = File(...),
+        rights_status: RightsStatus = Form(RightsStatus.UNKNOWN),
+        database: Session = Depends(session),
     ) -> SourceResponse:
         filename = _safe_filename(file.filename)
         content = file.file.read(upload_limit + 1)
@@ -121,7 +124,12 @@ def create_app(
         if existing is not None:
             response.status_code = status.HTTP_200_OK
             return _duplicate_response(existing)
-        source = SourceVideo(source_uri="", original_filename=filename, content_hash=digest)
+        source = SourceVideo(
+            source_uri="",
+            original_filename=filename,
+            content_hash=digest,
+            rights_status=rights_status,
+        )
         database.add(source)
         database.flush()
         destination = storage_service.source_directory(source.id) / filename

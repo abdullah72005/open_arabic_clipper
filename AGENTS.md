@@ -1,3 +1,44 @@
+# open_arabic_clipper — Project Memory
+
+## Product and stage
+
+- Product name: `open_arabic_clipper` (working product label: ClipFactory).
+- Current scope: Stage 1 only — local-first foundation, ingest/probe pipeline,
+  storage, jobs, dashboard shell, and operational tooling.
+- Explicitly out of scope until later stages: transcription, AI clip selection,
+  advanced rendering/reframing, social publishing, and automatic authorization.
+- Process only media the operator owns or is authorized to process. Never add
+  DRM, login, paywall, CAPTCHA, or platform-protection circumvention.
+
+## Technical decisions
+
+- Runtime: Python 3.12, FastAPI, SQLAlchemy 2, Alembic, PostgreSQL, Redis,
+  Celery, and structured JSON logging.
+- UI: Next.js, TypeScript, and Tailwind CSS.
+- Media interfaces use FFmpeg/ffprobe through safe argument arrays; GPU use is
+  optional and must never be required.
+- The storage service is the sole owner of application filesystem paths.
+- Pipeline stages are persisted, idempotent, retryable, and resumable. Stage 1
+  ends at `READY_FOR_TRANSCRIPTION`; future stage authorization must gate
+  UNKNOWN-rights sources before candidate generation, rendering, or publishing.
+
+## Local development facts (not product requirements)
+
+- This workspace is a WSL2 checkout on a Windows-mounted drive.
+- Docker Desktop/Compose, Node/npm, and internet access are available.
+- Host Python is 3.10.12; use Docker's Python 3.12 runtime or install Python
+  3.12 before native backend work.
+- FFmpeg and ffprobe are currently absent from the host PATH; Docker images
+  install them, and native setup documentation must cover installation.
+- No NVIDIA/CUDA tooling was detected. Do not make GPU assumptions.
+
+## Working agreements
+
+- Keep implementation and tests in the monorepo boundaries documented below.
+- Add tests for each feature or bugfix; run formatting, linting, and relevant
+  tests before completion claims.
+- Update README and operational docs whenever commands or configuration change.
+
 # Repository Guidelines
 
 ## Project Structure & Module Organization
