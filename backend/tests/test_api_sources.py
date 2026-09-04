@@ -8,7 +8,7 @@ from uuid import UUID
 import pytest
 from fastapi import Response
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
 from app.api.app import CeleryDispatcher, create_app
@@ -249,14 +249,34 @@ def test_retranscribe_queues_a_transcription_job(
 ) -> None:
     test_client, _ = client
     source = test_client.post("/sources/upload", files={"file": ("clip.mp4", b"video")}).json()
+    factory = test_client.app.state.session_factory
+    with factory() as session:
+        session.add(
+            Transcript(
+                source_video_id=UUID(source["id"]),
+                whisper_model="small",
+                input_fingerprint="cached",
+                raw_text="cached",
+                normalized_text="cached",
+                segments=[],
+                word_segments=[],
+            )
+        )
+        session.commit()
     calls: list[tuple[str, str, str]] = []
     monkeypatch.setattr(
         "app.workers.tasks.run_pipeline_stage.delay", lambda *args: calls.append(args)
     )
 
-    response = test_client.post(f"/api/sources/{source['id']}/retranscribe")
+    response = test_client.post(f"/api/sources/{source['id']}/retranscribe?force=true")
 
     assert response.status_code == 202
     assert response.json()["kind"] == "TRANSCRIPTION"
     assert calls[0][0] == source["id"]
     assert calls[0][1] == "TRANSCRIPTION"
+    with factory() as session:
+        transcript = session.scalar(
+            select(Transcript).where(Transcript.source_video_id == UUID(source["id"]))
+        )
+        assert transcript is not None
+        assert transcript.input_fingerprint == ""

@@ -257,9 +257,19 @@ def create_app(
         response_model=JobResponse,
         status_code=status.HTTP_202_ACCEPTED,
     )
-    def retranscribe_source(source_id: UUID, database: Session = Depends(session)) -> JobResponse:
+    def retranscribe_source(
+        source_id: UUID,
+        force: bool = False,
+        database: Session = Depends(session),
+    ) -> JobResponse:
         """Queue a fresh local ASR run; option changes invalidate its transcript cache."""
         _source_or_404(database, source_id)
+        if force:
+            transcript = database.scalar(
+                select(Transcript).where(Transcript.source_video_id == source_id)
+            )
+            if transcript is not None:
+                transcript.input_fingerprint = ""
         job = ProcessingJob(source_video_id=source_id, kind=JobKind.TRANSCRIPTION)
         database.add(job)
         database.commit()
