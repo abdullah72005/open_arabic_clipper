@@ -8,8 +8,9 @@ and records silence/quality signals through `READY_FOR_ANALYSIS`. It does not
 select clips, reframe, render, publish, or automatically authorize content.
 
 Only process material you own or are explicitly authorized to process. URL
-ingest accepts permitted public sources only. The software does not bypass DRM,
-logins, paywalls, CAPTCHAs, or platform protections.
+ingest downloads permitted public sources directly; an optional outbound proxy
+may be configured. The software does not bypass DRM, logins, paywalls,
+CAPTCHAs, or platform protections.
 
 ## Quick start (Docker)
 

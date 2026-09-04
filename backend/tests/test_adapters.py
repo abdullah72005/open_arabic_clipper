@@ -12,9 +12,10 @@ from app.services.source_adapters import (
     MAX_DOWNLOAD_DIAGNOSTIC_BYTES,
     LocalFileAdapter,
     SourceAcquisitionError,
-    SourceConfigurationError,
     SourceValidationError,
     YtDlpAdapter,
+    _directory_size,
+    _downloaded_path,
     normalize_source_url,
 )
 from app.services.storage import StorageService
@@ -129,13 +130,42 @@ def test_ytdlp_download_command_ignores_ambient_configuration(tmp_path: Path) ->
     assert "--print" not in command
 
 
-def test_ytdlp_adapter_rejects_url_acquisition_without_trusted_egress_proxy(
-    tmp_path: Path,
-) -> None:
+def test_ytdlp_direct_download_command_uses_no_proxy_or_credentials(tmp_path: Path) -> None:
     adapter = YtDlpAdapter(StorageService(tmp_path / "storage"))
 
-    with pytest.raises(SourceConfigurationError, match="egress proxy"):
-        adapter.inspect("https://8.8.8.8/video")
+    command = adapter._download_command(tmp_path / "source", "https://example.com/video")
+
+    assert "--proxy" not in command
+    assert "--cookies" not in command
+    assert "--username" not in command
+
+
+def test_directory_size_ignores_fragment_removed_during_download_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fragment = tmp_path / "video.part-Frag42"
+    fragment.write_bytes(b"partial")
+    original_stat = Path.stat
+    calls = 0
+
+    def disappearing_stat(path: Path, *args: object, **kwargs: object):
+        nonlocal calls
+        if path == fragment:
+            calls += 1
+            if calls == 2:
+                raise FileNotFoundError
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", disappearing_stat)
+
+    assert _directory_size(tmp_path) == 0
+
+
+def test_downloaded_path_accepts_restricted_filename_with_leading_dots(tmp_path: Path) -> None:
+    media = tmp_path / "..-video-id.webm"
+    media.write_bytes(b"authorized video")
+
+    assert _downloaded_path(tmp_path) == media
 
 
 def test_ytdlp_download_monitor_terminates_when_directory_exceeds_cap(

@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 import subprocess
+import uuid
 from pathlib import Path
 
+import pytest
 from sqlalchemy.orm import Session
 
-from app.core.enums import PipelineStage
+from app.core.enums import PipelineStage, RightsStatus
 from app.db.base import Base
 from app.media.audio import AudioExtractor
 from app.media.ffprobe import FFprobe
 from app.models import SourceVideo
-from app.pipeline.runner import PipelineRunner
+from app.pipeline.runner import PipelineRunner, StageExecutionError
 from app.pipeline.stages import (
     AudioAnalysisExecutor,
     AudioExtractionExecutor,
@@ -19,6 +21,7 @@ from app.pipeline.stages import (
     TranscriptionExecutor,
     TranscriptNormalizationExecutor,
 )
+from app.services.source_adapters import AcquiredSource
 from app.services.storage import StorageService
 from app.transcription.engine import TranscriptionResult
 from app.transcription.service import TranscriptionOptions
@@ -99,3 +102,39 @@ def test_generated_owned_media_reaches_ready_for_analysis(
         assert source.transcript.chunks[0].text == "أهلا hello"
         assert source.audio_analysis is not None
         assert source.quality_assessment is not None
+
+
+def test_ingest_downloads_an_authorized_public_url_into_owned_storage(tmp_path: Path) -> None:
+    downloaded = tmp_path / "downloaded.mp4"
+    downloaded.write_bytes(b"authorized video")
+
+    class RecordingAdapter:
+        def acquire(self, source_id: uuid.UUID, source_url: str) -> AcquiredSource:
+            assert source_url == "https://example.com/authorized-video"
+            return AcquiredSource(
+                path=downloaded,
+                original_filename="authorized-video.mp4",
+                source_url=source_url,
+            )
+
+    source = SourceVideo(
+        id=uuid.uuid4(),
+        source_uri="https://example.com/authorized-video",
+        rights_status=RightsStatus.PERMISSION,
+    )
+
+    IngestExecutor(url_adapter=RecordingAdapter()).execute(source)
+
+    assert source.source_uri == str(downloaded)
+    assert source.original_filename == "authorized-video.mp4"
+
+
+def test_ingest_rejects_public_url_without_explicit_rights() -> None:
+    source = SourceVideo(
+        id=uuid.uuid4(),
+        source_uri="https://example.com/unapproved-video",
+        rights_status=RightsStatus.UNKNOWN,
+    )
+
+    with pytest.raises(StageExecutionError, match="explicit rights"):
+        IngestExecutor().execute(source)

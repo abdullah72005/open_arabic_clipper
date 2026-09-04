@@ -10,12 +10,14 @@ from time import monotonic
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
+from app.core.enums import RightsStatus
 from app.core.settings import get_settings
 from app.media.analysis import parse_silencedetect, silence_ratio, windowed_rms
 from app.media.audio import AudioExtractor
 from app.media.ffprobe import FFprobe, MediaMetadata
 from app.models import AudioAnalysis, AudioArtifact, SourceVideo, Transcript, TranscriptChunk
 from app.pipeline.runner import StageExecutionError
+from app.services.source_adapters import YtDlpAdapter
 from app.services.source_quality import assess_source
 from app.services.storage import StorageCategory, StorageService
 from app.transcription.chunking import ChunkConfig, build_chunks
@@ -96,9 +98,21 @@ class TranscriptionExecutor:
 class IngestExecutor:
     """Mark a source accepted by the API as ready for its media probe."""
 
+    def __init__(self, url_adapter: YtDlpAdapter | None = None) -> None:
+        settings = get_settings()
+        self._url_adapter = url_adapter or YtDlpAdapter(
+            StorageService(settings.storage_root), egress_proxy=settings.url_egress_proxy
+        )
+
     def execute(self, source: SourceVideo) -> SourceVideo:
         if not source.source_uri:
             raise StageExecutionError("source URI is missing")
+        if source.source_uri.startswith(("http://", "https://")):
+            if source.rights_status is RightsStatus.UNKNOWN:
+                raise StageExecutionError("explicit rights are required before URL acquisition")
+            acquired = self._url_adapter.acquire(source.id, source.source_uri)
+            source.source_uri = str(acquired.path)
+            source.original_filename = acquired.original_filename
         return source
 
 
