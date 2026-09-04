@@ -45,7 +45,7 @@ services:
     env_file:
       - path: .env
         required: false
-    command: ["celery", "-A", "app.workers.celery_app:celery_app", "worker", "--loglevel=INFO", "--concurrency=1"]
+    command: ["celery", "-A", "app.workers.celery_app:celery_app", "worker", "--loglevel=INFO", "--concurrency=1", "--queues=media,transcription"]
     environment:
       CLIPFACTORY_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-clipfactory}:${POSTGRES_PASSWORD:-clipfactory}@postgres:5432/${POSTGRES_DB:-clipfactory}
       CLIPFACTORY_REDIS_URL: redis://redis:6379/0

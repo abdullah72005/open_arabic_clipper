@@ -25,3 +25,31 @@ def test_settings_rejects_non_positive_upload_limit(
 
     with pytest.raises(ValidationError, match="greater than 0"):
         Settings()
+
+
+def test_settings_choose_practical_transcription_defaults() -> None:
+    """Default transcription settings avoid loading an impractical largest model."""
+
+    settings = Settings()
+
+    assert settings.whisper_model == "small"
+    assert settings.whisper_device == "auto"
+    assert settings.whisper_cpu_compute_type == "int8"
+
+
+def test_settings_accept_forced_transcription_language(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An operator can override auto-detection for a known-language source."""
+
+    monkeypatch.setenv("CLIPFACTORY_WHISPER_LANGUAGE", "ar")
+
+    assert Settings().whisper_language == "ar"
+
+
+def test_settings_builds_auto_transcription_options() -> None:
+    """Auto mode defers device selection while preserving configured output options."""
+
+    options = Settings().transcription_options()
+
+    assert options.model == "small"
+    assert options.device == "auto"
+    assert options.language is None

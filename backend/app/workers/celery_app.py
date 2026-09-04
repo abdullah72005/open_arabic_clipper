@@ -13,6 +13,8 @@ celery_app.conf.update(
     task_acks_late=True,
     worker_prefetch_multiplier=1,
     worker_concurrency=1,
+    task_default_queue="media",
+    task_routes={"clipfactory.run_transcription": {"queue": "transcription"}},
     task_track_started=True,
     timezone="UTC",
 )
