@@ -7,13 +7,13 @@ import json
 import re
 import socket
 import subprocess
-import tempfile
+import threading
 import time
 import uuid
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import BinaryIO, Protocol
 from urllib.parse import SplitResult, urlsplit, urlunsplit
 
 from app.services.storage import StorageService, StorageValidationError
@@ -217,35 +217,37 @@ class YtDlpAdapter:
         """Run yt-dlp while enforcing a bounded output directory size."""
 
         _assert_public_host_resolution(urlsplit(normalized_url).hostname)
-        with tempfile.TemporaryDirectory(prefix=".yt-dlp-", dir=output_directory) as temporary_dir:
-            diagnostic_path = Path(temporary_dir) / "stderr.log"
-            with diagnostic_path.open("wb") as diagnostics:
-                try:
-                    process = subprocess.Popen(
-                        command,
-                        stdout=subprocess.DEVNULL,
-                        stderr=diagnostics,
-                    )
-                except OSError as error:
-                    raise SourceAcquisitionError("yt-dlp acquisition failed") from error
+        try:
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+        except OSError as error:
+            raise SourceAcquisitionError("yt-dlp acquisition failed") from error
 
-                while process.poll() is None:
-                    if _directory_size(output_directory) > self._max_download_bytes:
-                        process.terminate()
-                        process.wait()
-                        raise SourceAcquisitionError(
-                            "yt-dlp exceeded the configured download limit"
-                        )
-                    if diagnostic_path.stat().st_size > MAX_DOWNLOAD_DIAGNOSTIC_BYTES:
-                        process.terminate()
-                        process.wait()
-                        raise SourceAcquisitionError("yt-dlp produced excessive diagnostic output")
-                    time.sleep(0.1)
+        stderr = process.stderr
+        if stderr is None:
+            process.terminate()
+            process.wait()
+            raise SourceAcquisitionError("yt-dlp diagnostic stream is unavailable")
+        diagnostic_tail = bytearray()
+        reader = threading.Thread(target=_drain_stderr, args=(stderr, diagnostic_tail), daemon=True)
+        reader.start()
 
-                returncode = process.wait()
-            diagnostic_text = _diagnostic_tail(diagnostic_path)
+        exceeded_limit = False
+        while process.poll() is None:
+            if _directory_size(output_directory) > self._max_download_bytes:
+                process.terminate()
+                exceeded_limit = True
+                break
+            time.sleep(0.1)
 
-        if _directory_size(output_directory) > self._max_download_bytes:
+        returncode = process.wait()
+        reader.join()
+        diagnostic_text = diagnostic_tail.decode("utf-8", errors="replace").strip()
+
+        if exceeded_limit or _directory_size(output_directory) > self._max_download_bytes:
             raise SourceAcquisitionError("yt-dlp exceeded the configured download limit")
         if returncode != 0:
             detail = f": {diagnostic_text}" if diagnostic_text else ""
@@ -354,10 +356,13 @@ def _directory_size(directory: Path) -> int:
     return total
 
 
-def _diagnostic_tail(path: Path) -> str:
-    """Read a bounded UTF-8 tail of an external tool's diagnostic output."""
+def _drain_stderr(stream: BinaryIO, tail: bytearray) -> None:
+    """Drain stderr continuously while retaining only its bounded byte tail."""
 
-    with path.open("rb") as diagnostics:
-        diagnostics.seek(0, 2)
-        diagnostics.seek(max(0, diagnostics.tell() - MAX_DOWNLOAD_DIAGNOSTIC_BYTES))
-        return diagnostics.read().decode("utf-8", errors="replace").strip()
+    try:
+        while chunk := stream.read(8 * 1024):
+            tail.extend(chunk)
+            if len(tail) > MAX_DOWNLOAD_DIAGNOSTIC_BYTES:
+                del tail[:-MAX_DOWNLOAD_DIAGNOSTIC_BYTES]
+    finally:
+        stream.close()

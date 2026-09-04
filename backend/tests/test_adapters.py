@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import socket
 import subprocess
 import uuid
@@ -8,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from app.services.source_adapters import (
+    MAX_DOWNLOAD_DIAGNOSTIC_BYTES,
     LocalFileAdapter,
     SourceAcquisitionError,
     SourceConfigurationError,
@@ -150,6 +152,7 @@ def test_ytdlp_download_monitor_terminates_when_directory_exceeds_cap(
 
     class RunningProcess:
         terminated = False
+        stderr = io.BytesIO()
 
         def poll(self) -> None:
             return None
@@ -174,7 +177,7 @@ def test_ytdlp_download_monitor_terminates_when_directory_exceeds_cap(
     assert process.terminated
 
 
-def test_ytdlp_download_avoids_pipe_backpressure_for_noisy_child_output(
+def test_ytdlp_download_continuously_drains_noisy_stderr_into_bounded_tail(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     output_directory = tmp_path / "source"
@@ -187,12 +190,10 @@ def test_ytdlp_download_avoids_pipe_backpressure_for_noisy_child_output(
 
     class FinishedNoisyProcess:
         returncode = 0
+        stderr = io.BytesIO(b"x" * (MAX_DOWNLOAD_DIAGNOSTIC_BYTES * 2))
 
         def poll(self) -> int:
             return 0
-
-        def communicate(self) -> tuple[str, str]:
-            return "x" * 1_000_000, "diagnostic"
 
         def wait(self) -> int:
             return 0
@@ -202,7 +203,8 @@ def test_ytdlp_download_avoids_pipe_backpressure_for_noisy_child_output(
         lambda *args, **kwargs: (calls.append(kwargs), FinishedNoisyProcess())[1],
     )
 
-    adapter._run_download(["yt-dlp"], "https://8.8.8.8/video", output_directory)
+    result = adapter._run_download(["yt-dlp"], "https://8.8.8.8/video", output_directory)
 
     assert calls[0]["stdout"] is subprocess.DEVNULL
-    assert calls[0]["stderr"] is not subprocess.PIPE
+    assert calls[0]["stderr"] is subprocess.PIPE
+    assert len(result.stderr) == MAX_DOWNLOAD_DIAGNOSTIC_BYTES
