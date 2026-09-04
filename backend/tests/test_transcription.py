@@ -136,6 +136,60 @@ def test_normalization_preserves_egyptian_arabic_and_embedded_english() -> None:
     assert normalize_transcript("  أنا  okay\n\nأنا  ") == "أنا okay أنا"
 
 
+def test_normalization_and_audio_analysis_persist_reusable_signals(
+    sqlite_engine: object, tmp_path: Path
+) -> None:
+    from app.db.base import Base
+    from app.models import AudioArtifact, SourceVideo, Transcript
+    from app.pipeline.stages import AudioAnalysisExecutor, TranscriptNormalizationExecutor
+    from app.services.storage import StorageCategory, StorageService
+
+    Base.metadata.create_all(sqlite_engine)
+    storage = StorageService(tmp_path / "storage")
+    with Session(sqlite_engine) as session:
+        source = SourceVideo(source_uri=str(tmp_path / "source.mp4"), content_hash="source")
+        session.add(source)
+        session.flush()
+        artifact_path = storage.resolve(StorageCategory.SOURCES, f"{source.id}/speech-analysis.wav")
+        artifact_path.parent.mkdir(parents=True, exist_ok=True)
+        artifact_path.write_bytes(b"wav")
+        session.add(
+            AudioArtifact(
+                source_video_id=source.id,
+                output_path=f"{source.id}/speech-analysis.wav",
+                content_hash="audio",
+                sample_rate=16_000,
+                duration=10.0,
+            )
+        )
+        session.add(
+            Transcript(
+                source_video_id=source.id,
+                whisper_model="small",
+                input_fingerprint="fingerprint",
+                raw_text="  أهلا  hello\n",
+                segments=[{"start": 0.0, "end": 2.0, "text": "  أهلا  hello "}],
+                word_segments=[{"start": 0.0, "end": 0.2, "word": "أهلا"}],
+                duration=10.0,
+            )
+        )
+        session.commit()
+
+        transcript = TranscriptNormalizationExecutor(session=session).execute(source)
+        analysis = AudioAnalysisExecutor(
+            session=session,
+            storage=storage,
+            command_runner=lambda _args: (
+                "silence_start: 2\\nsilence_end: 4 | silence_duration: 2\\n"
+            ),
+        ).execute(source)
+
+        assert transcript.normalized_text == "أهلا hello"
+        assert transcript.segments[0]["normalized_text"] == "أهلا hello"
+        assert analysis.silence_ratio == 0.2
+        assert analysis.speech_density == 0.8
+
+
 def test_chunking_uses_segment_boundaries_and_neighbor_context() -> None:
     """Later analysis gets coherent timestamp ranges rather than character slices."""
 
