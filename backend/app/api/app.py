@@ -7,11 +7,13 @@ import os
 import shutil
 from collections.abc import Iterator
 from datetime import datetime
+from pathlib import Path
 from typing import Protocol
 from uuid import UUID, uuid4
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Response, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
@@ -221,6 +223,22 @@ def create_app(
     def get_transcript(source_id: UUID, database: Session = Depends(session)) -> TranscriptResponse:
         transcript = _transcript_or_404(database, source_id)
         return _transcript_response(transcript)
+
+    @app.get("/api/sources/{source_id}/media")
+    def get_source_media(source_id: UUID, database: Session = Depends(session)) -> FileResponse:
+        """Serve only the storage-owned local original for timestamp playback."""
+        source = _source_or_404(database, source_id)
+        source_path = Path(source.source_uri)
+        source_directory = storage.source_directory(source.id).resolve()
+        try:
+            source_path.resolve().relative_to(source_directory)
+        except (OSError, ValueError):
+            raise HTTPException(
+                status_code=404, detail="local source media is unavailable"
+            ) from None
+        if not source_path.is_file():
+            raise HTTPException(status_code=404, detail="local source media is unavailable")
+        return FileResponse(source_path)
 
     @app.get(
         "/api/sources/{source_id}/transcript/segments",

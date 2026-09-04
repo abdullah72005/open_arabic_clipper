@@ -1,7 +1,7 @@
 "use client";
 
 import { useParams, useRouter } from "next/navigation";
-import { useCallback, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import { ApiState } from "@/components/api-state";
 import { api, ApiError, type Transcript } from "@/lib/api-client";
 
@@ -11,7 +11,13 @@ function timestamp(value: number) {
   return `${minutes}:${seconds.toString().padStart(2, "0")}`;
 }
 
-function TranscriptViewer({ transcript }: { transcript: Transcript | null }) {
+function TranscriptViewer({
+  transcript,
+  onSeek
+}: {
+  transcript: Transcript | null;
+  onSeek: (seconds: number) => void;
+}) {
   if (!transcript) return <p className="muted">Transcript is not ready yet.</p>;
   const isArabic = transcript.language?.startsWith("ar") ?? false;
   return (
@@ -28,7 +34,7 @@ function TranscriptViewer({ transcript }: { transcript: Transcript | null }) {
           <button
             className="transcript-segment"
             key={`${segment.start}-${index}`}
-            onClick={() => document.getElementById("source-preview")?.scrollIntoView()}
+            onClick={() => onSeek(segment.start)}
             type="button"
           >
             <time>{timestamp(segment.start)}</time>
@@ -43,6 +49,7 @@ function TranscriptViewer({ transcript }: { transcript: Transcript | null }) {
 export default function SourceDetail() {
   const params = useParams<{ id: string }>();
   const router = useRouter();
+  const videoRef = useRef<HTMLVideoElement>(null);
   const [error, setError] = useState("");
   const load = useCallback(() => api.getSource(params.id), [params.id]);
   const loadTranscript = useCallback(
@@ -52,6 +59,13 @@ export default function SourceDetail() {
     }),
     [params.id],
   );
+  const seekTo = useCallback((seconds: number) => {
+    const video = videoRef.current;
+    if (!video) return;
+    video.currentTime = seconds;
+    video.scrollIntoView({ behavior: "smooth", block: "center" });
+    void video.play().catch(() => undefined);
+  }, []);
   const remove = async () => {
     if (!confirm("Delete this source and its stored local files?")) return;
     try {
@@ -68,6 +82,15 @@ export default function SourceDetail() {
         <>
           <section className="card">
             <h2>{source.original_filename ?? "URL source"}</h2>
+            {!source.source_uri.startsWith("http") && (
+              <video
+                controls
+                id="source-preview"
+                preload="metadata"
+                ref={videoRef}
+                src={api.sourceMediaUrl(source.id)}
+              />
+            )}
             <dl>
               <dt>Origin</dt><dd>{source.source_uri}</dd>
               <dt>Rights</dt><dd>{source.rights_status}</dd>
@@ -77,7 +100,9 @@ export default function SourceDetail() {
             <button className="button danger" onClick={remove}>Delete source</button>
             {error && <p className="error">{error}</p>}
           </section>
-          <ApiState load={loadTranscript}>{(transcript) => <TranscriptViewer transcript={transcript} />}</ApiState>
+          <ApiState load={loadTranscript}>
+            {(transcript) => <TranscriptViewer onSeek={seekTo} transcript={transcript} />}
+          </ApiState>
         </>
       )}
     </ApiState>

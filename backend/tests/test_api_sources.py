@@ -27,6 +27,26 @@ class RecordingDispatcher:
         self.job_ids.append(job_id)
 
 
+def test_source_media_returns_stored_local_upload(
+    client: tuple[TestClient, RecordingDispatcher],
+) -> None:
+    test_client, _ = client
+
+    created = test_client.post(
+        "/sources/upload",
+        data={"rights_status": RightsStatus.OWNED.value},
+        files={"file": ("owned-video.mp4", b"owned media", "video/mp4")},
+    )
+
+    assert created.status_code == 201
+    source_id = created.json()["id"]
+    media = test_client.get(f"/api/sources/{source_id}/media")
+
+    assert media.status_code == 200, media.text
+    assert media.content == b"owned media"
+    assert media.headers["content-type"].startswith("video/mp4")
+
+
 @pytest.fixture
 def client(tmp_path: Path) -> Iterator[tuple[TestClient, RecordingDispatcher]]:
     engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'api.sqlite3'}")

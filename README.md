@@ -58,7 +58,8 @@ Use `GET /api/sources/{id}/transcript` for the persisted raw and normalized
 evidence, `GET /api/sources/{id}/transcript/search?q=...` for timestamped
 segments, and `POST /api/sources/{id}/retranscribe` to queue a new local ASR job.
 Arabic transcript panels render RTL when Arabic is detected; mixed segments retain
-their original Unicode text.
+their original Unicode text. Source detail pages play storage-owned local media;
+selecting a transcript segment seeks playback to its timestamp.
 
 Operator commands are available from the backend environment: `python -m app.cli
 transcribe SOURCE_ID`, `python -m app.cli transcript SOURCE_ID`, and `python -m

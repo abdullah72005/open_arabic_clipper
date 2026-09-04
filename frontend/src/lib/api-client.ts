@@ -90,6 +90,8 @@ export function createApiClient(baseUrl: string, fetcher: Fetcher = fetch) {
   return {
     listSources: () => request<Source[]>("/sources"),
     getSource: (id: string) => request<Source>(`/sources/${encodeURIComponent(id)}`),
+    sourceMediaUrl: (id: string) =>
+      `${baseUrl.replace(/\/$/, "")}/api/sources/${encodeURIComponent(id)}/media`,
     getTranscript: (id: string) =>
       request<Transcript>(`/api/sources/${encodeURIComponent(id)}/transcript`),
     submitUrls: (urls: string[], rights_status: RightsStatus = "UNKNOWN") =>

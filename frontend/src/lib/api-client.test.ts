@@ -3,6 +3,12 @@ import { describe, expect, it } from "vitest";
 import { ApiError, createApiClient } from "./api-client";
 
 describe("API client", () => {
+  it("builds a local source-media URL for transcript timestamp playback", () => {
+    const client = createApiClient("http://api.test");
+
+    expect(client.sourceMediaUrl("source-1")).toBe("http://api.test/api/sources/source-1/media");
+  });
+
   it("loads timestamped auto-detected transcripts from the Stage 2 API", async () => {
     const fetcher = async (input: RequestInfo | URL) => {
       expect(String(input)).toBe("http://api.test/api/sources/source-1/transcript");
