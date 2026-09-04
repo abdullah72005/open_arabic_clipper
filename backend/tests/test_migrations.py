@@ -3,7 +3,12 @@ from pathlib import Path
 
 
 def _load_migration() -> object:
-    path = Path(__file__).parents[1] / "alembic" / "versions" / "20260904_0002_expand_rights_statuses.py"
+    path = (
+        Path(__file__).parents[1]
+        / "alembic"
+        / "versions"
+        / "20260904_0002_expand_rights_statuses.py"
+    )
     specification = importlib.util.spec_from_file_location("rights_status_migration", path)
     assert specification is not None
     assert specification.loader is not None

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
-from types import SimpleNamespace
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import UUID
 
 import pytest
@@ -103,7 +103,11 @@ def test_upload_reads_the_request_file_in_bounded_chunks(
     client: tuple[TestClient, RecordingDispatcher],
 ) -> None:
     test_client, _ = client
-    route = next(route for route in test_client.app.routes if getattr(route, "path", None) == "/sources/upload")
+    route = next(
+        route
+        for route in test_client.app.routes
+        if getattr(route, "path", None) == "/sources/upload"
+    )
     reader = _BoundedReader(b"video-data")
     fake_upload = SimpleNamespace(filename="streamed.mp4", file=reader)
     session_factory = test_client.app.state.session_factory

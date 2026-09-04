@@ -117,9 +117,7 @@ def create_app(
         database: Session = Depends(session),
     ) -> SourceResponse:
         filename = _safe_filename(file.filename)
-        temporary_path = storage_service.resolve(
-            StorageCategory.TEMPORARY, f"upload-{uuid4()}.tmp"
-        )
+        temporary_path = storage_service.resolve(StorageCategory.TEMPORARY, f"upload-{uuid4()}.tmp")
         digest = hashlib.sha256()
         bytes_written = 0
 
@@ -128,7 +126,9 @@ def create_app(
             while chunk := file.file.read(UPLOAD_CHUNK_BYTES):
                 bytes_written += len(chunk)
                 if bytes_written > upload_limit:
-                    raise HTTPException(status_code=413, detail="upload exceeds configured size limit")
+                    raise HTTPException(
+                        status_code=413, detail="upload exceeds configured size limit"
+                    )
                 storage_service.ensure_capacity(len(chunk))
                 digest.update(chunk)
                 yield chunk
