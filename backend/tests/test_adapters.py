@@ -10,6 +10,7 @@ import pytest
 from app.services.source_adapters import (
     LocalFileAdapter,
     SourceAcquisitionError,
+    SourceConfigurationError,
     SourceValidationError,
     YtDlpAdapter,
     normalize_source_url,
@@ -38,7 +39,7 @@ def test_ytdlp_adapter_rejects_hostname_resolving_to_private_address(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     storage = StorageService(tmp_path / "storage")
-    adapter = YtDlpAdapter(storage)
+    adapter = YtDlpAdapter(storage, egress_proxy="http://trusted-proxy:8080")
 
     monkeypatch.setattr(
         socket,
@@ -54,7 +55,7 @@ def test_ytdlp_adapter_rejects_unknown_download_size_before_running_download(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     storage = StorageService(tmp_path / "storage")
-    adapter = YtDlpAdapter(storage)
+    adapter = YtDlpAdapter(storage, egress_proxy="http://trusted-proxy:8080")
     monkeypatch.setattr(adapter, "inspect", lambda url: {"title": "unknown size"})
 
     def fail_if_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
@@ -85,7 +86,7 @@ def test_ytdlp_commands_are_argument_vectors_without_shell_execution(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     storage = StorageService(tmp_path / "storage")
-    adapter = YtDlpAdapter(storage, binary="yt-dlp-test")
+    adapter = YtDlpAdapter(storage, binary="yt-dlp-test", egress_proxy="http://trusted-proxy:8080")
     calls: list[tuple[object, dict[str, object]]] = []
 
     def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
@@ -106,14 +107,63 @@ def test_ytdlp_commands_are_argument_vectors_without_shell_execution(
     assert isinstance(command, list)
     assert command[0] == "yt-dlp-test"
     assert "--ignore-config" in command
+    assert command[command.index("--proxy") + 1] == "http://trusted-proxy:8080"
     assert "shell" not in keyword_arguments
     assert "--no-simulate" not in command
     assert command[-1] == "https://example.com/video"
 
 
 def test_ytdlp_download_command_ignores_ambient_configuration(tmp_path: Path) -> None:
-    adapter = YtDlpAdapter(StorageService(tmp_path / "storage"))
+    adapter = YtDlpAdapter(
+        StorageService(tmp_path / "storage"), egress_proxy="http://trusted-proxy:8080"
+    )
 
     command = adapter._download_command(tmp_path / "source", "https://example.com/video")
 
     assert "--ignore-config" in command
+    assert command[command.index("--proxy") + 1] == "http://trusted-proxy:8080"
+    assert command[command.index("--max-filesize") + 1] == str(adapter._max_download_bytes)
+
+
+def test_ytdlp_adapter_rejects_url_acquisition_without_trusted_egress_proxy(
+    tmp_path: Path,
+) -> None:
+    adapter = YtDlpAdapter(StorageService(tmp_path / "storage"))
+
+    with pytest.raises(SourceConfigurationError, match="egress proxy"):
+        adapter.inspect("https://8.8.8.8/video")
+
+
+def test_ytdlp_download_monitor_terminates_when_directory_exceeds_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output_directory = tmp_path / "source"
+    output_directory.mkdir()
+    (output_directory / "partial.mp4").write_bytes(b"12345")
+    adapter = YtDlpAdapter(
+        StorageService(tmp_path / "storage"),
+        egress_proxy="http://trusted-proxy:8080",
+        max_download_bytes=4,
+    )
+
+    class RunningProcess:
+        terminated = False
+
+        def poll(self) -> None:
+            return None
+
+        def terminate(self) -> None:
+            self.terminated = True
+
+        def communicate(self) -> tuple[str, str]:
+            return "", ""
+
+    process = RunningProcess()
+    monkeypatch.setattr(
+        "app.services.source_adapters.subprocess.Popen", lambda *args, **kwargs: process
+    )
+
+    with pytest.raises(SourceAcquisitionError, match="configured download limit"):
+        adapter._run_download(["yt-dlp"], "https://8.8.8.8/video", output_directory)
+
+    assert process.terminated

@@ -7,6 +7,7 @@ import json
 import re
 import socket
 import subprocess
+import time
 import uuid
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
@@ -27,6 +28,10 @@ class SourceAdapterError(RuntimeError):
 
 class SourceValidationError(SourceAdapterError, ValueError):
     """Raised when a source input cannot be acquired safely."""
+
+
+class SourceConfigurationError(SourceAdapterError):
+    """Raised when safe URL acquisition has not been configured."""
 
 
 class SourcePermissionError(SourceAdapterError):
@@ -117,16 +122,19 @@ class YtDlpAdapter:
         *,
         binary: str = "yt-dlp",
         max_download_bytes: int = DEFAULT_MAX_REMOTE_DOWNLOAD_BYTES,
+        egress_proxy: str | None = None,
     ) -> None:
         if max_download_bytes <= 0:
             raise SourceValidationError("maximum remote download size must be positive")
         self._storage = storage
         self._binary = binary
         self._max_download_bytes = max_download_bytes
+        self._egress_proxy = egress_proxy
 
     def inspect(self, url: str) -> Mapping[str, object]:
         """Read public metadata before downloading, using a safe argument vector."""
 
+        self._require_egress_proxy()
         normalized_url = normalize_source_url(url)
         result = self._run(self._metadata_command(normalized_url), normalized_url)
         try:
@@ -138,6 +146,7 @@ class YtDlpAdapter:
         return metadata
 
     def acquire(self, source_id: uuid.UUID | str, source: Path | str) -> AcquiredSource:
+        self._require_egress_proxy()
         if not isinstance(source, str):
             raise SourceValidationError("yt-dlp source must be a URL string")
         normalized_url = normalize_source_url(source)
@@ -145,7 +154,11 @@ class YtDlpAdapter:
         expected_bytes = _expected_bytes(metadata, self._max_download_bytes)
         self._storage.ensure_capacity(expected_bytes)
         source_directory = self._storage.source_directory(source_id)
-        result = self._run(self._download_command(source_directory, normalized_url), normalized_url)
+        result = self._run_download(
+            self._download_command(source_directory, normalized_url),
+            normalized_url,
+            source_directory,
+        )
         acquired_path = _downloaded_path(result.stdout, source_directory)
         if not acquired_path.is_file():
             raise SourceAcquisitionError(
@@ -161,6 +174,8 @@ class YtDlpAdapter:
         return [
             self._binary,
             "--ignore-config",
+            "--proxy",
+            self._require_egress_proxy(),
             "--no-playlist",
             "--dump-single-json",
             normalized_url,
@@ -171,11 +186,15 @@ class YtDlpAdapter:
         return [
             self._binary,
             "--ignore-config",
+            "--proxy",
+            self._require_egress_proxy(),
             "--no-playlist",
             "--no-write-info-json",
             "--no-write-thumbnail",
             "--no-write-subs",
             "--restrict-filenames",
+            "--max-filesize",
+            str(self._max_download_bytes),
             "--output",
             output_template,
             "--print",
@@ -190,6 +209,47 @@ class YtDlpAdapter:
             return subprocess.run(command, check=True, capture_output=True, text=True)
         except (OSError, subprocess.CalledProcessError) as error:
             raise SourceAcquisitionError("yt-dlp acquisition failed") from error
+
+    def _run_download(
+        self, command: list[str], normalized_url: str, output_directory: Path
+    ) -> subprocess.CompletedProcess[str]:
+        """Run yt-dlp while enforcing a bounded output directory size."""
+
+        _assert_public_host_resolution(urlsplit(normalized_url).hostname)
+        try:
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        except OSError as error:
+            raise SourceAcquisitionError("yt-dlp acquisition failed") from error
+
+        while process.poll() is None:
+            if _directory_size(output_directory) > self._max_download_bytes:
+                process.terminate()
+                process.communicate()
+                raise SourceAcquisitionError("yt-dlp exceeded the configured download limit")
+            time.sleep(0.1)
+
+        stdout, stderr = process.communicate()
+        if _directory_size(output_directory) > self._max_download_bytes:
+            raise SourceAcquisitionError("yt-dlp exceeded the configured download limit")
+        if process.returncode != 0:
+            raise subprocess.CalledProcessError(
+                process.returncode, command, output=stdout, stderr=stderr
+            )
+        return subprocess.CompletedProcess(
+            command, process.returncode, stdout=stdout, stderr=stderr
+        )
+
+    def _require_egress_proxy(self) -> str:
+        if not self._egress_proxy:
+            raise SourceConfigurationError(
+                "URL acquisition requires a configured trusted egress proxy"
+            )
+        return self._egress_proxy
 
 
 def sanitize_filename(value: str) -> str:
@@ -277,3 +337,13 @@ def _downloaded_path(stdout: str, source_directory: Path) -> Path:
             "yt-dlp reported a path outside the source directory"
         ) from error
     return candidate
+
+
+def _directory_size(directory: Path) -> int:
+    """Return regular-file bytes written below an adapter-owned output directory."""
+
+    total = 0
+    for candidate in directory.rglob("*"):
+        if candidate.is_file():
+            total += candidate.stat().st_size
+    return total

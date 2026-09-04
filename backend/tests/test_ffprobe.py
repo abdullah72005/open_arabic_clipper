@@ -81,6 +81,26 @@ def test_parse_ffprobe_json_rejects_non_finite_numbers(duration: str) -> None:
         parse_ffprobe_json(json.dumps(payload))
 
 
+@pytest.mark.parametrize("sample_rate", [float("inf"), float("nan")])
+def test_parse_ffprobe_json_rejects_non_finite_integer_fields(sample_rate: float) -> None:
+    payload = {
+        "format": {"duration": "1"},
+        "streams": [
+            {
+                "codec_type": "video",
+                "codec_name": "h264",
+                "width": 1,
+                "height": 1,
+                "avg_frame_rate": "24/1",
+            },
+            {"codec_type": "audio", "codec_name": "aac", "sample_rate": sample_rate},
+        ],
+    }
+
+    with pytest.raises(ProbeParseError):
+        parse_ffprobe_json(payload)
+
+
 def test_ffprobe_uses_safe_argument_vector(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     media_path = tmp_path / "video.mp4"
     media_path.write_bytes(b"synthetic")

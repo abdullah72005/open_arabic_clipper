@@ -126,7 +126,7 @@ def _nonempty_string(value: object, field: str) -> str:
 def _positive_int(value: object, field: str) -> int:
     try:
         parsed = int(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError) as error:
+    except (OverflowError, TypeError, ValueError) as error:
         raise ProbeParseError(f"{field} must be a positive integer") from error
     if not math.isfinite(parsed) or parsed <= 0:
         raise ProbeParseError(f"{field} must be a positive integer")
