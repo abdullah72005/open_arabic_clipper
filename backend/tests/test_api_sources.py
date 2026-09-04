@@ -14,6 +14,7 @@ from sqlalchemy.orm import sessionmaker
 from app.api.app import CeleryDispatcher, create_app
 from app.core.enums import PipelineStage, RightsStatus
 from app.db.base import Base
+from app.models import SourceVideo, Transcript
 from app.services.storage import StorageService
 
 
@@ -207,3 +208,37 @@ def test_cancelled_job_is_not_dispatched_again(
     assert len(dispatcher.job_ids) == 1
     assert test_client.post(f"/sources/{source['id']}/process").status_code == 202
     assert len(dispatcher.job_ids) == 2
+
+
+def test_transcript_search_returns_timestamped_mixed_language_segment(
+    client: tuple[TestClient, RecordingDispatcher],
+) -> None:
+    """API search keeps Arabic/English source text and its seek position."""
+
+    test_client, _ = client
+    factory = test_client.app.state.session_factory
+    with factory() as session:
+        source = SourceVideo(source_uri="/imports/episode.mp4")
+        session.add(source)
+        session.flush()
+        session.add(
+            Transcript(
+                source_video_id=source.id,
+                whisper_model="small",
+                transcription_options={},
+                input_fingerprint="a" * 64,
+                raw_text="أهلا hello",
+                normalized_text="أهلا hello",
+                segments=[{"start": 12.4, "end": 14.0, "text": "أهلا hello", "words": []}],
+                word_segments=[],
+                duration=14.0,
+                language="ar",
+            )
+        )
+        session.commit()
+        source_id = source.id
+
+    response = test_client.get(f"/api/sources/{source_id}/transcript/search?q=hello")
+
+    assert response.status_code == 200
+    assert response.json()["segments"][0]["start"] == 12.4
