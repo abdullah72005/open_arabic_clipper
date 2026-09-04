@@ -70,3 +70,6 @@ duration, wall-clock time, real-time factor, audio-minutes-per-wall-minute,
 model, device, and compute type from the actual local run. No representative
 licensed Arabic sample is bundled with this repository, so benchmark figures are
 intentionally not fabricated.
+
+The current local cached-model benchmark is recorded in
+[benchmark results](docs/BENCHMARKS.md).

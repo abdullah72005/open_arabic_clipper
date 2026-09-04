@@ -35,6 +35,7 @@ services:
       CLIPFACTORY_STORAGE_ROOT: /var/lib/clipfactory
     volumes:
       - ./storage:/var/lib/clipfactory
+      - whisper_model_cache:/root/.cache/huggingface
     ports: ["${BACKEND_PORT:-8300}:8000"]
     depends_on:
       postgres: { condition: service_healthy }
@@ -52,6 +53,7 @@ services:
       CLIPFACTORY_STORAGE_ROOT: /var/lib/clipfactory
     volumes:
       - ./storage:/var/lib/clipfactory
+      - whisper_model_cache:/root/.cache/huggingface
     depends_on:
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy }
@@ -67,3 +69,4 @@ services:
 volumes:
   postgres_data:
   redis_data:
+  whisper_model_cache:

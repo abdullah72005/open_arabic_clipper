@@ -47,3 +47,22 @@ def test_stage_2_migration_declares_transcript_tables() -> None:
 
     assert module.revision == "20260904_0003"
     assert module.down_revision == "20260904_0002"
+    assert "INGEST" in module._PIPELINE_BEFORE
+
+
+def test_pipeline_stage_forward_migration_restores_ingest() -> None:
+    path = (
+        Path(__file__).parents[1]
+        / "alembic"
+        / "versions"
+        / "20260904_0005_add_ingest_pipeline_stage.py"
+    )
+    specification = importlib.util.spec_from_file_location("pipeline_ingest_migration", path)
+    assert specification is not None
+    assert specification.loader is not None
+    module = importlib.util.module_from_spec(specification)
+    specification.loader.exec_module(module)
+
+    assert module.revision == "20260904_0005"
+    assert module.down_revision == "20260904_0004"
+    assert "INGEST" in module._AFTER
