@@ -26,7 +26,9 @@ services:
 
   backend:
     build: ./backend
-    env_file: .env
+    env_file:
+      - path: .env
+        required: false
     environment:
       CLIPFACTORY_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-clipfactory}:${POSTGRES_PASSWORD:-clipfactory}@postgres:5432/${POSTGRES_DB:-clipfactory}
       CLIPFACTORY_REDIS_URL: redis://redis:6379/0
@@ -40,7 +42,9 @@ services:
 
   worker:
     build: ./backend
-    env_file: .env
+    env_file:
+      - path: .env
+        required: false
     command: ["celery", "-A", "app.workers.celery_app:celery_app", "worker", "--loglevel=INFO", "--concurrency=1"]
     environment:
       CLIPFACTORY_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-clipfactory}:${POSTGRES_PASSWORD:-clipfactory}@postgres:5432/${POSTGRES_DB:-clipfactory}
