@@ -1,0 +1,65 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-clipfactory}
+      POSTGRES_USER: ${POSTGRES_USER:-clipfactory}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-clipfactory}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  backend:
+    build: ./backend
+    env_file: .env
+    environment:
+      CLIPFACTORY_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-clipfactory}:${POSTGRES_PASSWORD:-clipfactory}@postgres:5432/${POSTGRES_DB:-clipfactory}
+      CLIPFACTORY_REDIS_URL: redis://redis:6379/0
+      CLIPFACTORY_STORAGE_ROOT: /var/lib/clipfactory
+    volumes:
+      - ./storage:/var/lib/clipfactory
+    ports: ["${BACKEND_PORT:-8000}:8000"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+
+  worker:
+    build: ./backend
+    env_file: .env
+    command: ["celery", "-A", "app.workers.celery_app:celery_app", "worker", "--loglevel=INFO", "--concurrency=1"]
+    environment:
+      CLIPFACTORY_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-clipfactory}:${POSTGRES_PASSWORD:-clipfactory}@postgres:5432/${POSTGRES_DB:-clipfactory}
+      CLIPFACTORY_REDIS_URL: redis://redis:6379/0
+      CLIPFACTORY_STORAGE_ROOT: /var/lib/clipfactory
+    volumes:
+      - ./storage:/var/lib/clipfactory
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:8000}
+    ports: ["${FRONTEND_PORT:-3000}:3000"]
+    depends_on: [backend]
+
+volumes:
+  postgres_data:
+  redis_data:
