@@ -14,6 +14,8 @@ from app.db.session import create_session_factory
 from app.models import ProcessingJob, SourceVideo, Transcript
 from app.services.health import HealthService
 from app.services.storage import StorageService
+from app.transcription.benchmark import benchmark_transcription
+from app.transcription.engine import WhisperEngine
 from app.workers.tasks import run_pipeline_stage
 
 app = typer.Typer(no_args_is_help=True)
@@ -103,3 +105,13 @@ def transcript(source_id: UUID) -> None:
                 ensure_ascii=False,
             )
         )
+
+
+@app.command()
+def benchmark(audio_path: Path) -> None:
+    """Measure local configured faster-whisper throughput on representative audio."""
+    if not audio_path.is_file():
+        raise typer.BadParameter("audio_path must be a readable local file")
+    settings = get_settings()
+    report = benchmark_transcription(audio_path, WhisperEngine(), settings.transcription_options())
+    typer.echo(json.dumps(report.as_dict()))

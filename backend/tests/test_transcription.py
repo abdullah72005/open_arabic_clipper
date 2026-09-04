@@ -191,6 +191,30 @@ def test_normalization_and_audio_analysis_persist_reusable_signals(
         assert analysis.speech_density == 0.8
 
 
+def test_benchmark_reports_actual_transcription_throughput(tmp_path: Path) -> None:
+    from app.transcription.benchmark import benchmark_transcription
+    from app.transcription.engine import TranscriptionResult
+
+    class FixedEngine:
+        def transcribe(self, _path: Path, _options: TranscriptionOptions) -> TranscriptionResult:
+            return TranscriptionResult(
+                language="ar",
+                language_probability=0.9,
+                raw_text="أهلا",
+                segments=[],
+                word_segments=[],
+                duration=30.0,
+            )
+
+    report = benchmark_transcription(
+        tmp_path / "sample.wav", FixedEngine(), TranscriptionOptions("small", "cpu", "int8", 5)
+    )
+
+    assert report.source_audio_seconds == 30.0
+    assert report.real_time_factor >= 0.0
+    assert report.audio_minutes_per_wall_minute > 0.0
+
+
 def test_chunking_uses_segment_boundaries_and_neighbor_context() -> None:
     """Later analysis gets coherent timestamp ranges rather than character slices."""
 

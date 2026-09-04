@@ -63,3 +63,10 @@ their original Unicode text.
 Operator commands are available from the backend environment: `python -m app.cli
 transcribe SOURCE_ID`, `python -m app.cli transcript SOURCE_ID`, and `python -m
 app.cli retranscribe SOURCE_ID`. The latter bypasses the cache by default.
+
+Before selecting a deployment default, run `python -m app.cli benchmark
+REPRESENTATIVE_AUTHORIZED_AUDIO.wav` on the target machine. It prints the source
+duration, wall-clock time, real-time factor, audio-minutes-per-wall-minute,
+model, device, and compute type from the actual local run. No representative
+licensed Arabic sample is bundled with this repository, so benchmark figures are
+intentionally not fabricated.
