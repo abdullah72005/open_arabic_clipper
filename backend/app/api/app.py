@@ -23,6 +23,7 @@ from app.models import ProcessingJob, SourceVideo, Transcript
 from app.services.health import CheckStatus, HealthService
 from app.services.source_adapters import SourceValidationError, normalize_source_url
 from app.services.storage import StorageCategory, StorageService
+from app.workers.tasks import run_pipeline_stage
 
 UPLOAD_CHUNK_BYTES = 1024 * 1024
 
@@ -250,6 +251,21 @@ def create_app(
                 if query in str(segment.get("text", "")).casefold()
             ]
         )
+
+    @app.post(
+        "/api/sources/{source_id}/retranscribe",
+        response_model=JobResponse,
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    def retranscribe_source(source_id: UUID, database: Session = Depends(session)) -> JobResponse:
+        """Queue a fresh local ASR run; option changes invalidate its transcript cache."""
+        _source_or_404(database, source_id)
+        job = ProcessingJob(source_video_id=source_id, kind=JobKind.TRANSCRIPTION)
+        database.add(job)
+        database.commit()
+        database.refresh(job)
+        run_pipeline_stage.delay(str(source_id), PipelineStage.TRANSCRIPTION.value, str(job.id))
+        return JobResponse.model_validate(job)
 
     @app.delete("/sources/{source_id}", status_code=status.HTTP_204_NO_CONTENT)
     def delete_source(source_id: UUID, database: Session = Depends(session)) -> None:

@@ -242,3 +242,21 @@ def test_transcript_search_returns_timestamped_mixed_language_segment(
 
     assert response.status_code == 200
     assert response.json()["segments"][0]["start"] == 12.4
+
+
+def test_retranscribe_queues_a_transcription_job(
+    client: tuple[TestClient, RecordingDispatcher], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    test_client, _ = client
+    source = test_client.post("/sources/upload", files={"file": ("clip.mp4", b"video")}).json()
+    calls: list[tuple[str, str, str]] = []
+    monkeypatch.setattr(
+        "app.workers.tasks.run_pipeline_stage.delay", lambda *args: calls.append(args)
+    )
+
+    response = test_client.post(f"/api/sources/{source['id']}/retranscribe")
+
+    assert response.status_code == 202
+    assert response.json()["kind"] == "TRANSCRIPTION"
+    assert calls[0][0] == source["id"]
+    assert calls[0][1] == "TRANSCRIPTION"
