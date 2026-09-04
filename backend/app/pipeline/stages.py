@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from time import monotonic
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -10,6 +11,7 @@ from sqlalchemy.orm import Session
 from app.core.settings import get_settings
 from app.models import AudioArtifact, SourceVideo, Transcript
 from app.pipeline.runner import StageExecutionError
+from app.services.storage import StorageCategory, StorageService
 from app.transcription.engine import TranscriptionResult, WhisperEngine
 from app.transcription.service import TranscriptionOptions
 
@@ -23,10 +25,12 @@ class TranscriptionExecutor:
         session: Session,
         engine: WhisperEngine,
         options: TranscriptionOptions | None = None,
+        storage: StorageService | None = None,
     ) -> None:
         self._session = session
         self._engine = engine
         self._options = options or get_settings().transcription_options()
+        self._storage = storage
 
     def execute(self, source: SourceVideo) -> Transcript:
         artifact = self._session.scalar(
@@ -40,16 +44,27 @@ class TranscriptionExecutor:
         )
         if existing is not None and existing.input_fingerprint == fingerprint:
             return existing
-        result = self._engine.transcribe(Path(artifact.output_path), self._options)
+        audio_path = Path(artifact.output_path)
+        if not audio_path.is_absolute():
+            storage = self._storage or StorageService(get_settings().storage_root)
+            audio_path = storage.resolve(StorageCategory.SOURCES, audio_path)
+        started_at = monotonic()
+        result = self._engine.transcribe(audio_path, self._options)
         transcript = existing or Transcript(source_video_id=source.id)
-        self._apply(transcript, result, fingerprint)
+        self._apply(transcript, result, fingerprint, monotonic() - started_at)
         if existing is None:
             self._session.add(transcript)
         self._session.commit()
         self._session.refresh(transcript)
         return transcript
 
-    def _apply(self, transcript: Transcript, result: TranscriptionResult, fingerprint: str) -> None:
+    def _apply(
+        self,
+        transcript: Transcript,
+        result: TranscriptionResult,
+        fingerprint: str,
+        processing_duration: float,
+    ) -> None:
         transcript.language = result.language
         transcript.detected_language_probability = result.language_probability
         transcript.whisper_model = self._options.model
@@ -67,3 +82,4 @@ class TranscriptionExecutor:
         transcript.segments = result.segments
         transcript.word_segments = result.word_segments
         transcript.duration = result.duration
+        transcript.processing_duration = processing_duration
