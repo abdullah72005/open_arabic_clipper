@@ -9,7 +9,10 @@ import time
 import uuid
 from collections.abc import Iterable, Mapping
 from enum import Enum
+from itertools import islice
 from pathlib import Path
+
+TEMPORARY_CLEANUP_SCAN_LIMIT = 1_000
 
 
 class StorageError(RuntimeError):
@@ -138,10 +141,15 @@ class StorageService:
             raise StorageValidationError("cleanup limit must be positive")
         cutoff = time.time() - older_than_seconds
         removed = 0
-        for candidate in self.category_root(StorageCategory.TEMPORARY).rglob("*.tmp"):
+        temporary_root = self.category_root(StorageCategory.TEMPORARY)
+        for candidate in islice(temporary_root.iterdir(), TEMPORARY_CLEANUP_SCAN_LIMIT):
             if removed == limit:
                 break
-            if candidate.is_file() and candidate.stat().st_mtime <= cutoff:
+            if (
+                candidate.suffix == ".tmp"
+                and candidate.is_file()
+                and candidate.stat().st_mtime <= cutoff
+            ):
                 candidate.unlink()
                 removed += 1
         return removed

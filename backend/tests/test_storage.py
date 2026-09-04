@@ -66,6 +66,22 @@ def test_cleanup_removes_only_expired_temporary_files(tmp_path: Path) -> None:
     assert regular.exists()
 
 
+def test_cleanup_does_not_recursively_traverse_temporary_directories(tmp_path: Path) -> None:
+    storage = StorageService(tmp_path)
+    nested_temporary_file = (
+        storage.category_root(StorageCategory.TEMPORARY) / "nested" / "old.tmp"
+    )
+    nested_temporary_file.parent.mkdir()
+    nested_temporary_file.write_bytes(b"data")
+    old_timestamp = time.time() - 120
+    os.utime(nested_temporary_file, (old_timestamp, old_timestamp))
+
+    removed = storage.cleanup_temporary_files(older_than_seconds=60)
+
+    assert removed == 0
+    assert nested_temporary_file.exists()
+
+
 def test_ensure_capacity_raises_recoverable_error_when_free_space_is_insufficient(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
