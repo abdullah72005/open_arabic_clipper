@@ -123,6 +123,8 @@ def test_ytdlp_download_command_ignores_ambient_configuration(tmp_path: Path) ->
     assert "--ignore-config" in command
     assert command[command.index("--proxy") + 1] == "http://trusted-proxy:8080"
     assert command[command.index("--max-filesize") + 1] == str(adapter._max_download_bytes)
+    assert "--no-progress" in command
+    assert "--print" not in command
 
 
 def test_ytdlp_adapter_rejects_url_acquisition_without_trusted_egress_proxy(
@@ -158,6 +160,9 @@ def test_ytdlp_download_monitor_terminates_when_directory_exceeds_cap(
         def communicate(self) -> tuple[str, str]:
             return "", ""
 
+        def wait(self) -> int:
+            return 0
+
     process = RunningProcess()
     monkeypatch.setattr(
         "app.services.source_adapters.subprocess.Popen", lambda *args, **kwargs: process
@@ -167,3 +172,37 @@ def test_ytdlp_download_monitor_terminates_when_directory_exceeds_cap(
         adapter._run_download(["yt-dlp"], "https://8.8.8.8/video", output_directory)
 
     assert process.terminated
+
+
+def test_ytdlp_download_avoids_pipe_backpressure_for_noisy_child_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output_directory = tmp_path / "source"
+    output_directory.mkdir()
+    adapter = YtDlpAdapter(
+        StorageService(tmp_path / "storage"),
+        egress_proxy="http://trusted-proxy:8080",
+    )
+    calls: list[dict[str, object]] = []
+
+    class FinishedNoisyProcess:
+        returncode = 0
+
+        def poll(self) -> int:
+            return 0
+
+        def communicate(self) -> tuple[str, str]:
+            return "x" * 1_000_000, "diagnostic"
+
+        def wait(self) -> int:
+            return 0
+
+    monkeypatch.setattr(
+        "app.services.source_adapters.subprocess.Popen",
+        lambda *args, **kwargs: (calls.append(kwargs), FinishedNoisyProcess())[1],
+    )
+
+    adapter._run_download(["yt-dlp"], "https://8.8.8.8/video", output_directory)
+
+    assert calls[0]["stdout"] is subprocess.DEVNULL
+    assert calls[0]["stderr"] is not subprocess.PIPE

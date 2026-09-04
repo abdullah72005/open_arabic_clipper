@@ -7,6 +7,7 @@ import json
 import re
 import socket
 import subprocess
+import tempfile
 import time
 import uuid
 from collections.abc import Iterator, Mapping
@@ -20,6 +21,7 @@ from app.services.storage import StorageService, StorageValidationError
 _INVALID_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9._-]+")
 _CHUNK_SIZE = 1024 * 1024
 DEFAULT_MAX_REMOTE_DOWNLOAD_BYTES = 2 * 1024 * 1024 * 1024
+MAX_DOWNLOAD_DIAGNOSTIC_BYTES = 64 * 1024
 
 
 class SourceAdapterError(RuntimeError):
@@ -154,12 +156,12 @@ class YtDlpAdapter:
         expected_bytes = _expected_bytes(metadata, self._max_download_bytes)
         self._storage.ensure_capacity(expected_bytes)
         source_directory = self._storage.source_directory(source_id)
-        result = self._run_download(
+        self._run_download(
             self._download_command(source_directory, normalized_url),
             normalized_url,
             source_directory,
         )
-        acquired_path = _downloaded_path(result.stdout, source_directory)
+        acquired_path = _downloaded_path(source_directory)
         if not acquired_path.is_file():
             raise SourceAcquisitionError(
                 "yt-dlp did not produce a media file in the source directory"
@@ -193,12 +195,11 @@ class YtDlpAdapter:
             "--no-write-thumbnail",
             "--no-write-subs",
             "--restrict-filenames",
+            "--no-progress",
             "--max-filesize",
             str(self._max_download_bytes),
             "--output",
             output_template,
-            "--print",
-            "after_move:filepath",
             normalized_url,
         ]
 
@@ -216,33 +217,40 @@ class YtDlpAdapter:
         """Run yt-dlp while enforcing a bounded output directory size."""
 
         _assert_public_host_resolution(urlsplit(normalized_url).hostname)
-        try:
-            process = subprocess.Popen(
-                command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-        except OSError as error:
-            raise SourceAcquisitionError("yt-dlp acquisition failed") from error
+        with tempfile.TemporaryDirectory(prefix=".yt-dlp-", dir=output_directory) as temporary_dir:
+            diagnostic_path = Path(temporary_dir) / "stderr.log"
+            with diagnostic_path.open("wb") as diagnostics:
+                try:
+                    process = subprocess.Popen(
+                        command,
+                        stdout=subprocess.DEVNULL,
+                        stderr=diagnostics,
+                    )
+                except OSError as error:
+                    raise SourceAcquisitionError("yt-dlp acquisition failed") from error
 
-        while process.poll() is None:
-            if _directory_size(output_directory) > self._max_download_bytes:
-                process.terminate()
-                process.communicate()
-                raise SourceAcquisitionError("yt-dlp exceeded the configured download limit")
-            time.sleep(0.1)
+                while process.poll() is None:
+                    if _directory_size(output_directory) > self._max_download_bytes:
+                        process.terminate()
+                        process.wait()
+                        raise SourceAcquisitionError(
+                            "yt-dlp exceeded the configured download limit"
+                        )
+                    if diagnostic_path.stat().st_size > MAX_DOWNLOAD_DIAGNOSTIC_BYTES:
+                        process.terminate()
+                        process.wait()
+                        raise SourceAcquisitionError("yt-dlp produced excessive diagnostic output")
+                    time.sleep(0.1)
 
-        stdout, stderr = process.communicate()
+                returncode = process.wait()
+            diagnostic_text = _diagnostic_tail(diagnostic_path)
+
         if _directory_size(output_directory) > self._max_download_bytes:
             raise SourceAcquisitionError("yt-dlp exceeded the configured download limit")
-        if process.returncode != 0:
-            raise subprocess.CalledProcessError(
-                process.returncode, command, output=stdout, stderr=stderr
-            )
-        return subprocess.CompletedProcess(
-            command, process.returncode, stdout=stdout, stderr=stderr
-        )
+        if returncode != 0:
+            detail = f": {diagnostic_text}" if diagnostic_text else ""
+            raise SourceAcquisitionError(f"yt-dlp acquisition failed{detail}")
+        return subprocess.CompletedProcess(command, returncode, stdout="", stderr=diagnostic_text)
 
     def _require_egress_proxy(self) -> str:
         if not self._egress_proxy:
@@ -325,18 +333,15 @@ def _assert_public_host_resolution(hostname: str | None) -> None:
             raise SourceValidationError("URL hostname resolves to a non-public address")
 
 
-def _downloaded_path(stdout: str, source_directory: Path) -> Path:
-    printed_paths = [line.strip() for line in stdout.splitlines() if line.strip()]
-    if not printed_paths:
-        raise SourceAcquisitionError("yt-dlp did not report an output path")
-    candidate = Path(printed_paths[-1]).resolve()
-    try:
-        candidate.relative_to(source_directory.resolve())
-    except ValueError as error:
-        raise SourceAcquisitionError(
-            "yt-dlp reported a path outside the source directory"
-        ) from error
-    return candidate
+def _downloaded_path(source_directory: Path) -> Path:
+    candidates = [
+        candidate
+        for candidate in source_directory.iterdir()
+        if candidate.is_file() and not candidate.name.startswith(".")
+    ]
+    if len(candidates) != 1:
+        raise SourceAcquisitionError("yt-dlp did not produce exactly one media file")
+    return candidates[0]
 
 
 def _directory_size(directory: Path) -> int:
@@ -347,3 +352,12 @@ def _directory_size(directory: Path) -> int:
         if candidate.is_file():
             total += candidate.stat().st_size
     return total
+
+
+def _diagnostic_tail(path: Path) -> str:
+    """Read a bounded UTF-8 tail of an external tool's diagnostic output."""
+
+    with path.open("rb") as diagnostics:
+        diagnostics.seek(0, 2)
+        diagnostics.seek(max(0, diagnostics.tell() - MAX_DOWNLOAD_DIAGNOSTIC_BYTES))
+        return diagnostics.read().decode("utf-8", errors="replace").strip()
