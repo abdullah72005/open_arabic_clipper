@@ -5,6 +5,7 @@ from app.models.processing_job import ProcessingJob
 from app.models.source_quality_assessment import SourceQualityAssessment
 from app.models.source_video import SourceVideo
 from app.models.transcript import Transcript
+from app.models.transcript_chunk import TranscriptChunk
 
 __all__ = [
     "AudioAnalysis",
@@ -14,4 +15,5 @@ __all__ = [
     "SourceQualityAssessment",
     "SourceVideo",
     "Transcript",
+    "TranscriptChunk",
 ]

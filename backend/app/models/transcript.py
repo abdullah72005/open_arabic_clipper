@@ -12,6 +12,7 @@ from app.db.base import Base
 
 if TYPE_CHECKING:
     from app.models.source_video import SourceVideo
+    from app.models.transcript_chunk import TranscriptChunk
 
 
 class Transcript(Base):
@@ -42,3 +43,8 @@ class Transcript(Base):
     )
 
     source_video: Mapped["SourceVideo"] = relationship(back_populates="transcript")
+    chunks: Mapped[list["TranscriptChunk"]] = relationship(
+        back_populates="transcript",
+        cascade="all, delete-orphan",
+        order_by="TranscriptChunk.sequence",
+    )

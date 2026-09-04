@@ -7,16 +7,17 @@ from collections.abc import Callable
 from pathlib import Path
 from time import monotonic
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from app.core.settings import get_settings
 from app.media.analysis import parse_silencedetect, silence_ratio
 from app.media.audio import AudioExtractor
-from app.models import AudioAnalysis, AudioArtifact, SourceVideo, Transcript
+from app.models import AudioAnalysis, AudioArtifact, SourceVideo, Transcript, TranscriptChunk
 from app.pipeline.runner import StageExecutionError
 from app.services.source_quality import assess_source
 from app.services.storage import StorageCategory, StorageService
+from app.transcription.chunking import ChunkConfig, build_chunks
 from app.transcription.engine import TranscriptionResult, WhisperEngine
 from app.transcription.normalization import normalize_transcript
 from app.transcription.service import TranscriptionOptions
@@ -118,6 +119,22 @@ class TranscriptNormalizationExecutor:
             {**segment, "normalized_text": normalize_transcript(str(segment.get("text", "")))}
             for segment in transcript.segments
         ]
+        self._session.execute(
+            delete(TranscriptChunk).where(TranscriptChunk.transcript_id == transcript.id)
+        )
+        self._session.add_all(
+            TranscriptChunk(
+                transcript_id=transcript.id,
+                sequence=sequence,
+                start_time=chunk.start_time,
+                end_time=chunk.end_time,
+                text=chunk.text,
+                segment_indexes=chunk.segment_indexes,
+                preceding_context=chunk.preceding_context,
+                following_context=chunk.following_context,
+            )
+            for sequence, chunk in enumerate(build_chunks(transcript.segments, ChunkConfig()))
+        )
         self._session.commit()
         self._session.refresh(transcript)
         return transcript

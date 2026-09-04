@@ -186,6 +186,7 @@ def test_normalization_and_audio_analysis_persist_reusable_signals(
 
         assert transcript.normalized_text == "أهلا hello"
         assert transcript.segments[0]["normalized_text"] == "أهلا hello"
+        assert transcript.chunks[0].segment_indexes == [0]
         assert analysis.silence_ratio == 0.2
         assert analysis.speech_density == 0.8
 

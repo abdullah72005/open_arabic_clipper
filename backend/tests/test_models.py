@@ -104,3 +104,39 @@ def test_source_persists_timestamped_transcript_data(sqlite_engine: object) -> N
         assert source.transcript is not None
         assert source.transcript.segments[0]["start"] == 0.0
         assert source.transcript.segments[0]["no_speech_prob"] == 0.01
+
+
+def test_transcript_persists_timestamped_semantic_chunks(sqlite_engine: object) -> None:
+    from app.models import TranscriptChunk
+
+    Base.metadata.create_all(sqlite_engine)
+    with Session(sqlite_engine) as session:
+        source = SourceVideo(source_uri="/imports/episode.mp4")
+        session.add(source)
+        session.flush()
+        transcript = Transcript(
+            source_video_id=source.id,
+            whisper_model="small",
+            input_fingerprint="c" * 64,
+            raw_text="أهلا hello",
+            normalized_text="أهلا hello",
+            segments=[],
+            word_segments=[],
+        )
+        session.add(transcript)
+        session.flush()
+        session.add(
+            TranscriptChunk(
+                transcript_id=transcript.id,
+                sequence=0,
+                start_time=0.0,
+                end_time=2.0,
+                text="أهلا hello",
+                segment_indexes=[0, 1],
+                preceding_context="",
+                following_context="Next sentence.",
+            )
+        )
+        session.commit()
+
+        assert transcript.chunks[0].segment_indexes == [0, 1]
