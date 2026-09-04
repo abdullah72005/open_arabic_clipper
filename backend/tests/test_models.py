@@ -1,0 +1,69 @@
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
+
+from app.core.enums import JobKind, JobStatus, PipelineRunStatus, PipelineStage, RightsStatus
+from app.db.base import Base
+from app.models import PipelineRun, ProcessingJob, SourceVideo
+
+
+def test_source_video_defaults_and_content_hash_is_unique(sqlite_engine: object) -> None:
+    """A source records safe defaults and cannot duplicate known content."""
+
+    Base.metadata.create_all(sqlite_engine)
+    with Session(sqlite_engine) as session:
+        source = SourceVideo(source_uri="/imports/episode.mp4", content_hash="abc123")
+        session.add(source)
+        session.commit()
+
+        assert source.id is not None
+        assert source.rights_status is RightsStatus.UNKNOWN
+        assert source.lifecycle_state is PipelineStage.INGEST
+        assert source.created_at is not None
+        assert source.updated_at is not None
+
+        session.add(SourceVideo(source_uri="/imports/copy.mp4", content_hash="abc123"))
+        try:
+            session.commit()
+        except IntegrityError:
+            session.rollback()
+        else:
+            raise AssertionError("content hashes must be unique")
+
+
+def test_processing_job_defaults_to_queued_ingest(sqlite_engine: object) -> None:
+    """New ingest work is represented by a durable queued job."""
+
+    Base.metadata.create_all(sqlite_engine)
+    with Session(sqlite_engine) as session:
+        source = SourceVideo(source_uri="/imports/episode.mp4")
+        session.add(source)
+        session.flush()
+        job = ProcessingJob(source_video_id=source.id)
+        session.add(job)
+        session.commit()
+
+        assert job.id is not None
+        assert job.kind is JobKind.INGEST
+        assert job.status is JobStatus.QUEUED
+        assert job.retry_count == 0
+
+
+def test_pipeline_run_can_transition_from_queued_to_running(sqlite_engine: object) -> None:
+    """Pipeline-run status changes persist for resumable processing."""
+
+    Base.metadata.create_all(sqlite_engine)
+    with Session(sqlite_engine) as session:
+        source = SourceVideo(source_uri="/imports/episode.mp4")
+        session.add(source)
+        session.flush()
+        run = PipelineRun(source_video_id=source.id)
+        session.add(run)
+        session.commit()
+
+        assert run.stage is PipelineStage.INGEST
+        assert run.status is PipelineRunStatus.QUEUED
+        run.status = PipelineRunStatus.RUNNING
+        session.commit()
+        session.refresh(run)
+
+        assert run.status is PipelineRunStatus.RUNNING
