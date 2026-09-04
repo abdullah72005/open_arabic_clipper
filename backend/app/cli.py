@@ -115,3 +115,7 @@ def benchmark(audio_path: Path) -> None:
     settings = get_settings()
     report = benchmark_transcription(audio_path, WhisperEngine(), settings.transcription_options())
     typer.echo(json.dumps(report.as_dict()))
+
+
+if __name__ == "__main__":
+    app()

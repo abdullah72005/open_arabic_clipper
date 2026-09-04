@@ -196,6 +196,9 @@ def test_benchmark_reports_actual_transcription_throughput(tmp_path: Path) -> No
     from app.transcription.engine import TranscriptionResult
 
     class FixedEngine:
+        def resolved_hardware(self, _options: TranscriptionOptions) -> tuple[str, str]:
+            return "cpu", "int8"
+
         def transcribe(self, _path: Path, _options: TranscriptionOptions) -> TranscriptionResult:
             return TranscriptionResult(
                 language="ar",
@@ -211,6 +214,8 @@ def test_benchmark_reports_actual_transcription_throughput(tmp_path: Path) -> No
     )
 
     assert report.source_audio_seconds == 30.0
+    assert report.device == "cpu"
+    assert report.compute_type == "int8"
     assert report.real_time_factor >= 0.0
     assert report.audio_minutes_per_wall_minute > 0.0
 

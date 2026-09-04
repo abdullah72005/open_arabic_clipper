@@ -28,6 +28,7 @@ def benchmark_transcription(
     audio_path: Path, engine: WhisperEngine, options: TranscriptionOptions
 ) -> BenchmarkReport:
     """Run the configured engine once and report throughput from actual timings."""
+    device, compute_type = engine.resolved_hardware(options)
     started = monotonic()
     result = engine.transcribe(audio_path, options)
     wall_clock = monotonic() - started
@@ -38,6 +39,6 @@ def benchmark_transcription(
         real_time_factor=wall_clock / duration if duration else 0.0,
         audio_minutes_per_wall_minute=duration / wall_clock if wall_clock else 0.0,
         model=options.model,
-        device=options.device,
-        compute_type=options.compute_type,
+        device=device,
+        compute_type=compute_type,
     )

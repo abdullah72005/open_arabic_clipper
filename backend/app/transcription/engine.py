@@ -66,6 +66,10 @@ class WhisperEngine:
             word_segments=words,
         )
 
+    def resolved_hardware(self, options: TranscriptionOptions) -> tuple[str, str]:
+        """Expose the effective device policy for operational reporting."""
+        return self._resolve_hardware(options)
+
     def _resolve_hardware(self, options: TranscriptionOptions) -> tuple[str, str]:
         cuda = self._cuda_available()
         use_cuda = options.device == "cuda" and cuda or options.device == "auto" and cuda
