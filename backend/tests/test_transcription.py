@@ -1,6 +1,8 @@
 from dataclasses import replace
 from pathlib import Path
 
+from sqlalchemy.orm import Session
+
 from app.transcription.service import TranscriptionOptions
 from app.workers.celery_app import celery_app
 
@@ -79,6 +81,51 @@ def test_engine_falls_back_to_cpu_int8_and_preserves_word_timestamps() -> None:
     assert result.language == "ar"
     assert result.language_probability == 0.97
     assert result.segments[0]["words"][0]["start"] == 0.0
+
+
+def test_transcription_executor_persists_raw_timestamped_result(
+    sqlite_engine: object, tmp_path: Path
+) -> None:
+    """Worker-stage execution stores raw evidence and detected language for reuse."""
+
+    from app.db.base import Base
+    from app.models import AudioArtifact, SourceVideo
+    from app.pipeline.stages import TranscriptionExecutor
+    from app.transcription.engine import TranscriptionResult
+
+    class FakeEngine:
+        def transcribe(self, path: Path, options: TranscriptionOptions) -> TranscriptionResult:
+            return TranscriptionResult(
+                language="ar",
+                language_probability=0.9,
+                raw_text="أهلا hello",
+                duration=1.0,
+                segments=[{"start": 0.0, "end": 1.0, "text": "أهلا hello", "words": []}],
+                word_segments=[],
+            )
+
+    Base.metadata.create_all(sqlite_engine)
+    with Session(sqlite_engine) as session:
+        source = SourceVideo(source_uri=str(tmp_path / "source.mp4"), content_hash="source")
+        session.add(source)
+        session.flush()
+        audio_path = tmp_path / "speech.wav"
+        audio_path.write_bytes(b"wav")
+        artifact = AudioArtifact(
+            source_video_id=source.id,
+            output_path=str(audio_path),
+            content_hash="audio",
+            source_content_hash="source",
+            sample_rate=16000,
+            duration=1.0,
+        )
+        session.add(artifact)
+        session.commit()
+
+        transcript = TranscriptionExecutor(session=session, engine=FakeEngine()).execute(source)
+
+        assert transcript.language == "ar"
+        assert transcript.segments[0]["start"] == 0.0
 
 
 def test_normalization_preserves_egyptian_arabic_and_embedded_english() -> None:
