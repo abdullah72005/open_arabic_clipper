@@ -33,7 +33,6 @@ _NEXT_STAGE: Final = {
     PipelineStage.AUDIO_EXTRACTION: PipelineStage.TRANSCRIPTION,
     PipelineStage.TRANSCRIPTION: PipelineStage.TRANSCRIPT_NORMALIZATION,
     PipelineStage.TRANSCRIPT_NORMALIZATION: PipelineStage.AUDIO_ANALYSIS,
-    PipelineStage.AUDIO_ANALYSIS: PipelineStage.READY_FOR_ANALYSIS,
 }
 
 

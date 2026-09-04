@@ -116,3 +116,10 @@ def test_transcription_stage_advances_to_normalization_and_uses_transcription_jo
         assert job is not None
         assert job.kind is JobKind.TRANSCRIPTION
         assert source.lifecycle_state is PipelineStage.TRANSCRIPT_NORMALIZATION
+
+
+def test_audio_analysis_is_terminal_worker_stage() -> None:
+    """The runner advances it to READY_FOR_ANALYSIS without another executor task."""
+    from app.workers.tasks import _NEXT_STAGE
+
+    assert PipelineStage.AUDIO_ANALYSIS not in _NEXT_STAGE
