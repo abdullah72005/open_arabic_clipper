@@ -94,3 +94,25 @@ def test_retry_increments_job_count_without_replacing_source(sqlite_engine: obje
 def test_autopilot_rejects_unknown_rights() -> None:
     with pytest.raises(AutopilotAuthorizationError, match="UNKNOWN"):
         require_autopilot_authorization(RightsStatus.UNKNOWN)
+
+
+def test_transcription_stage_advances_to_normalization_and_uses_transcription_job(
+    sqlite_engine: object,
+) -> None:
+    """Durable transcription work has its own retryable job and lifecycle transition."""
+
+    Base.metadata.create_all(sqlite_engine)
+    with Session(sqlite_engine) as session:
+        source = _source(session)
+        source.lifecycle_state = PipelineStage.TRANSCRIPTION
+        session.commit()
+
+        result = PipelineRunner(session, {PipelineStage.TRANSCRIPTION: RecordingExecutor()}).run(
+            source.id, PipelineStage.TRANSCRIPTION
+        )
+
+        job = session.get(ProcessingJob, result.job_id)
+        session.refresh(source)
+        assert job is not None
+        assert job.kind is JobKind.TRANSCRIPTION
+        assert source.lifecycle_state is PipelineStage.TRANSCRIPT_NORMALIZATION
