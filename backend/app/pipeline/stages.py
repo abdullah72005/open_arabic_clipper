@@ -11,7 +11,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from app.core.settings import get_settings
-from app.media.analysis import parse_silencedetect, silence_ratio
+from app.media.analysis import parse_silencedetect, silence_ratio, windowed_rms
 from app.media.audio import AudioExtractor
 from app.models import AudioAnalysis, AudioArtifact, SourceVideo, Transcript, TranscriptChunk
 from app.pipeline.runner import StageExecutionError
@@ -198,7 +198,9 @@ class AudioAnalysisExecutor:
         analysis = existing or AudioAnalysis(source_video_id=source.id)
         analysis.audio_hash = artifact.content_hash
         analysis.silence_intervals = [interval.__dict__ for interval in intervals]
-        analysis.features = [{"start": 0.0, "end": duration, "speech_density": 1.0 - ratio}]
+        analysis.features = windowed_rms(audio_path)
+        if not analysis.features:
+            analysis.features = [{"start": 0.0, "end": duration, "rms": 0.0}]
         analysis.silence_ratio = ratio
         analysis.speech_density = 1.0 - ratio
         analysis.speech_rate = len(transcript.word_segments) * 60.0 / duration if duration else 0.0

@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import math
 import re
+import wave
 from dataclasses import dataclass
+from pathlib import Path
 
 _START = re.compile(r"silence_start:\s*(?P<start>[0-9.]+)")
 _END = re.compile(
@@ -46,3 +49,27 @@ def silence_ratio(intervals: list[SilenceInterval], duration: float) -> float:
     if duration <= 0:
         return 0.0
     return min(1.0, sum(interval.duration for interval in intervals) / duration)
+
+
+def windowed_rms(path: Path, window_seconds: float = 1.0) -> list[dict[str, float]]:
+    """Return lightweight RMS amplitude windows from the cached 16-bit WAV."""
+    try:
+        with wave.open(str(path), "rb") as audio:
+            if audio.getsampwidth() != 2 or audio.getframerate() <= 0:
+                return []
+            frames_per_window = max(1, int(audio.getframerate() * window_seconds))
+            features: list[dict[str, float]] = []
+            start = 0.0
+            while frames := audio.readframes(frames_per_window):
+                samples = memoryview(frames).cast("h")
+                rms = (
+                    math.sqrt(sum(sample * sample for sample in samples) / len(samples))
+                    if samples
+                    else 0.0
+                )
+                end = start + len(samples) / audio.getnchannels() / audio.getframerate()
+                features.append({"start": start, "end": end, "rms": rms})
+                start = end
+            return features
+    except (EOFError, wave.Error):
+        return []
