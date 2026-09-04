@@ -27,3 +27,23 @@ def test_rights_status_migration_normalizes_legacy_authorized_rows(monkeypatch: 
     assert statements == [
         "UPDATE source_videos SET rights_status = 'PERMISSION' WHERE rights_status = 'AUTHORIZED'"
     ]
+
+
+def test_stage_2_migration_declares_transcript_tables() -> None:
+    """Schema migration introduces durable transcript and analysis records."""
+
+    path = (
+        Path(__file__).parents[1]
+        / "alembic"
+        / "versions"
+        / "20260904_0003_stage_2_transcription.py"
+    )
+    specification = importlib.util.spec_from_file_location("stage_2_migration", path)
+
+    assert specification is not None
+    assert specification.loader is not None
+    module = importlib.util.module_from_spec(specification)
+    specification.loader.exec_module(module)
+
+    assert module.revision == "20260904_0003"
+    assert module.down_revision == "20260904_0002"

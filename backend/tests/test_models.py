@@ -3,7 +3,7 @@ from sqlalchemy.orm import Session
 
 from app.core.enums import JobKind, JobStatus, PipelineRunStatus, PipelineStage, RightsStatus
 from app.db.base import Base
-from app.models import PipelineRun, ProcessingJob, SourceVideo
+from app.models import PipelineRun, ProcessingJob, SourceVideo, Transcript
 
 
 def test_source_video_defaults_and_content_hash_is_unique(sqlite_engine: object) -> None:
@@ -67,3 +67,40 @@ def test_pipeline_run_can_transition_from_queued_to_running(sqlite_engine: objec
         session.refresh(run)
 
         assert run.status is PipelineRunStatus.RUNNING
+
+
+def test_source_persists_timestamped_transcript_data(sqlite_engine: object) -> None:
+    """A reusable transcript retains timestamp and confidence data for later analysis."""
+
+    Base.metadata.create_all(sqlite_engine)
+    with Session(sqlite_engine) as session:
+        source = SourceVideo(source_uri="/imports/episode.mp4", content_hash="audio-source")
+        session.add(source)
+        session.flush()
+        transcript = Transcript(
+            source_video_id=source.id,
+            language="ar",
+            whisper_model="small",
+            transcription_options={"beam_size": 5},
+            input_fingerprint="f" * 64,
+            raw_text="أهلا",
+            normalized_text="أهلا",
+            segments=[
+                {
+                    "start": 0.0,
+                    "end": 0.8,
+                    "text": "أهلا",
+                    "avg_logprob": -0.1,
+                    "no_speech_prob": 0.01,
+                    "words": [],
+                }
+            ],
+            word_segments=[],
+            duration=0.8,
+        )
+        session.add(transcript)
+        session.commit()
+
+        assert source.transcript is not None
+        assert source.transcript.segments[0]["start"] == 0.0
+        assert source.transcript.segments[0]["no_speech_prob"] == 0.01
