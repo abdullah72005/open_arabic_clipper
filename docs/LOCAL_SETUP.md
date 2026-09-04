@@ -13,7 +13,7 @@ docker compose ps
 ```
 
 Use `docker compose logs -f backend worker` to observe jobs. The dashboard is
-on `http://localhost:3000`; API docs are on `http://localhost:8000/docs`.
+on `http://localhost:3301`; API docs are on `http://localhost:8300/docs`.
 
 ## Native backend
 
@@ -25,4 +25,4 @@ From `backend/`, create a Python 3.12 environment, install with
 `celery -A app.workers.celery_app:celery_app worker --concurrency=1`.
 
 For the dashboard, run `npm install && npm run dev` from `frontend/`. Set
-`NEXT_PUBLIC_API_BASE_URL=http://localhost:8000` before its build or dev server.
+`NEXT_PUBLIC_API_BASE_URL=http://localhost:8300` before its build or dev server.

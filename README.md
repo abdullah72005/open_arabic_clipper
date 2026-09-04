@@ -17,7 +17,7 @@ docker compose exec backend alembic upgrade head
 docker compose exec backend python -m app.cli health
 ```
 
-Open `http://localhost:3000` for the dashboard and `http://localhost:8000/docs`
+Open `http://localhost:3301` for the dashboard and `http://localhost:8300/docs`
 for the API. Stop services with `docker compose down`; add `-v` only when you
 intentionally want to remove database and Redis volumes. Local media remains
 under `./storage`.
@@ -33,7 +33,7 @@ docker compose run --rm frontend npm run build
 ```
 
 The frontend image is built for the browser API base URL configured by
-`NEXT_PUBLIC_API_BASE_URL`; use `http://localhost:8000` for local browser use.
+`NEXT_PUBLIC_API_BASE_URL`; use `http://localhost:8300` for local browser use.
 
 Read [local setup](docs/LOCAL_SETUP.md), [architecture](docs/ARCHITECTURE.md),
 [pipeline](docs/PIPELINE.md), and [troubleshooting](docs/TROUBLESHOOTING.md)

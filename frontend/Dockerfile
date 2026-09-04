@@ -4,7 +4,7 @@ COPY package*.json ./
 # Use install rather than ci until the registry-generated lock is refreshed.
 RUN npm install
 COPY . .
-ARG NEXT_PUBLIC_API_BASE_URL=http://localhost:8000
+ARG NEXT_PUBLIC_API_BASE_URL=http://localhost:8300
 ENV NEXT_PUBLIC_API_BASE_URL=$NEXT_PUBLIC_API_BASE_URL
 RUN npm run build
 
