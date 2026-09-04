@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 from app.core.settings import get_settings
 from app.media.analysis import parse_silencedetect, silence_ratio, windowed_rms
 from app.media.audio import AudioExtractor
+from app.media.ffprobe import FFprobe, MediaMetadata
 from app.models import AudioAnalysis, AudioArtifact, SourceVideo, Transcript, TranscriptChunk
 from app.pipeline.runner import StageExecutionError
 from app.services.source_quality import assess_source
@@ -90,6 +91,31 @@ class TranscriptionExecutor:
         transcript.word_segments = result.word_segments
         transcript.duration = result.duration
         transcript.processing_duration = processing_duration
+
+
+class IngestExecutor:
+    """Mark a source accepted by the API as ready for its media probe."""
+
+    def execute(self, source: SourceVideo) -> SourceVideo:
+        if not source.source_uri:
+            raise StageExecutionError("source URI is missing")
+        return source
+
+
+class ProbeExecutor:
+    """Validate a local ingested media file with the safe ffprobe adapter."""
+
+    def __init__(self, probe: FFprobe) -> None:
+        self._probe = probe
+
+    def execute(self, source: SourceVideo) -> MediaMetadata:
+        source_path = Path(source.source_uri)
+        if not source_path.is_file():
+            raise StageExecutionError("source media file is unavailable for probing")
+        try:
+            return self._probe.probe(source_path)
+        except Exception as error:
+            raise StageExecutionError("ffprobe failed to validate source media") from error
 
 
 class AudioExtractionExecutor:

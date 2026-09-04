@@ -11,12 +11,15 @@ from app.core.enums import JobKind, PipelineStage
 from app.core.settings import get_settings
 from app.db.session import create_session_factory
 from app.media.audio import AudioExtractor
+from app.media.ffprobe import FFprobe
 from app.models import ProcessingJob
 from app.pipeline.executor import StageExecutor
 from app.pipeline.runner import PipelineRunner
 from app.pipeline.stages import (
     AudioAnalysisExecutor,
     AudioExtractionExecutor,
+    IngestExecutor,
+    ProbeExecutor,
     TranscriptionExecutor,
     TranscriptNormalizationExecutor,
 )
@@ -46,6 +49,8 @@ def _stage_executors(session: Session) -> dict[PipelineStage, StageExecutor]:
     settings = get_settings()
     storage = StorageService(settings.storage_root)
     defaults: dict[PipelineStage, StageExecutor] = {
+        PipelineStage.INGEST: IngestExecutor(),
+        PipelineStage.PROBE: ProbeExecutor(FFprobe(binary=settings.ffprobe_binary)),
         PipelineStage.AUDIO_EXTRACTION: AudioExtractionExecutor(
             AudioExtractor(session=session, storage=storage, ffmpeg_binary=settings.ffmpeg_binary)
         ),

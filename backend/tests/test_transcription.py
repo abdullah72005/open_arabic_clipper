@@ -215,6 +215,28 @@ def test_benchmark_reports_actual_transcription_throughput(tmp_path: Path) -> No
     assert report.audio_minutes_per_wall_minute > 0.0
 
 
+def test_ingest_and_probe_executors_validate_local_source(tmp_path: Path) -> None:
+    from app.models import SourceVideo
+    from app.pipeline.stages import IngestExecutor, ProbeExecutor
+
+    source_path = tmp_path / "source.mp4"
+    source_path.write_bytes(b"media")
+    source = SourceVideo(source_uri=str(source_path))
+
+    class RecordingProbe:
+        def __init__(self) -> None:
+            self.paths: list[Path] = []
+
+        def probe(self, path: Path) -> object:
+            self.paths.append(path)
+            return object()
+
+    probe = RecordingProbe()
+    assert IngestExecutor().execute(source) is source
+    assert ProbeExecutor(probe).execute(source) is not None
+    assert probe.paths == [source_path]
+
+
 def test_chunking_uses_segment_boundaries_and_neighbor_context() -> None:
     """Later analysis gets coherent timestamp ranges rather than character slices."""
 
