@@ -79,3 +79,27 @@ def test_engine_falls_back_to_cpu_int8_and_preserves_word_timestamps() -> None:
     assert result.language == "ar"
     assert result.language_probability == 0.97
     assert result.segments[0]["words"][0]["start"] == 0.0
+
+
+def test_normalization_preserves_egyptian_arabic_and_embedded_english() -> None:
+    """Display cleanup removes noise without translating dialect or Latin tokens."""
+
+    from app.transcription.normalization import normalize_transcript
+
+    assert normalize_transcript("  أنا  okay\n\nأنا  ") == "أنا okay أنا"
+
+
+def test_chunking_uses_segment_boundaries_and_neighbor_context() -> None:
+    """Later analysis gets coherent timestamp ranges rather than character slices."""
+
+    from app.transcription.chunking import ChunkConfig, build_chunks
+
+    segments = [
+        {"start": 0.0, "end": 10.0, "text": "First sentence."},
+        {"start": 10.0, "end": 20.0, "text": "Second sentence."},
+        {"start": 20.0, "end": 30.0, "text": "Third sentence."},
+    ]
+    chunks = build_chunks(segments, ChunkConfig(target_seconds=20, context_segments=1))
+
+    assert chunks[0].segment_indexes == [0, 1]
+    assert chunks[0].following_context == "Third sentence."
