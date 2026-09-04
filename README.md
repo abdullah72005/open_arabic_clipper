@@ -1,7 +1,10 @@
 # ClipFactory / open_arabic_clipper
 
-ClipFactory is a local-first foundation for safely ingesting media and probing
-its metadata. Stage 1 ends at `READY_FOR_TRANSCRIPTION`: it does not transcribe,
+ClipFactory is a local-first foundation for safely ingesting media, probing its
+metadata, and transcribing owned or authorized media. Stage 2 extracts a cached
+mono 16 kHz WAV, runs local faster-whisper with automatic Arabic (Egyptian/MSA),
+English, and mixed-speech detection, normalizes transcript text conservatively,
+and records silence/quality signals through `READY_FOR_ANALYSIS`. It does not
 select clips, reframe, render, publish, or automatically authorize content.
 
 Only process material you own or are explicitly authorized to process. URL
@@ -42,3 +45,17 @@ The frontend image is built for the browser API base URL configured by
 Read [local setup](docs/LOCAL_SETUP.md), [architecture](docs/ARCHITECTURE.md),
 [pipeline](docs/PIPELINE.md), and [troubleshooting](docs/TROUBLESHOOTING.md)
 before using external media sources.
+
+## Stage 2 transcription
+
+Workers need FFmpeg/ffprobe and the local `faster-whisper` dependency. Configure
+`CLIPFACTORY_WHISPER_MODEL` (`tiny`, `base`, `small`, `medium`, or `large-v3`),
+`CLIPFACTORY_WHISPER_DEVICE` (`auto`, `cpu`, or `cuda`), and optionally
+`CLIPFACTORY_WHISPER_FORCED_LANGUAGE` (`ar` or `en`). `auto` uses CUDA only when
+available and otherwise uses CPU `int8` inference.
+
+Use `GET /api/sources/{id}/transcript` for the persisted raw and normalized
+evidence, `GET /api/sources/{id}/transcript/search?q=...` for timestamped
+segments, and `POST /api/sources/{id}/retranscribe` to queue a new local ASR job.
+Arabic transcript panels render RTL when Arabic is detected; mixed segments retain
+their original Unicode text.
