@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import subprocess
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -127,7 +128,7 @@ def _positive_int(value: object, field: str) -> int:
         parsed = int(value)  # type: ignore[arg-type]
     except (TypeError, ValueError) as error:
         raise ProbeParseError(f"{field} must be a positive integer") from error
-    if parsed <= 0:
+    if not math.isfinite(parsed) or parsed <= 0:
         raise ProbeParseError(f"{field} must be a positive integer")
     return parsed
 
@@ -137,7 +138,7 @@ def _positive_float(value: object, field: str) -> float:
         parsed = float(value)  # type: ignore[arg-type]
     except (TypeError, ValueError) as error:
         raise ProbeParseError(f"{field} must be a positive number") from error
-    if parsed <= 0:
+    if not math.isfinite(parsed) or parsed <= 0:
         raise ProbeParseError(f"{field} must be a positive number")
     return parsed
 

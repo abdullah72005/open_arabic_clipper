@@ -62,6 +62,25 @@ def test_parse_ffprobe_json_rejects_zero_frame_rate_denominator() -> None:
         parse_ffprobe_json(json.dumps(payload))
 
 
+@pytest.mark.parametrize("duration", ["inf", "-inf", "nan"])
+def test_parse_ffprobe_json_rejects_non_finite_numbers(duration: str) -> None:
+    payload = {
+        "format": {"duration": duration},
+        "streams": [
+            {
+                "codec_type": "video",
+                "codec_name": "h264",
+                "width": 1,
+                "height": 1,
+                "avg_frame_rate": "24/1",
+            }
+        ],
+    }
+
+    with pytest.raises(ProbeParseError):
+        parse_ffprobe_json(json.dumps(payload))
+
+
 def test_ffprobe_uses_safe_argument_vector(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     media_path = tmp_path / "video.mp4"
     media_path.write_bytes(b"synthetic")

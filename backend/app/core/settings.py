@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     ffmpeg_binary: str = "ffmpeg"
     ffprobe_binary: str = "ffprobe"
     max_upload_bytes: int = Field(default=2 * 1024 * 1024 * 1024, gt=0)
+    max_remote_download_bytes: int = Field(default=2 * 1024 * 1024 * 1024, gt=0)
     max_concurrent_uploads: int = Field(default=2, gt=0)
     cors_origins: list[str] = ["http://localhost:3000"]
 

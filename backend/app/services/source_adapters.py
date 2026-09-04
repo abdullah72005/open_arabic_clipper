@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import re
+import socket
 import subprocess
 import uuid
 from collections.abc import Iterator, Mapping
@@ -16,6 +18,7 @@ from app.services.storage import StorageService, StorageValidationError
 
 _INVALID_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9._-]+")
 _CHUNK_SIZE = 1024 * 1024
+DEFAULT_MAX_REMOTE_DOWNLOAD_BYTES = 2 * 1024 * 1024 * 1024
 
 
 class SourceAdapterError(RuntimeError):
@@ -62,6 +65,7 @@ def normalize_source_url(value: str) -> str:
         raise SourceValidationError("URLs with credentials are not supported")
     if not parsed.hostname:
         raise SourceValidationError("URL must include a hostname")
+    _assert_public_ip_literal(parsed.hostname)
 
     normalized = SplitResult(
         scheme=parsed.scheme.lower(),
@@ -107,15 +111,24 @@ class YtDlpAdapter:
         "Authentication, DRM, paywall, CAPTCHA, and access-control bypass are unsupported."
     )
 
-    def __init__(self, storage: StorageService, *, binary: str = "yt-dlp") -> None:
+    def __init__(
+        self,
+        storage: StorageService,
+        *,
+        binary: str = "yt-dlp",
+        max_download_bytes: int = DEFAULT_MAX_REMOTE_DOWNLOAD_BYTES,
+    ) -> None:
+        if max_download_bytes <= 0:
+            raise SourceValidationError("maximum remote download size must be positive")
         self._storage = storage
         self._binary = binary
+        self._max_download_bytes = max_download_bytes
 
     def inspect(self, url: str) -> Mapping[str, object]:
         """Read public metadata before downloading, using a safe argument vector."""
 
         normalized_url = normalize_source_url(url)
-        result = self._run(self._metadata_command(normalized_url))
+        result = self._run(self._metadata_command(normalized_url), normalized_url)
         try:
             metadata = json.loads(result.stdout)
         except json.JSONDecodeError as error:
@@ -129,9 +142,10 @@ class YtDlpAdapter:
             raise SourceValidationError("yt-dlp source must be a URL string")
         normalized_url = normalize_source_url(source)
         metadata = self.inspect(normalized_url)
-        self._storage.ensure_capacity(_expected_bytes(metadata))
+        expected_bytes = _expected_bytes(metadata, self._max_download_bytes)
+        self._storage.ensure_capacity(expected_bytes)
         source_directory = self._storage.source_directory(source_id)
-        result = self._run(self._download_command(source_directory, normalized_url))
+        result = self._run(self._download_command(source_directory, normalized_url), normalized_url)
         acquired_path = _downloaded_path(result.stdout, source_directory)
         if not acquired_path.is_file():
             raise SourceAcquisitionError(
@@ -144,12 +158,19 @@ class YtDlpAdapter:
         )
 
     def _metadata_command(self, normalized_url: str) -> list[str]:
-        return [self._binary, "--no-playlist", "--dump-single-json", normalized_url]
+        return [
+            self._binary,
+            "--ignore-config",
+            "--no-playlist",
+            "--dump-single-json",
+            normalized_url,
+        ]
 
     def _download_command(self, source_directory: Path, normalized_url: str) -> list[str]:
         output_template = str(source_directory / "%(title).100B-%(id)s.%(ext)s")
         return [
             self._binary,
+            "--ignore-config",
             "--no-playlist",
             "--no-write-info-json",
             "--no-write-thumbnail",
@@ -163,7 +184,8 @@ class YtDlpAdapter:
         ]
 
     @staticmethod
-    def _run(command: list[str]) -> subprocess.CompletedProcess[str]:
+    def _run(command: list[str], normalized_url: str) -> subprocess.CompletedProcess[str]:
+        _assert_public_host_resolution(urlsplit(normalized_url).hostname)
         try:
             return subprocess.run(command, check=True, capture_output=True, text=True)
         except (OSError, subprocess.CalledProcessError) as error:
@@ -200,14 +222,47 @@ def _file_chunks(path: Path) -> Iterator[bytes]:
             yield chunk
 
 
-def _expected_bytes(metadata: Mapping[str, object]) -> int:
+def _expected_bytes(metadata: Mapping[str, object], maximum_bytes: int) -> int:
     for key in ("filesize", "filesize_approx"):
         value = metadata.get(key)
-        if isinstance(value, int) and value >= 0:
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            if value > maximum_bytes:
+                raise SourceAcquisitionError(
+                    "yt-dlp metadata exceeds the configured download limit"
+                )
             return value
-        if isinstance(value, float) and value >= 0:
-            return int(value)
-    return 0
+    raise SourceAcquisitionError("yt-dlp metadata must provide a known size before download")
+
+
+def _assert_public_ip_literal(hostname: str) -> None:
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        return
+    if not address.is_global:
+        raise SourceValidationError("URL target must be a public address")
+
+
+def _assert_public_host_resolution(hostname: str | None) -> None:
+    if hostname is None:
+        raise SourceValidationError("URL must include a hostname")
+    try:
+        literal = ipaddress.ip_address(hostname)
+    except ValueError:
+        literal = None
+    if literal is not None:
+        if not literal.is_global:
+            raise SourceValidationError("URL target must be a public address")
+        return
+    try:
+        resolved_addresses = socket.getaddrinfo(hostname, None, type=socket.SOCK_STREAM)
+    except OSError as error:
+        raise SourceValidationError("URL hostname could not be resolved") from error
+    if not resolved_addresses:
+        raise SourceValidationError("URL hostname could not be resolved")
+    for _, _, _, _, sockaddr in resolved_addresses:
+        if not ipaddress.ip_address(sockaddr[0]).is_global:
+            raise SourceValidationError("URL hostname resolves to a non-public address")
 
 
 def _downloaded_path(stdout: str, source_directory: Path) -> Path:
