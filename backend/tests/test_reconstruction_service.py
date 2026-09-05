@@ -1,5 +1,6 @@
 from app.transcription.reconstruction.providers import (
     GenerationRequest,
+    ProviderResponseError,
     ResolutionChoice,
     ResolutionRequest,
 )
@@ -60,6 +61,29 @@ def test_reconstructor_without_provider_preserves_stage_2_5_text() -> None:
 
     assert result.segments[0].contextual_reconstructed_text == "خلي بالك"
     assert result.segments[0].applied is False
+
+
+def test_reconstructor_falls_back_only_for_expected_provider_failures() -> None:
+    class BrokenProvider:
+        def generate_candidates(
+            self, requests: list[GenerationRequest]
+        ) -> dict[int, list[ReconstructionCandidate]]:
+            raise ProviderResponseError("invalid JSON")
+
+        def resolve_candidates(
+            self, requests: list[ResolutionRequest]
+        ) -> dict[int, ResolutionChoice]:
+            raise AssertionError("resolution must not run")
+
+    result = ContextualReconstructor(BrokenProvider()).reconstruct(
+        [{"start": 0.0, "end": 1.0, "text": "خطي بالك", "corrected_text": "خلي بالك"}],
+        language="ar",
+        transcription_fingerprint="asr-v1",
+        correction_version="egyptian-ar-v1",
+    )
+
+    assert result.segments[0].contextual_reconstructed_text == "خلي بالك"
+    assert result.segments[0].quality_flags[0].value == "RECONSTRUCTION_PROVIDER_ERROR"
 
 
 def test_final_text_priority_keeps_manual_text_above_reconstruction() -> None:

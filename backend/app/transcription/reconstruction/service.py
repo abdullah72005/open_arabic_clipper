@@ -10,6 +10,7 @@ from app.transcription.reconstruction.confidence import decide_candidate
 from app.transcription.reconstruction.entities import build_entity_memory
 from app.transcription.reconstruction.providers import (
     GenerationRequest,
+    ProviderResponseError,
     ReconstructionProvider,
     ResolutionRequest,
 )
@@ -67,7 +68,7 @@ class ContextualReconstructor:
                     for request in requests
                 ]
             )
-        except Exception:
+        except (OSError, ProviderResponseError):
             results = tuple(
                 self._fallback(index, segment, provider_error=True)
                 for index, segment in enumerate(segments)
