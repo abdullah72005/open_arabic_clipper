@@ -127,13 +127,7 @@ class ContextualCorrector:
                 previous=context_window(segments, index, self._config.context_segments).previous,
                 raw_text=str(segment.get("text", "")),
                 following=context_window(segments, index, self._config.context_segments).following,
-                candidate_text=(
-                    self._by_confusion.get(
-                        normalize_for_comparison(str(segment.get("text", "")))
-                    ).canonical
-                    if normalize_for_comparison(str(segment.get("text", ""))) in self._by_confusion
-                    else None
-                ),
+                candidate_text=self._candidate_text(str(segment.get("text", ""))),
             )
             for index, segment in enumerate(segments)
         ]
@@ -150,6 +144,10 @@ class ContextualCorrector:
             except (ProviderResponseError, OSError):
                 continue
         return results
+
+    def _candidate_text(self, raw_text: str) -> str | None:
+        entry = self._by_confusion.get(normalize_for_comparison(raw_text))
+        return entry.canonical if entry is not None else None
 
     def _correct_one(
         self,
