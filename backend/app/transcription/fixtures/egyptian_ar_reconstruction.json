@@ -1,0 +1,13 @@
+{
+  "version": "egyptian-ar-reconstruction-v1",
+  "fixtures": [
+    {"id":"democracy-joined","category":"connected_speech","previous":"الناس اتكلمت عن النظام","raw":"دي موقراطية","next":"ومحتاجين نحافظ عليها","expected":"ديموقراطية","semantic_review":"Join a split political term without formalizing dialect.","must_change":true,"protected_tokens":[]},
+    {"id":"president-narrative","category":"narrative","previous":"العربية كانت ماشية في الموكب","raw":"ياخدها الرئيس","next":"لحد ما وصلوا القصر","expected":"كان بيقودها الرئيس","semantic_review":"Context restores the spoken narrative predicate.","must_change":true,"protected_tokens":[]},
+    {"id":"farmer-narrative","category":"narrative","previous":"في الموسم ده","raw":"الفلاحين يزرعو الارض","next":"قبل المطر بيومين","expected":"الفلاحين بيزرعوا الأرض","semantic_review":"Repair connected Egyptian speech without adding a fact.","must_change":true,"protected_tokens":[]},
+    {"id":"united-fruit","category":"entities","previous":"الشركة كانت مشهورة وقتها","raw":"United Fruit Company سنة 1950","next":"وكان ليها نفوذ كبير","expected":"United Fruit Company سنة 1950","semantic_review":"Latin organization name and number must remain exact.","must_change":false,"protected_tokens":["United Fruit Company","1950"]},
+    {"id":"valid-slang","category":"slang","previous":"شوفت الفيديو","raw":"الموضوع ده جامد اوي","next":"عجبني جدا","expected":"الموضوع ده جامد اوي","semantic_review":"Preserve unusual but valid colloquial slang.","must_change":false,"protected_tokens":[]},
+    {"id":"filler-repetition","category":"filler","previous":"خلينا نفكر","raw":"بص يعني يعني الموضوع كده","next":"محتاج وقت","expected":"بص يعني يعني الموضوع كده","semantic_review":"Do not remove authentic speech fillers.","must_change":false,"protected_tokens":[]},
+    {"id":"code-switch","category":"code_switching","previous":"في الاجتماع","raw":"هنعمل deploy بعد الـ review","next":"وبعدين نراقب logs","expected":"هنعمل deploy بعد الـ review","semantic_review":"Preserve technical code switching.","must_change":false,"protected_tokens":["deploy","review","logs"]},
+    {"id":"unfamiliar-name","category":"entities","previous":"في المؤتمر امبارح","raw":"نورهان جرجس قدمت الورقة","next":"والناس صفقت","expected":"نورهان جرجس قدمت الورقة","semantic_review":"Do not normalize or invent an unfamiliar name.","must_change":false,"protected_tokens":[]}
+  ]
+}
