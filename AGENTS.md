@@ -3,9 +3,10 @@
 ## Product and stage
 
 - Product name: `open_arabic_clipper` (working product label: ClipFactory).
-- Current scope: Stage 1 only — local-first foundation, ingest/probe pipeline,
-  storage, jobs, dashboard shell, and operational tooling.
-- Explicitly out of scope until later stages: transcription, AI clip selection,
+- Current scope: Stage 2.5 — local-first ingest/probe, cached audio,
+  faster-whisper transcription, conservative contextual Egyptian correction,
+  storage, jobs, dashboard, and operational tooling through `READY_FOR_ANALYSIS`.
+- Explicitly out of scope until later stages: Stage 3 AI clip selection,
   advanced rendering/reframing, social publishing, and automatic authorization.
 - Process only media the operator owns or is authorized to process. Never add
   DRM, login, paywall, CAPTCHA, or platform-protection circumvention.
@@ -18,9 +19,10 @@
 - Media interfaces use FFmpeg/ffprobe through safe argument arrays; GPU use is
   optional and must never be required.
 - The storage service is the sole owner of application filesystem paths.
-- Pipeline stages are persisted, idempotent, retryable, and resumable. Stage 1
-  ends at `READY_FOR_TRANSCRIPTION`; future stage authorization must gate
-  UNKNOWN-rights sources before candidate generation, rendering, or publishing.
+- Pipeline stages are persisted, idempotent, retryable, and resumable. Stage 2.5
+  preserves raw ASR text/timestamps and derives correction/final fields without
+  realignment; future stage authorization must gate UNKNOWN-rights sources before
+  candidate generation, rendering, or publishing.
 
 ## Local development facts (not product requirements)
 

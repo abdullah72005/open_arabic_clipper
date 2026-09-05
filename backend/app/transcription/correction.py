@@ -7,7 +7,7 @@ import re
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping
+from typing import Mapping, Sequence
 
 from app.transcription.providers import (
     CorrectionProvider,
@@ -31,6 +31,7 @@ class CorrectionConfig:
     high_confidence: float = 0.90
     medium_confidence: float = 0.75
     max_small_edit_ratio: float = 0.25
+    provider_batch_size: int = 32
 
 
 @dataclass(frozen=True)
@@ -106,7 +107,7 @@ class ContextualCorrector:
         )
         return cls(entries, str(payload["version"]), config, provider)
 
-    def correct(self, segments: list[Mapping[str, object]]) -> list[SegmentCorrection]:
+    def correct(self, segments: Sequence[Mapping[str, object]]) -> list[SegmentCorrection]:
         """Return one correction per input segment while retaining input ordering."""
 
         provider_results = self._provider_results(segments)
@@ -116,7 +117,7 @@ class ContextualCorrector:
         ]
 
     def _provider_results(
-        self, segments: list[Mapping[str, object]]
+        self, segments: Sequence[Mapping[str, object]]
     ) -> dict[int, ProviderCorrection]:
         if self._provider is None or not segments:
             return {}
@@ -126,29 +127,40 @@ class ContextualCorrector:
                 previous=context_window(segments, index, self._config.context_segments).previous,
                 raw_text=str(segment.get("text", "")),
                 following=context_window(segments, index, self._config.context_segments).following,
+                candidate_text=(
+                    self._by_confusion.get(
+                        normalize_for_comparison(str(segment.get("text", "")))
+                    ).canonical
+                    if normalize_for_comparison(str(segment.get("text", ""))) in self._by_confusion
+                    else None
+                ),
             )
             for index, segment in enumerate(segments)
         ]
-        try:
-            return validate_provider_results(
-                {request.segment_index for request in requests},
-                self._provider.correct_batch(requests),
-            )
-        except (ProviderResponseError, OSError):
-            return {}
+        results: dict[int, ProviderCorrection] = {}
+        for start in range(0, len(requests), self._config.provider_batch_size):
+            batch = requests[start : start + self._config.provider_batch_size]
+            try:
+                results.update(
+                    validate_provider_results(
+                        {request.segment_index for request in batch},
+                        self._provider.correct_batch(batch),
+                    )
+                )
+            except (ProviderResponseError, OSError):
+                continue
+        return results
 
     def _correct_one(
         self,
         index: int,
-        segments: list[Mapping[str, object]],
+        segments: Sequence[Mapping[str, object]],
         provider_result: ProviderCorrection | None,
     ) -> SegmentCorrection:
         raw_text = str(segments[index].get("text", ""))
         entry = self._by_confusion.get(normalize_for_comparison(raw_text))
         if provider_result is not None and self._provider_result_is_safe(raw_text, provider_result):
-            if entry is None:
-                return self._provider_correction(index, raw_text, provider_result, "llm")
-            if provider_result.corrected_text == entry.canonical:
+            if entry is not None and provider_result.corrected_text == entry.canonical:
                 return self._provider_correction(index, raw_text, provider_result, "llm+lexicon")
         if entry is None or entry.priority < 90:
             return self._unchanged(index, raw_text)
@@ -180,6 +192,11 @@ class ContextualCorrector:
         if result.changed != (result.corrected_text != raw_text):
             return False
         if _protected_tokens(raw_text) != _protected_tokens(result.corrected_text):
+            return False
+        if (
+            _normalized_edit_ratio(raw_text, result.corrected_text)
+            > self._config.max_small_edit_ratio
+        ):
             return False
         return len(result.corrected_text) <= len(raw_text) + max(4, int(len(raw_text) * 0.35))
 
@@ -223,8 +240,28 @@ def normalize_for_comparison(text: str) -> str:
     )
 
 
+def _normalized_edit_ratio(raw_text: str, corrected_text: str) -> float:
+    """Bound provider rewrites so uncertain Arabic names and facts stay intact."""
+    raw = normalize_for_comparison(raw_text)
+    corrected = normalize_for_comparison(corrected_text)
+    longest = max(len(raw), len(corrected), 1)
+    previous = list(range(len(corrected) + 1))
+    for raw_index, raw_character in enumerate(raw, start=1):
+        current = [raw_index]
+        for corrected_index, corrected_character in enumerate(corrected, start=1):
+            current.append(
+                min(
+                    current[-1] + 1,
+                    previous[corrected_index] + 1,
+                    previous[corrected_index - 1] + (raw_character != corrected_character),
+                )
+            )
+        previous = current
+    return previous[-1] / longest
+
+
 def context_window(
-    segments: list[Mapping[str, object]], target_index: int, context_segments: int = 2
+    segments: Sequence[Mapping[str, object]], target_index: int, context_segments: int = 2
 ) -> CorrectionContext:
     """Return neighboring raw text without exposing non-target output slots."""
 

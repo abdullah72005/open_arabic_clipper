@@ -263,11 +263,11 @@ class TranscriptNormalizationExecutor:
 
 
 def _raw_transcript_confidence(segments: list[dict[str, object]]) -> float:
-    logprobs = [
-        float(value)
-        for segment in segments
-        if isinstance(value := segment.get("avg_logprob"), int | float)
-    ]
+    logprobs: list[float] = []
+    for segment in segments:
+        value = segment.get("avg_logprob")
+        if isinstance(value, int | float):
+            logprobs.append(float(value))
     return max(0.0, min(1.0, 1.0 + sum(logprobs) / len(logprobs))) if logprobs else 0.0
 
 

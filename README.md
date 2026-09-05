@@ -3,8 +3,9 @@
 ClipFactory is a local-first foundation for safely ingesting media, probing its
 metadata, and transcribing owned or authorized media. Stage 2 extracts a cached
 mono 16 kHz WAV, runs local faster-whisper with automatic Arabic (Egyptian/MSA),
-English, and mixed-speech detection, normalizes transcript text conservatively,
-and records silence/quality signals through `READY_FOR_ANALYSIS`. It does not
+English, and mixed-speech detection, preserves raw ASR evidence, applies
+conservative contextual Egyptian-Arabic correction, and records silence/quality
+signals through `READY_FOR_ANALYSIS`. It does not
 select clips, reframe, render, publish, or automatically authorize content.
 
 Only process material you own or are explicitly authorized to process. URL
@@ -47,20 +48,42 @@ Read [local setup](docs/LOCAL_SETUP.md), [architecture](docs/ARCHITECTURE.md),
 [pipeline](docs/PIPELINE.md), and [troubleshooting](docs/TROUBLESHOOTING.md)
 before using external media sources.
 
-## Stage 2 transcription
+## Stage 2 and Stage 2.5 transcription quality
 
 Workers need FFmpeg/ffprobe and the local `faster-whisper` dependency. Configure
 `CLIPFACTORY_WHISPER_MODEL` (`tiny`, `base`, `small`, `medium`, or `large-v3`),
 `CLIPFACTORY_WHISPER_DEVICE` (`auto`, `cpu`, or `cuda`), and optionally
-`CLIPFACTORY_WHISPER_FORCED_LANGUAGE` (`ar` or `en`). `auto` uses CUDA only when
+`CLIPFACTORY_WHISPER_LANGUAGE` (`ar` or `en`). `auto` uses CUDA only when
 available and otherwise uses CPU `int8` inference.
 
-Use `GET /api/sources/{id}/transcript` for the persisted raw and normalized
-evidence, `GET /api/sources/{id}/transcript/search?q=...` for timestamped
+The default decoder remains `small`, auto device selection, CPU `int8`, beam 5,
+word timestamps, faster-whisper fallback temperatures `[0, 0.2, 0.4, 0.6, 0.8,
+1]`, previous-text conditioning enabled, VAD disabled, and no prompt/hotwords.
+`CLIPFACTORY_WHISPER_TEMPERATURE`,
+`CLIPFACTORY_WHISPER_CONDITION_ON_PREVIOUS_TEXT`,
+`CLIPFACTORY_WHISPER_VAD_FILTER`, `CLIPFACTORY_WHISPER_INITIAL_PROMPT`, and
+`CLIPFACTORY_WHISPER_HOTWORDS` are output-affecting settings and invalidate the
+transcript cache. Do not opt into prompt/hotword/VAD changes without an
+operator-authorized benchmark covering Arabic, English, and code-switched audio.
+
+Stage 2.5 preserves `raw_text` and every raw segment `text`/timestamp permanently.
+It adds `corrected_text`, `final_text`, confidence indicators, correction method,
+version, and per-segment correction metadata. The default local corrector uses
+the versioned Egyptian phrase lexicon only; it never requires a network or an
+LLM. To opt into a local OpenAI-compatible endpoint such as Ollama, configure
+`CLIPFACTORY_CORRECTION_PROVIDER=openai_compatible` plus provider base URL and
+model. Provider responses are batched, context-bounded, schema-validated, and
+may only approve a declared lexicon candidate; they fall back to raw/lexicon
+output on any failure or unsafe change.
+
+Use `GET /api/sources/{id}/transcript` for raw/corrected/final evidence,
+`GET /api/sources/{id}/transcript/search?q=...` for timestamped final-text
 segments, and `POST /api/sources/{id}/retranscribe` to queue a new local ASR job.
-Arabic transcript panels render RTL when Arabic is detected; mixed segments retain
-their original Unicode text. Source detail pages play storage-owned local media;
-selecting a transcript segment seeks playback to its timestamp.
+Operators can save or clear a final manual correction with `POST` or `DELETE`
+`/api/sources/{id}/transcript/segments/{segment_index}/override`; raw and
+automatic text remain unchanged. Arabic transcript panels show a correction debug
+view and retain original Unicode code-switched terms. Selecting a segment seeks
+storage-owned local playback to its original timestamp.
 
 Operator commands are available from the backend environment: `python -m app.cli
 transcribe SOURCE_ID`, `python -m app.cli transcript SOURCE_ID`, and `python -m
@@ -75,3 +98,16 @@ intentionally not fabricated.
 
 The current local cached-model benchmark is recorded in
 [benchmark results](docs/BENCHMARKS.md).
+
+Run the deterministic correction fixture benchmark in the backend container:
+
+```bash
+python -m app.transcription.correction_benchmark \
+  --fixture app/transcription/fixtures/egyptian_ar_correction.json --baseline
+python -m app.transcription.correction_benchmark \
+  --fixture app/transcription/fixtures/egyptian_ar_correction.json
+```
+
+Fixture metrics are regression evidence, not ground-truth dialect accuracy. Use
+an authorized audio set and manual semantic review before enabling any LLM model
+or changing Whisper decoding defaults.

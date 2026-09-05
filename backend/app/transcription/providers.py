@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Protocol, cast
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
@@ -19,6 +19,8 @@ Do not formalize.
 Do not summarize.
 Do not add information.
 Preserve English/code-switched words.
+Only choose between raw_text and candidate_text. If candidate_text is null,
+return raw_text unchanged.
 
 If the raw text is already plausible, return it unchanged."""
 
@@ -33,6 +35,7 @@ class CorrectionRequest:
     previous: tuple[str, ...]
     raw_text: str
     following: tuple[str, ...]
+    candidate_text: str | None = None
 
 
 @dataclass(frozen=True)
@@ -61,7 +64,7 @@ class OpenAICompatibleCorrectionProvider:
         model: str,
         api_key: str | None,
         timeout_seconds: float,
-        request: HttpRequest = None,
+        request: HttpRequest | None = None,
     ) -> None:
         self._url = f"{base_url.rstrip('/')}/v1/chat/completions"
         self._model = model
@@ -85,6 +88,7 @@ class OpenAICompatibleCorrectionProvider:
                                     "segment_id": request.segment_index,
                                     "previous": list(request.previous),
                                     "raw_text": request.raw_text,
+                                    "candidate_text": request.candidate_text,
                                     "next": list(request.following),
                                 }
                                 for request in requests
@@ -188,4 +192,4 @@ def _parse_openai_response(response: bytes) -> list[ProviderCorrection]:
 def _request_bytes(url: str, body: bytes, headers: dict[str, str], timeout: float) -> bytes:
     request = Request(url, data=body, headers=headers, method="POST")
     with urlopen(request, timeout=timeout) as response:  # noqa: S310 - configured local endpoint
-        return response.read()
+        return cast(bytes, response.read())

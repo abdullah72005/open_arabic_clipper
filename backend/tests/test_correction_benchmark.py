@@ -1,6 +1,11 @@
+import json
+
+import pytest
+
 from app.transcription.correction import ContextualCorrector
 from app.transcription.correction_benchmark import (
     default_fixture_path,
+    main,
     run_correction_fixture_benchmark,
 )
 
@@ -21,3 +26,12 @@ def test_fixture_benchmark_improves_egyptian_examples_without_english_regression
     assert report.corrected_exact_match_rate > report.baseline_exact_match_rate
     assert report.wall_clock_seconds >= 0
     assert report.peak_memory_bytes > 0
+
+
+def test_benchmark_cli_reports_latency_and_memory(capsys: pytest.CaptureFixture[str]) -> None:
+    """Operators can capture machine-readable fixture evidence in local environments."""
+
+    main(["--fixture", str(default_fixture_path())])
+
+    output = json.loads(capsys.readouterr().out)
+    assert {"wall_clock_seconds", "peak_memory_bytes"} <= output.keys()

@@ -17,9 +17,9 @@ def test_contextual_provider_receives_bounded_windows_and_can_correct_target() -
 
     class RecordingProvider:
         def __init__(self) -> None:
-            self.requests: list[object] = []
+            self.requests: list[CorrectionRequest] = []
 
-        def correct_batch(self, requests: list[object]) -> list[ProviderCorrection]:
+        def correct_batch(self, requests: list[CorrectionRequest]) -> list[ProviderCorrection]:
             self.requests = requests
             return [
                 ProviderCorrection(
@@ -44,6 +44,7 @@ def test_contextual_provider_receives_bounded_windows_and_can_correct_target() -
     assert request.previous == ("عامل إيه", "يا جماعة")
     assert request.raw_text == "خطي بالك"
     assert request.following == ("الموضوع", "مش سهل")
+    assert request.candidate_text == "خلي بالك"
     assert corrections[2].corrected_text == "خلي بالك"
     assert corrections[2].method == "llm+lexicon"
 
@@ -58,6 +59,31 @@ def test_validator_rejects_missing_duplicate_or_unrequested_segment_ids() -> Non
 
     with pytest.raises(ProviderResponseError, match="duplicate"):
         validate_provider_results({0, 1}, response)
+
+
+def test_provider_cannot_apply_a_small_rewrite_to_an_arabic_name() -> None:
+    """Provider output must not silently substitute a named person."""
+
+    class NameChangingProvider:
+        def correct_batch(self, requests: list[CorrectionRequest]) -> list[ProviderCorrection]:
+            return [
+                ProviderCorrection(
+                    segment_index=request.segment_index,
+                    corrected_text="أحمد صلاح",
+                    changed=True,
+                    confidence=0.99,
+                    changes=[{"from": "محمد", "to": "أحمد", "reason": "unclear audio"}],
+                )
+                for request in requests
+            ]
+
+    corrections = ContextualCorrector.from_default_lexicon(provider=NameChangingProvider()).correct(
+        [{"start": 0.0, "end": 1.0, "text": "محمد صلاح"}]
+    )
+
+    assert corrections[0].corrected_text == "محمد صلاح"
+    assert corrections[0].applied is False
+    assert corrections[0].method == "unchanged"
 
 
 def test_openai_compatible_provider_uses_structured_json_prompt() -> None:
@@ -119,6 +145,8 @@ def test_openai_compatible_provider_uses_structured_json_prompt() -> None:
 
     assert result[0].corrected_text == "خلي بالك"
     assert captured["url"] == "http://ollama:11434/v1/chat/completions"
-    payload = json.loads(captured["body"])
+    body = captured["body"]
+    assert isinstance(body, bytes)
+    payload = json.loads(body)
     assert payload["response_format"] == {"type": "json_object"}
     assert "Preserve the speaker's exact meaning and dialect." in payload["messages"][0]["content"]

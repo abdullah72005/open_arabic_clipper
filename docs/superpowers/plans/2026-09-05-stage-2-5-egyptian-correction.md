@@ -120,7 +120,7 @@ def test_fixture_benchmark_improves_egyptian_without_english_regression() -> Non
 
 ### Task 4: Persistence, pipeline, quality, Whisper settings
 
-**Files:** Modify transcript model, `pipeline/stages.py`, settings, transcription service/engine, quality service, Stage 2 tests; create `backend/alembic/versions/20260905_0005_stage_2_5_correction.py`.
+**Files:** Modify transcript model, `pipeline/stages.py`, settings, transcription service/engine, quality service, Stage 2 tests; create `backend/alembic/versions/20260905_0006_stage_2_5_correction.py`.
 
 **Interfaces:** `TranscriptionOptions` gains temperature/previous-text/VAD/initial-prompt/hotwords; `TranscriptNormalizationExecutor(session, corrector=None)` is idempotent; transcript gains corrected/final text and confidence/ratio/method/version fields.
 
@@ -143,7 +143,7 @@ Add fingerprint/engine option tests, migration upgrade/downgrade, raw/order/word
 
 - [ ] **Step 4: Verify green.** Run Step 2 command. Expected: all existing Stage 2 behavior preserved.
 
-- [ ] **Step 5: Commit.** Run `git add backend/app/models/transcript.py backend/alembic/versions/20260905_0005_stage_2_5_correction.py backend/app/pipeline/stages.py backend/app/core/settings.py backend/app/transcription/service.py backend/app/transcription/engine.py backend/app/services/source_quality.py backend/tests && git commit -m "Persist contextual transcript corrections"`.
+- [ ] **Step 5: Commit.** Run `git add backend/app/models/transcript.py backend/alembic/versions/20260905_0006_stage_2_5_correction.py backend/app/pipeline/stages.py backend/app/core/settings.py backend/app/transcription/service.py backend/app/transcription/engine.py backend/app/services/source_quality.py backend/tests && git commit -m "Persist contextual transcript corrections"`.
 
 ### Task 5: API, manual feedback, debug UI
 

@@ -24,3 +24,28 @@ real pipeline measurement, not a controlled benchmark, so the longer
 
 Run `python -m app.cli benchmark AUTHORIZED_AUDIO_FILE` on target hardware
 before changing the default model or device policy.
+
+## Stage 2.5 Egyptian correction fixture benchmark
+
+On 2026-09-05, the deterministic `egyptian_ar_correction.json` corpus was run
+in the backend Python 3.12 container with baseline display normalization and the
+default local `egyptian-ar-v1` lexicon corrector. The 14 manually reviewed cases
+include Arabic-only, English-only, code-switched technical speech, names,
+numbers, filler words, slang, negation, questions, football, and the three
+operator-supplied phonetic errors.
+
+| Mode | Exact fixture match | Token error signal | Improved | Unchanged | Worse | Auto rate | Uncertain rate | Wall time | Peak memory |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Baseline normalization | 78.57% | 10.94% | 0 | 14 | 0 | 0.00% | 100.00% | 4.44 ms | 6,760 B |
+| Stage 2.5 local lexicon | 100.00% | 0.00% | 3 | 11 | 0 | 21.43% | 78.57% | 6.67 ms | 7,284 B |
+
+Observed fixture overhead is 2.23 ms and 524 B. These micro-benchmark values do
+not include faster-whisper inference or an optional LLM endpoint. Standard WER
+and exact spelling can misrepresent dialect quality, so each fixture also has a
+manual semantic-correctness note. The meaningful result is that all three known
+Egyptian errors become clear while the English-only and code-switch cases remain
+unchanged.
+
+Known remaining cases: unknown Egyptian phonetic confusions, ambiguous names or
+numbers, and corrections that require acoustic evidence beyond nearby text stay
+raw until an operator adds and benchmarks a reviewed lexicon entry.
