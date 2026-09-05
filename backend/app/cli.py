@@ -13,9 +13,14 @@ from app.core.settings import get_settings
 from app.db.session import create_session_factory
 from app.models import ProcessingJob, SourceVideo, Transcript
 from app.services.health import HealthService
-from app.services.storage import StorageService
+from app.services.storage import StorageCategory, StorageService
 from app.transcription.benchmark import benchmark_transcription
 from app.transcription.engine import WhisperEngine
+from app.transcription.reconstruction.benchmark import (
+    evaluate_completion_gate,
+    load_benchmark_manifest,
+    run_reconstruction_benchmark,
+)
 from app.workers.tasks import run_pipeline_stage
 
 app = typer.Typer(no_args_is_help=True)
@@ -140,6 +145,26 @@ def benchmark(audio_path: Path) -> None:
     settings = get_settings()
     report = benchmark_transcription(audio_path, WhisperEngine(), settings.transcription_options())
     typer.echo(json.dumps(report.as_dict()))
+
+
+@app.command("benchmark-reconstruction")
+def benchmark_reconstruction(manifest_name: str) -> None:
+    """Evaluate a private, human-reviewed unseen-audio reconstruction manifest."""
+
+    manifest_path = _storage().resolve(StorageCategory.BENCHMARKS, manifest_name)
+    manifest = load_benchmark_manifest(manifest_path)
+    report = run_reconstruction_benchmark(manifest)
+    passed, reasons = evaluate_completion_gate(report)
+    typer.echo(
+        json.dumps(
+            {
+                "report": report.model_dump(mode="json"),
+                "passed": passed,
+                "reasons": reasons,
+                "status": "READY FOR STAGE 3" if passed else "STAGE 2.7 MUST CONTINUE",
+            }
+        )
+    )
 
 
 if __name__ == "__main__":

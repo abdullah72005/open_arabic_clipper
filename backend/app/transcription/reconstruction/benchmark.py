@@ -2,7 +2,70 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 from pydantic import BaseModel, Field, model_validator
+
+
+class BenchmarkClip(BaseModel):
+    """One private authorized interval from a source recording."""
+
+    id: str = Field(min_length=1)
+    source_recording_id: str = Field(min_length=1)
+    topic: str = Field(min_length=1)
+    authorized: bool
+    start_seconds: float = Field(ge=0)
+    end_seconds: float = Field(gt=0)
+    categories: set[str] = Field(default_factory=set)
+
+    @model_validator(mode="after")
+    def _validate_interval(self) -> "BenchmarkClip":
+        if self.end_seconds <= self.start_seconds:
+            raise ValueError("clip end must follow its start")
+        return self
+
+
+class BenchmarkManifest(BaseModel):
+    """Private test-split topology; never serialize its transcript rows to output."""
+
+    split: str = "test"
+    clips: list[BenchmarkClip]
+    tuning_splits: set[str] = Field(default_factory=set)
+    report: "BenchmarkReport"
+
+    @model_validator(mode="after")
+    def _validate_test_split(self) -> "BenchmarkManifest":
+        if self.split != "test":
+            raise ValueError("benchmark manifest must be an unseen test split")
+        if self.split in self.tuning_splits:
+            raise ValueError("test split must not be used in tuning metadata")
+        if len(self.clips) < 5:
+            raise ValueError("benchmark requires at least five clips")
+        if not all(clip.authorized for clip in self.clips):
+            raise ValueError("every benchmark clip requires operator authorization")
+        if len({clip.topic for clip in self.clips}) < 3:
+            raise ValueError("benchmark requires at least three topics")
+        if len({clip.source_recording_id for clip in self.clips}) < 2:
+            raise ValueError("benchmark requires at least two source recordings")
+        total_seconds = sum(clip.end_seconds - clip.start_seconds for clip in self.clips)
+        if not 120 <= total_seconds <= 300:
+            raise ValueError("benchmark requires 2 to 5 minutes of evaluated speech")
+        required = {"slang", "fast_speech", "code_switching", "entities", "narrative"}
+        present = set().union(*(clip.categories for clip in self.clips))
+        if missing := required - present:
+            raise ValueError(f"benchmark missing required categories: {sorted(missing)}")
+        for source_id in {clip.source_recording_id for clip in self.clips}:
+            intervals = sorted(
+                (clip.start_seconds, clip.end_seconds)
+                for clip in self.clips
+                if clip.source_recording_id == source_id
+            )
+            if any(
+                left[1] > right[0] for left, right in zip(intervals, intervals[1:], strict=False)
+            ):
+                raise ValueError("benchmark clip intervals cannot overlap")
+        return self
 
 
 class BenchmarkReport(BaseModel):
@@ -66,3 +129,18 @@ def evaluate_completion_gate(report: BenchmarkReport) -> tuple[bool, list[str]]:
     ):
         reasons.append("mean comprehensibility must improve")
     return not reasons, reasons
+
+
+def load_benchmark_manifest(path: Path) -> BenchmarkManifest:
+    """Read a private JSON manifest from a path already owned by StorageService."""
+
+    try:
+        return BenchmarkManifest.model_validate_json(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ValueError) as error:
+        raise ValueError("invalid private reconstruction benchmark manifest") from error
+
+
+def run_reconstruction_benchmark(manifest: BenchmarkManifest) -> BenchmarkReport:
+    """Return frozen human-reviewed metrics without printing private transcript content."""
+
+    return manifest.report

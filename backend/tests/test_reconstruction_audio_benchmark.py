@@ -1,4 +1,10 @@
-from app.transcription.reconstruction.benchmark import BenchmarkReport, evaluate_completion_gate
+import pytest
+
+from app.transcription.reconstruction.benchmark import (
+    BenchmarkManifest,
+    BenchmarkReport,
+    evaluate_completion_gate,
+)
 
 
 def _report(**changes: object) -> BenchmarkReport:
@@ -36,3 +42,13 @@ def test_completion_gate_rejects_any_hallucination() -> None:
 
     assert passed is False
     assert "hallucinated facts/names/numbers/clauses must be zero" in reasons
+
+
+def test_manifest_requires_authorized_diverse_unseen_clips() -> None:
+    clip = {"id": "c1", "source_recording_id": "source-1", "topic": "news", "authorized": True,
+            "start_seconds": 0, "end_seconds": 120}
+
+    with pytest.raises(ValueError, match="five"):
+        BenchmarkManifest.model_validate(
+            {"split": "test", "clips": [clip], "report": _report().model_dump()}
+        )
