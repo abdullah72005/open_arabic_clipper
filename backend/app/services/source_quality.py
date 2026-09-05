@@ -29,6 +29,10 @@ def assess_source(
     )
     reasons = [
         f"transcript_confidence={confidence:.2f}",
+        f"raw_transcript_confidence={transcript.raw_transcript_confidence:.2f}",
+        f"correction_confidence={transcript.correction_confidence:.2f}",
+        f"corrected_segment_ratio={transcript.corrected_segment_ratio:.2f}",
+        f"uncertain_segment_ratio={transcript.uncertain_segment_ratio:.2f}",
         f"speech_density={analysis.speech_density:.2f}",
         f"silence_ratio={analysis.silence_ratio:.2f}",
     ]

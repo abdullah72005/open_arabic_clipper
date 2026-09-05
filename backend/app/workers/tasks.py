@@ -60,7 +60,9 @@ def _stage_executors(session: Session) -> dict[PipelineStage, StageExecutor]:
             options=settings.transcription_options(),
             storage=storage,
         ),
-        PipelineStage.TRANSCRIPT_NORMALIZATION: TranscriptNormalizationExecutor(session=session),
+        PipelineStage.TRANSCRIPT_NORMALIZATION: TranscriptNormalizationExecutor(
+            session=session, corrector=settings.contextual_corrector()
+        ),
         PipelineStage.AUDIO_ANALYSIS: AudioAnalysisExecutor(
             session=session, storage=storage, ffmpeg_binary=settings.ffmpeg_binary
         ),

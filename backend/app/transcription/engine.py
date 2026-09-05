@@ -54,6 +54,11 @@ class WhisperEngine:
             beam_size=options.beam_size,
             language=options.language,
             word_timestamps=options.word_timestamps,
+            temperature=options.temperature,
+            condition_on_previous_text=options.condition_on_previous_text,
+            vad_filter=options.vad_filter,
+            initial_prompt=options.initial_prompt,
+            hotwords=options.hotwords,
         )
         serialized_segments = [_serialize_segment(segment) for segment in segments]
         words = [word for segment in serialized_segments for word in segment["words"]]

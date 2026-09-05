@@ -5,6 +5,8 @@ from typing import Literal
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.transcription.correction import ContextualCorrector, CorrectionConfig
+from app.transcription.providers import CorrectionProvider, OpenAICompatibleCorrectionProvider
 from app.transcription.service import TranscriptionOptions
 
 
@@ -31,6 +33,21 @@ class Settings(BaseSettings):
     whisper_beam_size: int = Field(default=5, gt=0, le=20)
     whisper_language: str | None = Field(default=None, min_length=2, max_length=16)
     whisper_word_timestamps: bool = True
+    whisper_temperature: tuple[float, ...] = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
+    whisper_condition_on_previous_text: bool = True
+    whisper_vad_filter: bool = False
+    whisper_initial_prompt: str | None = Field(default=None, max_length=4_000)
+    whisper_hotwords: str | None = Field(default=None, max_length=4_000)
+    correction_context_segments: int = Field(default=2, ge=0, le=5)
+    correction_high_confidence: float = Field(default=0.90, ge=0, le=1)
+    correction_medium_confidence: float = Field(default=0.75, ge=0, le=1)
+    correction_max_small_edit_ratio: float = Field(default=0.25, ge=0, le=1)
+    correction_provider_batch_size: int = Field(default=32, gt=0, le=200)
+    correction_provider: Literal["disabled", "openai_compatible"] = "disabled"
+    correction_provider_base_url: str | None = Field(default=None, max_length=2_048)
+    correction_provider_model: str | None = Field(default=None, max_length=256)
+    correction_provider_api_key: str | None = Field(default=None, max_length=4_096)
+    correction_provider_timeout_seconds: float = Field(default=30.0, gt=0, le=300)
     transcription_queue_concurrency: int = Field(default=1, gt=0)
     cors_origins: list[str] = ["http://localhost:3301"]
 
@@ -46,6 +63,46 @@ class Settings(BaseSettings):
             word_timestamps=self.whisper_word_timestamps,
             cpu_compute_type=self.whisper_cpu_compute_type,
             cuda_compute_type=self.whisper_cuda_compute_type,
+            temperature=self.whisper_temperature,
+            condition_on_previous_text=self.whisper_condition_on_previous_text,
+            vad_filter=self.whisper_vad_filter,
+            initial_prompt=self.whisper_initial_prompt,
+            hotwords=self.whisper_hotwords,
+        )
+
+    def correction_config(self) -> CorrectionConfig:
+        """Build safe correction thresholds and local-provider batch bounds."""
+
+        return CorrectionConfig(
+            context_segments=self.correction_context_segments,
+            high_confidence=self.correction_high_confidence,
+            medium_confidence=self.correction_medium_confidence,
+            max_small_edit_ratio=self.correction_max_small_edit_ratio,
+            provider_batch_size=self.correction_provider_batch_size,
+        )
+
+    def correction_provider_instance(self) -> CorrectionProvider | None:
+        """Return an explicit local LLM integration only when fully configured."""
+
+        if self.correction_provider == "disabled":
+            return None
+        if not self.correction_provider_base_url or not self.correction_provider_model:
+            raise ValueError(
+                "correction_provider_base_url and correction_provider_model are required "
+                "for an openai_compatible correction provider"
+            )
+        return OpenAICompatibleCorrectionProvider(
+            base_url=self.correction_provider_base_url,
+            model=self.correction_provider_model,
+            api_key=self.correction_provider_api_key,
+            timeout_seconds=self.correction_provider_timeout_seconds,
+        )
+
+    def contextual_corrector(self) -> ContextualCorrector:
+        """Build local lexicon correction with an optional explicitly configured provider."""
+
+        return ContextualCorrector.from_default_lexicon(
+            config=self.correction_config(), provider=self.correction_provider_instance()
         )
 
 

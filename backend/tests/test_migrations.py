@@ -66,3 +66,17 @@ def test_pipeline_stage_forward_migration_restores_ingest() -> None:
     assert module.revision == "20260904_0005"
     assert module.down_revision == "20260904_0004"
     assert "INGEST" in module._AFTER
+
+
+def test_stage_2_5_migration_preserves_raw_and_adds_derived_correction_columns() -> None:
+    path = (
+        Path(__file__).parents[1] / "alembic" / "versions" / "20260905_0006_stage_2_5_correction.py"
+    )
+    specification = importlib.util.spec_from_file_location("stage_2_5_correction_migration", path)
+    assert specification is not None
+    assert specification.loader is not None
+    module = importlib.util.module_from_spec(specification)
+    specification.loader.exec_module(module)
+
+    assert module.revision == "20260905_0006"
+    assert module.down_revision == "20260904_0005"

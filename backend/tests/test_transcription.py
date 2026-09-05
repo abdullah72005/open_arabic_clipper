@@ -88,6 +88,42 @@ def test_engine_falls_back_to_cpu_int8_and_preserves_word_timestamps() -> None:
     assert result.segments[0]["words"][0]["start"] == 0.0
 
 
+def test_engine_passes_explicit_safe_decoding_options() -> None:
+    """Optional Whisper controls are explicit, output-affecting, and still local."""
+
+    from app.transcription.engine import WhisperEngine
+
+    received: dict[str, object] = {}
+
+    class RecordingModel:
+        def transcribe(self, _path: str, **kwargs: object) -> tuple[list[FakeSegment], FakeInfo]:
+            received.update(kwargs)
+            return [FakeSegment()], FakeInfo()
+
+    WhisperEngine(
+        model_factory=lambda *_args: RecordingModel(), cuda_available=lambda: False
+    ).transcribe(
+        Path("speech.wav"),
+        TranscriptionOptions(
+            "small",
+            "cpu",
+            "int8",
+            5,
+            temperature=(0.0, 0.4),
+            condition_on_previous_text=False,
+            vad_filter=True,
+            initial_prompt="مصري",
+            hotwords="خلي بالك",
+        ),
+    )
+
+    assert received["temperature"] == (0.0, 0.4)
+    assert received["condition_on_previous_text"] is False
+    assert received["vad_filter"] is True
+    assert received["initial_prompt"] == "مصري"
+    assert received["hotwords"] == "خلي بالك"
+
+
 def test_transcription_executor_persists_raw_timestamped_result(
     sqlite_engine: object, tmp_path: Path
 ) -> None:
@@ -194,6 +230,49 @@ def test_normalization_and_audio_analysis_persist_reusable_signals(
         assert transcript.chunks[0].segment_indexes == [0]
         assert analysis.silence_ratio == 0.2
         assert analysis.speech_density == 0.8
+
+
+def test_normalization_persists_raw_corrected_final_text_and_timestamp(
+    sqlite_engine: object, tmp_path: Path
+) -> None:
+    """Stage 2.5 persists derived correction state without altering ASR timestamps."""
+
+    from app.db.base import Base
+    from app.models import SourceVideo, Transcript
+    from app.pipeline.stages import TranscriptNormalizationExecutor
+
+    Base.metadata.create_all(sqlite_engine)
+    with Session(sqlite_engine) as session:
+        source = SourceVideo(source_uri=str(tmp_path / "source.mp4"), content_hash="source")
+        session.add(source)
+        session.flush()
+        session.add(
+            Transcript(
+                source_video_id=source.id,
+                whisper_model="small",
+                input_fingerprint="fingerprint",
+                raw_text="خطي بالك",
+                normalized_text="خطي بالك",
+                segments=[{"start": 0.0, "end": 1.0, "text": "خطي بالك", "words": []}],
+                word_segments=[],
+                duration=1.0,
+            )
+        )
+        session.commit()
+
+        transcript = TranscriptNormalizationExecutor(session=session).execute(source)
+
+        assert transcript.raw_text == "خطي بالك"
+        assert transcript.corrected_text == "خلي بالك"
+        assert transcript.final_text == "خلي بالك"
+        assert transcript.segments[0]["raw_text"] == "خطي بالك"
+        assert transcript.segments[0]["corrected_text"] == "خلي بالك"
+        assert transcript.segments[0]["final_text"] == "خلي بالك"
+        assert transcript.segments[0]["correction_applied"] is True
+        assert transcript.segments[0]["start"] == 0.0
+        assert transcript.segments[0]["end"] == 1.0
+        assert transcript.corrected_segment_ratio == 1.0
+        assert transcript.uncertain_segment_ratio == 0.0
 
 
 def test_benchmark_reports_actual_transcription_throughput(tmp_path: Path) -> None:

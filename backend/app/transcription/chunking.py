@@ -71,4 +71,6 @@ def _time(segment: Mapping[str, object], field: str) -> float:
 
 
 def _text(segment: Mapping[str, object]) -> str:
-    return str(segment.get("text", ""))
+    return str(
+        segment.get("final_text") or segment.get("normalized_text") or segment.get("text", "")
+    )

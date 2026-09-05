@@ -21,6 +21,10 @@ def test_source_quality_assessment_is_persisted_and_advisory(sqlite_engine: obje
             input_fingerprint="a" * 64,
             raw_text="أهلا hello",
             normalized_text="أهلا hello",
+            raw_transcript_confidence=0.8,
+            correction_confidence=0.95,
+            corrected_segment_ratio=0.2,
+            uncertain_segment_ratio=0.4,
             duration=10,
             segments=[{"start": 0.0, "end": 2.0, "text": "أهلا hello", "avg_logprob": -0.2}],
             word_segments=[],
@@ -43,4 +47,8 @@ def test_source_quality_assessment_is_persisted_and_advisory(sqlite_engine: obje
 
         assert assessment.overall_source_quality_score > 0
         assert assessment.reasons
+        assert "raw_transcript_confidence=0.80" in assessment.reasons
+        assert "correction_confidence=0.95" in assessment.reasons
+        assert "corrected_segment_ratio=0.20" in assessment.reasons
+        assert "uncertain_segment_ratio=0.40" in assessment.reasons
         assert source.lifecycle_state.value != "FAILED"

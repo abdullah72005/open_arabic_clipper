@@ -77,3 +77,18 @@ def test_settings_explicit_compute_type_overrides_per_device_defaults(
     options = Settings().transcription_options()
 
     assert options.compute_type == "float16"
+
+
+def test_settings_builds_opt_in_local_correction_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The local-first default is lexicon-only; compatible LLM use is explicit configuration."""
+
+    monkeypatch.setenv("CLIPFACTORY_CORRECTION_PROVIDER", "openai_compatible")
+    monkeypatch.setenv("CLIPFACTORY_CORRECTION_PROVIDER_BASE_URL", "http://ollama:11434")
+    monkeypatch.setenv("CLIPFACTORY_CORRECTION_PROVIDER_MODEL", "qwen-local")
+    monkeypatch.setenv("CLIPFACTORY_CORRECTION_PROVIDER_BATCH_SIZE", "8")
+
+    settings = Settings()
+
+    assert settings.correction_config().provider_batch_size == 8
+    provider = settings.correction_provider_instance()
+    assert provider is not None

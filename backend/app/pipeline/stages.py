@@ -21,6 +21,7 @@ from app.services.source_adapters import YtDlpAdapter
 from app.services.source_quality import assess_source
 from app.services.storage import StorageCategory, StorageService
 from app.transcription.chunking import ChunkConfig, build_chunks
+from app.transcription.correction import ContextualCorrector
 from app.transcription.engine import TranscriptionResult, WhisperEngine
 from app.transcription.normalization import normalize_transcript
 from app.transcription.service import TranscriptionOptions
@@ -85,10 +86,23 @@ class TranscriptionExecutor:
             "beam_size": self._options.beam_size,
             "language": self._options.language,
             "word_timestamps": self._options.word_timestamps,
+            "temperature": self._options.temperature,
+            "condition_on_previous_text": self._options.condition_on_previous_text,
+            "vad_filter": self._options.vad_filter,
+            "initial_prompt": self._options.initial_prompt,
+            "hotwords": self._options.hotwords,
         }
         transcript.input_fingerprint = fingerprint
         transcript.raw_text = result.raw_text
         transcript.normalized_text = result.raw_text
+        transcript.corrected_text = result.raw_text
+        transcript.final_text = result.raw_text
+        transcript.raw_transcript_confidence = _raw_transcript_confidence(result.segments)
+        transcript.correction_confidence = 0.0
+        transcript.corrected_segment_ratio = 0.0
+        transcript.uncertain_segment_ratio = 1.0 if result.segments else 0.0
+        transcript.correction_method = "pending"
+        transcript.correction_version = "pending"
         transcript.segments = result.segments
         transcript.word_segments = result.word_segments
         transcript.duration = result.duration
@@ -145,8 +159,9 @@ class AudioExtractionExecutor:
 class TranscriptNormalizationExecutor:
     """Normalize a persisted transcript without rewriting its raw ASR evidence."""
 
-    def __init__(self, *, session: Session) -> None:
+    def __init__(self, *, session: Session, corrector: ContextualCorrector | None = None) -> None:
         self._session = session
+        self._corrector = corrector or ContextualCorrector.from_default_lexicon()
 
     def execute(self, source: SourceVideo) -> Transcript:
         transcript = self._session.scalar(
@@ -154,11 +169,78 @@ class TranscriptNormalizationExecutor:
         )
         if transcript is None:
             raise StageExecutionError("transcript is missing")
-        transcript.normalized_text = normalize_transcript(transcript.raw_text)
-        transcript.segments = [
-            {**segment, "normalized_text": normalize_transcript(str(segment.get("text", "")))}
-            for segment in transcript.segments
+        previous_overrides = {
+            index: (
+                str(segment.get("raw_text", segment.get("text", ""))),
+                segment.get("operator_text"),
+            )
+            for index, segment in enumerate(transcript.segments)
+            if segment.get("operator_text")
+        }
+        corrections = self._corrector.correct(transcript.segments)
+        normalized_segments: list[dict[str, object]] = []
+        for segment, correction in zip(transcript.segments, corrections, strict=True):
+            previous = previous_overrides.get(correction.segment_index)
+            operator_text = (
+                str(previous[1])
+                if previous is not None and previous[0] == correction.raw_text
+                else None
+            )
+            final_text = operator_text or correction.corrected_text
+            normalized_segments.append(
+                {
+                    **segment,
+                    "raw_text": correction.raw_text,
+                    "corrected_text": correction.corrected_text,
+                    "correction_applied": correction.applied,
+                    "correction_confidence": correction.confidence,
+                    "correction_method": correction.method,
+                    "correction_version": correction.version,
+                    "correction_changes": correction.changes,
+                    "operator_text": operator_text,
+                    "final_text": final_text,
+                    "normalized_text": normalize_transcript(final_text),
+                }
+            )
+        transcript.segments = normalized_segments
+        transcript.corrected_text = " ".join(
+            str(segment["corrected_text"]) for segment in normalized_segments
+        ).strip()
+        transcript.final_text = " ".join(
+            str(segment["final_text"]) for segment in normalized_segments
+        ).strip()
+        transcript.normalized_text = normalize_transcript(transcript.final_text)
+        total_segments = len(normalized_segments)
+        applied = [segment for segment in normalized_segments if segment["correction_applied"]]
+        uncertain = [
+            segment
+            for segment in normalized_segments
+            if segment["correction_method"] == "unchanged"
         ]
+        transcript.raw_transcript_confidence = _raw_transcript_confidence(normalized_segments)
+        transcript.correction_confidence = (
+            sum(float(segment["correction_confidence"]) for segment in applied) / len(applied)
+            if applied
+            else 0.0
+        )
+        transcript.corrected_segment_ratio = (
+            len(applied) / total_segments if total_segments else 0.0
+        )
+        transcript.uncertain_segment_ratio = (
+            len(uncertain) / total_segments if total_segments else 0.0
+        )
+        transcript.correction_method = (
+            "mixed"
+            if len({str(segment["correction_method"]) for segment in normalized_segments}) > 1
+            else str(normalized_segments[0]["correction_method"])
+            if normalized_segments
+            else "unchanged"
+        )
+        transcript.correction_version = (
+            str(normalized_segments[0]["correction_version"])
+            if normalized_segments
+            else "egyptian-ar-v1"
+        )
         self._session.execute(
             delete(TranscriptChunk).where(TranscriptChunk.transcript_id == transcript.id)
         )
@@ -178,6 +260,15 @@ class TranscriptNormalizationExecutor:
         self._session.commit()
         self._session.refresh(transcript)
         return transcript
+
+
+def _raw_transcript_confidence(segments: list[dict[str, object]]) -> float:
+    logprobs = [
+        float(value)
+        for segment in segments
+        if isinstance(value := segment.get("avg_logprob"), int | float)
+    ]
+    return max(0.0, min(1.0, 1.0 + sum(logprobs) / len(logprobs))) if logprobs else 0.0
 
 
 SilenceCommandRunner = Callable[[list[str]], str]
