@@ -49,3 +49,25 @@ unchanged.
 Known remaining cases: unknown Egyptian phonetic confusions, ambiguous names or
 numbers, and corrections that require acoustic evidence beyond nearby text stay
 raw until an operator adds and benchmarks a reviewed lexicon entry.
+
+## Stage 2.7 contextual reconstruction gate
+
+No Stage 2.7 quality or performance value has been recorded yet. Fixture tests
+exercise safety and regressions only; they cannot prove real Egyptian-audio
+improvement. A private, operator-authorized unseen test manifest must contain at
+least five non-overlapping clips totaling two to five minutes, across three
+topics and two recordings, including slang, fast speech, code switching,
+entities, and narrative speech. Every evaluated segment requires a frozen human
+reference and review label.
+
+Store that manifest below the storage service `benchmarks/` category and run:
+
+```bash
+python -m app.cli benchmark-reconstruction stage-2-7/unseen-test-v1.json
+```
+
+The command prints only aggregate metrics and fails readiness unless it records
+the provider model identifier/digest, a 10-point semantic lift, 25% improvement
+of Stage 2.5-wrong segments, no more than 2% regression, 98% preservation, zero
+hallucinations, and non-decreasing category comprehensibility. Until measured
+evidence meets all bounds, Stage 2.7 remains open.

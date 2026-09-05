@@ -48,7 +48,7 @@ Read [local setup](docs/LOCAL_SETUP.md), [architecture](docs/ARCHITECTURE.md),
 [pipeline](docs/PIPELINE.md), and [troubleshooting](docs/TROUBLESHOOTING.md)
 before using external media sources.
 
-## Stage 2 and Stage 2.5 transcription quality
+## Stage 2, 2.5, and 2.7 transcription quality
 
 Workers need FFmpeg/ffprobe and the local `faster-whisper` dependency. Configure
 `CLIPFACTORY_WHISPER_MODEL` (`tiny`, `base`, `small`, `medium`, or `large-v3`),
@@ -75,6 +75,15 @@ LLM. To opt into a local OpenAI-compatible endpoint such as Ollama, configure
 model. Provider responses are batched, context-bounded, schema-validated, and
 may only approve a declared lexicon candidate; they fall back to raw/lexicon
 output on any failure or unsafe change.
+
+Stage 2.7 runs after Stage 2.5 and before audio analysis. It retains raw ASR,
+Stage 2.5, Stage 2.7, and manual text separately; final text is always manual
+override, then an applied HIGH-confidence reconstruction, then Stage 2.5, then
+raw ASR. `CLIPFACTORY_RECONSTRUCTION_PROVIDER=disabled` is the safe default.
+An explicitly configured local OpenAI-compatible provider uses two structured,
+temperature-zero passes; invalid or unavailable responses preserve Stage 2.5 and
+do not block `READY_FOR_ANALYSIS`. Use `POST /api/sources/{id}/reconstruct` or
+`python -m app.cli reconstruct SOURCE_ID --force` to queue it.
 
 Use `GET /api/sources/{id}/transcript` for raw/corrected/final evidence,
 `GET /api/sources/{id}/transcript/search?q=...` for timestamped final-text
@@ -111,3 +120,9 @@ python -m app.transcription.correction_benchmark \
 Fixture metrics are regression evidence, not ground-truth dialect accuracy. Use
 an authorized audio set and manual semantic review before enabling any LLM model
 or changing Whisper decoding defaults.
+
+Stage 2.7 readiness requires a private manifest inside storage-owned
+`benchmarks/`, with no transcript bodies committed to the repository. Run
+`python -m app.cli benchmark-reconstruction stage-2-7/unseen-test-v1.json`.
+Only its aggregate report and acceptance result are printed; until the strict
+unseen-audio gate passes, the status is `STAGE 2.7 MUST CONTINUE`.
