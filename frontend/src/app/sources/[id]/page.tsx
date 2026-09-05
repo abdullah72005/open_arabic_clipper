@@ -108,6 +108,7 @@ export default function SourceDetail() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const [error, setError] = useState("");
   const [transcriptRevision, setTranscriptRevision] = useState(0);
+  const [jobRevision, setJobRevision] = useState(0);
   const load = useCallback(() => api.getSource(params.id), [params.id]);
   const loadTranscript = useCallback(
     () => api.getTranscript(params.id).catch((cause) => {
@@ -132,6 +133,15 @@ export default function SourceDetail() {
       setError(cause instanceof Error ? cause.message : "Delete failed");
     }
   };
+  const retry = async () => {
+    setError("");
+    try {
+      await api.retrySource(params.id);
+      setJobRevision((value) => value + 1);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Retry failed");
+    }
+  };
 
   return (
     <ApiState load={load}>
@@ -153,6 +163,14 @@ export default function SourceDetail() {
               <dt>Rights</dt><dd>{source.rights_status}</dd>
               <dt>Pipeline state</dt><dd>{source.lifecycle_state}</dd>
             </dl>
+            <ApiState key={jobRevision} load={api.listJobs}>
+              {(jobs) => {
+                const job = jobs.find((item) => item.source_video_id === source.id);
+                if (!job) return null;
+                const canRetry = ["FAILED", "CANCELLED"].includes(job.status);
+                return <div><strong>{job.kind} — {job.status}</strong>{job.error_message && <p className="error">Reason: {job.error_message}</p>}{canRetry && <button className="button" onClick={() => void retry()}>Retry</button>}</div>;
+              }}
+            </ApiState>
             <p className="muted">Transcription auto-detects Arabic, English, and mixed speech locally.</p>
             <button className="button danger" onClick={remove}>Delete source</button>
             {error && <p className="error">{error}</p>}

@@ -10,7 +10,6 @@ from time import monotonic
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
-from app.core.enums import RightsStatus
 from app.core.settings import get_settings
 from app.media.analysis import parse_silencedetect, silence_ratio, windowed_rms
 from app.media.audio import AudioExtractor
@@ -122,8 +121,6 @@ class IngestExecutor:
         if not source.source_uri:
             raise StageExecutionError("source URI is missing")
         if source.source_uri.startswith(("http://", "https://")):
-            if source.rights_status is RightsStatus.UNKNOWN:
-                raise StageExecutionError("explicit rights are required before URL acquisition")
             acquired = self._url_adapter.acquire(source.id, source.source_uri)
             source.source_uri = str(acquired.path)
             source.original_filename = acquired.original_filename

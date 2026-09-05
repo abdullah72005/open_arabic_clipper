@@ -21,8 +21,8 @@
 - The storage service is the sole owner of application filesystem paths.
 - Pipeline stages are persisted, idempotent, retryable, and resumable. Stage 2.5
   preserves raw ASR text/timestamps and derives correction/final fields without
-  realignment; future stage authorization must gate UNKNOWN-rights sources before
-  candidate generation, rendering, or publishing.
+  realignment. Rights/provenance are tracked throughout the pipeline but do not
+  block local analysis; publishing eligibility is evaluated separately.
 
 ## Local development facts (not product requirements)
 

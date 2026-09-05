@@ -4,7 +4,9 @@ export type RightsStatus =
   | "LICENSED"
   | "PERMISSION"
   | "PUBLIC_DOMAIN"
-  | "OTHER_ALLOWED";
+  | "OTHER_ALLOWED"
+  | "THIRD_PARTY_UNKNOWN"
+  | "THIRD_PARTY_REUSE";
 export type PipelineStage =
   | "INGEST"
   | "PROBE"
@@ -141,6 +143,7 @@ export function createApiClient(baseUrl: string, fetcher: Fetcher = fetch) {
       return request<Source>("/sources/upload", { method: "POST", body });
     },
     deleteSource: (id: string) => request<void>(`/sources/${encodeURIComponent(id)}`, { method: "DELETE" }),
+    retrySource: (id: string) => request<Job>(`/sources/${encodeURIComponent(id)}/retry`, { method: "POST" }),
     listJobs: () => request<Job[]>("/jobs"),
     getJob: (id: string) => request<Job>(`/jobs/${encodeURIComponent(id)}`),
     cancelJob: (id: string) => request<Job>(`/jobs/${encodeURIComponent(id)}/cancel`, { method: "POST" }),
