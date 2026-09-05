@@ -5,7 +5,16 @@ export type RightsStatus =
   | "PERMISSION"
   | "PUBLIC_DOMAIN"
   | "OTHER_ALLOWED";
-export type PipelineStage = "INGEST" | "PROBE" | "READY_FOR_TRANSCRIPTION" | "FAILED";
+export type PipelineStage =
+  | "INGEST"
+  | "PROBE"
+  | "AUDIO_EXTRACTION"
+  | "TRANSCRIPTION"
+  | "TRANSCRIPT_NORMALIZATION"
+  | "AUDIO_ANALYSIS"
+  | "READY_FOR_TRANSCRIPTION"
+  | "READY_FOR_ANALYSIS"
+  | "FAILED";
 export type JobStatus = "QUEUED" | "RUNNING" | "SUCCEEDED" | "FAILED" | "CANCELLED";
 
 export interface Source {
@@ -38,6 +47,25 @@ export interface StorageUsage {
   free_bytes: number;
 }
 
+export interface TranscriptSegment {
+  start: number;
+  end: number;
+  text: string;
+  normalized_text?: string;
+  avg_logprob?: number | null;
+  no_speech_prob?: number | null;
+}
+
+export interface Transcript {
+  source_video_id: string;
+  language: string | null;
+  detected_language_probability: number | null;
+  raw_text: string;
+  normalized_text: string;
+  segments: TranscriptSegment[];
+  duration: number;
+}
+
 type Fetcher = typeof fetch;
 
 export class ApiError extends Error {
@@ -62,6 +90,10 @@ export function createApiClient(baseUrl: string, fetcher: Fetcher = fetch) {
   return {
     listSources: () => request<Source[]>("/sources"),
     getSource: (id: string) => request<Source>(`/sources/${encodeURIComponent(id)}`),
+    sourceMediaUrl: (id: string) =>
+      `${baseUrl.replace(/\/$/, "")}/api/sources/${encodeURIComponent(id)}/media`,
+    getTranscript: (id: string) =>
+      request<Transcript>(`/api/sources/${encodeURIComponent(id)}/transcript`),
     submitUrls: (urls: string[], rights_status: RightsStatus = "UNKNOWN") =>
       Promise.all(
         urls.map((url) =>

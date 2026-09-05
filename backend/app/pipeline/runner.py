@@ -124,9 +124,7 @@ class PipelineRunner:
             if job is None or job.source_video_id != source_id:
                 raise LookupError(f"processing job {job_id} does not belong to source {source_id}")
             return job
-        if stage is not PipelineStage.INGEST:
-            return None
-        job = ProcessingJob(source_video_id=source_id, kind=JobKind.INGEST)
+        job = ProcessingJob(source_video_id=source_id, kind=_job_kind_for_stage(stage))
         self._session.add(job)
         return job
 
@@ -149,12 +147,32 @@ class PipelineRunner:
 def _stage_for_job_kind(kind: JobKind) -> PipelineStage:
     if kind is JobKind.INGEST:
         return PipelineStage.INGEST
+    if kind is JobKind.PROBE:
+        return PipelineStage.PROBE
+    if kind is JobKind.TRANSCRIPTION:
+        return PipelineStage.TRANSCRIPTION
     raise ValueError(f"no pipeline stage is defined for job kind {kind.value}")
+
+
+def _job_kind_for_stage(stage: PipelineStage) -> JobKind:
+    if stage is PipelineStage.PROBE:
+        return JobKind.PROBE
+    if stage is PipelineStage.TRANSCRIPTION:
+        return JobKind.TRANSCRIPTION
+    return JobKind.INGEST
 
 
 def _next_stage(stage: PipelineStage) -> PipelineStage:
     if stage is PipelineStage.INGEST:
         return PipelineStage.PROBE
     if stage is PipelineStage.PROBE:
-        return PipelineStage.READY_FOR_TRANSCRIPTION
-    return PipelineStage.READY_FOR_TRANSCRIPTION
+        return PipelineStage.AUDIO_EXTRACTION
+    if stage is PipelineStage.AUDIO_EXTRACTION:
+        return PipelineStage.TRANSCRIPTION
+    if stage is PipelineStage.TRANSCRIPTION:
+        return PipelineStage.TRANSCRIPT_NORMALIZATION
+    if stage is PipelineStage.TRANSCRIPT_NORMALIZATION:
+        return PipelineStage.AUDIO_ANALYSIS
+    if stage is PipelineStage.AUDIO_ANALYSIS:
+        return PipelineStage.READY_FOR_ANALYSIS
+    return PipelineStage.READY_FOR_ANALYSIS

@@ -1,8 +1,11 @@
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from app.transcription.service import TranscriptionOptions
 
 
 class Settings(BaseSettings):
@@ -20,7 +23,30 @@ class Settings(BaseSettings):
     max_remote_download_bytes: int = Field(default=2 * 1024 * 1024 * 1024, gt=0)
     url_egress_proxy: str | None = None
     max_concurrent_uploads: int = Field(default=2, gt=0)
+    whisper_model: Literal["tiny", "base", "small", "medium", "large-v3"] = "small"
+    whisper_device: Literal["auto", "cpu", "cuda"] = "auto"
+    whisper_compute_type: str | None = None
+    whisper_cpu_compute_type: str = "int8"
+    whisper_cuda_compute_type: str = "float16"
+    whisper_beam_size: int = Field(default=5, gt=0, le=20)
+    whisper_language: str | None = Field(default=None, min_length=2, max_length=16)
+    whisper_word_timestamps: bool = True
+    transcription_queue_concurrency: int = Field(default=1, gt=0)
     cors_origins: list[str] = ["http://localhost:3301"]
+
+    def transcription_options(self) -> TranscriptionOptions:
+        """Build the output-affecting options passed to the worker-side engine."""
+
+        return TranscriptionOptions(
+            model=self.whisper_model,
+            device=self.whisper_device,
+            compute_type=self.whisper_compute_type or "auto",
+            beam_size=self.whisper_beam_size,
+            language=self.whisper_language,
+            word_timestamps=self.whisper_word_timestamps,
+            cpu_compute_type=self.whisper_cpu_compute_type,
+            cuda_compute_type=self.whisper_cuda_compute_type,
+        )
 
 
 @lru_cache

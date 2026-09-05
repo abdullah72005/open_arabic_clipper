@@ -7,11 +7,13 @@ import os
 import shutil
 from collections.abc import Iterator
 from datetime import datetime
+from pathlib import Path
 from typing import Protocol
 from uuid import UUID, uuid4
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Response, UploadFile, status
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Response, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
@@ -19,10 +21,11 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.core.enums import JobKind, JobStatus, PipelineStage, RightsStatus
 from app.core.settings import get_settings
 from app.db.session import create_session_factory
-from app.models import ProcessingJob, SourceVideo
+from app.models import ProcessingJob, SourceVideo, Transcript
 from app.services.health import CheckStatus, HealthService
 from app.services.source_adapters import SourceValidationError, normalize_source_url
 from app.services.storage import StorageCategory, StorageService
+from app.workers.tasks import run_pipeline_stage
 
 UPLOAD_CHUNK_BYTES = 1024 * 1024
 
@@ -75,6 +78,24 @@ class StorageResponse(BaseModel):
     total_bytes: int
     used_bytes: int
     free_bytes: int
+
+
+class TranscriptResponse(BaseModel):
+    source_video_id: UUID
+    language: str | None
+    detected_language_probability: float | None
+    whisper_model: str
+    transcription_options: dict[str, object]
+    raw_text: str
+    normalized_text: str
+    segments: list[dict[str, object]]
+    word_segments: list[dict[str, object]]
+    duration: float
+    processing_duration: float | None
+
+
+class TranscriptSearchResponse(BaseModel):
+    segments: list[dict[str, object]]
 
 
 def create_app(
@@ -198,6 +219,82 @@ def create_app(
     def get_source(source_id: UUID, database: Session = Depends(session)) -> SourceResponse:
         return SourceResponse.model_validate(_source_or_404(database, source_id))
 
+    @app.get("/api/sources/{source_id}/transcript", response_model=TranscriptResponse)
+    def get_transcript(source_id: UUID, database: Session = Depends(session)) -> TranscriptResponse:
+        transcript = _transcript_or_404(database, source_id)
+        return _transcript_response(transcript)
+
+    @app.get("/api/sources/{source_id}/media")
+    def get_source_media(source_id: UUID, database: Session = Depends(session)) -> FileResponse:
+        """Serve only the storage-owned local original for timestamp playback."""
+        source = _source_or_404(database, source_id)
+        source_path = Path(source.source_uri)
+        source_directory = storage_service.source_directory(source.id).resolve()
+        try:
+            source_path.resolve().relative_to(source_directory)
+        except (OSError, ValueError):
+            raise HTTPException(
+                status_code=404, detail="local source media is unavailable"
+            ) from None
+        if not source_path.is_file():
+            raise HTTPException(status_code=404, detail="local source media is unavailable")
+        return FileResponse(source_path)
+
+    @app.get(
+        "/api/sources/{source_id}/transcript/segments",
+        response_model=TranscriptSearchResponse,
+    )
+    def get_transcript_segments(
+        source_id: UUID, offset: int = 0, limit: int = 200, database: Session = Depends(session)
+    ) -> TranscriptSearchResponse:
+        transcript = _transcript_or_404(database, source_id)
+        bounded_offset = max(offset, 0)
+        bounded_limit = min(max(limit, 1), 500)
+        return TranscriptSearchResponse(
+            segments=transcript.segments[bounded_offset : bounded_offset + bounded_limit]
+        )
+
+    @app.get("/api/sources/{source_id}/transcript/search", response_model=TranscriptSearchResponse)
+    def search_transcript(
+        source_id: UUID,
+        q: str = Query(min_length=1, max_length=256),
+        database: Session = Depends(session),
+    ) -> TranscriptSearchResponse:
+        transcript = _transcript_or_404(database, source_id)
+        query = q.casefold()
+        return TranscriptSearchResponse(
+            segments=[
+                segment
+                for segment in transcript.segments
+                if query in str(segment.get("text", "")).casefold()
+            ]
+        )
+
+    @app.post(
+        "/api/sources/{source_id}/retranscribe",
+        response_model=JobResponse,
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    def retranscribe_source(
+        source_id: UUID,
+        force: bool = False,
+        database: Session = Depends(session),
+    ) -> JobResponse:
+        """Queue a fresh local ASR run; option changes invalidate its transcript cache."""
+        _source_or_404(database, source_id)
+        if force:
+            transcript = database.scalar(
+                select(Transcript).where(Transcript.source_video_id == source_id)
+            )
+            if transcript is not None:
+                transcript.input_fingerprint = ""
+        job = ProcessingJob(source_video_id=source_id, kind=JobKind.TRANSCRIPTION)
+        database.add(job)
+        database.commit()
+        database.refresh(job)
+        run_pipeline_stage.delay(str(source_id), PipelineStage.TRANSCRIPTION.value, str(job.id))
+        return JobResponse.model_validate(job)
+
     @app.delete("/sources/{source_id}", status_code=status.HTTP_204_NO_CONTENT)
     def delete_source(source_id: UUID, database: Session = Depends(session)) -> None:
         source = _source_or_404(database, source_id)
@@ -304,6 +401,30 @@ def _source_or_404(database: Session, source_id: UUID) -> SourceVideo:
     if source is None:
         raise HTTPException(status_code=404, detail="source not found")
     return source
+
+
+def _transcript_or_404(database: Session, source_id: UUID) -> Transcript:
+    _source_or_404(database, source_id)
+    transcript = database.scalar(select(Transcript).where(Transcript.source_video_id == source_id))
+    if transcript is None:
+        raise HTTPException(status_code=404, detail="transcript not found")
+    return transcript
+
+
+def _transcript_response(transcript: Transcript) -> TranscriptResponse:
+    return TranscriptResponse(
+        source_video_id=transcript.source_video_id,
+        language=transcript.language,
+        detected_language_probability=transcript.detected_language_probability,
+        whisper_model=transcript.whisper_model,
+        transcription_options=transcript.transcription_options,
+        raw_text=transcript.raw_text,
+        normalized_text=transcript.normalized_text,
+        segments=transcript.segments,
+        word_segments=transcript.word_segments,
+        duration=transcript.duration,
+        processing_duration=transcript.processing_duration,
+    )
 
 
 def _job_or_404(database: Session, job_id: UUID) -> ProcessingJob:

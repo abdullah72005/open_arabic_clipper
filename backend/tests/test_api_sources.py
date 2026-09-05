@@ -8,12 +8,13 @@ from uuid import UUID
 import pytest
 from fastapi import Response
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
 from app.api.app import CeleryDispatcher, create_app
 from app.core.enums import PipelineStage, RightsStatus
 from app.db.base import Base
+from app.models import SourceVideo, Transcript
 from app.services.storage import StorageService
 
 
@@ -24,6 +25,45 @@ class RecordingDispatcher:
     def dispatch(self, source_id: UUID, job_id: UUID) -> None:
         del source_id
         self.job_ids.append(job_id)
+
+
+def test_source_media_returns_stored_local_upload(
+    client: tuple[TestClient, RecordingDispatcher],
+) -> None:
+    test_client, _ = client
+
+    created = test_client.post(
+        "/sources/upload",
+        data={"rights_status": RightsStatus.OWNED.value},
+        files={"file": ("owned-video.mp4", b"owned media", "video/mp4")},
+    )
+
+    assert created.status_code == 201
+    source_id = created.json()["id"]
+    media = test_client.get(f"/api/sources/{source_id}/media")
+
+    assert media.status_code == 200, media.text
+    assert media.content == b"owned media"
+    assert media.headers["content-type"].startswith("video/mp4")
+
+
+def test_source_media_uses_configured_storage_when_not_injected(tmp_path: Path) -> None:
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'default-storage.sqlite3'}")
+    Base.metadata.create_all(engine)
+    app = create_app(
+        session_factory=sessionmaker(engine, expire_on_commit=False),
+        dispatcher=RecordingDispatcher(),
+    )
+
+    with TestClient(app) as test_client:
+        created = test_client.post(
+            "/sources/upload",
+            files={"file": ("owned-video.mp4", b"owned media", "video/mp4")},
+        )
+        media = test_client.get(f"/api/sources/{created.json()['id']}/media")
+
+    engine.dispose()
+    assert media.status_code == 200, media.text
 
 
 @pytest.fixture
@@ -207,3 +247,75 @@ def test_cancelled_job_is_not_dispatched_again(
     assert len(dispatcher.job_ids) == 1
     assert test_client.post(f"/sources/{source['id']}/process").status_code == 202
     assert len(dispatcher.job_ids) == 2
+
+
+def test_transcript_search_returns_timestamped_mixed_language_segment(
+    client: tuple[TestClient, RecordingDispatcher],
+) -> None:
+    """API search keeps Arabic/English source text and its seek position."""
+
+    test_client, _ = client
+    factory = test_client.app.state.session_factory
+    with factory() as session:
+        source = SourceVideo(source_uri="/imports/episode.mp4")
+        session.add(source)
+        session.flush()
+        session.add(
+            Transcript(
+                source_video_id=source.id,
+                whisper_model="small",
+                transcription_options={},
+                input_fingerprint="a" * 64,
+                raw_text="أهلا hello",
+                normalized_text="أهلا hello",
+                segments=[{"start": 12.4, "end": 14.0, "text": "أهلا hello", "words": []}],
+                word_segments=[],
+                duration=14.0,
+                language="ar",
+            )
+        )
+        session.commit()
+        source_id = source.id
+
+    response = test_client.get(f"/api/sources/{source_id}/transcript/search?q=hello")
+
+    assert response.status_code == 200
+    assert response.json()["segments"][0]["start"] == 12.4
+
+
+def test_retranscribe_queues_a_transcription_job(
+    client: tuple[TestClient, RecordingDispatcher], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    test_client, _ = client
+    source = test_client.post("/sources/upload", files={"file": ("clip.mp4", b"video")}).json()
+    factory = test_client.app.state.session_factory
+    with factory() as session:
+        session.add(
+            Transcript(
+                source_video_id=UUID(source["id"]),
+                whisper_model="small",
+                input_fingerprint="cached",
+                raw_text="cached",
+                normalized_text="cached",
+                segments=[],
+                word_segments=[],
+            )
+        )
+        session.commit()
+    calls: list[tuple[str, str, str]] = []
+    monkeypatch.setattr(
+        "app.workers.tasks.run_pipeline_stage.delay", lambda *args: calls.append(args)
+    )
+
+    response = test_client.post(f"/api/sources/{source['id']}/retranscribe?force=true")
+
+    assert response.status_code == 202
+    assert response.json()["kind"] == "TRANSCRIPTION"
+    assert calls[0][0] == source["id"]
+    assert calls[0][1] == "TRANSCRIPTION"
+    with factory() as session:
+        transcript = session.scalar(
+            select(Transcript).where(Transcript.source_video_id == UUID(source["id"]))
+        )
+        assert transcript is not None
+        assert transcript.input_fingerprint == ""

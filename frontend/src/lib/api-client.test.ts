@@ -3,6 +3,35 @@ import { describe, expect, it } from "vitest";
 import { ApiError, createApiClient } from "./api-client";
 
 describe("API client", () => {
+  it("builds a local source-media URL for transcript timestamp playback", () => {
+    const client = createApiClient("http://api.test");
+
+    expect(client.sourceMediaUrl("source-1")).toBe("http://api.test/api/sources/source-1/media");
+  });
+
+  it("loads timestamped auto-detected transcripts from the Stage 2 API", async () => {
+    const fetcher = async (input: RequestInfo | URL) => {
+      expect(String(input)).toBe("http://api.test/api/sources/source-1/transcript");
+      return new Response(
+        JSON.stringify({
+          source_video_id: "source-1",
+          language: "ar",
+          detected_language_probability: 0.98,
+          raw_text: "أهلا hello",
+          normalized_text: "أهلا hello",
+          segments: [{ start: 0, end: 1, text: "أهلا hello" }],
+          duration: 1,
+        }),
+        { headers: { "content-type": "application/json" } },
+      );
+    };
+
+    await expect(createApiClient("http://api.test", fetcher).getTranscript("source-1")).resolves.toMatchObject({
+      language: "ar",
+      segments: [{ start: 0, text: "أهلا hello" }],
+    });
+  });
+
   it("uses the configured base URL and returns typed source data", async () => {
     const fetcher = async (input: RequestInfo | URL) => {
       expect(String(input)).toBe("http://api.test/sources");
@@ -31,7 +60,7 @@ describe("API client", () => {
     );
 
     await expect(client.getSource("missing")).rejects.toEqual(
-      expect.objectContaining<ApiError>({ status: 404, message: "not found" })
+      expect.objectContaining<ApiError>({ name: "ApiError", status: 404, message: "not found" })
     );
   });
 

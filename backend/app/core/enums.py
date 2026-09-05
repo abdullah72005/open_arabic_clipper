@@ -13,17 +13,23 @@ class RightsStatus(str, Enum):
 
 
 class PipelineStage(str, Enum):
-    """The persisted Stage 1 source lifecycle."""
+    """The persisted source lifecycle."""
 
     INGEST = "INGEST"
     PROBE = "PROBE"
     READY_FOR_TRANSCRIPTION = "READY_FOR_TRANSCRIPTION"
+    AUDIO_EXTRACTION = "AUDIO_EXTRACTION"
+    TRANSCRIPTION = "TRANSCRIPTION"
+    TRANSCRIPT_NORMALIZATION = "TRANSCRIPT_NORMALIZATION"
+    AUDIO_ANALYSIS = "AUDIO_ANALYSIS"
+    READY_FOR_ANALYSIS = "READY_FOR_ANALYSIS"
 
 
 class JobKind(str, Enum):
-    """Background operations supported by the Stage 1 pipeline."""
+    """Background operations supported by the pipeline."""
 
     INGEST = "INGEST"
+    TRANSCRIPTION = "TRANSCRIPTION"
     PROBE = "PROBE"
 
 

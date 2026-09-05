@@ -11,8 +11,12 @@ from app.core.enums import PipelineStage, RightsStatus
 from app.db.base import Base
 
 if TYPE_CHECKING:
+    from app.models.audio_analysis import AudioAnalysis
+    from app.models.audio_artifact import AudioArtifact
     from app.models.pipeline_run import PipelineRun
     from app.models.processing_job import ProcessingJob
+    from app.models.source_quality_assessment import SourceQualityAssessment
+    from app.models.transcript import Transcript
 
 
 class SourceVideo(Base):
@@ -49,4 +53,16 @@ class SourceVideo(Base):
     )
     pipeline_runs: Mapped[list["PipelineRun"]] = relationship(
         back_populates="source_video", cascade="all, delete-orphan"
+    )
+    audio_artifact: Mapped["AudioArtifact | None"] = relationship(
+        back_populates="source_video", cascade="all, delete-orphan", uselist=False
+    )
+    transcript: Mapped["Transcript | None"] = relationship(
+        back_populates="source_video", cascade="all, delete-orphan", uselist=False
+    )
+    audio_analysis: Mapped["AudioAnalysis | None"] = relationship(
+        back_populates="source_video", cascade="all, delete-orphan", uselist=False
+    )
+    quality_assessment: Mapped["SourceQualityAssessment | None"] = relationship(
+        back_populates="source_video", cascade="all, delete-orphan", uselist=False
     )

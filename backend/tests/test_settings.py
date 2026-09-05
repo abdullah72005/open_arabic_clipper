@@ -25,3 +25,55 @@ def test_settings_rejects_non_positive_upload_limit(
 
     with pytest.raises(ValidationError, match="greater than 0"):
         Settings()
+
+
+def test_settings_choose_practical_transcription_defaults() -> None:
+    """Default transcription settings avoid loading an impractical largest model."""
+
+    settings = Settings()
+
+    assert settings.whisper_model == "small"
+    assert settings.whisper_device == "auto"
+    assert settings.whisper_cpu_compute_type == "int8"
+
+
+def test_settings_accept_forced_transcription_language(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An operator can override auto-detection for a known-language source."""
+
+    monkeypatch.setenv("CLIPFACTORY_WHISPER_LANGUAGE", "ar")
+
+    assert Settings().whisper_language == "ar"
+
+
+def test_settings_builds_auto_transcription_options() -> None:
+    """Auto mode defers device selection while preserving configured output options."""
+
+    options = Settings().transcription_options()
+
+    assert options.model == "small"
+    assert options.device == "auto"
+    assert options.language is None
+
+
+def test_settings_transcription_options_honor_compute_type_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The cpu/cuda compute-type env vars reach the worker-side engine."""
+
+    monkeypatch.setenv("CLIPFACTORY_WHISPER_CPU_COMPUTE_TYPE", "int8_float16")
+    monkeypatch.setenv("CLIPFACTORY_WHISPER_CUDA_COMPUTE_TYPE", "float32")
+
+    options = Settings().transcription_options()
+
+    assert options.cpu_compute_type == "int8_float16"
+    assert options.cuda_compute_type == "float32"
+
+
+def test_settings_explicit_compute_type_overrides_per_device_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CLIPFACTORY_WHISPER_COMPUTE_TYPE", "float16")
+
+    options = Settings().transcription_options()
+
+    assert options.compute_type == "float16"

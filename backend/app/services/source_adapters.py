@@ -136,7 +136,6 @@ class YtDlpAdapter:
     def inspect(self, url: str) -> Mapping[str, object]:
         """Read public metadata before downloading, using a safe argument vector."""
 
-        self._require_egress_proxy()
         normalized_url = normalize_source_url(url)
         result = self._run(self._metadata_command(normalized_url), normalized_url)
         try:
@@ -148,7 +147,6 @@ class YtDlpAdapter:
         return metadata
 
     def acquire(self, source_id: uuid.UUID | str, source: Path | str) -> AcquiredSource:
-        self._require_egress_proxy()
         if not isinstance(source, str):
             raise SourceValidationError("yt-dlp source must be a URL string")
         normalized_url = normalize_source_url(source)
@@ -173,11 +171,11 @@ class YtDlpAdapter:
         )
 
     def _metadata_command(self, normalized_url: str) -> list[str]:
+        command = [self._binary, "--ignore-config"]
+        if self._egress_proxy:
+            command.extend(["--proxy", self._egress_proxy])
         return [
-            self._binary,
-            "--ignore-config",
-            "--proxy",
-            self._require_egress_proxy(),
+            *command,
             "--no-playlist",
             "--dump-single-json",
             normalized_url,
@@ -185,11 +183,11 @@ class YtDlpAdapter:
 
     def _download_command(self, source_directory: Path, normalized_url: str) -> list[str]:
         output_template = str(source_directory / "%(title).100B-%(id)s.%(ext)s")
+        command = [self._binary, "--ignore-config"]
+        if self._egress_proxy:
+            command.extend(["--proxy", self._egress_proxy])
         return [
-            self._binary,
-            "--ignore-config",
-            "--proxy",
-            self._require_egress_proxy(),
+            *command,
             "--no-playlist",
             "--no-write-info-json",
             "--no-write-thumbnail",
@@ -339,7 +337,7 @@ def _downloaded_path(source_directory: Path) -> Path:
     candidates = [
         candidate
         for candidate in source_directory.iterdir()
-        if candidate.is_file() and not candidate.name.startswith(".")
+        if candidate.is_file() and not candidate.name.endswith((".part", ".ytdl"))
     ]
     if len(candidates) != 1:
         raise SourceAcquisitionError("yt-dlp did not produce exactly one media file")
@@ -352,7 +350,10 @@ def _directory_size(directory: Path) -> int:
     total = 0
     for candidate in directory.rglob("*"):
         if candidate.is_file():
-            total += candidate.stat().st_size
+            try:
+                total += candidate.stat().st_size
+            except FileNotFoundError:
+                continue
     return total
 
 

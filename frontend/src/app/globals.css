@@ -15,3 +15,6 @@ button, input, textarea, select { font: inherit; }
 .button.danger { background:#d85d67; color:white; }.button:disabled { opacity:.55; cursor:not-allowed; }
 input,textarea,select { width:100%; color:var(--text); background:#0b1424; border:1px solid var(--line); border-radius:8px; padding:10px; }
 table { width:100%; border-collapse:collapse; } th,td { padding:10px; text-align:left; border-bottom:1px solid var(--line); }
+.transcript-segments { display:grid; gap:8px; max-height:480px; overflow:auto; }
+.transcript-segment { display:grid; grid-template-columns:64px 1fr; gap:12px; width:100%; text-align:start; color:var(--text); background:#0b1424; border:1px solid var(--line); border-radius:8px; padding:10px; cursor:pointer; }
+.transcript-segment:hover { border-color:var(--accent); }.transcript-segment time { color:var(--accent); font-variant-numeric:tabular-nums; }
