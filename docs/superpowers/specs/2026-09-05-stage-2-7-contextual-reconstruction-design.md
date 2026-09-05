@@ -166,13 +166,16 @@ into source-wide pseudo-evidence.
 ## Source-local entity memory
 
 `SourceEntityMemory` is rebuilt for each reconstruction run and never shared
-between sources. It accepts:
+between sources. Its initial pass accepts:
 
 - exact Latin runs and digit strings from raw segments;
-- an Arabic span nominated by the provider only when that exact span appears in
-  raw text;
 - repeated Arabic forms only after two source occurrences;
 - a canonical form only when it already appears verbatim in the source.
+
+Pass A may nominate an Arabic entity with exact evidence segment IDs. Application
+code augments the memory only after confirming that the nominated surface form is
+a verbatim raw-text span at every cited ID. Augmented memory is then available to
+Pass B and candidate validation.
 
 The memory records surface form, exact supporting segment IDs, occurrence count,
 and normalized comparison key. It may preserve or prefer an observed repeated
@@ -405,7 +408,7 @@ Stage 2.7 status as `MUST CONTINUE`.
 ## Error handling
 
 - Provider batches receive two attempts total for connection reset, timeout, or
-  HTTP 429/5xx using bounded exponential delays of 0.5 then 1.0 seconds.
+  HTTP 429/5xx, with one bounded 0.5-second delay between attempts.
 - Schema, identity, or safety errors are not retried with the same response.
 - Pass A failure selects Stage 2.5 for every affected target.
 - Pass B failure stores valid Pass A winner only as LOW review evidence and
@@ -427,8 +430,9 @@ New operator entry points:
 
 - `POST /api/sources/{id}/reconstruct?force=false` queues a reconstruction job;
 - `python -m app.cli reconstruct SOURCE_ID --force` does the same;
-- `python -m app.cli benchmark-reconstruction MANIFEST.json` runs the private
-  unseen-audio evaluation and prints JSON.
+- `python -m app.cli benchmark-reconstruction MANIFEST_NAME.json` resolves the
+  name inside the storage-owned `benchmarks` category, runs the private
+  unseen-audio evaluation, and prints JSON.
 
 Source detail keeps final text primary. Correction details show raw, Stage 2.5,
 Stage 2.7 candidate/applied text, confidence level/score, flags, method, and
@@ -532,4 +536,3 @@ quality gate above has current evidence.
 - The reference Qwen3 family advertises 100+ languages/dialects; this supports
   evaluation, not promotion without ClipFactory's own Egyptian benchmark:
   <https://ollama.com/library/qwen3>
-
