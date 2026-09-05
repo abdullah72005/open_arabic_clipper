@@ -32,6 +32,21 @@ describe("API client", () => {
     });
   });
 
+  it("sends a manual transcript override with the stable segment index", async () => {
+    const fetcher = async (input: RequestInfo | URL, init?: RequestInit) => {
+      expect(String(input)).toBe("http://api.test/api/sources/source-1/transcript/segments/0/override");
+      expect(init?.method).toBe("POST");
+      expect(init?.body).toBe(JSON.stringify({ text: "خلي بالك" }));
+      return new Response(JSON.stringify({ start: 0, end: 1, text: "خطي بالك", final_text: "خلي بالك" }), {
+        headers: { "content-type": "application/json" }
+      });
+    };
+
+    await expect(
+      createApiClient("http://api.test", fetcher).overrideTranscriptSegment("source-1", 0, "خلي بالك")
+    ).resolves.toMatchObject({ final_text: "خلي بالك" });
+  });
+
   it("uses the configured base URL and returns typed source data", async () => {
     const fetcher = async (input: RequestInfo | URL) => {
       expect(String(input)).toBe("http://api.test/sources");

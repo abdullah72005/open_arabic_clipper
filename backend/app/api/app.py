@@ -15,16 +15,18 @@ from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.enums import JobKind, JobStatus, PipelineStage, RightsStatus
 from app.core.settings import get_settings
 from app.db.session import create_session_factory
-from app.models import ProcessingJob, SourceVideo, Transcript
+from app.models import ProcessingJob, SourceVideo, Transcript, TranscriptChunk
 from app.services.health import CheckStatus, HealthService
 from app.services.source_adapters import SourceValidationError, normalize_source_url
 from app.services.storage import StorageCategory, StorageService
+from app.transcription.chunking import ChunkConfig, build_chunks
+from app.transcription.normalization import normalize_transcript
 from app.workers.tasks import run_pipeline_stage
 
 UPLOAD_CHUNK_BYTES = 1024 * 1024
@@ -88,6 +90,14 @@ class TranscriptResponse(BaseModel):
     transcription_options: dict[str, object]
     raw_text: str
     normalized_text: str
+    corrected_text: str
+    final_text: str
+    raw_transcript_confidence: float
+    correction_confidence: float
+    corrected_segment_ratio: float
+    uncertain_segment_ratio: float
+    correction_method: str
+    correction_version: str
     segments: list[dict[str, object]]
     word_segments: list[dict[str, object]]
     duration: float
@@ -96,6 +106,10 @@ class TranscriptResponse(BaseModel):
 
 class TranscriptSearchResponse(BaseModel):
     segments: list[dict[str, object]]
+
+
+class TranscriptOverrideRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=20_000)
 
 
 def create_app(
@@ -254,6 +268,41 @@ def create_app(
             segments=transcript.segments[bounded_offset : bounded_offset + bounded_limit]
         )
 
+    @app.post("/api/sources/{source_id}/transcript/segments/{segment_index}/override")
+    def override_transcript_segment(
+        source_id: UUID,
+        segment_index: int,
+        request: TranscriptOverrideRequest,
+        database: Session = Depends(session),
+    ) -> dict[str, object]:
+        """Persist operator feedback without changing raw or automatic transcript evidence."""
+
+        transcript = _transcript_or_404(database, source_id)
+        segments = _copy_segments(transcript)
+        segment = _segment_or_404(segments, segment_index)
+        segment["operator_text"] = request.text.strip()
+        segment["final_text"] = segment["operator_text"]
+        _persist_final_segments(database, transcript, segments)
+        database.commit()
+        database.refresh(transcript)
+        return transcript.segments[segment_index]
+
+    @app.delete("/api/sources/{source_id}/transcript/segments/{segment_index}/override")
+    def clear_transcript_segment_override(
+        source_id: UUID, segment_index: int, database: Session = Depends(session)
+    ) -> dict[str, object]:
+        """Restore automatic corrected text while keeping the feedback audit fields intact."""
+
+        transcript = _transcript_or_404(database, source_id)
+        segments = _copy_segments(transcript)
+        segment = _segment_or_404(segments, segment_index)
+        segment["operator_text"] = None
+        segment["final_text"] = _automatic_segment_text(segment)
+        _persist_final_segments(database, transcript, segments)
+        database.commit()
+        database.refresh(transcript)
+        return transcript.segments[segment_index]
+
     @app.get("/api/sources/{source_id}/transcript/search", response_model=TranscriptSearchResponse)
     def search_transcript(
         source_id: UUID,
@@ -266,7 +315,7 @@ def create_app(
             segments=[
                 segment
                 for segment in transcript.segments
-                if query in str(segment.get("text", "")).casefold()
+                if query in _final_segment_text(segment).casefold()
             ]
         )
 
@@ -420,6 +469,14 @@ def _transcript_response(transcript: Transcript) -> TranscriptResponse:
         transcription_options=transcript.transcription_options,
         raw_text=transcript.raw_text,
         normalized_text=transcript.normalized_text,
+        corrected_text=transcript.corrected_text,
+        final_text=transcript.final_text,
+        raw_transcript_confidence=transcript.raw_transcript_confidence,
+        correction_confidence=transcript.correction_confidence,
+        corrected_segment_ratio=transcript.corrected_segment_ratio,
+        uncertain_segment_ratio=transcript.uncertain_segment_ratio,
+        correction_method=transcript.correction_method,
+        correction_version=transcript.correction_version,
         segments=transcript.segments,
         word_segments=transcript.word_segments,
         duration=transcript.duration,
@@ -432,6 +489,50 @@ def _job_or_404(database: Session, job_id: UUID) -> ProcessingJob:
     if job is None:
         raise HTTPException(status_code=404, detail="job not found")
     return job
+
+
+def _copy_segments(transcript: Transcript) -> list[dict[str, object]]:
+    return [dict(segment) for segment in transcript.segments]
+
+
+def _segment_or_404(segments: list[dict[str, object]], segment_index: int) -> dict[str, object]:
+    if segment_index < 0 or segment_index >= len(segments):
+        raise HTTPException(status_code=404, detail="transcript segment not found")
+    return segments[segment_index]
+
+
+def _automatic_segment_text(segment: dict[str, object]) -> str:
+    return str(
+        segment.get("corrected_text") or segment.get("normalized_text") or segment.get("text", "")
+    )
+
+
+def _final_segment_text(segment: dict[str, object]) -> str:
+    return str(segment.get("final_text") or _automatic_segment_text(segment))
+
+
+def _persist_final_segments(
+    database: Session, transcript: Transcript, segments: list[dict[str, object]]
+) -> None:
+    """Atomically refresh only derived display/chunk state after manual text feedback."""
+
+    transcript.segments = segments
+    transcript.final_text = " ".join(_final_segment_text(segment) for segment in segments).strip()
+    transcript.normalized_text = normalize_transcript(transcript.final_text)
+    database.execute(delete(TranscriptChunk).where(TranscriptChunk.transcript_id == transcript.id))
+    database.add_all(
+        TranscriptChunk(
+            transcript_id=transcript.id,
+            sequence=sequence,
+            start_time=chunk.start_time,
+            end_time=chunk.end_time,
+            text=chunk.text,
+            segment_indexes=chunk.segment_indexes,
+            preceding_context=chunk.preceding_context,
+            following_context=chunk.following_context,
+        )
+        for sequence, chunk in enumerate(build_chunks(segments, ChunkConfig()))
+    )
 
 
 def _duplicate_response(source: SourceVideo) -> SourceResponse:

@@ -52,6 +52,14 @@ export interface TranscriptSegment {
   end: number;
   text: string;
   normalized_text?: string;
+  raw_text?: string;
+  corrected_text?: string;
+  final_text?: string;
+  operator_text?: string | null;
+  correction_applied?: boolean;
+  correction_confidence?: number;
+  correction_method?: string;
+  correction_version?: string;
   avg_logprob?: number | null;
   no_speech_prob?: number | null;
 }
@@ -62,6 +70,14 @@ export interface Transcript {
   detected_language_probability: number | null;
   raw_text: string;
   normalized_text: string;
+  corrected_text?: string;
+  final_text?: string;
+  raw_transcript_confidence?: number;
+  correction_confidence?: number;
+  corrected_segment_ratio?: number;
+  uncertain_segment_ratio?: number;
+  correction_method?: string;
+  correction_version?: string;
   segments: TranscriptSegment[];
   duration: number;
 }
@@ -94,6 +110,20 @@ export function createApiClient(baseUrl: string, fetcher: Fetcher = fetch) {
       `${baseUrl.replace(/\/$/, "")}/api/sources/${encodeURIComponent(id)}/media`,
     getTranscript: (id: string) =>
       request<Transcript>(`/api/sources/${encodeURIComponent(id)}/transcript`),
+    overrideTranscriptSegment: (id: string, segmentIndex: number, text: string) =>
+      request<TranscriptSegment>(
+        `/api/sources/${encodeURIComponent(id)}/transcript/segments/${segmentIndex}/override`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ text })
+        }
+      ),
+    clearTranscriptSegmentOverride: (id: string, segmentIndex: number) =>
+      request<TranscriptSegment>(
+        `/api/sources/${encodeURIComponent(id)}/transcript/segments/${segmentIndex}/override`,
+        { method: "DELETE" }
+      ),
     submitUrls: (urls: string[], rights_status: RightsStatus = "UNKNOWN") =>
       Promise.all(
         urls.map((url) =>

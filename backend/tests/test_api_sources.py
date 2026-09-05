@@ -283,6 +283,68 @@ def test_transcript_search_returns_timestamped_mixed_language_segment(
     assert response.json()["segments"][0]["start"] == 12.4
 
 
+def test_operator_override_preserves_raw_correction_and_timestamp(
+    client: tuple[TestClient, RecordingDispatcher],
+) -> None:
+    """Manual feedback changes only final display text and remains available for evaluation."""
+
+    test_client, _ = client
+    factory = test_client.app.state.session_factory
+    with factory() as session:
+        source = SourceVideo(source_uri="/imports/episode.mp4")
+        session.add(source)
+        session.flush()
+        session.add(
+            Transcript(
+                source_video_id=source.id,
+                whisper_model="small",
+                transcription_options={},
+                input_fingerprint="o" * 64,
+                raw_text="خطي بالك",
+                normalized_text="خلي بالك",
+                corrected_text="خلي بالك",
+                final_text="خلي بالك",
+                segments=[
+                    {
+                        "start": 0.0,
+                        "end": 1.0,
+                        "text": "خطي بالك",
+                        "raw_text": "خطي بالك",
+                        "corrected_text": "خلي بالك",
+                        "final_text": "خلي بالك",
+                        "correction_applied": True,
+                        "correction_confidence": 0.97,
+                        "correction_method": "lexicon",
+                        "correction_version": "egyptian-ar-v1",
+                        "words": [],
+                    }
+                ],
+                word_segments=[],
+                duration=1.0,
+            )
+        )
+        session.commit()
+        source_id = source.id
+
+    response = test_client.post(
+        f"/api/sources/{source_id}/transcript/segments/0/override",
+        json={"text": "خلي بالك يا أحمد"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["raw_text"] == "خطي بالك"
+    assert response.json()["corrected_text"] == "خلي بالك"
+    assert response.json()["final_text"] == "خلي بالك يا أحمد"
+    assert response.json()["start"] == 0.0
+    assert response.json()["end"] == 1.0
+    assert test_client.get(f"/api/sources/{source_id}/transcript/search?q=أحمد").json()["segments"]
+
+    cleared = test_client.delete(f"/api/sources/{source_id}/transcript/segments/0/override")
+
+    assert cleared.status_code == 200
+    assert cleared.json()["final_text"] == "خلي بالك"
+
+
 def test_retranscribe_queues_a_transcription_job(
     client: tuple[TestClient, RecordingDispatcher], monkeypatch: pytest.MonkeyPatch
 ) -> None:
