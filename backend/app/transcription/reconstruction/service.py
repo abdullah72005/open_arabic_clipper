@@ -7,11 +7,12 @@ import json
 from collections.abc import Mapping, Sequence
 
 from app.transcription.reconstruction.confidence import decide_candidate
-from app.transcription.reconstruction.entities import build_entity_memory
+from app.transcription.reconstruction.entities import SourceEntityMemory, build_entity_memory
 from app.transcription.reconstruction.providers import (
     GenerationRequest,
     ProviderResponseError,
     ReconstructionProvider,
+    ResolutionChoice,
     ResolutionRequest,
 )
 from app.transcription.reconstruction.types import (
@@ -96,8 +97,8 @@ class ContextualReconstructor:
         index: int,
         segment: Mapping[str, object],
         generated: list[ReconstructionCandidate],
-        choice: object,
-        memory: object,
+        choice: ResolutionChoice,
+        memory: SourceEntityMemory,
     ) -> SegmentReconstruction:
         raw = str(segment.get("raw_text", segment.get("text", "")))
         corrected = str(segment.get("corrected_text", raw))

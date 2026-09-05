@@ -25,6 +25,7 @@ from app.transcription.engine import TranscriptionResult, WhisperEngine
 from app.transcription.normalization import normalize_transcript
 from app.transcription.reconstruction import ContextualReconstructor
 from app.transcription.reconstruction.service import select_final_text
+from app.transcription.reconstruction.types import SegmentReconstruction
 from app.transcription.service import TranscriptionOptions
 
 
@@ -373,7 +374,7 @@ class ContextualReconstructionExecutor:
         return transcript
 
 
-def _reconstruction_method(segments: tuple[object, ...]) -> str:
+def _reconstruction_method(segments: tuple[SegmentReconstruction, ...]) -> str:
     if all(getattr(segment, "candidate_text", None) is None for segment in segments):
         return "stage2_5_fallback"
     if any(
