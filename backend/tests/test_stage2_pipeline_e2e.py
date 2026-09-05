@@ -16,6 +16,7 @@ from app.pipeline.runner import PipelineRunner
 from app.pipeline.stages import (
     AudioAnalysisExecutor,
     AudioExtractionExecutor,
+    ContextualReconstructionExecutor,
     IngestExecutor,
     ProbeExecutor,
     TranscriptionExecutor,
@@ -24,6 +25,7 @@ from app.pipeline.stages import (
 from app.services.source_adapters import AcquiredSource
 from app.services.storage import StorageService
 from app.transcription.engine import TranscriptionResult
+from app.transcription.reconstruction import ContextualReconstructor
 from app.transcription.service import TranscriptionOptions
 
 
@@ -83,6 +85,9 @@ def test_generated_owned_media_reaches_ready_for_analysis(
             PipelineStage.TRANSCRIPT_NORMALIZATION: TranscriptNormalizationExecutor(
                 session=session
             ),
+            PipelineStage.CONTEXTUAL_RECONSTRUCTION: ContextualReconstructionExecutor(
+                session=session, reconstructor=ContextualReconstructor(provider=None)
+            ),
             PipelineStage.AUDIO_ANALYSIS: AudioAnalysisExecutor(session=session, storage=storage),
         }
         runner = PipelineRunner(session, executors)
@@ -92,6 +97,7 @@ def test_generated_owned_media_reaches_ready_for_analysis(
             PipelineStage.AUDIO_EXTRACTION,
             PipelineStage.TRANSCRIPTION,
             PipelineStage.TRANSCRIPT_NORMALIZATION,
+            PipelineStage.CONTEXTUAL_RECONSTRUCTION,
             PipelineStage.AUDIO_ANALYSIS,
         ):
             runner.run(source.id, stage)

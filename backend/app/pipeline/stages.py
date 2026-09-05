@@ -23,6 +23,8 @@ from app.transcription.chunking import ChunkConfig, build_chunks
 from app.transcription.correction import ContextualCorrector
 from app.transcription.engine import TranscriptionResult, WhisperEngine
 from app.transcription.normalization import normalize_transcript
+from app.transcription.reconstruction import ContextualReconstructor
+from app.transcription.reconstruction.service import select_final_text
 from app.transcription.service import TranscriptionOptions
 
 
@@ -95,6 +97,7 @@ class TranscriptionExecutor:
         transcript.raw_text = result.raw_text
         transcript.normalized_text = result.raw_text
         transcript.corrected_text = result.raw_text
+        transcript.contextual_reconstructed_text = ""
         transcript.final_text = result.raw_text
         transcript.raw_transcript_confidence = _raw_transcript_confidence(result.segments)
         transcript.correction_confidence = 0.0
@@ -102,6 +105,13 @@ class TranscriptionExecutor:
         transcript.uncertain_segment_ratio = 1.0 if result.segments else 0.0
         transcript.correction_method = "pending"
         transcript.correction_version = "pending"
+        transcript.reconstruction_fingerprint = ""
+        transcript.reconstruction_confidence = 0.0
+        transcript.reconstructed_segment_ratio = 0.0
+        transcript.reconstruction_method = "pending"
+        transcript.reconstruction_version = "pending"
+        transcript.reconstruction_processing_duration = None
+        transcript.reconstruction_metadata = {}
         transcript.segments = result.segments
         transcript.word_segments = result.word_segments
         transcript.duration = result.duration
@@ -238,6 +248,14 @@ class TranscriptNormalizationExecutor:
             if normalized_segments
             else "egyptian-ar-v1"
         )
+        transcript.contextual_reconstructed_text = transcript.corrected_text
+        transcript.reconstruction_fingerprint = ""
+        transcript.reconstruction_confidence = 0.0
+        transcript.reconstructed_segment_ratio = 0.0
+        transcript.reconstruction_method = "pending"
+        transcript.reconstruction_version = "pending"
+        transcript.reconstruction_processing_duration = None
+        transcript.reconstruction_metadata = {}
         self._session.execute(
             delete(TranscriptChunk).where(TranscriptChunk.transcript_id == transcript.id)
         )
@@ -257,6 +275,114 @@ class TranscriptNormalizationExecutor:
         self._session.commit()
         self._session.refresh(transcript)
         return transcript
+
+
+class ContextualReconstructionExecutor:
+    """Persist bounded Stage 2.7 derivations without rewriting prior transcript evidence."""
+
+    def __init__(self, *, session: Session, reconstructor: ContextualReconstructor) -> None:
+        self._session = session
+        self._reconstructor = reconstructor
+
+    def execute(self, source: SourceVideo) -> Transcript:
+        transcript = self._session.scalar(
+            select(Transcript).where(Transcript.source_video_id == source.id)
+        )
+        if transcript is None:
+            raise StageExecutionError("normalized transcript is missing")
+        started_at = monotonic()
+        result = self._reconstructor.reconstruct(
+            transcript.segments,
+            language=transcript.language,
+            transcription_fingerprint=transcript.input_fingerprint,
+            correction_version=transcript.correction_version,
+        )
+        if transcript.reconstruction_fingerprint == result.fingerprint:
+            return transcript
+
+        persisted_segments: list[dict[str, object]] = []
+        for segment, reconstruction in zip(transcript.segments, result.segments, strict=True):
+            raw = str(segment.get("raw_text", segment.get("text", "")))
+            corrected = str(segment.get("corrected_text", raw))
+            operator_text = segment.get("operator_text")
+            operator = str(operator_text) if operator_text else None
+            final_text = select_final_text(
+                operator_text=operator,
+                reconstructed=reconstruction.contextual_reconstructed_text,
+                reconstruction_applied=reconstruction.applied,
+                level=reconstruction.confidence_level,
+                corrected=corrected,
+                raw=raw,
+            )
+            persisted_segments.append(
+                {
+                    **segment,
+                    "contextual_reconstructed_text": reconstruction.contextual_reconstructed_text,
+                    "reconstruction_candidate_text": reconstruction.candidate_text,
+                    "reconstruction_applied": reconstruction.applied,
+                    "reconstruction_confidence": reconstruction.confidence,
+                    "reconstruction_confidence_level": reconstruction.confidence_level.value,
+                    "reconstruction_quality_flags": [
+                        flag.value for flag in reconstruction.quality_flags
+                    ],
+                    "final_text": final_text,
+                    "normalized_text": normalize_transcript(final_text),
+                }
+            )
+
+        transcript.segments = persisted_segments
+        transcript.contextual_reconstructed_text = result.contextual_reconstructed_text
+        transcript.final_text = " ".join(
+            str(segment["final_text"]) for segment in persisted_segments
+        ).strip()
+        transcript.normalized_text = normalize_transcript(transcript.final_text)
+        total = len(result.segments)
+        applied = [item for item in result.segments if item.applied]
+        flags = sorted({flag.value for item in result.segments for flag in item.quality_flags})
+        transcript.reconstruction_fingerprint = result.fingerprint
+        transcript.reconstruction_confidence = (
+            sum(item.confidence for item in applied) / len(applied) if applied else 0.0
+        )
+        transcript.reconstructed_segment_ratio = len(applied) / total if total else 0.0
+        transcript.reconstruction_method = _reconstruction_method(result.segments)
+        transcript.reconstruction_version = "stage2.7-v1"
+        transcript.reconstruction_processing_duration = monotonic() - started_at
+        transcript.reconstruction_metadata = {
+            "segments": total,
+            "applied_segments": len(applied),
+            "quality_flags": flags,
+        }
+        self._session.execute(
+            delete(TranscriptChunk).where(TranscriptChunk.transcript_id == transcript.id)
+        )
+        self._session.add_all(
+            TranscriptChunk(
+                transcript_id=transcript.id,
+                sequence=sequence,
+                start_time=chunk.start_time,
+                end_time=chunk.end_time,
+                text=chunk.text,
+                segment_indexes=chunk.segment_indexes,
+                preceding_context=chunk.preceding_context,
+                following_context=chunk.following_context,
+            )
+            for sequence, chunk in enumerate(build_chunks(persisted_segments, ChunkConfig()))
+        )
+        self._session.commit()
+        self._session.refresh(transcript)
+        return transcript
+
+
+def _reconstruction_method(segments: tuple[object, ...]) -> str:
+    if all(getattr(segment, "candidate_text", None) is None for segment in segments):
+        return "stage2_5_fallback"
+    if any(
+        "RECONSTRUCTION_PROVIDER_ERROR"
+        in {flag.value for flag in getattr(segment, "quality_flags", ())}
+        for segment in segments
+    ):
+        return "provider_fallback"
+    return "contextual_reconstruction"
 
 
 def _raw_transcript_confidence(segments: list[dict[str, object]]) -> float:

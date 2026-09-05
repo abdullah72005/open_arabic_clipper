@@ -148,3 +148,30 @@ def test_probe_stage_uses_probe_job_kind_and_retries_to_probe(
 
         assert result.run_id is not None
         assert source.lifecycle_state is PipelineStage.AUDIO_EXTRACTION
+
+
+def test_reconstruction_stage_uses_its_own_job_and_advances_to_audio_analysis(
+    sqlite_engine: object,
+) -> None:
+    """Stage 2.7 is independently retryable and sits before audio analysis."""
+
+    from app.pipeline.runner import _job_kind_for_stage, _stage_for_job_kind
+
+    assert _job_kind_for_stage(PipelineStage.CONTEXTUAL_RECONSTRUCTION) is JobKind.RECONSTRUCTION
+    assert _stage_for_job_kind(JobKind.RECONSTRUCTION) is PipelineStage.CONTEXTUAL_RECONSTRUCTION
+
+    Base.metadata.create_all(sqlite_engine)
+    with Session(sqlite_engine) as session:
+        source = _source(session)
+        source.lifecycle_state = PipelineStage.CONTEXTUAL_RECONSTRUCTION
+        session.commit()
+
+        result = PipelineRunner(
+            session, {PipelineStage.CONTEXTUAL_RECONSTRUCTION: RecordingExecutor()}
+        ).run(source.id, PipelineStage.CONTEXTUAL_RECONSTRUCTION)
+
+        job = session.get(ProcessingJob, result.job_id)
+        session.refresh(source)
+        assert job is not None
+        assert job.kind is JobKind.RECONSTRUCTION
+        assert source.lifecycle_state is PipelineStage.AUDIO_ANALYSIS

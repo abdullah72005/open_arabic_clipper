@@ -151,6 +151,8 @@ def _stage_for_job_kind(kind: JobKind) -> PipelineStage:
         return PipelineStage.PROBE
     if kind is JobKind.TRANSCRIPTION:
         return PipelineStage.TRANSCRIPTION
+    if kind is JobKind.RECONSTRUCTION:
+        return PipelineStage.CONTEXTUAL_RECONSTRUCTION
     raise ValueError(f"no pipeline stage is defined for job kind {kind.value}")
 
 
@@ -159,6 +161,8 @@ def _job_kind_for_stage(stage: PipelineStage) -> JobKind:
         return JobKind.PROBE
     if stage is PipelineStage.TRANSCRIPTION:
         return JobKind.TRANSCRIPTION
+    if stage is PipelineStage.CONTEXTUAL_RECONSTRUCTION:
+        return JobKind.RECONSTRUCTION
     return JobKind.INGEST
 
 
@@ -172,6 +176,8 @@ def _next_stage(stage: PipelineStage) -> PipelineStage:
     if stage is PipelineStage.TRANSCRIPTION:
         return PipelineStage.TRANSCRIPT_NORMALIZATION
     if stage is PipelineStage.TRANSCRIPT_NORMALIZATION:
+        return PipelineStage.CONTEXTUAL_RECONSTRUCTION
+    if stage is PipelineStage.CONTEXTUAL_RECONSTRUCTION:
         return PipelineStage.AUDIO_ANALYSIS
     if stage is PipelineStage.AUDIO_ANALYSIS:
         return PipelineStage.READY_FOR_ANALYSIS

@@ -18,6 +18,7 @@ from app.pipeline.runner import PipelineRunner
 from app.pipeline.stages import (
     AudioAnalysisExecutor,
     AudioExtractionExecutor,
+    ContextualReconstructionExecutor,
     IngestExecutor,
     ProbeExecutor,
     TranscriptionExecutor,
@@ -35,7 +36,8 @@ _NEXT_STAGE: Final = {
     PipelineStage.PROBE: PipelineStage.AUDIO_EXTRACTION,
     PipelineStage.AUDIO_EXTRACTION: PipelineStage.TRANSCRIPTION,
     PipelineStage.TRANSCRIPTION: PipelineStage.TRANSCRIPT_NORMALIZATION,
-    PipelineStage.TRANSCRIPT_NORMALIZATION: PipelineStage.AUDIO_ANALYSIS,
+    PipelineStage.TRANSCRIPT_NORMALIZATION: PipelineStage.CONTEXTUAL_RECONSTRUCTION,
+    PipelineStage.CONTEXTUAL_RECONSTRUCTION: PipelineStage.AUDIO_ANALYSIS,
 }
 
 
@@ -62,6 +64,9 @@ def _stage_executors(session: Session) -> dict[PipelineStage, StageExecutor]:
         ),
         PipelineStage.TRANSCRIPT_NORMALIZATION: TranscriptNormalizationExecutor(
             session=session, corrector=settings.contextual_corrector()
+        ),
+        PipelineStage.CONTEXTUAL_RECONSTRUCTION: ContextualReconstructionExecutor(
+            session=session, reconstructor=settings.contextual_reconstructor()
         ),
         PipelineStage.AUDIO_ANALYSIS: AudioAnalysisExecutor(
             session=session, storage=storage, ffmpeg_binary=settings.ffmpeg_binary

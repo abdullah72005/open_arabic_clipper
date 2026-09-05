@@ -283,6 +283,67 @@ def test_normalization_persists_raw_corrected_final_text_and_timestamp(
         assert transcript.uncertain_segment_ratio == 0.0
 
 
+def test_reconstruction_persists_derived_text_without_replacing_prior_evidence(
+    sqlite_engine: object, tmp_path: Path
+) -> None:
+    """Stage 2.7 keeps ASR, correction, and manual values separate from final display text."""
+
+    from app.db.base import Base
+    from app.models import SourceVideo, Transcript
+    from app.pipeline.stages import ContextualReconstructionExecutor
+    from app.transcription.reconstruction import ContextualReconstructor
+
+    Base.metadata.create_all(sqlite_engine)
+    with Session(sqlite_engine) as session:
+        source = SourceVideo(source_uri=str(tmp_path / "source.mp4"), content_hash="source")
+        session.add(source)
+        session.flush()
+        session.add(
+            Transcript(
+                source_video_id=source.id,
+                whisper_model="small",
+                input_fingerprint="fingerprint",
+                raw_text="خطي بالك يا صحبي",
+                corrected_text="خلي بالك يا صاحبي",
+                segments=[
+                    {
+                        "start": 0.0,
+                        "end": 1.0,
+                        "text": "خطي بالك",
+                        "raw_text": "خطي بالك",
+                        "corrected_text": "خلي بالك",
+                    },
+                    {
+                        "start": 1.0,
+                        "end": 2.0,
+                        "text": "يا صحبي",
+                        "raw_text": "يا صحبي",
+                        "corrected_text": "يا صاحبي",
+                        "operator_text": "يا صديقي",
+                    },
+                ],
+                word_segments=[],
+                duration=2.0,
+            )
+        )
+        session.commit()
+
+        transcript = ContextualReconstructionExecutor(
+            session=session, reconstructor=ContextualReconstructor(provider=None)
+        ).execute(source)
+
+        assert transcript.raw_text == "خطي بالك يا صحبي"
+        assert transcript.corrected_text == "خلي بالك يا صاحبي"
+        assert transcript.contextual_reconstructed_text == "خلي بالك يا صاحبي"
+        assert transcript.final_text == "خلي بالك يا صديقي"
+        assert transcript.segments[0]["raw_text"] == "خطي بالك"
+        assert transcript.segments[0]["corrected_text"] == "خلي بالك"
+        assert transcript.segments[0]["contextual_reconstructed_text"] == "خلي بالك"
+        assert transcript.segments[1]["final_text"] == "يا صديقي"
+        assert transcript.reconstruction_method == "stage2_5_fallback"
+        assert transcript.chunks[0].text == "خلي بالك يا صديقي"
+
+
 def test_benchmark_reports_actual_transcription_throughput(tmp_path: Path) -> None:
     from app.transcription.benchmark import benchmark_transcription
     from app.transcription.engine import TranscriptionResult
