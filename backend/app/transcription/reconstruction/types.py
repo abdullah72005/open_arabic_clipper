@@ -66,3 +66,23 @@ class ResolutionScores:
     discourse_continuity: float
     entity_consistency: float
     selection_confidence: float
+
+
+@dataclass(frozen=True)
+class SegmentReconstruction:
+    segment_index: int
+    raw_text: str
+    corrected_text: str
+    contextual_reconstructed_text: str
+    candidate_text: str | None
+    applied: bool
+    confidence: float
+    confidence_level: ConfidenceLevel
+    quality_flags: tuple[QualityFlag, ...]
+
+
+@dataclass(frozen=True)
+class ReconstructionResult:
+    segments: tuple[SegmentReconstruction, ...]
+    contextual_reconstructed_text: str
+    fingerprint: str
