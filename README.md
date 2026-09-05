@@ -51,12 +51,13 @@ before using external media sources.
 ## Stage 2, 2.5, and 2.7 transcription quality
 
 Workers need FFmpeg/ffprobe and the local `faster-whisper` dependency. Configure
-`CLIPFACTORY_WHISPER_MODEL` (`tiny`, `base`, `small`, `medium`, or `large-v3`),
+`CLIPFACTORY_WHISPER_MODEL` (`tiny`, `base`, `small`, `medium`, `large-v3`, or
+`large-v3-turbo`),
 `CLIPFACTORY_WHISPER_DEVICE` (`auto`, `cpu`, or `cuda`), and optionally
 `CLIPFACTORY_WHISPER_LANGUAGE` (`ar` or `en`). `auto` uses CUDA only when
 available and otherwise uses CPU `int8` inference.
 
-The default decoder remains `small`, auto device selection, CPU `int8`, beam 5,
+The default decoder is `large-v3-turbo`, with auto device selection, CPU `int8`, beam 5,
 word timestamps, faster-whisper fallback temperatures `[0, 0.2, 0.4, 0.6, 0.8,
 1]`, previous-text conditioning enabled, VAD disabled, and no prompt/hotwords.
 `CLIPFACTORY_WHISPER_TEMPERATURE`,

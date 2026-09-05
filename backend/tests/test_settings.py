@@ -27,12 +27,12 @@ def test_settings_rejects_non_positive_upload_limit(
         Settings()
 
 
-def test_settings_choose_practical_transcription_defaults() -> None:
-    """Default transcription settings avoid loading an impractical largest model."""
+def test_settings_default_to_large_v3_turbo_transcription() -> None:
+    """Default transcription uses the requested high-quality turbo model."""
 
     settings = Settings()
 
-    assert settings.whisper_model == "small"
+    assert settings.whisper_model == "large-v3-turbo"
     assert settings.whisper_device == "auto"
     assert settings.whisper_cpu_compute_type == "int8"
 
@@ -50,7 +50,7 @@ def test_settings_builds_auto_transcription_options() -> None:
 
     options = Settings().transcription_options()
 
-    assert options.model == "small"
+    assert options.model == "large-v3-turbo"
     assert options.device == "auto"
     assert options.language is None
 
