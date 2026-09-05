@@ -53,3 +53,27 @@ def test_settings_builds_auto_transcription_options() -> None:
     assert options.model == "small"
     assert options.device == "auto"
     assert options.language is None
+
+
+def test_settings_transcription_options_honor_compute_type_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The cpu/cuda compute-type env vars reach the worker-side engine."""
+
+    monkeypatch.setenv("CLIPFACTORY_WHISPER_CPU_COMPUTE_TYPE", "int8_float16")
+    monkeypatch.setenv("CLIPFACTORY_WHISPER_CUDA_COMPUTE_TYPE", "float32")
+
+    options = Settings().transcription_options()
+
+    assert options.cpu_compute_type == "int8_float16"
+    assert options.cuda_compute_type == "float32"
+
+
+def test_settings_explicit_compute_type_overrides_per_device_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CLIPFACTORY_WHISPER_COMPUTE_TYPE", "float16")
+
+    options = Settings().transcription_options()
+
+    assert options.compute_type == "float16"

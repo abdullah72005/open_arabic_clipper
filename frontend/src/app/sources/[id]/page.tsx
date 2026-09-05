@@ -19,9 +19,8 @@ function TranscriptViewer({
   onSeek: (seconds: number) => void;
 }) {
   if (!transcript) return <p className="muted">Transcript is not ready yet.</p>;
-  const isArabic = transcript.language?.startsWith("ar") ?? false;
   return (
-    <section className="card transcript" dir={isArabic ? "rtl" : "auto"}>
+    <section className="card transcript" dir="auto">
       <h3>Transcript</h3>
       <p className="muted">
         {transcript.language ?? "Auto-detected"}

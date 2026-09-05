@@ -74,8 +74,16 @@ class WhisperEngine:
         cuda = self._cuda_available()
         use_cuda = options.device == "cuda" and cuda or options.device == "auto" and cuda
         if use_cuda:
-            return "cuda", options.compute_type if options.compute_type != "auto" else "float16"
-        return "cpu", options.compute_type if options.compute_type != "auto" else "int8"
+            return (
+                "cuda",
+                options.compute_type
+                if options.compute_type != "auto"
+                else options.cuda_compute_type,
+            )
+        return (
+            "cpu",
+            options.compute_type if options.compute_type != "auto" else options.cpu_compute_type,
+        )
 
 
 def _default_model_factory(model: str, device: str, compute_type: str) -> WhisperModel:

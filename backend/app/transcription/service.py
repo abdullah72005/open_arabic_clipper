@@ -17,6 +17,8 @@ class TranscriptionOptions:
     beam_size: int
     language: str | None = None
     word_timestamps: bool = True
+    cpu_compute_type: str = "int8"
+    cuda_compute_type: str = "float16"
 
     def fingerprint(self, audio_hash: str) -> str:
         """Return the deterministic cache key for audio and output-affecting options."""

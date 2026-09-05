@@ -147,12 +147,16 @@ class PipelineRunner:
 def _stage_for_job_kind(kind: JobKind) -> PipelineStage:
     if kind is JobKind.INGEST:
         return PipelineStage.INGEST
+    if kind is JobKind.PROBE:
+        return PipelineStage.PROBE
     if kind is JobKind.TRANSCRIPTION:
         return PipelineStage.TRANSCRIPTION
     raise ValueError(f"no pipeline stage is defined for job kind {kind.value}")
 
 
 def _job_kind_for_stage(stage: PipelineStage) -> JobKind:
+    if stage is PipelineStage.PROBE:
+        return JobKind.PROBE
     if stage is PipelineStage.TRANSCRIPTION:
         return JobKind.TRANSCRIPTION
     return JobKind.INGEST

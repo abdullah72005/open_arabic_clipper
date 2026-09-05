@@ -44,6 +44,8 @@ class Settings(BaseSettings):
             beam_size=self.whisper_beam_size,
             language=self.whisper_language,
             word_timestamps=self.whisper_word_timestamps,
+            cpu_compute_type=self.whisper_cpu_compute_type,
+            cuda_compute_type=self.whisper_cuda_compute_type,
         )
 
 
