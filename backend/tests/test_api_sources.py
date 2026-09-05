@@ -316,6 +316,10 @@ def test_operator_override_preserves_raw_correction_and_timestamp(
                         "correction_confidence": 0.97,
                         "correction_method": "lexicon",
                         "correction_version": "egyptian-ar-v1",
+                        "contextual_reconstructed_text": "خلي بالك يا صاحبي",
+                        "reconstruction_applied": True,
+                        "reconstruction_confidence": 0.93,
+                        "reconstruction_confidence_level": "HIGH",
                         "words": [],
                     }
                 ],
@@ -342,7 +346,52 @@ def test_operator_override_preserves_raw_correction_and_timestamp(
     cleared = test_client.delete(f"/api/sources/{source_id}/transcript/segments/0/override")
 
     assert cleared.status_code == 200
-    assert cleared.json()["final_text"] == "خلي بالك"
+    assert cleared.json()["final_text"] == "خلي بالك يا صاحبي"
+
+
+def test_reconstruct_queues_independent_job_and_force_only_clears_its_cache(
+    client: tuple[TestClient, RecordingDispatcher], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    test_client, _ = client
+    source = test_client.post("/sources/upload", files={"file": ("clip.mp4", b"video")}).json()
+    factory = test_client.app.state.session_factory
+    with factory() as session:
+        session.add(
+            Transcript(
+                source_video_id=UUID(source["id"]),
+                whisper_model="small",
+                input_fingerprint="asr-fingerprint",
+                reconstruction_fingerprint="reconstruction-fingerprint",
+                raw_text="cached",
+                normalized_text="cached",
+                segments=[],
+                word_segments=[],
+            )
+        )
+        session.commit()
+    calls: list[tuple[object, ...]] = []
+    monkeypatch.setattr(
+        "app.workers.tasks.run_pipeline_stage.delay", lambda *args: calls.append(args)
+    )
+
+    response = test_client.post(f"/api/sources/{source['id']}/reconstruct?force=true")
+
+    assert response.status_code == 202
+    assert response.json()["kind"] == "RECONSTRUCTION"
+    assert calls[0][0:2] == (source["id"], "CONTEXTUAL_RECONSTRUCTION")
+    assert calls[0][3] is True
+    with factory() as session:
+        transcript = session.scalar(
+            select(Transcript).where(Transcript.source_video_id == UUID(source["id"]))
+        )
+        assert transcript is not None
+        assert transcript.input_fingerprint == "asr-fingerprint"
+        assert transcript.reconstruction_fingerprint == ""
+
+    transcript_response = test_client.get(f"/api/sources/{source['id']}/transcript")
+    assert transcript_response.status_code == 200
+    assert transcript_response.json()["reconstruction_method"] == "pending"
+    assert transcript_response.json()["contextual_reconstructed_text"] == ""
 
 
 def test_retranscribe_queues_a_transcription_job(

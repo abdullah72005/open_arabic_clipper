@@ -14,8 +14,7 @@ function timestamp(value: number) {
 function TranscriptViewer({
   transcript,
   sourceId,
-  onSeek
-  ,
+  onSeek,
   onUpdated
 }: {
   transcript: Transcript | null;
@@ -74,12 +73,22 @@ function TranscriptViewer({
               <time>{timestamp(segment.start)}</time>
               <span>{segment.final_text ?? segment.corrected_text ?? segment.normalized_text ?? segment.text}</span>
             </button>
-            {(segment.correction_applied || segment.operator_text) && (
+            {(segment.correction_applied || segment.reconstruction_applied || segment.operator_text) && (
               <details>
                 <summary>Correction details</summary>
                 <p><strong>Raw:</strong> {segment.raw_text ?? segment.text}</p>
-                <p><strong>Automatic:</strong> {segment.corrected_text ?? segment.normalized_text ?? segment.text}</p>
+                <p><strong>Stage 2.5:</strong> {segment.corrected_text ?? segment.normalized_text ?? segment.text}</p>
                 <p className="muted">{segment.correction_method ?? "unchanged"} · {Math.round((segment.correction_confidence ?? 0) * 100)}%</p>
+                {segment.contextual_reconstructed_text && (
+                  <>
+                    <p><strong>Stage 2.7:</strong> {segment.contextual_reconstructed_text}</p>
+                    <p className="muted">
+                      {segment.reconstruction_confidence_level ?? "LOW"} · {Math.round((segment.reconstruction_confidence ?? 0) * 100)}%
+                      {segment.reconstruction_quality_flags?.length ? ` · ${segment.reconstruction_quality_flags.join(", ")}` : ""}
+                    </p>
+                  </>
+                )}
+                {segment.operator_text && <p><strong>Manual:</strong> {segment.operator_text}</p>}
               </details>
             )}
             {editingIndex === index ? (
@@ -142,6 +151,15 @@ export default function SourceDetail() {
       setError(cause instanceof Error ? cause.message : "Retry failed");
     }
   };
+  const reconstruct = async () => {
+    setError("");
+    try {
+      await api.reconstructTranscript(params.id);
+      setJobRevision((value) => value + 1);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not queue transcript reconstruction");
+    }
+  };
 
   return (
     <ApiState load={load}>
@@ -172,6 +190,7 @@ export default function SourceDetail() {
               }}
             </ApiState>
             <p className="muted">Transcription auto-detects Arabic, English, and mixed speech locally.</p>
+            <button className="button" onClick={() => void reconstruct()}>Reconstruct transcript</button>
             <button className="button danger" onClick={remove}>Delete source</button>
             {error && <p className="error">{error}</p>}
           </section>

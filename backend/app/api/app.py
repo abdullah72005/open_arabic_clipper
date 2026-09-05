@@ -98,6 +98,14 @@ class TranscriptResponse(BaseModel):
     uncertain_segment_ratio: float
     correction_method: str
     correction_version: str
+    contextual_reconstructed_text: str
+    reconstruction_fingerprint: str
+    reconstruction_confidence: float
+    reconstructed_segment_ratio: float
+    reconstruction_method: str
+    reconstruction_version: str
+    reconstruction_processing_duration: float | None
+    reconstruction_metadata: dict[str, object]
     segments: list[dict[str, object]]
     word_segments: list[dict[str, object]]
     duration: float
@@ -344,6 +352,34 @@ def create_app(
         run_pipeline_stage.delay(str(source_id), PipelineStage.TRANSCRIPTION.value, str(job.id))
         return JobResponse.model_validate(job)
 
+    @app.post(
+        "/api/sources/{source_id}/reconstruct",
+        response_model=JobResponse,
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    def reconstruct_source(
+        source_id: UUID,
+        force: bool = False,
+        database: Session = Depends(session),
+    ) -> JobResponse:
+        """Queue Stage 2.7 reconstruction while leaving ASR and correction caches intact."""
+
+        _source_or_404(database, source_id)
+        if force:
+            transcript = database.scalar(
+                select(Transcript).where(Transcript.source_video_id == source_id)
+            )
+            if transcript is not None:
+                transcript.reconstruction_fingerprint = ""
+        job = ProcessingJob(source_video_id=source_id, kind=JobKind.RECONSTRUCTION)
+        database.add(job)
+        database.commit()
+        database.refresh(job)
+        run_pipeline_stage.delay(
+            str(source_id), PipelineStage.CONTEXTUAL_RECONSTRUCTION.value, str(job.id), force
+        )
+        return JobResponse.model_validate(job)
+
     @app.delete("/sources/{source_id}", status_code=status.HTTP_204_NO_CONTENT)
     def delete_source(source_id: UUID, database: Session = Depends(session)) -> None:
         source = _source_or_404(database, source_id)
@@ -477,6 +513,14 @@ def _transcript_response(transcript: Transcript) -> TranscriptResponse:
         uncertain_segment_ratio=transcript.uncertain_segment_ratio,
         correction_method=transcript.correction_method,
         correction_version=transcript.correction_version,
+        contextual_reconstructed_text=transcript.contextual_reconstructed_text,
+        reconstruction_fingerprint=transcript.reconstruction_fingerprint,
+        reconstruction_confidence=transcript.reconstruction_confidence,
+        reconstructed_segment_ratio=transcript.reconstructed_segment_ratio,
+        reconstruction_method=transcript.reconstruction_method,
+        reconstruction_version=transcript.reconstruction_version,
+        reconstruction_processing_duration=transcript.reconstruction_processing_duration,
+        reconstruction_metadata=transcript.reconstruction_metadata,
         segments=transcript.segments,
         word_segments=transcript.word_segments,
         duration=transcript.duration,
@@ -502,6 +546,11 @@ def _segment_or_404(segments: list[dict[str, object]], segment_index: int) -> di
 
 
 def _automatic_segment_text(segment: dict[str, object]) -> str:
+    if (
+        segment.get("reconstruction_applied")
+        and segment.get("reconstruction_confidence_level") == "HIGH"
+    ):
+        return str(segment.get("contextual_reconstructed_text") or "")
     return str(
         segment.get("corrected_text") or segment.get("normalized_text") or segment.get("text", "")
     )

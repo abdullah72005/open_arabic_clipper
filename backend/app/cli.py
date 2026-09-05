@@ -74,6 +74,25 @@ def _queue_transcription(source_id: UUID, *, force: bool) -> UUID:
     return job_id
 
 
+def _queue_reconstruction(source_id: UUID, *, force: bool) -> UUID:
+    with create_session_factory()() as session:
+        if session.get(SourceVideo, source_id) is None:
+            raise typer.BadParameter("source does not exist")
+        if force:
+            cached = session.query(Transcript).filter_by(source_video_id=source_id).one_or_none()
+            if cached is not None:
+                cached.reconstruction_fingerprint = ""
+        job = ProcessingJob(source_video_id=source_id, kind=JobKind.RECONSTRUCTION)
+        session.add(job)
+        session.commit()
+        session.refresh(job)
+        job_id = job.id
+    run_pipeline_stage.delay(
+        str(source_id), PipelineStage.CONTEXTUAL_RECONSTRUCTION.value, str(job_id), force
+    )
+    return job_id
+
+
 @app.command()
 def transcribe(source_id: UUID) -> None:
     """Queue local transcription, reusing a valid fingerprinted transcript."""
@@ -84,6 +103,12 @@ def transcribe(source_id: UUID) -> None:
 def retranscribe(source_id: UUID, force: bool = True) -> None:
     """Queue transcription and, by default, bypass the transcript cache."""
     typer.echo(str(_queue_transcription(source_id, force=force)))
+
+
+@app.command()
+def reconstruct(source_id: UUID, force: bool = False) -> None:
+    """Queue bounded contextual reconstruction, reusing its current fingerprint by default."""
+    typer.echo(str(_queue_reconstruction(source_id, force=force)))
 
 
 @app.command()

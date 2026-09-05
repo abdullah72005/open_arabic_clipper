@@ -13,6 +13,7 @@ export type PipelineStage =
   | "AUDIO_EXTRACTION"
   | "TRANSCRIPTION"
   | "TRANSCRIPT_NORMALIZATION"
+  | "CONTEXTUAL_RECONSTRUCTION"
   | "AUDIO_ANALYSIS"
   | "READY_FOR_TRANSCRIPTION"
   | "READY_FOR_ANALYSIS"
@@ -62,6 +63,12 @@ export interface TranscriptSegment {
   correction_confidence?: number;
   correction_method?: string;
   correction_version?: string;
+  contextual_reconstructed_text?: string;
+  reconstruction_candidate_text?: string | null;
+  reconstruction_applied?: boolean;
+  reconstruction_confidence?: number;
+  reconstruction_confidence_level?: "HIGH" | "MEDIUM" | "LOW";
+  reconstruction_quality_flags?: string[];
   avg_logprob?: number | null;
   no_speech_prob?: number | null;
 }
@@ -80,6 +87,14 @@ export interface Transcript {
   uncertain_segment_ratio?: number;
   correction_method?: string;
   correction_version?: string;
+  contextual_reconstructed_text?: string;
+  reconstruction_fingerprint?: string;
+  reconstruction_confidence?: number;
+  reconstructed_segment_ratio?: number;
+  reconstruction_method?: string;
+  reconstruction_version?: string;
+  reconstruction_processing_duration?: number | null;
+  reconstruction_metadata?: Record<string, unknown>;
   segments: TranscriptSegment[];
   duration: number;
 }
@@ -112,6 +127,10 @@ export function createApiClient(baseUrl: string, fetcher: Fetcher = fetch) {
       `${baseUrl.replace(/\/$/, "")}/api/sources/${encodeURIComponent(id)}/media`,
     getTranscript: (id: string) =>
       request<Transcript>(`/api/sources/${encodeURIComponent(id)}/transcript`),
+    reconstructTranscript: (id: string, force = false) =>
+      request<Job>(`/api/sources/${encodeURIComponent(id)}/reconstruct?force=${force}`, {
+        method: "POST"
+      }),
     overrideTranscriptSegment: (id: string, segmentIndex: number, text: string) =>
       request<TranscriptSegment>(
         `/api/sources/${encodeURIComponent(id)}/transcript/segments/${segmentIndex}/override`,

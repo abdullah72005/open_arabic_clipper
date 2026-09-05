@@ -53,6 +53,30 @@ def test_completed_stage_is_skipped(sqlite_engine: object) -> None:
         assert executor.calls == 0
 
 
+def test_force_reexecutes_a_completed_stage(sqlite_engine: object) -> None:
+    """An operator-requested rerun must not be hidden by a historical success record."""
+
+    Base.metadata.create_all(sqlite_engine)
+    with Session(sqlite_engine) as session:
+        source = _source(session)
+        session.add(
+            PipelineRun(
+                source_video_id=source.id,
+                stage=PipelineStage.CONTEXTUAL_RECONSTRUCTION,
+                status=PipelineRunStatus.SUCCEEDED,
+            )
+        )
+        session.commit()
+        executor = RecordingExecutor()
+
+        result = PipelineRunner(
+            session, {PipelineStage.CONTEXTUAL_RECONSTRUCTION: executor}
+        ).run(source.id, PipelineStage.CONTEXTUAL_RECONSTRUCTION, force=True)
+
+        assert result.skipped is False
+        assert executor.calls == 1
+
+
 def test_failure_persists_stage_and_job_error(sqlite_engine: object) -> None:
     Base.metadata.create_all(sqlite_engine)
     with Session(sqlite_engine) as session:

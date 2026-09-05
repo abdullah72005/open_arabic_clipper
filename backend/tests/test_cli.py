@@ -9,4 +9,5 @@ def test_stage_2_transcript_commands_are_exposed() -> None:
     assert result.exit_code == 0
     assert "transcribe" in result.stdout
     assert "retranscribe" in result.stdout
+    assert "reconstruct" in result.stdout
     assert "transcript" in result.stdout

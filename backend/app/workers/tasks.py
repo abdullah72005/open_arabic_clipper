@@ -79,7 +79,7 @@ def _stage_executors(session: Session) -> dict[PipelineStage, StageExecutor]:
     bind=True, autoretry_for=(), name="clipfactory.run_pipeline_stage"
 )
 def run_pipeline_stage(
-    self: Task, source_id: str, stage: str, job_id: str | None = None
+    self: Task, source_id: str, stage: str, job_id: str | None = None, force: bool = False
 ) -> dict[str, str | bool | None]:
     """Run one durable stage; retry only exceptions explicitly marked retryable."""
     parsed_stage = PipelineStage(stage)
@@ -93,7 +93,7 @@ def run_pipeline_stage(
             parsed_job_id = job.id
         runner = PipelineRunner(session, _stage_executors(session))
         try:
-            result = runner.run(UUID(source_id), parsed_stage, job_id=parsed_job_id)
+            result = runner.run(UUID(source_id), parsed_stage, job_id=parsed_job_id, force=force)
         except Exception as error:
             if getattr(error, "retryable", False):
                 if parsed_job_id is not None:
@@ -102,7 +102,7 @@ def run_pipeline_stage(
                         retry_job.retry_count += 1
                         session.commit()
                 raise self.retry(
-                    args=[source_id, stage, str(parsed_job_id) if parsed_job_id else None],
+                    args=[source_id, stage, str(parsed_job_id) if parsed_job_id else None, force],
                     exc=error,
                     max_retries=MAX_RETRIES,
                 ) from error

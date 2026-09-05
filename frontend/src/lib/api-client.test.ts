@@ -47,6 +47,19 @@ describe("API client", () => {
     ).resolves.toMatchObject({ final_text: "خلي بالك" });
   });
 
+  it("queues an encoded contextual reconstruction request with force", async () => {
+    const fetcher = async (input: RequestInfo | URL, init?: RequestInit) => {
+      expect(String(input)).toBe("http://api.test/api/sources/source%2Fid/reconstruct?force=true");
+      expect(init?.method).toBe("POST");
+      return new Response(JSON.stringify({ id: "job-1", kind: "RECONSTRUCTION", status: "QUEUED" }), {
+        headers: { "content-type": "application/json" }
+      });
+    };
+
+    await expect(createApiClient("http://api.test", fetcher).reconstructTranscript("source/id", true))
+      .resolves.toMatchObject({ kind: "RECONSTRUCTION" });
+  });
+
   it("uses the configured base URL and returns typed source data", async () => {
     const fetcher = async (input: RequestInfo | URL) => {
       expect(String(input)).toBe("http://api.test/sources");

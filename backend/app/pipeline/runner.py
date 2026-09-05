@@ -47,10 +47,11 @@ class PipelineRunner:
         stage: PipelineStage,
         *,
         job_id: UUID | None = None,
+        force: bool = False,
     ) -> PipelineResult:
         source = self._require_source(source_id)
         run = self._latest_run(source.id, stage)
-        if run is not None and run.status is PipelineRunStatus.SUCCEEDED:
+        if not force and run is not None and run.status is PipelineRunStatus.SUCCEEDED:
             return PipelineResult(run.id, job_id, skipped=True)
 
         job = self._load_or_create_job(source.id, stage, job_id)
