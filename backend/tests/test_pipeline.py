@@ -69,9 +69,9 @@ def test_force_reexecutes_a_completed_stage(sqlite_engine: object) -> None:
         session.commit()
         executor = RecordingExecutor()
 
-        result = PipelineRunner(
-            session, {PipelineStage.CONTEXTUAL_RECONSTRUCTION: executor}
-        ).run(source.id, PipelineStage.CONTEXTUAL_RECONSTRUCTION, force=True)
+        result = PipelineRunner(session, {PipelineStage.CONTEXTUAL_RECONSTRUCTION: executor}).run(
+            source.id, PipelineStage.CONTEXTUAL_RECONSTRUCTION, force=True
+        )
 
         assert result.skipped is False
         assert executor.calls == 1

@@ -75,9 +75,7 @@ def _queue_transcription(source_id: UUID, *, force: bool) -> UUID:
         session.commit()
         session.refresh(job)
         job_id = job.id
-    run_pipeline_stage.delay(
-        str(source_id), PipelineStage.TRANSCRIPTION.value, str(job_id), force
-    )
+    run_pipeline_stage.delay(str(source_id), PipelineStage.TRANSCRIPTION.value, str(job_id), force)
     return job_id
 
 

@@ -30,9 +30,9 @@ class Settings(BaseSettings):
     max_remote_download_bytes: int = Field(default=2 * 1024 * 1024 * 1024, gt=0)
     url_egress_proxy: str | None = None
     max_concurrent_uploads: int = Field(default=2, gt=0)
-    whisper_model: Literal[
-        "tiny", "base", "small", "medium", "large-v3", "large-v3-turbo"
-    ] = "large-v3-turbo"
+    whisper_model: Literal["tiny", "base", "small", "medium", "large-v3", "large-v3-turbo"] = (
+        "large-v3-turbo"
+    )
     whisper_device: Literal["auto", "cpu", "cuda"] = "auto"
     whisper_compute_type: str | None = None
     whisper_cpu_compute_type: str = "int8"
