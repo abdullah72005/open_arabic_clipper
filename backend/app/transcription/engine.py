@@ -113,8 +113,11 @@ def _serialize_segment(segment: object) -> dict[str, object]:
         "start": float(getattr(segment, "start")),
         "end": float(getattr(segment, "end")),
         "text": str(getattr(segment, "text")),
+        "tokens": [int(token) for token in getattr(segment, "tokens", None) or []],
         "avg_logprob": _optional_float(getattr(segment, "avg_logprob", None)),
+        "compression_ratio": _optional_float(getattr(segment, "compression_ratio", None)),
         "no_speech_prob": _optional_float(getattr(segment, "no_speech_prob", None)),
+        "temperature": _optional_float(getattr(segment, "temperature", None)),
         "words": words,
     }
 

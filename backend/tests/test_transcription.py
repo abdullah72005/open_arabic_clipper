@@ -16,10 +16,13 @@ class FakeWord:
 
 class FakeSegment:
     start = 0.0
-    end = 0.8
+    end = 1.25
     text = "أهلا"
+    tokens = [50364, 1234, 50414]
     avg_logprob = -0.1
+    compression_ratio = 1.17
     no_speech_prob = 0.01
+    temperature = 0.2
     words = [FakeWord()]
 
 
@@ -85,6 +88,11 @@ def test_engine_falls_back_to_cpu_int8_and_preserves_word_timestamps() -> None:
     assert created == [("small", "cpu", "int8")]
     assert result.language == "ar"
     assert result.language_probability == 0.97
+    assert result.segments[0]["tokens"] == [50364, 1234, 50414]
+    assert result.segments[0]["compression_ratio"] == 1.17
+    assert result.segments[0]["temperature"] == 0.2
+    assert result.segments[0]["start"] == 0.0
+    assert result.segments[0]["end"] == 1.25
     assert result.segments[0]["words"][0]["start"] == 0.0
 
 
