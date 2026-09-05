@@ -9,6 +9,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
+from app.transcription.providers import (
+    CorrectionProvider,
+    CorrectionRequest,
+    ProviderCorrection,
+    ProviderResponseError,
+    validate_provider_results,
+)
+
 _ARABIC_DIACRITICS = re.compile(r"[\u0610-\u061A\u064B-\u065F\u0670\u06D6-\u06ED]")
 _PUNCTUATION = re.compile(r"[^\w\s]", re.UNICODE)
 _WHITESPACE = re.compile(r"\s+")
@@ -65,10 +73,12 @@ class ContextualCorrector:
         entries: tuple[LexiconEntry, ...],
         version: str,
         config: CorrectionConfig = CorrectionConfig(),
+        provider: CorrectionProvider | None = None,
     ) -> None:
         self._entries = entries
         self._version = version
         self._config = config
+        self._provider = provider
         self._by_confusion = {
             normalize_for_comparison(confusion): entry
             for entry in entries
@@ -76,7 +86,11 @@ class ContextualCorrector:
         }
 
     @classmethod
-    def from_default_lexicon(cls, config: CorrectionConfig = CorrectionConfig()) -> ContextualCorrector:
+    def from_default_lexicon(
+        cls,
+        config: CorrectionConfig = CorrectionConfig(),
+        provider: CorrectionProvider | None = None,
+    ) -> ContextualCorrector:
         """Load growable phrase hints from data rather than application logic."""
 
         path = Path(__file__).with_name("lexicons") / "egyptian_ar.json"
@@ -90,18 +104,52 @@ class ContextualCorrector:
             )
             for entry in payload["entries"]
         )
-        return cls(entries, str(payload["version"]), config)
+        return cls(entries, str(payload["version"]), config, provider)
 
     def correct(self, segments: list[Mapping[str, object]]) -> list[SegmentCorrection]:
         """Return one correction per input segment while retaining input ordering."""
 
-        return [self._correct_one(index, segments) for index in range(len(segments))]
+        provider_results = self._provider_results(segments)
+        return [
+            self._correct_one(index, segments, provider_results.get(index))
+            for index in range(len(segments))
+        ]
+
+    def _provider_results(
+        self, segments: list[Mapping[str, object]]
+    ) -> dict[int, ProviderCorrection]:
+        if self._provider is None or not segments:
+            return {}
+        requests = [
+            CorrectionRequest(
+                segment_index=index,
+                previous=context_window(segments, index, self._config.context_segments).previous,
+                raw_text=str(segment.get("text", "")),
+                following=context_window(segments, index, self._config.context_segments).following,
+            )
+            for index, segment in enumerate(segments)
+        ]
+        try:
+            return validate_provider_results(
+                {request.segment_index for request in requests},
+                self._provider.correct_batch(requests),
+            )
+        except (ProviderResponseError, OSError):
+            return {}
 
     def _correct_one(
-        self, index: int, segments: list[Mapping[str, object]]
+        self,
+        index: int,
+        segments: list[Mapping[str, object]],
+        provider_result: ProviderCorrection | None,
     ) -> SegmentCorrection:
         raw_text = str(segments[index].get("text", ""))
         entry = self._by_confusion.get(normalize_for_comparison(raw_text))
+        if provider_result is not None and self._provider_result_is_safe(raw_text, provider_result):
+            if entry is None:
+                return self._provider_correction(index, raw_text, provider_result, "llm")
+            if provider_result.corrected_text == entry.canonical:
+                return self._provider_correction(index, raw_text, provider_result, "llm+lexicon")
         if entry is None or entry.priority < 90:
             return self._unchanged(index, raw_text)
 
@@ -126,6 +174,30 @@ class ContextualCorrector:
             uncertain=False,
         )
 
+    def _provider_result_is_safe(self, raw_text: str, result: ProviderCorrection) -> bool:
+        if result.confidence < self._config.high_confidence:
+            return False
+        if result.changed != (result.corrected_text != raw_text):
+            return False
+        if _protected_tokens(raw_text) != _protected_tokens(result.corrected_text):
+            return False
+        return len(result.corrected_text) <= len(raw_text) + max(4, int(len(raw_text) * 0.35))
+
+    def _provider_correction(
+        self, index: int, raw_text: str, result: ProviderCorrection, method: str
+    ) -> SegmentCorrection:
+        return SegmentCorrection(
+            segment_index=index,
+            raw_text=raw_text,
+            corrected_text=result.corrected_text,
+            applied=result.changed,
+            confidence=float(result.confidence),
+            method=method,
+            version=self._version,
+            changes=result.changes,
+            uncertain=False,
+        )
+
     def _unchanged(self, index: int, raw_text: str) -> SegmentCorrection:
         return SegmentCorrection(
             segment_index=index,
@@ -146,7 +218,9 @@ def normalize_for_comparison(text: str) -> str:
     canonical = unicodedata.normalize("NFC", text)
     without_diacritics = _ARABIC_DIACRITICS.sub("", canonical)
     without_punctuation = _PUNCTUATION.sub(" ", without_diacritics)
-    return _WHITESPACE.sub(" ", without_punctuation.translate(_ARABIC_COMPARISON)).strip().casefold()
+    return (
+        _WHITESPACE.sub(" ", without_punctuation.translate(_ARABIC_COMPARISON)).strip().casefold()
+    )
 
 
 def context_window(
@@ -166,7 +240,12 @@ def context_window(
         ),
         current=str(segments[target_index].get("text", "")),
         following=tuple(
-            str(segment.get("text", ""))
-            for segment in segments[target_index + 1 : following_end]
+            str(segment.get("text", "")) for segment in segments[target_index + 1 : following_end]
         ),
     )
+
+
+def _protected_tokens(text: str) -> tuple[str, ...]:
+    """Names/numbers and English technical terms must survive automatic edits exactly."""
+
+    return tuple(re.findall(r"[A-Za-z]+|[0-9٠-٩]+", text.casefold()))
