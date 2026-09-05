@@ -424,6 +424,7 @@ def test_retranscribe_queues_a_transcription_job(
     assert response.json()["kind"] == "TRANSCRIPTION"
     assert calls[0][0] == source["id"]
     assert calls[0][1] == "TRANSCRIPTION"
+    assert calls[0][3] is True
     with factory() as session:
         transcript = session.scalar(
             select(Transcript).where(Transcript.source_video_id == UUID(source["id"]))

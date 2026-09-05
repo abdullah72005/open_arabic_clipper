@@ -349,7 +349,9 @@ def create_app(
         database.add(job)
         database.commit()
         database.refresh(job)
-        run_pipeline_stage.delay(str(source_id), PipelineStage.TRANSCRIPTION.value, str(job.id))
+        run_pipeline_stage.delay(
+            str(source_id), PipelineStage.TRANSCRIPTION.value, str(job.id), force
+        )
         return JobResponse.model_validate(job)
 
     @app.post(
