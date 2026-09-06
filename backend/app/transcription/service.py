@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 from dataclasses import asdict, dataclass
+
+from app.pipeline.fingerprints import canonical_fingerprint
 
 
 @dataclass(frozen=True)
@@ -28,10 +28,6 @@ class TranscriptionOptions:
     def fingerprint(self, audio_hash: str) -> str:
         """Return the deterministic cache key for audio and output-affecting options."""
 
-        payload = json.dumps(
-            {"audio_hash": audio_hash, "options": asdict(self)},
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        )
-        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        return canonical_fingerprint("transcription-input", "1", {
+            "audio_hash": audio_hash, "options": asdict(self),
+        })
