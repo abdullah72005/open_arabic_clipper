@@ -1,0 +1,131 @@
+{
+  "version": "egyptian-ar-fixtures-v1",
+  "fixtures": [
+    {
+      "id": "greeting-response",
+      "category": "greeting",
+      "previous": "عامل ايه يا جماعة",
+      "raw": "لاخبر سالفون",
+      "next": "النهاردة هنتكلم عن",
+      "expected": "الأخبار زي الفل",
+      "semantic_review": "Meaning becomes a clear Egyptian greeting response."
+    },
+    {
+      "id": "warning-phrase",
+      "category": "connected_speech",
+      "previous": "بص يا صاحبي",
+      "raw": "خطي بالك",
+      "next": "الموضوع ده مش سهل",
+      "expected": "خلي بالك",
+      "semantic_review": "Meaning becomes a clear colloquial warning."
+    },
+    {
+      "id": "public-opinion",
+      "category": "connected_speech",
+      "previous": "في كلام كتير عن الاقتصاد",
+      "raw": "بس فيه نس كتير بتقول إن الوضع صاب",
+      "next": "ومحتاجين حلول",
+      "expected": "بس في ناس كتير بتقول إن الوضع صعب",
+      "semantic_review": "Meaning becomes a clear statement about public opinion."
+    },
+    {
+      "id": "filler-words",
+      "category": "filler_words",
+      "previous": "خلينا نفكر",
+      "raw": "بص يعني الموضوع كده",
+      "next": "محتاج وقت",
+      "expected": "بص يعني الموضوع كده",
+      "semantic_review": "Already understandable Egyptian filler language."
+    },
+    {
+      "id": "slang",
+      "category": "slang",
+      "previous": "شوفت الفيديو",
+      "raw": "الموضوع ده جامد اوي",
+      "next": "عجبني جدا",
+      "expected": "الموضوع ده جامد اوي",
+      "semantic_review": "Preserve colloquial style instead of formalizing."
+    },
+    {
+      "id": "negation",
+      "category": "negation",
+      "previous": "سألت على الاجتماع",
+      "raw": "مفيش حد جه",
+      "next": "هنأجله لبكرة",
+      "expected": "مفيش حد جه",
+      "semantic_review": "Already clear Egyptian negation."
+    },
+    {
+      "id": "question",
+      "category": "question",
+      "previous": "خلصت شغلك",
+      "raw": "انت رايح فين",
+      "next": "استنى دقيقة",
+      "expected": "انت رايح فين",
+      "semantic_review": "Question remains colloquial and clear."
+    },
+    {
+      "id": "football",
+      "category": "football",
+      "previous": "اتفرجت على الماتش",
+      "raw": "الأهلي كسب اتنين صفر",
+      "next": "وكان ماتش حلو",
+      "expected": "الأهلي كسب اتنين صفر",
+      "semantic_review": "Football result and number must remain unchanged."
+    },
+    {
+      "id": "business-tech",
+      "category": "business_tech",
+      "previous": "راجعنا السيستم",
+      "raw": "بص الـ backend كان فيه issue في الـ database",
+      "next": "وصلحناه بسرعة",
+      "expected": "بص الـ backend كان فيه issue في الـ database",
+      "semantic_review": "English technical terms must remain usable."
+    },
+    {
+      "id": "code-switching",
+      "category": "arabic_english",
+      "previous": "في الاجتماع",
+      "raw": "هنعمل deploy بعد الـ review",
+      "next": "وبعدين نراقب logs",
+      "expected": "هنعمل deploy بعد الـ review",
+      "semantic_review": "Do not transliterate normal English technical words."
+    },
+    {
+      "id": "named-person",
+      "category": "named_people",
+      "previous": "في الماتش امبارح",
+      "raw": "محمد صلاح سجل جولين",
+      "next": "والفريق كسب",
+      "expected": "محمد صلاح سجل جولين",
+      "semantic_review": "Named person must not be guessed or normalized."
+    },
+    {
+      "id": "number",
+      "category": "numbers",
+      "previous": "سعر العربية",
+      "raw": "السعر خمس تلاف جنيه",
+      "next": "وده مناسب",
+      "expected": "السعر خمس تلاف جنيه",
+      "semantic_review": "Spoken amount must remain unchanged."
+    },
+    {
+      "id": "correct-arabic",
+      "category": "arabic_only",
+      "previous": "هتعمل ايه",
+      "raw": "خلي بالك الموضوع ده مش سهل",
+      "next": "خد وقتك",
+      "expected": "خلي بالك الموضوع ده مش سهل",
+      "semantic_review": "Already correct Egyptian Arabic must not change."
+    },
+    {
+      "id": "english-only",
+      "category": "english_only",
+      "previous": "Please check this",
+      "raw": "The backend deployment completed successfully",
+      "next": "We can monitor the logs now",
+      "expected": "The backend deployment completed successfully",
+      "semantic_review": "English-only ASR must not regress."
+    }
+  ]
+}

@@ -1,0 +1,113 @@
+{
+  "version": "egyptian-ar-v1",
+  "entries": [
+    {
+      "canonical": "الأخبار زي الفل",
+      "confusions": ["لاخبر سالفون"],
+      "priority": 96,
+      "notes": "High-confidence greeting response from operator-verified Egyptian audio."
+    },
+    {
+      "canonical": "خلي بالك",
+      "confusions": ["خطي بالك"],
+      "priority": 97,
+      "notes": "Common Egyptian warning phrase with a one-consonant ASR confusion."
+    },
+    {
+      "canonical": "بس في ناس كتير بتقول إن الوضع صعب",
+      "confusions": ["بس فيه نس كتير بتقول إن الوضع صاب"],
+      "priority": 95,
+      "notes": "Operator-verified phrase containing several connected-speech errors."
+    },
+    {
+      "canonical": "في ناس",
+      "confusions": [],
+      "priority": 70,
+      "notes": "Common Egyptian phrase hint; no automatic replacement declared."
+    },
+    {
+      "canonical": "بص",
+      "confusions": [],
+      "priority": 70,
+      "notes": "Colloquial attention marker."
+    },
+    {
+      "canonical": "يعني",
+      "confusions": [],
+      "priority": 65,
+      "notes": "Common filler word."
+    },
+    {
+      "canonical": "كده",
+      "confusions": [],
+      "priority": 65,
+      "notes": "Common colloquial form."
+    },
+    {
+      "canonical": "مش",
+      "confusions": [],
+      "priority": 65,
+      "notes": "Egyptian negation hint."
+    },
+    {
+      "canonical": "عشان",
+      "confusions": [],
+      "priority": 65,
+      "notes": "Egyptian causal connector."
+    },
+    {
+      "canonical": "لسه",
+      "confusions": [],
+      "priority": 65,
+      "notes": "Egyptian temporal marker."
+    },
+    {
+      "canonical": "دلوقتي",
+      "confusions": [],
+      "priority": 65,
+      "notes": "Egyptian temporal marker."
+    },
+    {
+      "canonical": "إزاي",
+      "confusions": [],
+      "priority": 65,
+      "notes": "Egyptian question word."
+    },
+    {
+      "canonical": "ليه",
+      "confusions": [],
+      "priority": 65,
+      "notes": "Egyptian question word."
+    },
+    {
+      "canonical": "برضه",
+      "confusions": [],
+      "priority": 65,
+      "notes": "Egyptian discourse marker."
+    },
+    {
+      "canonical": "أوي",
+      "confusions": [],
+      "priority": 65,
+      "notes": "Egyptian intensifier."
+    },
+    {
+      "canonical": "مفيش",
+      "confusions": [],
+      "priority": 65,
+      "notes": "Egyptian negation phrase."
+    },
+    {
+      "canonical": "ماشي",
+      "confusions": [],
+      "priority": 65,
+      "notes": "Egyptian acknowledgement."
+    },
+    {
+      "canonical": "زي الفل",
+      "confusions": [],
+      "priority": 70,
+      "notes": "Egyptian positive expression."
+    }
+  ]
+}

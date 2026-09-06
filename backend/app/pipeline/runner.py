@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import inspect
 from typing import Mapping
 from uuid import UUID
 
@@ -10,7 +11,7 @@ from sqlalchemy.orm import Session
 
 from app.core.enums import JobKind, JobStatus, PipelineRunStatus, PipelineStage
 from app.models import PipelineRun, ProcessingJob, SourceVideo
-from app.pipeline.executor import StageExecutor
+from app.pipeline.executor import StageExecutionResult, StageExecutor
 
 
 class StageExecutionError(RuntimeError):
@@ -47,16 +48,35 @@ class PipelineRunner:
         stage: PipelineStage,
         *,
         job_id: UUID | None = None,
+        force: bool = False,
     ) -> PipelineResult:
         source = self._require_source(source_id)
+        executor = self._executors.get(stage)
+        if executor is None:
+            error = StageExecutionError(f"no executor registered for stage {stage.value}")
+            raise error
+        input_fingerprint = _input_fingerprint(executor, source)
         run = self._latest_run(source.id, stage)
-        if run is not None and run.status is PipelineRunStatus.SUCCEEDED:
+        if (
+            not force
+            and run is not None
+            and run.status is PipelineRunStatus.SUCCEEDED
+            and input_fingerprint
+            and run.input_fingerprint == input_fingerprint
+        ):
             return PipelineResult(run.id, job_id, skipped=True)
 
         job = self._load_or_create_job(source.id, stage, job_id)
         now = datetime.now(timezone.utc)
-        if run is None:
+        if run is None or (run.status is PipelineRunStatus.SUCCEEDED and (force or run.input_fingerprint != input_fingerprint)):
             run = PipelineRun(source_video_id=source.id, stage=stage)
+            if run is not None:
+                latest_attempt = self._session.scalar(
+                    select(PipelineRun.attempt)
+                    .where(PipelineRun.source_video_id == source.id, PipelineRun.stage == stage)
+                    .order_by(PipelineRun.attempt.desc())
+                )
+                run.attempt = (latest_attempt or 0) + 1
             self._session.add(run)
         elif run.status in {PipelineRunStatus.FAILED, PipelineRunStatus.CANCELLED}:
             run.attempt += 1
@@ -64,6 +84,7 @@ class PipelineRunner:
         run.error_message = None
         run.started_at = now
         run.completed_at = None
+        run.input_fingerprint = input_fingerprint or None
         if job is not None:
             job.status = JobStatus.RUNNING
             job.error_code = None
@@ -72,13 +93,11 @@ class PipelineRunner:
             job.completed_at = None
         self._session.commit()
 
-        executor = self._executors.get(stage)
-        if executor is None:
-            error = StageExecutionError(f"no executor registered for stage {stage.value}")
-            self._persist_failure(run, job, error)
-            raise error
         try:
-            executor.execute(source)
+            if "force" in inspect.signature(executor.execute).parameters:
+                result = executor.execute(source, force=force)
+            else:
+                result = executor.execute(source)
         except Exception as error:
             self._persist_failure(run, job, error)
             raise
@@ -86,6 +105,7 @@ class PipelineRunner:
         completed_at = datetime.now(timezone.utc)
         run.status = PipelineRunStatus.SUCCEEDED
         run.completed_at = completed_at
+        run.output_fingerprint = _output_fingerprint(result)
         if job is not None:
             job.status = JobStatus.SUCCEEDED
             job.completed_at = completed_at
@@ -151,7 +171,24 @@ def _stage_for_job_kind(kind: JobKind) -> PipelineStage:
         return PipelineStage.PROBE
     if kind is JobKind.TRANSCRIPTION:
         return PipelineStage.TRANSCRIPTION
+    if kind is JobKind.RECONSTRUCTION:
+        return PipelineStage.CONTEXTUAL_RECONSTRUCTION
     raise ValueError(f"no pipeline stage is defined for job kind {kind.value}")
+
+
+def _input_fingerprint(executor: StageExecutor, source: SourceVideo) -> str:
+    method = getattr(executor, "input_fingerprint", None)
+    if method is None:
+        return ""
+    value = str(method(source) or "")
+    return "" if value == "legacy" else value
+
+
+def _output_fingerprint(result: object) -> str | None:
+    if isinstance(result, StageExecutionResult):
+        return result.output_fingerprint
+    value = getattr(result, "output_fingerprint", None)
+    return str(value) if value else None
 
 
 def _job_kind_for_stage(stage: PipelineStage) -> JobKind:
@@ -159,6 +196,8 @@ def _job_kind_for_stage(stage: PipelineStage) -> JobKind:
         return JobKind.PROBE
     if stage is PipelineStage.TRANSCRIPTION:
         return JobKind.TRANSCRIPTION
+    if stage is PipelineStage.CONTEXTUAL_RECONSTRUCTION:
+        return JobKind.RECONSTRUCTION
     return JobKind.INGEST
 
 
@@ -172,6 +211,8 @@ def _next_stage(stage: PipelineStage) -> PipelineStage:
     if stage is PipelineStage.TRANSCRIPTION:
         return PipelineStage.TRANSCRIPT_NORMALIZATION
     if stage is PipelineStage.TRANSCRIPT_NORMALIZATION:
+        return PipelineStage.CONTEXTUAL_RECONSTRUCTION
+    if stage is PipelineStage.CONTEXTUAL_RECONSTRUCTION:
         return PipelineStage.AUDIO_ANALYSIS
     if stage is PipelineStage.AUDIO_ANALYSIS:
         return PipelineStage.READY_FOR_ANALYSIS

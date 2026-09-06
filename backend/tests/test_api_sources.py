@@ -12,9 +12,9 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
 from app.api.app import CeleryDispatcher, create_app
-from app.core.enums import PipelineStage, RightsStatus
+from app.core.enums import PipelineStage, ReconstructionStatus, RightsStatus
 from app.db.base import Base
-from app.models import SourceVideo, Transcript
+from app.models import SourceQualityAssessment, SourceVideo, Transcript
 from app.services.storage import StorageService
 
 
@@ -283,6 +283,117 @@ def test_transcript_search_returns_timestamped_mixed_language_segment(
     assert response.json()["segments"][0]["start"] == 12.4
 
 
+def test_operator_override_preserves_raw_correction_and_timestamp(
+    client: tuple[TestClient, RecordingDispatcher],
+) -> None:
+    """Manual feedback changes only final display text and remains available for evaluation."""
+
+    test_client, _ = client
+    factory = test_client.app.state.session_factory
+    with factory() as session:
+        source = SourceVideo(source_uri="/imports/episode.mp4")
+        session.add(source)
+        session.flush()
+        session.add(
+            Transcript(
+                source_video_id=source.id,
+                whisper_model="small",
+                transcription_options={},
+                input_fingerprint="o" * 64,
+                raw_text="خطي بالك",
+                normalized_text="خلي بالك",
+                corrected_text="خلي بالك",
+                final_text="خلي بالك",
+                segments=[
+                    {
+                        "start": 0.0,
+                        "end": 1.0,
+                        "text": "خطي بالك",
+                        "raw_text": "خطي بالك",
+                        "corrected_text": "خلي بالك",
+                        "final_text": "خلي بالك",
+                        "correction_applied": True,
+                        "correction_confidence": 0.97,
+                        "correction_method": "lexicon",
+                        "correction_version": "egyptian-ar-v1",
+                        "contextual_reconstructed_text": "خلي بالك يا صاحبي",
+                        "reconstruction_applied": True,
+                        "reconstruction_confidence": 0.93,
+                        "reconstruction_confidence_level": "HIGH",
+                        "words": [],
+                    }
+                ],
+                word_segments=[],
+                duration=1.0,
+            )
+        )
+        session.commit()
+        source_id = source.id
+
+    response = test_client.post(
+        f"/api/sources/{source_id}/transcript/segments/0/override",
+        json={"text": "خلي بالك يا أحمد"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["raw_text"] == "خطي بالك"
+    assert response.json()["corrected_text"] == "خلي بالك"
+    assert response.json()["final_text"] == "خلي بالك يا أحمد"
+    assert response.json()["start"] == 0.0
+    assert response.json()["end"] == 1.0
+    assert test_client.get(f"/api/sources/{source_id}/transcript/search?q=أحمد").json()["segments"]
+
+    cleared = test_client.delete(f"/api/sources/{source_id}/transcript/segments/0/override")
+
+    assert cleared.status_code == 200
+    assert cleared.json()["final_text"] == "خلي بالك يا صاحبي"
+
+
+def test_reconstruct_queues_independent_job_and_force_only_clears_its_cache(
+    client: tuple[TestClient, RecordingDispatcher], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    test_client, _ = client
+    source = test_client.post("/sources/upload", files={"file": ("clip.mp4", b"video")}).json()
+    factory = test_client.app.state.session_factory
+    with factory() as session:
+        session.add(
+            Transcript(
+                source_video_id=UUID(source["id"]),
+                whisper_model="small",
+                input_fingerprint="asr-fingerprint",
+                reconstruction_fingerprint="reconstruction-fingerprint",
+                raw_text="cached",
+                normalized_text="cached",
+                segments=[],
+                word_segments=[],
+            )
+        )
+        session.commit()
+    calls: list[tuple[object, ...]] = []
+    monkeypatch.setattr(
+        "app.workers.tasks.run_pipeline_stage.delay", lambda *args: calls.append(args)
+    )
+
+    response = test_client.post(f"/api/sources/{source['id']}/reconstruct?force=true")
+
+    assert response.status_code == 202
+    assert response.json()["kind"] == "RECONSTRUCTION"
+    assert calls[0][0:2] == (source["id"], "CONTEXTUAL_RECONSTRUCTION")
+    assert calls[0][3] is True
+    with factory() as session:
+        transcript = session.scalar(
+            select(Transcript).where(Transcript.source_video_id == UUID(source["id"]))
+        )
+        assert transcript is not None
+        assert transcript.input_fingerprint == "asr-fingerprint"
+        assert transcript.reconstruction_fingerprint == "reconstruction-fingerprint"
+
+    transcript_response = test_client.get(f"/api/sources/{source['id']}/transcript")
+    assert transcript_response.status_code == 200
+    assert transcript_response.json()["reconstruction_method"] == "pending"
+    assert transcript_response.json()["contextual_reconstructed_text"] == ""
+
+
 def test_retranscribe_queues_a_transcription_job(
     client: tuple[TestClient, RecordingDispatcher], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -313,9 +424,90 @@ def test_retranscribe_queues_a_transcription_job(
     assert response.json()["kind"] == "TRANSCRIPTION"
     assert calls[0][0] == source["id"]
     assert calls[0][1] == "TRANSCRIPTION"
+    assert calls[0][3] is True
     with factory() as session:
         transcript = session.scalar(
             select(Transcript).where(Transcript.source_video_id == UUID(source["id"]))
         )
         assert transcript is not None
-        assert transcript.input_fingerprint == ""
+        assert transcript.input_fingerprint == "cached"
+
+
+def test_quality_exposes_degraded_reconstruction_and_split_scores(
+    client: tuple[TestClient, RecordingDispatcher],
+) -> None:
+    test_client, _ = client
+    factory = test_client.app.state.session_factory
+    with factory() as session:
+        source = SourceVideo(source_uri="/imports/degraded.mp4")
+        session.add(source)
+        session.flush()
+        session.add_all(
+            [
+                Transcript(
+                    source_video_id=source.id,
+                    whisper_model="large-v3-turbo",
+                    input_fingerprint="q" * 64,
+                    raw_text="دقل",
+                    normalized_text="دقل",
+                    corrected_text="دقل",
+                    final_text="دقل",
+                    reconstruction_status=ReconstructionStatus.PROVIDER_UNAVAILABLE,
+                    reconstruction_metadata={
+                        "provider_availability": "UNAVAILABLE",
+                        "model": "qwen3:8b",
+                        "api_key": "must-not-leak",
+                    },
+                    segments=[],
+                    word_segments=[],
+                ),
+                SourceQualityAssessment(
+                    source_video_id=source.id,
+                    audio_quality_score=0.985,
+                    transcript_quality_score=0.4,
+                    low_confidence_word_ratio=0.2,
+                    unresolved_segment_ratio=0.5,
+                    manual_review_required=True,
+                    overall_source_quality_score=0.4,
+                ),
+            ]
+        )
+        session.commit()
+        source_id = source.id
+
+    response = test_client.get(f"/api/sources/{source_id}/quality")
+
+    assert response.status_code == 200
+    assert response.json()["reconstruction_status"] == "PROVIDER_UNAVAILABLE"
+    assert response.json()["quality"] == {
+        "audio_quality_score": 0.985,
+        "transcript_quality_score": 0.4,
+        "low_confidence_word_ratio": 0.2,
+        "unresolved_segment_ratio": 0.5,
+        "manual_review_required": True,
+        "conservative_source_floor": 0.4,
+    }
+    transcript_response = test_client.get(f"/api/sources/{source_id}/transcript").json()
+    assert transcript_response["reconstruction_metadata"]["provider_health"] == {
+        "availability": "UNAVAILABLE",
+        "model": "qwen3:8b",
+        "model_digest": None,
+    }
+    assert transcript_response["reconstruction_metadata"]["reconstruction_status"] == (
+        "PROVIDER_UNAVAILABLE"
+    )
+    assert "api_key" not in transcript_response["reconstruction_metadata"]
+
+
+def test_quality_is_null_until_assessment_exists(
+    client: tuple[TestClient, RecordingDispatcher],
+) -> None:
+    test_client, _ = client
+    source = test_client.post(
+        "/sources/upload", files={"file": ("pending.mp4", b"video")}
+    ).json()
+
+    response = test_client.get(f"/api/sources/{source['id']}/quality")
+
+    assert response.status_code == 200
+    assert response.json() == {"reconstruction_status": None, "quality": None}

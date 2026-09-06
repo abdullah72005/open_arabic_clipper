@@ -36,6 +36,16 @@ def test_resolve_rejects_traversal_outside_a_category(tmp_path: Path) -> None:
         storage.resolve(StorageCategory.SOURCES, "../../outside.mp4")
 
 
+def test_benchmark_paths_remain_in_private_benchmark_storage(tmp_path: Path) -> None:
+    storage = StorageService(tmp_path)
+
+    manifest = storage.resolve(StorageCategory.BENCHMARKS, "stage-2-7/unseen-test-v1.json")
+
+    assert manifest.is_relative_to(storage.category_root(StorageCategory.BENCHMARKS))
+    with pytest.raises(StorageValidationError, match="absolute"):
+        storage.resolve(StorageCategory.BENCHMARKS, "/private/manifest.json")
+
+
 def test_atomic_write_replaces_the_complete_final_file(tmp_path: Path) -> None:
     storage = StorageService(tmp_path)
     destination = storage.source_directory(uuid.uuid4()) / "original.mp4"

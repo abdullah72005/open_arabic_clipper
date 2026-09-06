@@ -15,16 +15,25 @@ from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from app.core.enums import JobKind, JobStatus, PipelineStage, RightsStatus
+from app.core.enums import JobKind, JobStatus, PipelineStage, ReconstructionStatus, RightsStatus
 from app.core.settings import get_settings
 from app.db.session import create_session_factory
-from app.models import ProcessingJob, SourceVideo, Transcript
+from app.models import (
+    ProcessingJob,
+    SourceQualityAssessment,
+    SourceVideo,
+    Transcript,
+    TranscriptChunk,
+)
 from app.services.health import CheckStatus, HealthService
 from app.services.source_adapters import SourceValidationError, normalize_source_url
 from app.services.storage import StorageCategory, StorageService
+from app.transcription.chunking import ChunkConfig, build_chunks
+from app.transcription.normalization import normalize_transcript
+from app.transcription.reconstruction.providers import ReconstructionProvider
 from app.workers.tasks import run_pipeline_stage
 
 UPLOAD_CHUNK_BYTES = 1024 * 1024
@@ -88,14 +97,49 @@ class TranscriptResponse(BaseModel):
     transcription_options: dict[str, object]
     raw_text: str
     normalized_text: str
+    corrected_text: str
+    final_text: str
+    raw_transcript_confidence: float
+    correction_confidence: float
+    corrected_segment_ratio: float
+    uncertain_segment_ratio: float
+    correction_method: str
+    correction_version: str
+    contextual_reconstructed_text: str
+    reconstruction_fingerprint: str
+    reconstruction_confidence: float
+    reconstructed_segment_ratio: float
+    reconstruction_method: str
+    reconstruction_version: str
+    reconstruction_processing_duration: float | None
+    reconstruction_metadata: dict[str, object]
+    reconstruction_status: ReconstructionStatus
     segments: list[dict[str, object]]
     word_segments: list[dict[str, object]]
     duration: float
     processing_duration: float | None
 
 
+class QualityMetricsResponse(BaseModel):
+    audio_quality_score: float
+    transcript_quality_score: float
+    low_confidence_word_ratio: float
+    unresolved_segment_ratio: float
+    manual_review_required: bool
+    conservative_source_floor: float
+
+
+class QualityResponse(BaseModel):
+    reconstruction_status: ReconstructionStatus | None
+    quality: QualityMetricsResponse | None
+
+
 class TranscriptSearchResponse(BaseModel):
     segments: list[dict[str, object]]
+
+
+class TranscriptOverrideRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=20_000)
 
 
 def create_app(
@@ -112,7 +156,11 @@ def create_app(
     task_dispatcher = dispatcher or CeleryDispatcher()
     upload_limit = max_upload_bytes or settings.max_upload_bytes
     health_service = health or _default_health(
-        storage_service, factory, settings.ffmpeg_binary, settings.ffprobe_binary
+        storage_service,
+        factory,
+        settings.ffmpeg_binary,
+        settings.ffprobe_binary,
+        settings.reconstruction_provider_instance(),
     )
     app = FastAPI(title="ClipFactory API")
     app.add_middleware(
@@ -224,6 +272,18 @@ def create_app(
         transcript = _transcript_or_404(database, source_id)
         return _transcript_response(transcript)
 
+    @app.get("/api/sources/{source_id}/quality", response_model=QualityResponse)
+    def get_source_quality(
+        source_id: UUID, database: Session = Depends(session)
+    ) -> QualityResponse:
+        source = _source_or_404(database, source_id)
+        transcript = source.transcript
+        assessment = source.quality_assessment
+        return QualityResponse(
+            reconstruction_status=(transcript.reconstruction_status if transcript else None),
+            quality=_quality_metrics_response(assessment) if assessment else None,
+        )
+
     @app.get("/api/sources/{source_id}/media")
     def get_source_media(source_id: UUID, database: Session = Depends(session)) -> FileResponse:
         """Serve only the storage-owned local original for timestamp playback."""
@@ -254,6 +314,41 @@ def create_app(
             segments=transcript.segments[bounded_offset : bounded_offset + bounded_limit]
         )
 
+    @app.post("/api/sources/{source_id}/transcript/segments/{segment_index}/override")
+    def override_transcript_segment(
+        source_id: UUID,
+        segment_index: int,
+        request: TranscriptOverrideRequest,
+        database: Session = Depends(session),
+    ) -> dict[str, object]:
+        """Persist operator feedback without changing raw or automatic transcript evidence."""
+
+        transcript = _transcript_or_404(database, source_id)
+        segments = _copy_segments(transcript)
+        segment = _segment_or_404(segments, segment_index)
+        segment["operator_text"] = request.text.strip()
+        segment["final_text"] = segment["operator_text"]
+        _persist_final_segments(database, transcript, segments)
+        database.commit()
+        database.refresh(transcript)
+        return transcript.segments[segment_index]
+
+    @app.delete("/api/sources/{source_id}/transcript/segments/{segment_index}/override")
+    def clear_transcript_segment_override(
+        source_id: UUID, segment_index: int, database: Session = Depends(session)
+    ) -> dict[str, object]:
+        """Restore automatic corrected text while keeping the feedback audit fields intact."""
+
+        transcript = _transcript_or_404(database, source_id)
+        segments = _copy_segments(transcript)
+        segment = _segment_or_404(segments, segment_index)
+        segment["operator_text"] = None
+        segment["final_text"] = _automatic_segment_text(segment)
+        _persist_final_segments(database, transcript, segments)
+        database.commit()
+        database.refresh(transcript)
+        return transcript.segments[segment_index]
+
     @app.get("/api/sources/{source_id}/transcript/search", response_model=TranscriptSearchResponse)
     def search_transcript(
         source_id: UUID,
@@ -266,7 +361,7 @@ def create_app(
             segments=[
                 segment
                 for segment in transcript.segments
-                if query in str(segment.get("text", "")).casefold()
+                if query in _final_segment_text(segment).casefold()
             ]
         )
 
@@ -282,17 +377,35 @@ def create_app(
     ) -> JobResponse:
         """Queue a fresh local ASR run; option changes invalidate its transcript cache."""
         _source_or_404(database, source_id)
-        if force:
-            transcript = database.scalar(
-                select(Transcript).where(Transcript.source_video_id == source_id)
-            )
-            if transcript is not None:
-                transcript.input_fingerprint = ""
         job = ProcessingJob(source_video_id=source_id, kind=JobKind.TRANSCRIPTION)
         database.add(job)
         database.commit()
         database.refresh(job)
-        run_pipeline_stage.delay(str(source_id), PipelineStage.TRANSCRIPTION.value, str(job.id))
+        run_pipeline_stage.delay(
+            str(source_id), PipelineStage.TRANSCRIPTION.value, str(job.id), force
+        )
+        return JobResponse.model_validate(job)
+
+    @app.post(
+        "/api/sources/{source_id}/reconstruct",
+        response_model=JobResponse,
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    def reconstruct_source(
+        source_id: UUID,
+        force: bool = False,
+        database: Session = Depends(session),
+    ) -> JobResponse:
+        """Queue Stage 2.7 reconstruction while leaving ASR and correction caches intact."""
+
+        _source_or_404(database, source_id)
+        job = ProcessingJob(source_video_id=source_id, kind=JobKind.RECONSTRUCTION)
+        database.add(job)
+        database.commit()
+        database.refresh(job)
+        run_pipeline_stage.delay(
+            str(source_id), PipelineStage.CONTEXTUAL_RECONSTRUCTION.value, str(job.id), force
+        )
         return JobResponse.model_validate(job)
 
     @app.delete("/sources/{source_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -420,11 +533,72 @@ def _transcript_response(transcript: Transcript) -> TranscriptResponse:
         transcription_options=transcript.transcription_options,
         raw_text=transcript.raw_text,
         normalized_text=transcript.normalized_text,
+        corrected_text=transcript.corrected_text,
+        final_text=transcript.final_text,
+        raw_transcript_confidence=transcript.raw_transcript_confidence,
+        correction_confidence=transcript.correction_confidence,
+        corrected_segment_ratio=transcript.corrected_segment_ratio,
+        uncertain_segment_ratio=transcript.uncertain_segment_ratio,
+        correction_method=transcript.correction_method,
+        correction_version=transcript.correction_version,
+        contextual_reconstructed_text=transcript.contextual_reconstructed_text,
+        reconstruction_fingerprint=transcript.reconstruction_fingerprint,
+        reconstruction_confidence=transcript.reconstruction_confidence,
+        reconstructed_segment_ratio=transcript.reconstructed_segment_ratio,
+        reconstruction_method=transcript.reconstruction_method,
+        reconstruction_version=transcript.reconstruction_version,
+        reconstruction_processing_duration=transcript.reconstruction_processing_duration,
+        reconstruction_metadata=_public_reconstruction_metadata(transcript),
+        reconstruction_status=transcript.reconstruction_status,
         segments=transcript.segments,
         word_segments=transcript.word_segments,
         duration=transcript.duration,
         processing_duration=transcript.processing_duration,
     )
+
+
+def _quality_metrics_response(
+    assessment: SourceQualityAssessment,
+) -> QualityMetricsResponse:
+    return QualityMetricsResponse(
+        audio_quality_score=assessment.audio_quality_score,
+        transcript_quality_score=assessment.transcript_quality_score,
+        low_confidence_word_ratio=assessment.low_confidence_word_ratio,
+        unresolved_segment_ratio=assessment.unresolved_segment_ratio,
+        manual_review_required=assessment.manual_review_required,
+        conservative_source_floor=assessment.overall_source_quality_score,
+    )
+
+
+def _public_reconstruction_metadata(transcript: Transcript) -> dict[str, object]:
+    metadata = _without_secrets(transcript.reconstruction_metadata)
+    availability = metadata.get("provider_availability")
+    if availability is None and transcript.reconstruction_status is ReconstructionStatus.PROVIDER_UNAVAILABLE:
+        availability = "UNAVAILABLE"
+    metadata["reconstruction_status"] = transcript.reconstruction_status.value
+    metadata["provider_health"] = {
+        "availability": availability or "UNKNOWN",
+        "model": metadata.get("model"),
+        "model_digest": metadata.get("model_digest"),
+    }
+    return metadata
+
+
+def _without_secrets(metadata: dict[str, object]) -> dict[str, object]:
+    sensitive_fragments = ("api_key", "authorization", "password", "secret", "token")
+    return {
+        key: _public_metadata_value(value)
+        for key, value in metadata.items()
+        if not any(fragment in key.casefold() for fragment in sensitive_fragments)
+    }
+
+
+def _public_metadata_value(value: object) -> object:
+    if isinstance(value, dict):
+        return _without_secrets({str(key): item for key, item in value.items()})
+    if isinstance(value, list):
+        return [_public_metadata_value(item) for item in value]
+    return value
 
 
 def _job_or_404(database: Session, job_id: UUID) -> ProcessingJob:
@@ -434,12 +608,65 @@ def _job_or_404(database: Session, job_id: UUID) -> ProcessingJob:
     return job
 
 
+def _copy_segments(transcript: Transcript) -> list[dict[str, object]]:
+    return [dict(segment) for segment in transcript.segments]
+
+
+def _segment_or_404(segments: list[dict[str, object]], segment_index: int) -> dict[str, object]:
+    if segment_index < 0 or segment_index >= len(segments):
+        raise HTTPException(status_code=404, detail="transcript segment not found")
+    return segments[segment_index]
+
+
+def _automatic_segment_text(segment: dict[str, object]) -> str:
+    if (
+        segment.get("reconstruction_applied")
+        and segment.get("reconstruction_confidence_level") == "HIGH"
+    ):
+        return str(segment.get("contextual_reconstructed_text") or "")
+    return str(
+        segment.get("corrected_text") or segment.get("normalized_text") or segment.get("text", "")
+    )
+
+
+def _final_segment_text(segment: dict[str, object]) -> str:
+    return str(segment.get("final_text") or _automatic_segment_text(segment))
+
+
+def _persist_final_segments(
+    database: Session, transcript: Transcript, segments: list[dict[str, object]]
+) -> None:
+    """Atomically refresh only derived display/chunk state after manual text feedback."""
+
+    transcript.segments = segments
+    transcript.final_text = " ".join(_final_segment_text(segment) for segment in segments).strip()
+    transcript.normalized_text = normalize_transcript(transcript.final_text)
+    database.execute(delete(TranscriptChunk).where(TranscriptChunk.transcript_id == transcript.id))
+    database.add_all(
+        TranscriptChunk(
+            transcript_id=transcript.id,
+            sequence=sequence,
+            start_time=chunk.start_time,
+            end_time=chunk.end_time,
+            text=chunk.text,
+            segment_indexes=chunk.segment_indexes,
+            preceding_context=chunk.preceding_context,
+            following_context=chunk.following_context,
+        )
+        for sequence, chunk in enumerate(build_chunks(segments, ChunkConfig()))
+    )
+
+
 def _duplicate_response(source: SourceVideo) -> SourceResponse:
     return SourceResponse.model_validate(source)
 
 
 def _default_health(
-    storage: StorageService, factory: sessionmaker[Session], ffmpeg: str, ffprobe: str
+    storage: StorageService,
+    factory: sessionmaker[Session],
+    ffmpeg: str,
+    ffprobe: str,
+    reconstruction_provider: ReconstructionProvider | None,
 ) -> HealthService:
     def database() -> tuple[CheckStatus, str]:
         with factory() as session:
@@ -460,14 +687,21 @@ def _default_health(
             return CheckStatus.FAILED, str(err)
         return CheckStatus.HEALTHY, f"{report.free_bytes} bytes free"
 
+    checks = {
+        "database": database,
+        "redis": lambda: (CheckStatus.DEGRADED, "not checked"),
+        "worker": lambda: (CheckStatus.DEGRADED, "heartbeat unavailable"),
+        "ffmpeg": lambda: binary(ffmpeg),
+        "ffprobe": lambda: binary(ffprobe),
+        "storage": storage_check,
+    }
+    if reconstruction_provider is None:
+        checks["reconstruction_provider"] = lambda: (
+            CheckStatus.DEGRADED,
+            "reconstruction provider is disabled",
+        )
     return HealthService(
         storage,
-        {
-            "database": database,
-            "redis": lambda: (CheckStatus.DEGRADED, "not checked"),
-            "worker": lambda: (CheckStatus.DEGRADED, "heartbeat unavailable"),
-            "ffmpeg": lambda: binary(ffmpeg),
-            "ffprobe": lambda: binary(ffprobe),
-            "storage": storage_check,
-        },
+        checks,
+        reconstruction_provider=reconstruction_provider,
     )

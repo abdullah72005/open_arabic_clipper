@@ -4,18 +4,30 @@ export type RightsStatus =
   | "LICENSED"
   | "PERMISSION"
   | "PUBLIC_DOMAIN"
-  | "OTHER_ALLOWED";
+  | "OTHER_ALLOWED"
+  | "THIRD_PARTY_UNKNOWN"
+  | "THIRD_PARTY_REUSE";
 export type PipelineStage =
   | "INGEST"
   | "PROBE"
   | "AUDIO_EXTRACTION"
   | "TRANSCRIPTION"
   | "TRANSCRIPT_NORMALIZATION"
+  | "CONTEXTUAL_RECONSTRUCTION"
   | "AUDIO_ANALYSIS"
   | "READY_FOR_TRANSCRIPTION"
   | "READY_FOR_ANALYSIS"
   | "FAILED";
 export type JobStatus = "QUEUED" | "RUNNING" | "SUCCEEDED" | "FAILED" | "CANCELLED";
+export type ProviderAvailability = "AVAILABLE" | "UNAVAILABLE" | "MISCONFIGURED";
+export type ReconstructionStatus =
+  | "NOT_REQUIRED"
+  | "APPLIED"
+  | "UNCHANGED_HIGH_CONFIDENCE"
+  | "LOW_CONFIDENCE_UNRESOLVED"
+  | "PROVIDER_UNAVAILABLE"
+  | "FAILED"
+  | "MANUAL_OVERRIDE";
 
 export interface Source {
   id: string;
@@ -52,6 +64,30 @@ export interface TranscriptSegment {
   end: number;
   text: string;
   normalized_text?: string;
+  raw_text?: string;
+  corrected_text?: string;
+  final_text?: string;
+  operator_text?: string | null;
+  correction_applied?: boolean;
+  correction_confidence?: number;
+  correction_method?: string;
+  correction_version?: string;
+  contextual_reconstructed_text?: string;
+  reconstruction_candidate_text?: string | null;
+  reconstruction_applied?: boolean;
+  reconstruction_confidence?: number;
+  reconstruction_confidence_level?: "HIGH" | "MEDIUM" | "LOW";
+  reconstruction_quality_flags?: string[];
+  reconstruction_status?: ReconstructionStatus;
+  reconstruction_method?: string;
+  routing_score?: number | null;
+  routing_reasons?: string[];
+  focus_spans?: Array<{
+    word: string;
+    start: number | null;
+    end: number | null;
+    probability: number | null;
+  }>;
   avg_logprob?: number | null;
   no_speech_prob?: number | null;
 }
@@ -60,10 +96,43 @@ export interface Transcript {
   source_video_id: string;
   language: string | null;
   detected_language_probability: number | null;
+  whisper_model: string;
+  transcription_options: Record<string, unknown>;
   raw_text: string;
   normalized_text: string;
+  corrected_text?: string;
+  final_text?: string;
+  raw_transcript_confidence?: number;
+  correction_confidence?: number;
+  corrected_segment_ratio?: number;
+  uncertain_segment_ratio?: number;
+  correction_method?: string;
+  correction_version?: string;
+  contextual_reconstructed_text?: string;
+  reconstruction_fingerprint?: string;
+  reconstruction_confidence?: number;
+  reconstructed_segment_ratio?: number;
+  reconstruction_method?: string;
+  reconstruction_version?: string;
+  reconstruction_processing_duration?: number | null;
+  reconstruction_metadata?: Record<string, unknown>;
+  reconstruction_status: ReconstructionStatus;
   segments: TranscriptSegment[];
   duration: number;
+}
+
+export interface QualityMetrics {
+  audio_quality_score: number;
+  transcript_quality_score: number;
+  low_confidence_word_ratio: number;
+  unresolved_segment_ratio: number;
+  manual_review_required: boolean;
+  conservative_source_floor: number;
+}
+
+export interface QualityResponse {
+  reconstruction_status: ReconstructionStatus | null;
+  quality: QualityMetrics | null;
 }
 
 type Fetcher = typeof fetch;
@@ -94,6 +163,30 @@ export function createApiClient(baseUrl: string, fetcher: Fetcher = fetch) {
       `${baseUrl.replace(/\/$/, "")}/api/sources/${encodeURIComponent(id)}/media`,
     getTranscript: (id: string) =>
       request<Transcript>(`/api/sources/${encodeURIComponent(id)}/transcript`),
+    getQuality: (id: string) =>
+      request<QualityResponse>(`/api/sources/${encodeURIComponent(id)}/quality`),
+    retranscribeTranscript: (id: string, force = true) =>
+      request<Job>(`/api/sources/${encodeURIComponent(id)}/retranscribe?force=${force}`, {
+        method: "POST"
+      }),
+    reconstructTranscript: (id: string, force = false) =>
+      request<Job>(`/api/sources/${encodeURIComponent(id)}/reconstruct?force=${force}`, {
+        method: "POST"
+      }),
+    overrideTranscriptSegment: (id: string, segmentIndex: number, text: string) =>
+      request<TranscriptSegment>(
+        `/api/sources/${encodeURIComponent(id)}/transcript/segments/${segmentIndex}/override`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ text })
+        }
+      ),
+    clearTranscriptSegmentOverride: (id: string, segmentIndex: number) =>
+      request<TranscriptSegment>(
+        `/api/sources/${encodeURIComponent(id)}/transcript/segments/${segmentIndex}/override`,
+        { method: "DELETE" }
+      ),
     submitUrls: (urls: string[], rights_status: RightsStatus = "UNKNOWN") =>
       Promise.all(
         urls.map((url) =>
@@ -111,6 +204,7 @@ export function createApiClient(baseUrl: string, fetcher: Fetcher = fetch) {
       return request<Source>("/sources/upload", { method: "POST", body });
     },
     deleteSource: (id: string) => request<void>(`/sources/${encodeURIComponent(id)}`, { method: "DELETE" }),
+    retrySource: (id: string) => request<Job>(`/sources/${encodeURIComponent(id)}/retry`, { method: "POST" }),
     listJobs: () => request<Job[]>("/jobs"),
     getJob: (id: string) => request<Job>(`/jobs/${encodeURIComponent(id)}`),
     cancelJob: (id: string) => request<Job>(`/jobs/${encodeURIComponent(id)}/cancel`, { method: "POST" }),

@@ -3,8 +3,9 @@
 ClipFactory is a local-first foundation for safely ingesting media, probing its
 metadata, and transcribing owned or authorized media. Stage 2 extracts a cached
 mono 16 kHz WAV, runs local faster-whisper with automatic Arabic (Egyptian/MSA),
-English, and mixed-speech detection, normalizes transcript text conservatively,
-and records silence/quality signals through `READY_FOR_ANALYSIS`. It does not
+English, and mixed-speech detection, preserves raw ASR evidence, applies
+conservative contextual Egyptian-Arabic correction, and records silence/quality
+signals through `READY_FOR_ANALYSIS`. It does not
 select clips, reframe, render, publish, or automatically authorize content.
 
 Only process material you own or are explicitly authorized to process. URL
@@ -47,20 +48,68 @@ Read [local setup](docs/LOCAL_SETUP.md), [architecture](docs/ARCHITECTURE.md),
 [pipeline](docs/PIPELINE.md), and [troubleshooting](docs/TROUBLESHOOTING.md)
 before using external media sources.
 
-## Stage 2 transcription
+## Stage 2, 2.5, and 2.7 transcription quality
 
 Workers need FFmpeg/ffprobe and the local `faster-whisper` dependency. Configure
-`CLIPFACTORY_WHISPER_MODEL` (`tiny`, `base`, `small`, `medium`, or `large-v3`),
+`CLIPFACTORY_WHISPER_MODEL` (`tiny`, `base`, `small`, `medium`, `large-v3`, or
+`large-v3-turbo`),
 `CLIPFACTORY_WHISPER_DEVICE` (`auto`, `cpu`, or `cuda`), and optionally
-`CLIPFACTORY_WHISPER_FORCED_LANGUAGE` (`ar` or `en`). `auto` uses CUDA only when
+`CLIPFACTORY_WHISPER_LANGUAGE` (`ar` or `en`). `auto` uses CUDA only when
 available and otherwise uses CPU `int8` inference.
 
-Use `GET /api/sources/{id}/transcript` for the persisted raw and normalized
-evidence, `GET /api/sources/{id}/transcript/search?q=...` for timestamped
+The default decoder is `large-v3-turbo`, with auto device selection, CPU `int8`, beam 5,
+word timestamps, faster-whisper fallback temperatures `[0, 0.2, 0.4, 0.6, 0.8,
+1]`, previous-text conditioning enabled, VAD disabled, and no prompt/hotwords.
+`CLIPFACTORY_WHISPER_TEMPERATURE`,
+`CLIPFACTORY_WHISPER_CONDITION_ON_PREVIOUS_TEXT`,
+`CLIPFACTORY_WHISPER_VAD_FILTER`, `CLIPFACTORY_WHISPER_INITIAL_PROMPT`, and
+`CLIPFACTORY_WHISPER_HOTWORDS` are output-affecting settings and invalidate the
+transcript cache. Do not opt into prompt/hotword/VAD changes without an
+operator-authorized benchmark covering Arabic, English, and code-switched audio.
+
+Stage 2.5 preserves `raw_text` and every raw segment `text`/timestamp permanently.
+It adds `corrected_text`, `final_text`, confidence indicators, correction method,
+version, and per-segment correction metadata. The default local corrector uses
+the versioned Egyptian phrase lexicon only; it never requires a network or an
+LLM. To opt into a local OpenAI-compatible endpoint such as Ollama, configure
+`CLIPFACTORY_CORRECTION_PROVIDER=openai_compatible` plus provider base URL and
+model. Provider responses are batched, context-bounded, schema-validated, and
+may only approve a declared lexicon candidate; they fall back to raw/lexicon
+output on any failure or unsafe change.
+
+Stage 2.7 runs after Stage 2.5 and before audio analysis. It retains raw ASR,
+Stage 2.5, Stage 2.7, and manual text separately; final text is always manual
+override, then an applied HIGH-confidence reconstruction, then Stage 2.5, then
+raw ASR. The default provider configuration is local Ollama at
+`http://ollama:11434` with `qwen3:8b`; it never downloads a model implicitly.
+Start the optional service with `docker compose --profile reconstruction up -d
+ollama`, then have the operator explicitly pull the selected model (for example,
+`docker compose exec ollama ollama pull qwen3:8b`). Set
+`CLIPFACTORY_RECONSTRUCTION_PROVIDER=disabled` to run without a provider, or
+use `openai_compatible` with an operator-configured local endpoint. Invalid,
+unavailable, or release-failed providers preserve Stage 2.5 output and do not
+block `READY_FOR_ANALYSIS`; their status is recorded for review. Use
+`python -m app.cli reconstruction-health` to inspect safe provider/model
+metadata, and `POST /api/sources/{id}/reconstruct` or
+`python -m app.cli reconstruct SOURCE_ID --force` to queue reconstruction.
+
+Stage 2.7 cache reuse is dependency-aware: stage runs persist canonical input
+and output fingerprints, and changed upstream evidence reruns downstream work.
+Manual force requests queue the requested stage without clearing historical
+cache fields. The transcript API exposes reconstruction status and public
+derived metadata; `GET /api/sources/{id}/quality` separately reports audio and
+transcript/reconstruction quality, with the aggregate conservatively taking the
+lower score. The source detail page shows provider availability, unresolved or
+manual statuses, split-quality reasons, and bounded routing focus evidence.
+
+Use `GET /api/sources/{id}/transcript` for raw/corrected/final evidence,
+`GET /api/sources/{id}/transcript/search?q=...` for timestamped final-text
 segments, and `POST /api/sources/{id}/retranscribe` to queue a new local ASR job.
-Arabic transcript panels render RTL when Arabic is detected; mixed segments retain
-their original Unicode text. Source detail pages play storage-owned local media;
-selecting a transcript segment seeks playback to its timestamp.
+Operators can save or clear a final manual correction with `POST` or `DELETE`
+`/api/sources/{id}/transcript/segments/{segment_index}/override`; raw and
+automatic text remain unchanged. Arabic transcript panels show a correction debug
+view and retain original Unicode code-switched terms. Selecting a segment seeks
+storage-owned local playback to its original timestamp.
 
 Operator commands are available from the backend environment: `python -m app.cli
 transcribe SOURCE_ID`, `python -m app.cli transcript SOURCE_ID`, and `python -m
@@ -75,3 +124,31 @@ intentionally not fabricated.
 
 The current local cached-model benchmark is recorded in
 [benchmark results](docs/BENCHMARKS.md).
+
+Run the deterministic correction fixture benchmark in the backend container:
+
+```bash
+python -m app.transcription.correction_benchmark \
+  --fixture app/transcription/fixtures/egyptian_ar_correction.json --baseline
+python -m app.transcription.correction_benchmark \
+  --fixture app/transcription/fixtures/egyptian_ar_correction.json
+```
+
+Fixture metrics are regression evidence, not ground-truth dialect accuracy. Use
+an authorized audio set and manual semantic review before enabling any LLM model
+or changing Whisper decoding defaults.
+
+Stage 2.7 readiness requires a private manifest inside storage-owned
+`benchmarks/`, with no transcript bodies committed to the repository. Run
+`python -m app.cli benchmark-reconstruction stage-2-7/unseen-test-v1.json`.
+The runner executes raw `large-v3-turbo` ASR, Stage 2.5, then Stage 2.7 through
+the configured live provider, writes a JSONL comparison, a human-review
+worksheet, and an aggregate report under `storage/benchmarks/stage-2-7/results/`,
+and prints only aggregate metrics and storage-owned artifact paths. Use
+`--model` to compare an alternate configured model and
+`--allow-known-regression-set` only for the Chernobyl diagnostic run, which can
+never pass the unseen readiness gate. Until the strict unseen-audio gate passes,
+the status is `STAGE 2.7 MUST CONTINUE`.
+
+See [Stage 2.7 operations](docs/STAGE_2_7_OPERATIONS.md) for the persisted
+status contract and operator troubleshooting notes.

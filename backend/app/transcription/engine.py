@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -40,31 +41,42 @@ class WhisperEngine:
         *,
         model_factory: ModelFactory | None = None,
         cuda_available: CudaAvailability | None = None,
+        collect_garbage: Callable[[], int] = gc.collect,
     ) -> None:
         self._model_factory = model_factory or _default_model_factory
         self._cuda_available = cuda_available or _cuda_available
+        self._collect_garbage = collect_garbage
 
     def transcribe(self, audio_path: Path, options: TranscriptionOptions) -> TranscriptionResult:
         """Transcribe a WAV path without changing Whisper text or timestamps."""
 
         device, compute_type = self._resolve_hardware(options)
         model = self._model_factory(options.model, device, compute_type)
-        segments, info = model.transcribe(
-            str(audio_path),
-            beam_size=options.beam_size,
-            language=options.language,
-            word_timestamps=options.word_timestamps,
-        )
-        serialized_segments = [_serialize_segment(segment) for segment in segments]
-        words = [word for segment in serialized_segments for word in segment["words"]]
-        return TranscriptionResult(
-            language=_optional_str(getattr(info, "language", None)),
-            language_probability=_optional_float(getattr(info, "language_probability", None)),
-            raw_text="".join(str(segment["text"]) for segment in serialized_segments).strip(),
-            duration=float(getattr(info, "duration", 0.0) or 0.0),
-            segments=serialized_segments,
-            word_segments=words,
-        )
+        try:
+            segments, info = model.transcribe(
+                str(audio_path),
+                beam_size=options.beam_size,
+                language=options.language,
+                word_timestamps=options.word_timestamps,
+                temperature=options.temperature,
+                condition_on_previous_text=options.condition_on_previous_text,
+                vad_filter=options.vad_filter,
+                initial_prompt=options.initial_prompt,
+                hotwords=options.hotwords,
+            )
+            serialized_segments = [_serialize_segment(segment) for segment in segments]
+            words = [word for segment in serialized_segments for word in segment["words"]]
+            return TranscriptionResult(
+                language=_optional_str(getattr(info, "language", None)),
+                language_probability=_optional_float(getattr(info, "language_probability", None)),
+                raw_text="".join(str(segment["text"]) for segment in serialized_segments).strip(),
+                duration=float(getattr(info, "duration", 0.0) or 0.0),
+                segments=serialized_segments,
+                word_segments=words,
+            )
+        finally:
+            del model
+            self._collect_garbage()
 
     def resolved_hardware(self, options: TranscriptionOptions) -> tuple[str, str]:
         """Expose the effective device policy for operational reporting."""
@@ -108,8 +120,11 @@ def _serialize_segment(segment: object) -> dict[str, object]:
         "start": float(getattr(segment, "start")),
         "end": float(getattr(segment, "end")),
         "text": str(getattr(segment, "text")),
+        "tokens": [int(token) for token in getattr(segment, "tokens", None) or []],
         "avg_logprob": _optional_float(getattr(segment, "avg_logprob", None)),
+        "compression_ratio": _optional_float(getattr(segment, "compression_ratio", None)),
         "no_speech_prob": _optional_float(getattr(segment, "no_speech_prob", None)),
+        "temperature": _optional_float(getattr(segment, "temperature", None)),
         "words": words,
     }
 

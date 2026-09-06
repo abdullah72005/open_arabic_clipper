@@ -32,6 +32,67 @@ describe("API client", () => {
     });
   });
 
+  it("sends a manual transcript override with the stable segment index", async () => {
+    const fetcher = async (input: RequestInfo | URL, init?: RequestInit) => {
+      expect(String(input)).toBe("http://api.test/api/sources/source-1/transcript/segments/0/override");
+      expect(init?.method).toBe("POST");
+      expect(init?.body).toBe(JSON.stringify({ text: "خلي بالك" }));
+      return new Response(JSON.stringify({ start: 0, end: 1, text: "خطي بالك", final_text: "خلي بالك" }), {
+        headers: { "content-type": "application/json" }
+      });
+    };
+
+    await expect(
+      createApiClient("http://api.test", fetcher).overrideTranscriptSegment("source-1", 0, "خلي بالك")
+    ).resolves.toMatchObject({ final_text: "خلي بالك" });
+  });
+
+  it("queues an encoded contextual reconstruction request with force", async () => {
+    const fetcher = async (input: RequestInfo | URL, init?: RequestInit) => {
+      expect(String(input)).toBe("http://api.test/api/sources/source%2Fid/reconstruct?force=true");
+      expect(init?.method).toBe("POST");
+      return new Response(JSON.stringify({ id: "job-1", kind: "RECONSTRUCTION", status: "QUEUED" }), {
+        headers: { "content-type": "application/json" }
+      });
+    };
+
+    await expect(createApiClient("http://api.test", fetcher).reconstructTranscript("source/id", true))
+      .resolves.toMatchObject({ kind: "RECONSTRUCTION" });
+  });
+
+  it("loads split transcript quality and reconstruction status", async () => {
+    const fetcher = async (input: RequestInfo | URL) => {
+      expect(String(input)).toBe("http://api.test/api/sources/source-1/quality");
+      return new Response(JSON.stringify({
+        reconstruction_status: "PROVIDER_UNAVAILABLE",
+        quality: {
+          audio_quality_score: 0.985,
+          transcript_quality_score: 0.4,
+          low_confidence_word_ratio: 0.2,
+          unresolved_segment_ratio: 0.5,
+          manual_review_required: true,
+          conservative_source_floor: 0.4
+        }
+      }), { headers: { "content-type": "application/json" } });
+    };
+
+    await expect(createApiClient("http://api.test", fetcher).getQuality("source-1"))
+      .resolves.toMatchObject({ reconstruction_status: "PROVIDER_UNAVAILABLE" });
+  });
+
+  it("forces retranscription by default", async () => {
+    const fetcher = async (input: RequestInfo | URL, init?: RequestInit) => {
+      expect(String(input)).toBe("http://api.test/api/sources/source%2Fid/retranscribe?force=true");
+      expect(init?.method).toBe("POST");
+      return new Response(JSON.stringify({ id: "job-1", kind: "TRANSCRIPTION", status: "QUEUED" }), {
+        headers: { "content-type": "application/json" }
+      });
+    };
+
+    await expect(createApiClient("http://api.test", fetcher).retranscribeTranscript("source/id"))
+      .resolves.toMatchObject({ kind: "TRANSCRIPTION" });
+  });
+
   it("uses the configured base URL and returns typed source data", async () => {
     const fetcher = async (input: RequestInfo | URL) => {
       expect(String(input)).toBe("http://api.test/sources");

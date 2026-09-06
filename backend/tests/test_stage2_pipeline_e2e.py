@@ -12,10 +12,11 @@ from app.db.base import Base
 from app.media.audio import AudioExtractor
 from app.media.ffprobe import FFprobe
 from app.models import SourceVideo
-from app.pipeline.runner import PipelineRunner, StageExecutionError
+from app.pipeline.runner import PipelineRunner
 from app.pipeline.stages import (
     AudioAnalysisExecutor,
     AudioExtractionExecutor,
+    ContextualReconstructionExecutor,
     IngestExecutor,
     ProbeExecutor,
     TranscriptionExecutor,
@@ -24,6 +25,7 @@ from app.pipeline.stages import (
 from app.services.source_adapters import AcquiredSource
 from app.services.storage import StorageService
 from app.transcription.engine import TranscriptionResult
+from app.transcription.reconstruction import ContextualReconstructor
 from app.transcription.service import TranscriptionOptions
 
 
@@ -83,6 +85,9 @@ def test_generated_owned_media_reaches_ready_for_analysis(
             PipelineStage.TRANSCRIPT_NORMALIZATION: TranscriptNormalizationExecutor(
                 session=session
             ),
+            PipelineStage.CONTEXTUAL_RECONSTRUCTION: ContextualReconstructionExecutor(
+                session=session, reconstructor=ContextualReconstructor(provider=None)
+            ),
             PipelineStage.AUDIO_ANALYSIS: AudioAnalysisExecutor(session=session, storage=storage),
         }
         runner = PipelineRunner(session, executors)
@@ -92,6 +97,7 @@ def test_generated_owned_media_reaches_ready_for_analysis(
             PipelineStage.AUDIO_EXTRACTION,
             PipelineStage.TRANSCRIPTION,
             PipelineStage.TRANSCRIPT_NORMALIZATION,
+            PipelineStage.CONTEXTUAL_RECONSTRUCTION,
             PipelineStage.AUDIO_ANALYSIS,
         ):
             runner.run(source.id, stage)
@@ -129,12 +135,27 @@ def test_ingest_downloads_an_authorized_public_url_into_owned_storage(tmp_path: 
     assert source.original_filename == "authorized-video.mp4"
 
 
-def test_ingest_rejects_public_url_without_explicit_rights() -> None:
+@pytest.mark.parametrize(
+    "rights_status", [RightsStatus.UNKNOWN, RightsStatus.THIRD_PARTY_REUSE, RightsStatus.OWNED]
+)
+def test_ingest_acquires_public_url_regardless_of_rights(
+    tmp_path: Path, rights_status: RightsStatus
+) -> None:
     source = SourceVideo(
         id=uuid.uuid4(),
         source_uri="https://example.com/unapproved-video",
-        rights_status=RightsStatus.UNKNOWN,
+        rights_status=rights_status,
     )
 
-    with pytest.raises(StageExecutionError, match="explicit rights"):
-        IngestExecutor().execute(source)
+    downloaded = tmp_path / "public-video.mp4"
+    downloaded.write_bytes(b"public video")
+
+    class RecordingAdapter:
+        def acquire(self, source_id: uuid.UUID, source_url: str) -> AcquiredSource:
+            assert source_url == "https://example.com/unapproved-video"
+            return AcquiredSource(path=downloaded, original_filename="public-video.mp4")
+
+    IngestExecutor(url_adapter=RecordingAdapter()).execute(source)
+
+    assert source.source_uri == str(downloaded)
+    assert source.original_filename == "public-video.mp4"

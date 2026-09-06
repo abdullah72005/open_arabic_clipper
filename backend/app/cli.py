@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import asdict
 from pathlib import Path
 from uuid import UUID
 
@@ -13,12 +14,21 @@ from app.core.settings import get_settings
 from app.db.session import create_session_factory
 from app.models import ProcessingJob, SourceVideo, Transcript
 from app.services.health import HealthService
-from app.services.storage import StorageService
+from app.services.storage import StorageCategory, StorageService
 from app.transcription.benchmark import benchmark_transcription
 from app.transcription.engine import WhisperEngine
+from app.transcription.reconstruction.benchmark import (
+    BenchmarkRunner,
+    evaluate_completion_gate,
+    load_benchmark_manifest,
+    prompt_settings_fingerprint,
+)
+from app.transcription.reconstruction.service import ContextualReconstructor
+from app.transcription.reconstruction.types import ProviderAvailability, ProviderHealth
 from app.workers.tasks import run_pipeline_stage
 
 app = typer.Typer(no_args_is_help=True)
+_KNOWN_REGRESSION_MANIFEST_NAME = "stage-2-7/chernobyl-reference-v1.json"
 
 
 def _storage() -> StorageService:
@@ -29,6 +39,38 @@ def _storage() -> StorageService:
 def health() -> None:
     report = HealthService(_storage()).report()
     typer.echo(report.status.value)
+
+
+@app.command("reconstruction-health")
+def reconstruction_health() -> None:
+    """Verify configured reconstruction endpoint and exact model availability."""
+
+    settings = get_settings()
+    provider = settings.reconstruction_provider_instance()
+    report = (
+        provider.health()
+        if provider is not None
+        else ProviderHealth(
+            ProviderAvailability.MISCONFIGURED,
+            settings.reconstruction_provider,
+            settings.reconstruction_provider_model,
+            None,
+            "reconstruction provider is disabled",
+        )
+    )
+    typer.echo(
+        json.dumps(
+            {
+                "availability": report.availability.value,
+                "provider": report.provider,
+                "model": report.model,
+                "digest": report.model_digest,
+                "detail": report.detail,
+            }
+        )
+    )
+    if report.availability is not ProviderAvailability.AVAILABLE:
+        raise typer.Exit(1)
 
 
 @app.command()
@@ -61,16 +103,27 @@ def _queue_transcription(source_id: UUID, *, force: bool) -> UUID:
     with create_session_factory()() as session:
         if session.get(SourceVideo, source_id) is None:
             raise typer.BadParameter("source does not exist")
-        if force:
-            cached = session.query(Transcript).filter_by(source_video_id=source_id).one_or_none()
-            if cached is not None:
-                cached.input_fingerprint = ""
         job = ProcessingJob(source_video_id=source_id, kind=JobKind.TRANSCRIPTION)
         session.add(job)
         session.commit()
         session.refresh(job)
         job_id = job.id
-    run_pipeline_stage.delay(str(source_id), PipelineStage.TRANSCRIPTION.value, str(job_id))
+    run_pipeline_stage.delay(str(source_id), PipelineStage.TRANSCRIPTION.value, str(job_id), force)
+    return job_id
+
+
+def _queue_reconstruction(source_id: UUID, *, force: bool) -> UUID:
+    with create_session_factory()() as session:
+        if session.get(SourceVideo, source_id) is None:
+            raise typer.BadParameter("source does not exist")
+        job = ProcessingJob(source_video_id=source_id, kind=JobKind.RECONSTRUCTION)
+        session.add(job)
+        session.commit()
+        session.refresh(job)
+        job_id = job.id
+    run_pipeline_stage.delay(
+        str(source_id), PipelineStage.CONTEXTUAL_RECONSTRUCTION.value, str(job_id), force
+    )
     return job_id
 
 
@@ -81,9 +134,15 @@ def transcribe(source_id: UUID) -> None:
 
 
 @app.command()
-def retranscribe(source_id: UUID, force: bool = True) -> None:
+def retranscribe(source_id: UUID, force: bool = typer.Option(True, "--force/--no-force")) -> None:
     """Queue transcription and, by default, bypass the transcript cache."""
     typer.echo(str(_queue_transcription(source_id, force=force)))
+
+
+@app.command()
+def reconstruct(source_id: UUID, force: bool = typer.Option(False, "--force/--no-force")) -> None:
+    """Queue bounded contextual reconstruction, reusing its current fingerprint by default."""
+    typer.echo(str(_queue_reconstruction(source_id, force=force)))
 
 
 @app.command()
@@ -101,6 +160,7 @@ def transcript(source_id: UUID) -> None:
                     "normalized_text": current.normalized_text,
                     "segments": current.segments,
                     "word_segments": current.word_segments,
+                    "reconstruction_status": current.reconstruction_status.value,
                 },
                 ensure_ascii=False,
             )
@@ -115,6 +175,85 @@ def benchmark(audio_path: Path) -> None:
     settings = get_settings()
     report = benchmark_transcription(audio_path, WhisperEngine(), settings.transcription_options())
     typer.echo(json.dumps(report.as_dict()))
+
+
+@app.command("benchmark-reconstruction")
+def benchmark_reconstruction(
+    manifest_name: str,
+    model: str | None = typer.Option(None, "--model"),
+    allow_known_regression_set: bool = typer.Option(False, "--allow-known-regression-set"),
+) -> None:
+    """Run a private, authorized reconstruction benchmark through production stages."""
+
+    settings = get_settings()
+    storage = _storage()
+    if (
+        allow_known_regression_set
+        and manifest_name != _KNOWN_REGRESSION_MANIFEST_NAME
+    ):
+        raise typer.BadParameter(
+            "--allow-known-regression-set is reserved for the Chernobyl diagnostic manifest"
+        )
+    manifest_path = storage.resolve(StorageCategory.BENCHMARKS, manifest_name)
+    manifest = load_benchmark_manifest(
+        manifest_path,
+        allow_known_regression_set=allow_known_regression_set,
+        known_regression_manifest_path=storage.resolve(
+            StorageCategory.BENCHMARKS, _KNOWN_REGRESSION_MANIFEST_NAME
+        ),
+    )
+    provider = settings.reconstruction_provider_instance(model=model)
+    health = provider.health() if provider is not None else None
+    whisper_options = asdict(settings.transcription_options())
+    fingerprint = prompt_settings_fingerprint(
+        provider=settings.reconstruction_provider,
+        model=health.model if health is not None else None,
+        digest=health.model_digest if health is not None else None,
+        whisper_options=whisper_options,
+    )
+    runner = BenchmarkRunner(
+        storage=storage,
+        whisper_engine=WhisperEngine(),
+        corrector=settings.contextual_corrector(),
+        reconstructor=ContextualReconstructor(provider),
+        transcription_options=settings.transcription_options(),
+        provider_health=health,
+        prompt_settings_fingerprint=fingerprint,
+    )
+    report = runner.run(manifest)
+    passed, reasons = evaluate_completion_gate(
+        report, expected_prompt_settings_fingerprint=fingerprint
+    )
+    typer.echo(
+        json.dumps(
+            {
+                "model": report.model_identifier,
+                "model_digest": report.model_digest,
+                "provider_available": report.provider_available,
+                "human_labels_complete": report.human_labels_complete,
+                "model_feasible": report.model_feasible,
+                "semantic_correct_stage25": report.semantic_correct_stage25,
+                "semantic_correct_stage27": report.semantic_correct_stage27,
+                "improved": report.improved,
+                "unchanged_correct": report.unchanged_correct,
+                "unchanged_wrong": report.unchanged_wrong,
+                "regressed": report.regressed,
+                "hallucinated": report.hallucinated,
+                "unresolved": report.unresolved,
+                "source_audio_seconds": report.source_audio_seconds,
+                "wall_clock_seconds": report.wall_clock_seconds,
+                "peak_ram_bytes": report.peak_ram_bytes,
+                "peak_vram_bytes": report.peak_vram_bytes,
+                "comparison_path": str(report.comparison_path) if report.comparison_path else None,
+                "report_path": str(report.report_path) if report.report_path else None,
+                "worksheet_path": str(report.worksheet_path) if report.worksheet_path else None,
+                "passed": passed,
+                "reasons": reasons,
+                "status": "READY FOR STAGE 3" if passed else "STAGE 2.7 MUST CONTINUE",
+            },
+            ensure_ascii=False,
+        )
+    )
 
 
 if __name__ == "__main__":

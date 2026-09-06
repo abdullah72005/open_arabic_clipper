@@ -5,7 +5,9 @@ import { FormEvent, useState } from "react";
 import { ApiError, api, RightsStatus } from "@/lib/api-client";
 
 const rightsOptions: Array<{ value: RightsStatus; label: string }> = [
-  { value: "UNKNOWN", label: "Unknown — private ingest/probe only" },
+  { value: "UNKNOWN", label: "Unknown — process locally; publishing requires review" },
+  { value: "THIRD_PARTY_UNKNOWN", label: "Third-party — rights unknown" },
+  { value: "THIRD_PARTY_REUSE", label: "Third-party — reuse claimed" },
   { value: "OWNED", label: "Owned" },
   { value: "LICENSED", label: "Licensed" },
   { value: "PERMISSION", label: "Permission granted" },
