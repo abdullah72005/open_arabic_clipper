@@ -80,11 +80,27 @@ output on any failure or unsafe change.
 Stage 2.7 runs after Stage 2.5 and before audio analysis. It retains raw ASR,
 Stage 2.5, Stage 2.7, and manual text separately; final text is always manual
 override, then an applied HIGH-confidence reconstruction, then Stage 2.5, then
-raw ASR. `CLIPFACTORY_RECONSTRUCTION_PROVIDER=disabled` is the safe default.
-An explicitly configured local OpenAI-compatible provider uses two structured,
-temperature-zero passes; invalid or unavailable responses preserve Stage 2.5 and
-do not block `READY_FOR_ANALYSIS`. Use `POST /api/sources/{id}/reconstruct` or
-`python -m app.cli reconstruct SOURCE_ID --force` to queue it.
+raw ASR. The default provider configuration is local Ollama at
+`http://ollama:11434` with `qwen3:8b`; it never downloads a model implicitly.
+Start the optional service with `docker compose --profile reconstruction up -d
+ollama`, then have the operator explicitly pull the selected model (for example,
+`docker compose exec ollama ollama pull qwen3:8b`). Set
+`CLIPFACTORY_RECONSTRUCTION_PROVIDER=disabled` to run without a provider, or
+use `openai_compatible` with an operator-configured local endpoint. Invalid,
+unavailable, or release-failed providers preserve Stage 2.5 output and do not
+block `READY_FOR_ANALYSIS`; their status is recorded for review. Use
+`python -m app.cli reconstruction-health` to inspect safe provider/model
+metadata, and `POST /api/sources/{id}/reconstruct` or
+`python -m app.cli reconstruct SOURCE_ID --force` to queue reconstruction.
+
+Stage 2.7 cache reuse is dependency-aware: stage runs persist canonical input
+and output fingerprints, and changed upstream evidence reruns downstream work.
+Manual force requests queue the requested stage without clearing historical
+cache fields. The transcript API exposes reconstruction status and public
+derived metadata; `GET /api/sources/{id}/quality` separately reports audio and
+transcript/reconstruction quality, with the aggregate conservatively taking the
+lower score. The source detail page shows provider availability, unresolved or
+manual statuses, split-quality reasons, and bounded routing focus evidence.
 
 Use `GET /api/sources/{id}/transcript` for raw/corrected/final evidence,
 `GET /api/sources/{id}/transcript/search?q=...` for timestamped final-text
@@ -127,3 +143,6 @@ Stage 2.7 readiness requires a private manifest inside storage-owned
 `python -m app.cli benchmark-reconstruction stage-2-7/unseen-test-v1.json`.
 Only its aggregate report and acceptance result are printed; until the strict
 unseen-audio gate passes, the status is `STAGE 2.7 MUST CONTINUE`.
+
+See [Stage 2.7 operations](docs/STAGE_2_7_OPERATIONS.md) for the persisted
+status contract and operator troubleshooting notes.
