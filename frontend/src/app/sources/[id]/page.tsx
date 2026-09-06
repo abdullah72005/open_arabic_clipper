@@ -3,7 +3,8 @@
 import { useParams, useRouter } from "next/navigation";
 import { useCallback, useRef, useState } from "react";
 import { ApiState } from "@/components/api-state";
-import { api, ApiError, type Transcript } from "@/lib/api-client";
+import { TranscriptStatus } from "@/components/transcript-status";
+import { api, ApiError, type QualityResponse, type Transcript } from "@/lib/api-client";
 
 function timestamp(value: number) {
   const minutes = Math.floor(value / 60);
@@ -13,11 +14,13 @@ function timestamp(value: number) {
 
 function TranscriptViewer({
   transcript,
+  quality,
   sourceId,
   onSeek,
   onUpdated
 }: {
   transcript: Transcript | null;
+  quality: QualityResponse | null;
   sourceId: string;
   onSeek: (seconds: number) => void;
   onUpdated: () => void;
@@ -60,6 +63,7 @@ function TranscriptViewer({
   return (
     <section className="card transcript" dir="auto">
       <h3>Transcript</h3>
+      <TranscriptStatus quality={quality} transcript={transcript} />
       <p className="muted">
         {transcript.language ?? "Auto-detected"}
         {transcript.detected_language_probability
@@ -73,19 +77,33 @@ function TranscriptViewer({
               <time>{timestamp(segment.start)}</time>
               <span>{segment.final_text ?? segment.corrected_text ?? segment.normalized_text ?? segment.text}</span>
             </button>
-            {(segment.correction_applied || segment.reconstruction_applied || segment.operator_text) && (
+            {(segment.correction_applied
+              || segment.operator_text
+              || (segment.reconstruction_status ?? transcript.reconstruction_status) !== "NOT_REQUIRED") && (
               <details>
                 <summary>Correction details</summary>
                 <p><strong>Raw:</strong> {segment.raw_text ?? segment.text}</p>
                 <p><strong>Stage 2.5:</strong> {segment.corrected_text ?? segment.normalized_text ?? segment.text}</p>
                 <p className="muted">{segment.correction_method ?? "unchanged"} · {Math.round((segment.correction_confidence ?? 0) * 100)}%</p>
-                {segment.contextual_reconstructed_text && (
+                {(segment.contextual_reconstructed_text || segment.reconstruction_status) && (
                   <>
+                    <p><strong>Status:</strong> {segment.reconstruction_status ?? transcript.reconstruction_status}</p>
                     <p><strong>Stage 2.7:</strong> {segment.contextual_reconstructed_text}</p>
+                    {segment.reconstruction_candidate_text != null && (
+                      <p><strong>Candidate:</strong> {segment.reconstruction_candidate_text}</p>
+                    )}
                     <p className="muted">
                       {segment.reconstruction_confidence_level ?? "LOW"} · {Math.round((segment.reconstruction_confidence ?? 0) * 100)}%
                       {segment.reconstruction_quality_flags?.length ? ` · ${segment.reconstruction_quality_flags.join(", ")}` : ""}
                     </p>
+                    {segment.routing_reasons?.length ? (
+                      <p><strong>Routing reasons:</strong> {segment.routing_reasons.join(", ")}</p>
+                    ) : null}
+                    {segment.focus_spans?.length ? (
+                      <p><strong>Focus spans:</strong> {segment.focus_spans.map((span) => (
+                        <span key={`${span.word}-${span.start}-${span.end}`}> {span.word} · {Math.round((span.probability ?? 0) * 100)}%</span>
+                      ))}</p>
+                    ) : null}
                   </>
                 )}
                 {segment.operator_text && <p><strong>Manual:</strong> {segment.operator_text}</p>}
@@ -126,6 +144,10 @@ export default function SourceDetail() {
     }),
     [params.id],
   );
+  const loadTranscriptData = useCallback(
+    () => Promise.all([loadTranscript(), api.getQuality(params.id)]).then(([transcript, quality]) => ({ transcript, quality })),
+    [loadTranscript, params.id],
+  );
   const seekTo = useCallback((seconds: number) => {
     const video = videoRef.current;
     if (!video) return;
@@ -160,6 +182,15 @@ export default function SourceDetail() {
       setError(cause instanceof Error ? cause.message : "Could not queue transcript reconstruction");
     }
   };
+  const retranscribe = async () => {
+    setError("");
+    try {
+      await api.retranscribeTranscript(params.id);
+      setJobRevision((value) => value + 1);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not queue forced retranscription");
+    }
+  };
 
   return (
     <ApiState load={load}>
@@ -191,11 +222,12 @@ export default function SourceDetail() {
             </ApiState>
             <p className="muted">Transcription auto-detects Arabic, English, and mixed speech locally.</p>
             <button className="button" onClick={() => void reconstruct()}>Reconstruct transcript</button>
+            <button className="button" onClick={() => void retranscribe()}>Force retranscription</button>
             <button className="button danger" onClick={remove}>Delete source</button>
             {error && <p className="error">{error}</p>}
           </section>
-          <ApiState key={transcriptRevision} load={loadTranscript}>
-            {(transcript) => <TranscriptViewer onSeek={seekTo} onUpdated={() => setTranscriptRevision((value) => value + 1)} sourceId={source.id} transcript={transcript} />}
+          <ApiState key={transcriptRevision} load={loadTranscriptData}>
+            {({ transcript, quality }) => <TranscriptViewer onSeek={seekTo} onUpdated={() => setTranscriptRevision((value) => value + 1)} quality={quality} sourceId={source.id} transcript={transcript} />}
           </ApiState>
         </>
       )}

@@ -19,6 +19,15 @@ export type PipelineStage =
   | "READY_FOR_ANALYSIS"
   | "FAILED";
 export type JobStatus = "QUEUED" | "RUNNING" | "SUCCEEDED" | "FAILED" | "CANCELLED";
+export type ProviderAvailability = "AVAILABLE" | "UNAVAILABLE" | "MISCONFIGURED";
+export type ReconstructionStatus =
+  | "NOT_REQUIRED"
+  | "APPLIED"
+  | "UNCHANGED_HIGH_CONFIDENCE"
+  | "LOW_CONFIDENCE_UNRESOLVED"
+  | "PROVIDER_UNAVAILABLE"
+  | "FAILED"
+  | "MANUAL_OVERRIDE";
 
 export interface Source {
   id: string;
@@ -69,6 +78,16 @@ export interface TranscriptSegment {
   reconstruction_confidence?: number;
   reconstruction_confidence_level?: "HIGH" | "MEDIUM" | "LOW";
   reconstruction_quality_flags?: string[];
+  reconstruction_status?: ReconstructionStatus;
+  reconstruction_method?: string;
+  routing_score?: number | null;
+  routing_reasons?: string[];
+  focus_spans?: Array<{
+    word: string;
+    start: number | null;
+    end: number | null;
+    probability: number | null;
+  }>;
   avg_logprob?: number | null;
   no_speech_prob?: number | null;
 }
@@ -77,6 +96,8 @@ export interface Transcript {
   source_video_id: string;
   language: string | null;
   detected_language_probability: number | null;
+  whisper_model: string;
+  transcription_options: Record<string, unknown>;
   raw_text: string;
   normalized_text: string;
   corrected_text?: string;
@@ -95,8 +116,23 @@ export interface Transcript {
   reconstruction_version?: string;
   reconstruction_processing_duration?: number | null;
   reconstruction_metadata?: Record<string, unknown>;
+  reconstruction_status: ReconstructionStatus;
   segments: TranscriptSegment[];
   duration: number;
+}
+
+export interface QualityMetrics {
+  audio_quality_score: number;
+  transcript_quality_score: number;
+  low_confidence_word_ratio: number;
+  unresolved_segment_ratio: number;
+  manual_review_required: boolean;
+  conservative_source_floor: number;
+}
+
+export interface QualityResponse {
+  reconstruction_status: ReconstructionStatus | null;
+  quality: QualityMetrics | null;
 }
 
 type Fetcher = typeof fetch;
@@ -127,6 +163,12 @@ export function createApiClient(baseUrl: string, fetcher: Fetcher = fetch) {
       `${baseUrl.replace(/\/$/, "")}/api/sources/${encodeURIComponent(id)}/media`,
     getTranscript: (id: string) =>
       request<Transcript>(`/api/sources/${encodeURIComponent(id)}/transcript`),
+    getQuality: (id: string) =>
+      request<QualityResponse>(`/api/sources/${encodeURIComponent(id)}/quality`),
+    retranscribeTranscript: (id: string, force = true) =>
+      request<Job>(`/api/sources/${encodeURIComponent(id)}/retranscribe?force=${force}`, {
+        method: "POST"
+      }),
     reconstructTranscript: (id: string, force = false) =>
       request<Job>(`/api/sources/${encodeURIComponent(id)}/reconstruct?force=${force}`, {
         method: "POST"

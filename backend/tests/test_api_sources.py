@@ -12,9 +12,9 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
 from app.api.app import CeleryDispatcher, create_app
-from app.core.enums import PipelineStage, RightsStatus
+from app.core.enums import PipelineStage, ReconstructionStatus, RightsStatus
 from app.db.base import Base
-from app.models import SourceVideo, Transcript
+from app.models import SourceQualityAssessment, SourceVideo, Transcript
 from app.services.storage import StorageService
 
 
@@ -431,3 +431,83 @@ def test_retranscribe_queues_a_transcription_job(
         )
         assert transcript is not None
         assert transcript.input_fingerprint == "cached"
+
+
+def test_quality_exposes_degraded_reconstruction_and_split_scores(
+    client: tuple[TestClient, RecordingDispatcher],
+) -> None:
+    test_client, _ = client
+    factory = test_client.app.state.session_factory
+    with factory() as session:
+        source = SourceVideo(source_uri="/imports/degraded.mp4")
+        session.add(source)
+        session.flush()
+        session.add_all(
+            [
+                Transcript(
+                    source_video_id=source.id,
+                    whisper_model="large-v3-turbo",
+                    input_fingerprint="q" * 64,
+                    raw_text="دقل",
+                    normalized_text="دقل",
+                    corrected_text="دقل",
+                    final_text="دقل",
+                    reconstruction_status=ReconstructionStatus.PROVIDER_UNAVAILABLE,
+                    reconstruction_metadata={
+                        "provider_availability": "UNAVAILABLE",
+                        "model": "qwen3:8b",
+                        "api_key": "must-not-leak",
+                    },
+                    segments=[],
+                    word_segments=[],
+                ),
+                SourceQualityAssessment(
+                    source_video_id=source.id,
+                    audio_quality_score=0.985,
+                    transcript_quality_score=0.4,
+                    low_confidence_word_ratio=0.2,
+                    unresolved_segment_ratio=0.5,
+                    manual_review_required=True,
+                    overall_source_quality_score=0.4,
+                ),
+            ]
+        )
+        session.commit()
+        source_id = source.id
+
+    response = test_client.get(f"/api/sources/{source_id}/quality")
+
+    assert response.status_code == 200
+    assert response.json()["reconstruction_status"] == "PROVIDER_UNAVAILABLE"
+    assert response.json()["quality"] == {
+        "audio_quality_score": 0.985,
+        "transcript_quality_score": 0.4,
+        "low_confidence_word_ratio": 0.2,
+        "unresolved_segment_ratio": 0.5,
+        "manual_review_required": True,
+        "conservative_source_floor": 0.4,
+    }
+    transcript_response = test_client.get(f"/api/sources/{source_id}/transcript").json()
+    assert transcript_response["reconstruction_metadata"]["provider_health"] == {
+        "availability": "UNAVAILABLE",
+        "model": "qwen3:8b",
+        "model_digest": None,
+    }
+    assert transcript_response["reconstruction_metadata"]["reconstruction_status"] == (
+        "PROVIDER_UNAVAILABLE"
+    )
+    assert "api_key" not in transcript_response["reconstruction_metadata"]
+
+
+def test_quality_is_null_until_assessment_exists(
+    client: tuple[TestClient, RecordingDispatcher],
+) -> None:
+    test_client, _ = client
+    source = test_client.post(
+        "/sources/upload", files={"file": ("pending.mp4", b"video")}
+    ).json()
+
+    response = test_client.get(f"/api/sources/{source['id']}/quality")
+
+    assert response.status_code == 200
+    assert response.json() == {"reconstruction_status": None, "quality": None}

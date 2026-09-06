@@ -21,7 +21,13 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.core.enums import JobKind, JobStatus, PipelineStage, ReconstructionStatus, RightsStatus
 from app.core.settings import get_settings
 from app.db.session import create_session_factory
-from app.models import ProcessingJob, SourceVideo, Transcript, TranscriptChunk
+from app.models import (
+    ProcessingJob,
+    SourceQualityAssessment,
+    SourceVideo,
+    Transcript,
+    TranscriptChunk,
+)
 from app.services.health import CheckStatus, HealthService
 from app.services.source_adapters import SourceValidationError, normalize_source_url
 from app.services.storage import StorageCategory, StorageService
@@ -112,6 +118,20 @@ class TranscriptResponse(BaseModel):
     word_segments: list[dict[str, object]]
     duration: float
     processing_duration: float | None
+
+
+class QualityMetricsResponse(BaseModel):
+    audio_quality_score: float
+    transcript_quality_score: float
+    low_confidence_word_ratio: float
+    unresolved_segment_ratio: float
+    manual_review_required: bool
+    conservative_source_floor: float
+
+
+class QualityResponse(BaseModel):
+    reconstruction_status: ReconstructionStatus | None
+    quality: QualityMetricsResponse | None
 
 
 class TranscriptSearchResponse(BaseModel):
@@ -251,6 +271,18 @@ def create_app(
     def get_transcript(source_id: UUID, database: Session = Depends(session)) -> TranscriptResponse:
         transcript = _transcript_or_404(database, source_id)
         return _transcript_response(transcript)
+
+    @app.get("/api/sources/{source_id}/quality", response_model=QualityResponse)
+    def get_source_quality(
+        source_id: UUID, database: Session = Depends(session)
+    ) -> QualityResponse:
+        source = _source_or_404(database, source_id)
+        transcript = source.transcript
+        assessment = source.quality_assessment
+        return QualityResponse(
+            reconstruction_status=(transcript.reconstruction_status if transcript else None),
+            quality=_quality_metrics_response(assessment) if assessment else None,
+        )
 
     @app.get("/api/sources/{source_id}/media")
     def get_source_media(source_id: UUID, database: Session = Depends(session)) -> FileResponse:
@@ -516,13 +548,57 @@ def _transcript_response(transcript: Transcript) -> TranscriptResponse:
         reconstruction_method=transcript.reconstruction_method,
         reconstruction_version=transcript.reconstruction_version,
         reconstruction_processing_duration=transcript.reconstruction_processing_duration,
-        reconstruction_metadata=transcript.reconstruction_metadata,
+        reconstruction_metadata=_public_reconstruction_metadata(transcript),
         reconstruction_status=transcript.reconstruction_status,
         segments=transcript.segments,
         word_segments=transcript.word_segments,
         duration=transcript.duration,
         processing_duration=transcript.processing_duration,
     )
+
+
+def _quality_metrics_response(
+    assessment: SourceQualityAssessment,
+) -> QualityMetricsResponse:
+    return QualityMetricsResponse(
+        audio_quality_score=assessment.audio_quality_score,
+        transcript_quality_score=assessment.transcript_quality_score,
+        low_confidence_word_ratio=assessment.low_confidence_word_ratio,
+        unresolved_segment_ratio=assessment.unresolved_segment_ratio,
+        manual_review_required=assessment.manual_review_required,
+        conservative_source_floor=assessment.overall_source_quality_score,
+    )
+
+
+def _public_reconstruction_metadata(transcript: Transcript) -> dict[str, object]:
+    metadata = _without_secrets(transcript.reconstruction_metadata)
+    availability = metadata.get("provider_availability")
+    if availability is None and transcript.reconstruction_status is ReconstructionStatus.PROVIDER_UNAVAILABLE:
+        availability = "UNAVAILABLE"
+    metadata["reconstruction_status"] = transcript.reconstruction_status.value
+    metadata["provider_health"] = {
+        "availability": availability or "UNKNOWN",
+        "model": metadata.get("model"),
+        "model_digest": metadata.get("model_digest"),
+    }
+    return metadata
+
+
+def _without_secrets(metadata: dict[str, object]) -> dict[str, object]:
+    sensitive_fragments = ("api_key", "authorization", "password", "secret", "token")
+    return {
+        key: _public_metadata_value(value)
+        for key, value in metadata.items()
+        if not any(fragment in key.casefold() for fragment in sensitive_fragments)
+    }
+
+
+def _public_metadata_value(value: object) -> object:
+    if isinstance(value, dict):
+        return _without_secrets({str(key): item for key, item in value.items()})
+    if isinstance(value, list):
+        return [_public_metadata_value(item) for item in value]
+    return value
 
 
 def _job_or_404(database: Session, job_id: UUID) -> ProcessingJob:
