@@ -54,8 +54,9 @@ class ContextualReconstructor:
         result: ReconstructionResult = ReconstructionResult((), "", fingerprint)
         try:
             health = self._provider.health()
+            provider_method = f"{health.provider}:{health.model or 'unknown'}"
             if health.availability.value != "AVAILABLE":
-                results = tuple(self._fallback(index, segment, provider_error=True, status=ReconstructionStatus.PROVIDER_UNAVAILABLE, method=f"{health.provider}:{health.model or 'unknown'}") for index, segment in enumerate(segments))
+                results = tuple(self._fallback(index, segment, provider_error=True, status=ReconstructionStatus.PROVIDER_UNAVAILABLE, method=provider_method) for index, segment in enumerate(segments))
                 result = ReconstructionResult(results, _joined(results), fingerprint)
                 return result
             memory = build_entity_memory(segments)
@@ -84,7 +85,7 @@ class ContextualReconstructor:
             )
             memory = build_entity_memory(segments)
             results = tuple(
-                self._decide(index, segment, generated[index], resolved[index], memory)
+                self._decide(index, segment, generated[index], resolved[index], memory, provider_method)
                 for index, segment in enumerate(segments)
             )
             result = ReconstructionResult(results, _joined(results), fingerprint)
@@ -125,9 +126,15 @@ class ContextualReconstructor:
         generated: list[ReconstructionCandidate],
         choice: ResolutionChoice,
         memory: SourceEntityMemory,
+        provider_method: str = "provider:unknown",
     ) -> SegmentReconstruction:
         raw = str(segment.get("raw_text", segment.get("text", "")))
         corrected = str(segment.get("corrected_text", raw))
+        operator_text = segment.get("operator_text")
+        if operator_text:
+            return SegmentReconstruction(index, raw, corrected, str(operator_text), None, False,
+                1.0, ConfidenceLevel.HIGH, (), ReconstructionStatus.MANUAL_OVERRIDE,
+                reconstruction_method="operator:manual")
         candidate = next(
             (
                 item
@@ -146,7 +153,8 @@ class ContextualReconstructor:
             return SegmentReconstruction(index, raw, corrected, corrected, candidate.text, False, 0.0,
                 ConfidenceLevel.LOW, (QualityFlag.LOW_CONFIDENCE_UNRESOLVED,), ReconstructionStatus.LOW_CONFIDENCE_UNRESOLVED,
                 routing_score=routing.evidence.score, routing_reasons=(routing.reason,), focus_spans=routing.focus_spans,
-                validated_changes=candidate.changes, candidate_id=candidate.candidate_id)
+                validated_changes=candidate.changes, candidate_id=candidate.candidate_id,
+                reconstruction_method=provider_method)
         decision = decide_candidate(
             phonetic_similarity=validation.phonetic_similarity,
             resolution=choice.scores,
@@ -169,7 +177,7 @@ class ContextualReconstructor:
             decision.level,
             flags, status, routing_score=routing.evidence.score, routing_reasons=(routing.reason,),
             focus_spans=routing.focus_spans, validated_changes=candidate.changes,
-            reconstruction_method=f"provider:{getattr(self._provider, 'model', 'unknown')}",
+            reconstruction_method=provider_method,
             candidate_id=candidate.candidate_id, confidence_margin=choice.margin,
         )
 

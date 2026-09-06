@@ -19,7 +19,7 @@ class HighConfidenceProvider:
         self.release_calls = 0
 
     def health(self) -> ProviderHealth:
-        return ProviderHealth(ProviderAvailability.AVAILABLE, "test", "test", "sha256:x", "ok")
+        return ProviderHealth(ProviderAvailability.AVAILABLE, "ollama", "qwen3:8b", "sha256:x", "ok")
 
     def release(self) -> None:
         self.release_calls += 1
@@ -65,6 +65,16 @@ def test_reconstructor_applies_only_high_contextual_candidate() -> None:
     assert segment.applied is True
     assert result.contextual_reconstructed_text == "ضخمة"
     assert provider.release_calls == 1
+    assert segment.reconstruction_method == "ollama:qwen3:8b"
+
+
+def test_operator_text_precedes_provider_candidate_and_is_manual_override() -> None:
+    result = ContextualReconstructor(HighConfidenceProvider()).reconstruct(
+        [{"start": 0.0, "end": 1.0, "text": "دخم", "corrected_text": "دخم", "operator_text": "يدوي"}],
+        language="ar", transcription_fingerprint="asr-v1", correction_version="egyptian-ar-v1",
+    )
+    assert result.segments[0].contextual_reconstructed_text == "يدوي"
+    assert result.segments[0].status.value == "MANUAL_OVERRIDE"
 
 
 def test_reconstructor_preserves_result_when_release_fails_after_success() -> None:

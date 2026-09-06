@@ -32,3 +32,16 @@ with phonetic similarities `0.9357142857142857`, `0.8543478260869566`, and
 `0.91` respectively.
 
 Commit: `726a24f` (`Apply contextual multi-word reconstruction`)
+
+## Follow-up review fixes
+
+Added regressions for operator precedence and provider identity metadata. RED
+showed provider output replacing operator text and reported `provider:unknown`
+metadata. After the service fix, the focused suite passed:
+
+```text
+..................                                                       [100%]
+18 passed, 1 warning in 1.70s
+```
+
+Follow-up commit: `e03b7fb` (`Fix reconstruction audit metadata precedence`).
