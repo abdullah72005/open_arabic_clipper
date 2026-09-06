@@ -26,6 +26,16 @@ class WindowSegment:
     raw_text: str
     corrected_text: str
     acoustic: AcousticEvidence
+    previous_context: str = ""
+    following_context: str = ""
+    word_evidence: tuple["WordEvidence", ...] = ()
+
+@dataclass(frozen=True)
+class WordEvidence:
+    text: str
+    start: float | None = None
+    end: float | None = None
+    probability: float | None = None
 
 
 @dataclass(frozen=True)

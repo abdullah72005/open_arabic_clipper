@@ -10,6 +10,7 @@ from app.transcription.reconstruction.types import (
     AcousticEvidence,
     ReconstructionWindow,
     WindowSegment,
+    WordEvidence,
 )
 
 
@@ -109,6 +110,7 @@ def _window_segment(segments: Sequence[Mapping[str, object]], index: int) -> Win
         raw_text=raw_text,
         corrected_text=str(segment.get("corrected_text", raw_text)),
         acoustic=acoustic_evidence(segment),
+        word_evidence=tuple(WordEvidence(str(word.get("word", "")), _number(word.get("start")), _number(word.get("end")), _number(word.get("probability"))) for word in _words(segment)),
     )
 
 
