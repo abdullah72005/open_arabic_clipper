@@ -141,8 +141,14 @@ or changing Whisper decoding defaults.
 Stage 2.7 readiness requires a private manifest inside storage-owned
 `benchmarks/`, with no transcript bodies committed to the repository. Run
 `python -m app.cli benchmark-reconstruction stage-2-7/unseen-test-v1.json`.
-Only its aggregate report and acceptance result are printed; until the strict
-unseen-audio gate passes, the status is `STAGE 2.7 MUST CONTINUE`.
+The runner executes raw `large-v3-turbo` ASR, Stage 2.5, then Stage 2.7 through
+the configured live provider, writes a JSONL comparison, a human-review
+worksheet, and an aggregate report under `storage/benchmarks/stage-2-7/results/`,
+and prints only aggregate metrics and storage-owned artifact paths. Use
+`--model` to compare an alternate configured model and
+`--allow-known-regression-set` only for the Chernobyl diagnostic run, which can
+never pass the unseen readiness gate. Until the strict unseen-audio gate passes,
+the status is `STAGE 2.7 MUST CONTINUE`.
 
 See [Stage 2.7 operations](docs/STAGE_2_7_OPERATIONS.md) for the persisted
 status contract and operator troubleshooting notes.

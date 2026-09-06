@@ -1,4 +1,4 @@
-# Stage 1, Stage 2, and Stage 2.5 pipeline
+# Stage 1, Stage 2, Stage 2.5, and Stage 2.7 pipeline
 
 1. An operator submits a permitted public URL or uploads a local file.
 2. The API creates a durable source and queued ingest job.
@@ -9,15 +9,20 @@
 6. Raw source/segment text, segment ordering, timestamps, and word timestamps are persisted.
 7. Stage 2.5 derives conservative contextual Egyptian correction into separate
    corrected/final fields. It never realigns audio or overwrites raw evidence.
-8. Timestamp-aware chunks use final operator text when present, otherwise
-   corrected text; silence/quality signals are persisted.
-9. The source reaches `READY_FOR_ANALYSIS`.
+8. Stage 2.7 derives bounded contextual reconstruction through the managed local
+   Ollama provider. It preserves raw text, segment timestamps, and word
+   timestamps; it never creates, removes, merges, splits, or retimes segments.
+9. Timestamp-aware chunks use final operator text when present, otherwise
+   corrected text; silence/quality signals are persisted separately.
+10. The source reaches `READY_FOR_ANALYSIS`.
 
-Each stage is persisted and idempotent. Completed stages are skipped on resume;
-failures retain job and pipeline error data for an operator retry. Unknown
-rights are allowed through local ingest/probe only. Any future candidate
-generation, rendering, or publishing must first pass an explicit authorization
-policy; it must reject `UNKNOWN` rights by default.
+Each stage is persisted and idempotent. Stage runs persist canonical input and
+output fingerprints; a changed upstream evidence reruns downstream derived
+stages. Completed stages are skipped on resume; failures retain job and pipeline
+error data for an operator retry. Unknown rights are allowed through local
+ingest/probe only. Any future candidate generation, rendering, or publishing
+must first pass an explicit authorization policy; it must reject `UNKNOWN`
+rights by default.
 
 Correction uses at most two neighboring segments on either side, but emits one
 result per target segment only. Default operation is the local versioned lexicon.
@@ -25,3 +30,8 @@ An optional configured OpenAI-compatible local provider receives bounded batches
 with stable IDs and may only approve a declared lexicon candidate; invalid,
 missing, unsafe, or low-confidence output falls back to raw/lexicon text. Manual
 operator text is feedback data only and does not train a model online.
+
+Reconstruction defaults to the managed local Ollama provider (`qwen3:8b`) with
+routing-driven, schema-validated two-pass candidates and per-candidate scores.
+An unavailable or misconfigured provider persists a truthful status and leaves
+Stage 2.5 final; it never blocks `READY_FOR_ANALYSIS`.

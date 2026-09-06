@@ -17,6 +17,7 @@ the application remains portable and config-driven.
 | Git | 2.34.1 |
 | Free disk | 259 GiB free on the mounted Windows volume (952 GiB total) |
 | Network | HTTPS checks to PyPI and npm registry succeeded |
+| Ollama | `ollama/ollama` runs under the `reconstruction` profile; `qwen3:8b` pulled with digest `500a1f067a9f…b41` |
 
 ## Development implications
 
@@ -24,3 +25,10 @@ The Docker services use Python 3.12 and install FFmpeg, so they are the
 supported path on this machine. Native execution is still supported after the
 operator installs Python 3.12+ and FFmpeg/ffprobe. CPU-only operation is the
 default; later GPU acceleration is an optional enhancement.
+
+The 7.4 GiB RAM limit makes the provisional `qwen3:8b` reconstruction model
+infeasible for the live pipeline benchmark: loading it (~5.5 GiB) alongside
+faster-whisper and the running services triggers an out-of-memory kill.
+`qwen3.5:4b` (~3.4 GiB) loads but did not apply a reconstruction during the
+diagnostic because its unbatched request exceeded the model context; see
+`docs/BENCHMARKS.md` for measured results.

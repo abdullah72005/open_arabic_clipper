@@ -52,22 +52,37 @@ raw until an operator adds and benchmarks a reviewed lexicon entry.
 
 ## Stage 2.7 contextual reconstruction gate
 
-No Stage 2.7 quality or performance value has been recorded yet. Fixture tests
-exercise safety and regressions only; they cannot prove real Egyptian-audio
-improvement. A private, operator-authorized unseen test manifest must contain at
-least five non-overlapping clips totaling two to five minutes, across three
-topics and two recordings, including slang, fast speech, code switching,
-entities, and narrative speech. Every evaluated segment requires a frozen human
-reference and review label.
+The private runner (`python -m app.cli benchmark-reconstruction`) executes raw
+`large-v3-turbo` ASR, Stage 2.5 correction, then Stage 2.7 through the managed
+local Ollama provider, and writes a JSONL comparison, a human-review worksheet,
+and an aggregate report under `storage/benchmarks/stage-2-7/results/<run-id>/`.
+It prints only aggregate metrics and storage-owned artifact paths.
 
-Store that manifest below the storage service `benchmarks/` category and run:
+On 2026-09-06 the known Chernobyl diagnostic (source
+`37c14f55-eacb-4d9f-8775-47a721cba5a9`, first 30 seconds, the three
+operator-supplied failure phrases with their reviewed expected forms) was run
+with `--allow-known-regression-set` against two models:
 
-```bash
-python -m app.cli benchmark-reconstruction stage-2-7/unseen-test-v1.json
-```
+| Model | Model digest | Wall time | Peak process RAM | Result |
+| --- | --- | ---: | ---: | --- |
+| qwen3:8b | `500a1f067a9f…b41` | 163.4 s | 2.16 GiB | infeasible: `llama-server` killed (`signal: killed`) while loading ~5.5 GiB into 7.4 GiB RAM |
+| qwen3.5:4b | `2a654d98e6fb…eefd` | 212.6 s | 2.18 GiB | loaded in 52.97 s, but no reconstruction applied |
 
-The command prints only aggregate metrics and fails readiness unless it records
-the provider model identifier/digest, a 10-point semantic lift, 25% improvement
-of Stage 2.5-wrong segments, no more than 2% regression, 98% preservation, zero
-hallucinations, and non-decreasing category comprehensibility. Until measured
-evidence meets all bounds, Stage 2.7 remains open.
+The machine (Core Ultra 9 185H, 7.4 GiB RAM, 2 GiB swap, CPU-only) cannot hold
+`qwen3:8b` alongside the Whisper pipeline and services; the model load was
+out-of-memory killed. `qwen3.5:4b` loads, but its generation prompt reached
+46,587 tokens and was truncated by Ollama to 2,050 tokens (the configured
+two-pass reconstruction sends the full window evidence in one request), so the
+reconstruction produced no accepted change and Stage 2.5 stayed final. Raw ASR
+and Stage 2.5 completed for both runs; the three known multi-word errors
+remained unchanged.
+
+These are regression diagnostics only. The model comparison and the strict
+unseen-audio acceptance set (at least five non-overlapping clips, two to five
+minutes, three topics, two recordings, with human-reviewed references) remain
+open work, and a known diagnostic run is never counted as unseen readiness.
+
+The runner's safety gates reject unreviewed, unauthorized, or out-of-storage
+inputs; a known regression set can run but can never pass the unseen readiness
+gate. Until a feasible model and a completed unseen-audio evaluation pass every
+gate, Stage 2.7 remains open.

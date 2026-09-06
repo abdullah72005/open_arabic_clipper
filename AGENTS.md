@@ -3,9 +3,10 @@
 ## Product and stage
 
 - Product name: `open_arabic_clipper` (working product label: ClipFactory).
-- Current scope: Stage 2.5 — local-first ingest/probe, cached audio,
+- Current scope: Stage 2.7 — local-first ingest/probe, cached audio,
   faster-whisper transcription, conservative contextual Egyptian correction,
-  storage, jobs, dashboard, and operational tooling through `READY_FOR_ANALYSIS`.
+  bounded contextual reconstruction through a managed local provider, storage,
+  jobs, dashboard, and operational tooling through `READY_FOR_ANALYSIS`.
 - Explicitly out of scope until later stages: Stage 3 AI clip selection,
   advanced rendering/reframing, social publishing, and automatic authorization.
 - Process only media the operator owns or is authorized to process. Never add
@@ -21,8 +22,10 @@
 - The storage service is the sole owner of application filesystem paths.
 - Pipeline stages are persisted, idempotent, retryable, and resumable. Stage 2.5
   preserves raw ASR text/timestamps and derives correction/final fields without
-  realignment. Rights/provenance are tracked throughout the pipeline but do not
-  block local analysis; publishing eligibility is evaluated separately.
+  realignment. Stage 2.7 preserves raw ASR text, segment timestamps, and word
+  timestamps and derives reconstruction fields through a managed local provider.
+  Rights/provenance are tracked throughout the pipeline but do not block local
+  analysis; publishing eligibility is evaluated separately.
 
 ## Local development facts (not product requirements)
 

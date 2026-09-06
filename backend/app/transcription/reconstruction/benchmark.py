@@ -54,14 +54,6 @@ class Reconstructor(Protocol):
 
 _MANIFEST_VERSION = "stage-2-7-private-v1"
 _REQUIRED_CATEGORIES = {"slang", "fast_speech", "code_switching", "entities", "narrative"}
-_COMPARISON_STATUSES = (
-    "improved",
-    "unchanged_correct",
-    "unchanged_wrong",
-    "regressed",
-    "hallucinated",
-    "unresolved",
-)
 _SWAP_INFEASIBLE_BYTES = 1024**3
 
 
