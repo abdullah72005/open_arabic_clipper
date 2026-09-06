@@ -56,13 +56,13 @@ class PipelineRunner:
             error = StageExecutionError(f"no executor registered for stage {stage.value}")
             raise error
         input_fingerprint = _input_fingerprint(executor, source)
-        legacy_executor = not hasattr(executor, "input_fingerprint")
         run = self._latest_run(source.id, stage)
         if (
             not force
             and run is not None
             and run.status is PipelineRunStatus.SUCCEEDED
-            and (legacy_executor or (input_fingerprint and run.input_fingerprint == input_fingerprint))
+            and input_fingerprint
+            and run.input_fingerprint == input_fingerprint
         ):
             return PipelineResult(run.id, job_id, skipped=True)
 

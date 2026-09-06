@@ -15,3 +15,7 @@ Canonical fingerprints, persisted run input/output fingerprints, force propagati
 ## Commit
 
 Commit: `7bb2331a805d9700d5c867c01c3d3e08999ed8d7`
+
+## Follow-up
+
+Removed the legacy executor skip fallback and added canonical input/output fingerprints to ingest, probe, and audio-extraction executors. Regression coverage: `test_pipeline_fingerprints.py` — 3 passed. The historical pre-fingerprint test in the older `test_pipeline.py` intentionally now fails because NULL input fingerprints must rerun once.

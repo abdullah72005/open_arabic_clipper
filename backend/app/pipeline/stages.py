@@ -142,14 +142,19 @@ class IngestExecutor:
             StorageService(settings.storage_root), egress_proxy=settings.url_egress_proxy
         )
 
-    def execute(self, source: SourceVideo) -> SourceVideo:
+    def input_fingerprint(self, source: SourceVideo) -> str:
+        return canonical_fingerprint("ingest-input", "1", {"source_uri": source.source_uri or ""})
+
+    def execute(self, source: SourceVideo, *, force: bool = False) -> StageExecutionResult:
         if not source.source_uri:
             raise StageExecutionError("source URI is missing")
         if source.source_uri.startswith(("http://", "https://")):
             acquired = self._url_adapter.acquire(source.id, source.source_uri)
             source.source_uri = str(acquired.path)
             source.original_filename = acquired.original_filename
-        return source
+        return StageExecutionResult(canonical_fingerprint("ingest-output", "1", {
+            "source_uri": source.source_uri or "", "original_filename": source.original_filename or "",
+        }), source)
 
 
 class ProbeExecutor:
@@ -158,12 +163,16 @@ class ProbeExecutor:
     def __init__(self, probe: FFprobe) -> None:
         self._probe = probe
 
-    def execute(self, source: SourceVideo) -> MediaMetadata:
+    def input_fingerprint(self, source: SourceVideo) -> str:
+        return canonical_fingerprint("probe-input", "1", {"source_uri": source.source_uri or "", "content_hash": source.content_hash or ""})
+
+    def execute(self, source: SourceVideo, *, force: bool = False) -> StageExecutionResult:
         source_path = Path(source.source_uri)
         if not source_path.is_file():
             raise StageExecutionError("source media file is unavailable for probing")
         try:
-            return self._probe.probe(source_path)
+            metadata = self._probe.probe(source_path)
+            return StageExecutionResult(canonical_fingerprint("probe-output", "1", {"metadata": metadata.__dict__}), metadata)
         except Exception as error:
             raise StageExecutionError("ffprobe failed to validate source media") from error
 
@@ -174,8 +183,14 @@ class AudioExtractionExecutor:
     def __init__(self, extractor: AudioExtractor) -> None:
         self._extractor = extractor
 
-    def execute(self, source: SourceVideo) -> AudioArtifact:
-        return self._extractor.extract(source)
+    def input_fingerprint(self, source: SourceVideo) -> str:
+        return canonical_fingerprint("audio-extraction-input", "1", {"source_uri": source.source_uri or "", "content_hash": source.content_hash or ""})
+
+    def execute(self, source: SourceVideo, *, force: bool = False) -> StageExecutionResult:
+        artifact = self._extractor.extract(source)
+        return StageExecutionResult(canonical_fingerprint("audio-extraction-output", "1", {
+            "content_hash": artifact.content_hash, "output_path": artifact.output_path,
+        }), artifact)
 
 
 class TranscriptNormalizationExecutor:
