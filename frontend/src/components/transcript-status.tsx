@@ -1,3 +1,4 @@
+import React from "react";
 import type { QualityResponse, ReconstructionStatus, Transcript } from "@/lib/api-client";
 
 const statusLabels: Record<ReconstructionStatus, string> = {

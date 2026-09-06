@@ -1,3 +1,4 @@
+import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 
@@ -42,8 +43,8 @@ describe("TranscriptStatus", () => {
     );
 
     expect(markup).toContain("Reconstruction unavailable");
-    expect(markup).toContain("Transcript quality 40%");
-    expect(markup).toContain("Audio quality 99%");
+    expect(markup).toContain("Transcript quality</dt><dd>40%");
+    expect(markup).toContain("Audio quality</dt><dd>99%");
     expect(markup).toContain("Manual review required");
   });
 
