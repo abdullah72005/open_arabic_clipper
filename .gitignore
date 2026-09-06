@@ -18,3 +18,5 @@ storage/temp/*
 !storage/temp/.gitkeep
 storage/quarantine/*
 !storage/quarantine/.gitkeep
+storage/benchmarks/*
+!storage/benchmarks/.gitkeep
