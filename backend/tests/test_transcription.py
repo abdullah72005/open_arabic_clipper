@@ -411,6 +411,7 @@ def test_benchmark_reports_actual_transcription_throughput(tmp_path: Path) -> No
 
 
 def test_ingest_and_probe_executors_validate_local_source(tmp_path: Path) -> None:
+    from app.media.ffprobe import MediaMetadata
     from app.models import SourceVideo
     from app.pipeline.stages import IngestExecutor, ProbeExecutor
 
@@ -422,13 +423,21 @@ def test_ingest_and_probe_executors_validate_local_source(tmp_path: Path) -> Non
         def __init__(self) -> None:
             self.paths: list[Path] = []
 
-        def probe(self, path: Path) -> object:
+        def probe(self, path: Path) -> MediaMetadata:
             self.paths.append(path)
-            return object()
+            return MediaMetadata(
+                duration_seconds=1.0,
+                video_codec="h264",
+                width=16,
+                height=16,
+                frames_per_second=30.0,
+                audio_codec="aac",
+                audio_sample_rate=44100,
+            )
 
     probe = RecordingProbe()
-    assert IngestExecutor().execute(source) is source
-    assert ProbeExecutor(probe).execute(source) is not None
+    assert IngestExecutor().execute(source).value is source
+    assert ProbeExecutor(probe).execute(source).value is not None  # type: ignore[arg-type]
     assert probe.paths == [source_path]
 
 

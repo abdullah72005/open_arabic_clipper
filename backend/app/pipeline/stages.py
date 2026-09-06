@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import subprocess
 from collections.abc import Callable
+from dataclasses import asdict
 from pathlib import Path
 from time import monotonic
 
@@ -172,7 +173,10 @@ class ProbeExecutor:
             raise StageExecutionError("source media file is unavailable for probing")
         try:
             metadata = self._probe.probe(source_path)
-            return StageExecutionResult(canonical_fingerprint("probe-output", "1", {"metadata": metadata.__dict__}), metadata)
+            return StageExecutionResult(
+                canonical_fingerprint("probe-output", "1", {"metadata": asdict(metadata)}),
+                metadata,
+            )
         except Exception as error:
             raise StageExecutionError("ffprobe failed to validate source media") from error
 
