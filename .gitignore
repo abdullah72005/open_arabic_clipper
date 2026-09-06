@@ -6,6 +6,7 @@ __pycache__/
 coverage.xml
 .mypy_cache/
 .ruff_cache/
+.worktrees/
 backend/.coverage
 frontend/node_modules/
 frontend/.next/
