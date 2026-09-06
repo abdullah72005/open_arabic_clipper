@@ -5,9 +5,21 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 from uuid import UUID
 
-from sqlalchemy import JSON, DateTime, Float, ForeignKey, String, Text, func
+from sqlalchemy import (
+    JSON,
+    CheckConstraint,
+    DateTime,
+    Enum,
+    Float,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    func,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
+from app.core.enums import ReconstructionStatus
 from app.db.base import Base
 
 if TYPE_CHECKING:
@@ -19,6 +31,12 @@ class Transcript(Base):
     """Current reusable timestamped transcript for a source."""
 
     __tablename__ = "transcripts"
+    __table_args__ = (
+        CheckConstraint(
+            "transcription_revision >= 0",
+            name="ck_transcripts_transcription_revision_nonnegative",
+        ),
+    )
 
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
     source_video_id: Mapped[UUID] = mapped_column(
@@ -29,6 +47,23 @@ class Transcript(Base):
     whisper_model: Mapped[str] = mapped_column(String(64))
     transcription_options: Mapped[dict[str, object]] = mapped_column(JSON, default=dict)
     input_fingerprint: Mapped[str] = mapped_column(String(64), index=True)
+    transcription_revision: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    normalization_fingerprint: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="", server_default=""
+    )
+    reconstruction_status: Mapped[ReconstructionStatus] = mapped_column(
+        Enum(
+            ReconstructionStatus,
+            name="reconstruction_status",
+            native_enum=False,
+            create_constraint=True,
+        ),
+        nullable=False,
+        default=ReconstructionStatus.NOT_REQUIRED,
+        server_default=ReconstructionStatus.NOT_REQUIRED.value,
+    )
     raw_text: Mapped[str] = mapped_column(Text, default="")
     normalized_text: Mapped[str] = mapped_column(Text, default="")
     corrected_text: Mapped[str] = mapped_column(Text, default="")

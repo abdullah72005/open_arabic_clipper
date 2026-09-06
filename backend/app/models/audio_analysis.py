@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 from uuid import UUID
 
-from sqlalchemy import JSON, DateTime, Float, ForeignKey, func
+from sqlalchemy import JSON, DateTime, Float, ForeignKey, String, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
@@ -24,6 +24,9 @@ class AudioAnalysis(Base):
         ForeignKey("source_videos.id", ondelete="CASCADE"), unique=True, index=True
     )
     audio_hash: Mapped[str] = mapped_column(index=True)
+    input_fingerprint: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="", server_default=""
+    )
     silence_intervals: Mapped[list[dict[str, float]]] = mapped_column(JSON, default=list)
     features: Mapped[list[dict[str, float]]] = mapped_column(JSON, default=list)
     silence_ratio: Mapped[float] = mapped_column(Float, default=0)

@@ -55,3 +55,23 @@ class PipelineRunStatus(str, Enum):
     SUCCEEDED = "SUCCEEDED"
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
+
+
+class ProviderAvailability(str, Enum):
+    """Whether an optional reconstruction provider can serve requests."""
+
+    AVAILABLE = "AVAILABLE"
+    UNAVAILABLE = "UNAVAILABLE"
+    MISCONFIGURED = "MISCONFIGURED"
+
+
+class ReconstructionStatus(str, Enum):
+    """Truthful outcome of contextual transcript reconstruction."""
+
+    NOT_REQUIRED = "NOT_REQUIRED"
+    APPLIED = "APPLIED"
+    UNCHANGED_HIGH_CONFIDENCE = "UNCHANGED_HIGH_CONFIDENCE"
+    LOW_CONFIDENCE_UNRESOLVED = "LOW_CONFIDENCE_UNRESOLVED"
+    PROVIDER_UNAVAILABLE = "PROVIDER_UNAVAILABLE"
+    FAILED = "FAILED"
+    MANUAL_OVERRIDE = "MANUAL_OVERRIDE"
