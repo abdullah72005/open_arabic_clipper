@@ -178,6 +178,7 @@ def quality_input_fingerprint(transcript: Transcript, analysis: AudioAnalysis) -
                 "reconstruction_status": _status(transcript.reconstruction_status),
                 "reconstruction_metadata": transcript.reconstruction_metadata,
                 "segments": reconstruction_segments,
+                "word_segments": transcript.word_segments,
             },
         },
     )

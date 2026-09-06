@@ -216,3 +216,52 @@ def test_cached_audio_recomputes_transcript_derived_quality(
         assert analysis.speech_rate == pytest.approx(20.0)
         assert source.quality_assessment.input_fingerprint != original_quality_fingerprint
         assert source.quality_assessment.transcript_quality_score == 0.25
+
+
+def test_cached_audio_recomputes_speech_rate_when_word_segments_change(
+    sqlite_engine: object, tmp_path: Path
+) -> None:
+    from app.services.source_quality import assess_source
+
+    transcript = transcript_with(probabilities=[0.9])
+    transcript.word_segments = [{"word": "واحد"}]
+    Base.metadata.create_all(sqlite_engine)
+    with Session(sqlite_engine) as session:
+        source = SourceVideo(source_uri="/imports/changed-words.mp4")
+        session.add(source)
+        session.flush()
+        transcript.source_video_id = source.id
+        artifact = AudioArtifact(
+            source_video_id=source.id,
+            output_path="cached.wav",
+            content_hash="b" * 64,
+            sample_rate=16_000,
+            duration=3.0,
+        )
+        analysis = perfect_audio(source.id)
+        analysis.speech_rate = 20.0
+        session.add_all([transcript, artifact, analysis])
+        session.flush()
+        executor = AudioAnalysisExecutor(
+            session=session,
+            storage=StorageService(tmp_path),
+            command_runner=lambda _args: (_ for _ in ()).throw(
+                AssertionError("cached audio must not rerun FFmpeg")
+            ),
+        )
+        analysis.input_fingerprint = executor.input_fingerprint(source)
+        session.commit()
+        initial_quality = assess_source(session, source, transcript, analysis)
+        initial_quality_fingerprint = initial_quality.input_fingerprint
+
+        transcript.word_segments = [
+            {"word": "واحد"},
+            {"word": "اثنين"},
+            {"word": "ثلاثة"},
+        ]
+        session.commit()
+        result = executor.execute(source)
+
+        assert result.value is analysis
+        assert analysis.speech_rate == pytest.approx(60.0)
+        assert source.quality_assessment.input_fingerprint != initial_quality_fingerprint
