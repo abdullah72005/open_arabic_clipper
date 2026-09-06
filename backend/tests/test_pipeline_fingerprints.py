@@ -52,6 +52,18 @@ def test_historical_success_without_canonical_input_never_skips(sqlite_engine: o
         assert executor.calls == 1
 
 
+def test_historical_legacy_input_never_skips(sqlite_engine: object) -> None:
+    Base.metadata.create_all(sqlite_engine)
+    with Session(sqlite_engine) as session:
+        source = SourceVideo(source_uri=f"file:///tmp/{uuid4()}.mp4", rights_status=RightsStatus.OWNED)
+        session.add(source); session.commit()
+        session.add(PipelineRun(source_video_id=source.id, stage=PipelineStage.INGEST,
+                                status=PipelineRunStatus.SUCCEEDED, input_fingerprint="legacy"))
+        session.commit()
+        executor = FingerprintExecutor("legacy")
+        assert PipelineRunner(session, {PipelineStage.INGEST: executor}).run(source.id, PipelineStage.INGEST).skipped is False
+
+
 def test_runner_skips_only_matching_input_and_force_increments_attempt(sqlite_engine: object) -> None:
     Base.metadata.create_all(sqlite_engine)
     with Session(sqlite_engine) as session:

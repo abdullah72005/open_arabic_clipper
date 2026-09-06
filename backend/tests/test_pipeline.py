@@ -23,6 +23,9 @@ class RecordingExecutor:
         if self.error is not None:
             raise self.error
 
+    def input_fingerprint(self, source: SourceVideo) -> str:
+        return "recording-input-v1"
+
 
 def _source(session: Session, rights_status: RightsStatus = RightsStatus.OWNED) -> SourceVideo:
     source = SourceVideo(source_uri=f"file:///tmp/{uuid.uuid4()}.mp4", rights_status=rights_status)
@@ -40,6 +43,7 @@ def test_completed_stage_is_skipped(sqlite_engine: object) -> None:
                 source_video_id=source.id,
                 stage=PipelineStage.INGEST,
                 status=PipelineRunStatus.SUCCEEDED,
+                input_fingerprint="recording-input-v1",
             )
         )
         session.commit()

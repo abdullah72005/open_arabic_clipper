@@ -179,8 +179,9 @@ def _stage_for_job_kind(kind: JobKind) -> PipelineStage:
 def _input_fingerprint(executor: StageExecutor, source: SourceVideo) -> str:
     method = getattr(executor, "input_fingerprint", None)
     if method is None:
-        return "legacy"
-    return str(method(source) or "")
+        return ""
+    value = str(method(source) or "")
+    return "" if value == "legacy" else value
 
 
 def _output_fingerprint(result: object) -> str | None:
