@@ -102,6 +102,8 @@ class BenchmarkClip(BaseModel):
 
     @model_validator(mode="after")  # type: ignore[untyped-decorator]
     def _validate(self) -> "BenchmarkClip":
+        if self.id in {".", ".."} or "/" in self.id or "\\" in self.id:
+            raise ValueError("benchmark clip id must be a safe filename component")
         if self.end_seconds <= self.start_seconds:
             raise ValueError("clip end must follow its start")
         indexes = [segment.segment_index for segment in self.reference_segments]
@@ -505,10 +507,17 @@ def evaluate_completion_gate(
 
 
 def load_benchmark_manifest(
-    path: Path, *, allow_known_regression_set: bool = False
+    path: Path,
+    *,
+    allow_known_regression_set: bool = False,
+    known_regression_manifest_path: Path | None = None,
 ) -> BenchmarkManifest:
     """Read a private JSON manifest from a path already owned by StorageService."""
 
+    if allow_known_regression_set and path != known_regression_manifest_path:
+        raise ValueError(
+            "known regression override is reserved for the Chernobyl diagnostic manifest"
+        )
     try:
         payload = cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))
     except (OSError, json.JSONDecodeError) as error:

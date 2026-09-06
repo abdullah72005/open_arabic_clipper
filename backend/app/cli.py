@@ -28,6 +28,7 @@ from app.transcription.reconstruction.types import ProviderAvailability, Provide
 from app.workers.tasks import run_pipeline_stage
 
 app = typer.Typer(no_args_is_help=True)
+_KNOWN_REGRESSION_MANIFEST_NAME = "stage-2-7/chernobyl-reference-v1.json"
 
 
 def _storage() -> StorageService:
@@ -186,9 +187,20 @@ def benchmark_reconstruction(
 
     settings = get_settings()
     storage = _storage()
+    if (
+        allow_known_regression_set
+        and manifest_name != _KNOWN_REGRESSION_MANIFEST_NAME
+    ):
+        raise typer.BadParameter(
+            "--allow-known-regression-set is reserved for the Chernobyl diagnostic manifest"
+        )
     manifest_path = storage.resolve(StorageCategory.BENCHMARKS, manifest_name)
     manifest = load_benchmark_manifest(
-        manifest_path, allow_known_regression_set=allow_known_regression_set
+        manifest_path,
+        allow_known_regression_set=allow_known_regression_set,
+        known_regression_manifest_path=storage.resolve(
+            StorageCategory.BENCHMARKS, _KNOWN_REGRESSION_MANIFEST_NAME
+        ),
     )
     provider = settings.reconstruction_provider_instance(model=model)
     health = provider.health() if provider is not None else None

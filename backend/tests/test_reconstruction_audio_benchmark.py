@@ -19,6 +19,7 @@ from app.transcription.reconstruction.benchmark import (
     classify_comparison,
     comparison_status,
     evaluate_completion_gate,
+    load_benchmark_manifest,
 )
 from app.transcription.reconstruction.types import (
     ConfidenceLevel,
@@ -184,6 +185,23 @@ def test_manifest_refuses_unreviewed_unauthorized_and_out_of_storage_inputs() ->
     payload["sources"][0]["path"] = "/absolute/outside.webm"
     with pytest.raises(ValueError, match="storage-relative"):
         BenchmarkManifest.model_validate(payload)
+
+    for unsafe_clip_id in ("/tmp/escape", "../../escape"):
+        payload = _manifest().model_dump(mode="json")
+        payload["clips"][0]["id"] = unsafe_clip_id
+        with pytest.raises(ValueError, match="safe filename"):
+            BenchmarkManifest.model_validate(payload)
+
+
+def test_manifest_loader_refuses_non_chernobyl_diagnostic_override(tmp_path: Path) -> None:
+    payload = _manifest().model_dump(mode="json")
+    payload["sources"] = payload["sources"][:1]
+    payload["clips"] = payload["clips"][:1]
+    manifest_path = tmp_path / "arbitrary-diagnostic.json"
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Chernobyl diagnostic"):
+        load_benchmark_manifest(manifest_path, allow_known_regression_set=True)
 
 
 def test_manifest_requires_exact_reference_indexes_and_readiness_topology() -> None:

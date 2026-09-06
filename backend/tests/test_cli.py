@@ -27,6 +27,19 @@ def test_benchmark_reconstruction_exposes_model_and_regression_flags() -> None:
     assert "--allow-known-regression-set" in result.stdout
 
 
+def test_benchmark_reconstruction_limits_diagnostic_override_to_chernobyl_manifest() -> None:
+    result = CliRunner().invoke(
+        app,
+        [
+            "benchmark-reconstruction",
+            "other/stage-2-7/chernobyl-reference-v1.json",
+            "--allow-known-regression-set",
+        ],
+    )
+
+    assert result.exit_code == 2
+
+
 def test_reconstruction_health_prints_provider_identity_and_digest(monkeypatch) -> None:
     health = ProviderHealth(
         ProviderAvailability.AVAILABLE,
