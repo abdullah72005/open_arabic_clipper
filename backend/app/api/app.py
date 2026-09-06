@@ -18,7 +18,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from app.core.enums import JobKind, JobStatus, PipelineStage, RightsStatus
+from app.core.enums import JobKind, JobStatus, PipelineStage, ReconstructionStatus, RightsStatus
 from app.core.settings import get_settings
 from app.db.session import create_session_factory
 from app.models import ProcessingJob, SourceVideo, Transcript, TranscriptChunk
@@ -107,6 +107,7 @@ class TranscriptResponse(BaseModel):
     reconstruction_version: str
     reconstruction_processing_duration: float | None
     reconstruction_metadata: dict[str, object]
+    reconstruction_status: ReconstructionStatus
     segments: list[dict[str, object]]
     word_segments: list[dict[str, object]]
     duration: float
@@ -344,12 +345,6 @@ def create_app(
     ) -> JobResponse:
         """Queue a fresh local ASR run; option changes invalidate its transcript cache."""
         _source_or_404(database, source_id)
-        if force:
-            transcript = database.scalar(
-                select(Transcript).where(Transcript.source_video_id == source_id)
-            )
-            if transcript is not None:
-                transcript.input_fingerprint = ""
         job = ProcessingJob(source_video_id=source_id, kind=JobKind.TRANSCRIPTION)
         database.add(job)
         database.commit()
@@ -372,12 +367,6 @@ def create_app(
         """Queue Stage 2.7 reconstruction while leaving ASR and correction caches intact."""
 
         _source_or_404(database, source_id)
-        if force:
-            transcript = database.scalar(
-                select(Transcript).where(Transcript.source_video_id == source_id)
-            )
-            if transcript is not None:
-                transcript.reconstruction_fingerprint = ""
         job = ProcessingJob(source_video_id=source_id, kind=JobKind.RECONSTRUCTION)
         database.add(job)
         database.commit()
@@ -528,6 +517,7 @@ def _transcript_response(transcript: Transcript) -> TranscriptResponse:
         reconstruction_version=transcript.reconstruction_version,
         reconstruction_processing_duration=transcript.reconstruction_processing_duration,
         reconstruction_metadata=transcript.reconstruction_metadata,
+        reconstruction_status=transcript.reconstruction_status,
         segments=transcript.segments,
         word_segments=transcript.word_segments,
         duration=transcript.duration,

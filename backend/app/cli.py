@@ -99,10 +99,6 @@ def _queue_transcription(source_id: UUID, *, force: bool) -> UUID:
     with create_session_factory()() as session:
         if session.get(SourceVideo, source_id) is None:
             raise typer.BadParameter("source does not exist")
-        if force:
-            cached = session.query(Transcript).filter_by(source_video_id=source_id).one_or_none()
-            if cached is not None:
-                cached.input_fingerprint = ""
         job = ProcessingJob(source_video_id=source_id, kind=JobKind.TRANSCRIPTION)
         session.add(job)
         session.commit()
@@ -116,10 +112,6 @@ def _queue_reconstruction(source_id: UUID, *, force: bool) -> UUID:
     with create_session_factory()() as session:
         if session.get(SourceVideo, source_id) is None:
             raise typer.BadParameter("source does not exist")
-        if force:
-            cached = session.query(Transcript).filter_by(source_video_id=source_id).one_or_none()
-            if cached is not None:
-                cached.reconstruction_fingerprint = ""
         job = ProcessingJob(source_video_id=source_id, kind=JobKind.RECONSTRUCTION)
         session.add(job)
         session.commit()
@@ -138,13 +130,13 @@ def transcribe(source_id: UUID) -> None:
 
 
 @app.command()
-def retranscribe(source_id: UUID, force: bool = True) -> None:
+def retranscribe(source_id: UUID, force: bool = typer.Option(True, "--force/--no-force")) -> None:
     """Queue transcription and, by default, bypass the transcript cache."""
     typer.echo(str(_queue_transcription(source_id, force=force)))
 
 
 @app.command()
-def reconstruct(source_id: UUID, force: bool = False) -> None:
+def reconstruct(source_id: UUID, force: bool = typer.Option(False, "--force/--no-force")) -> None:
     """Queue bounded contextual reconstruction, reusing its current fingerprint by default."""
     typer.echo(str(_queue_reconstruction(source_id, force=force)))
 
@@ -164,6 +156,7 @@ def transcript(source_id: UUID) -> None:
                     "normalized_text": current.normalized_text,
                     "segments": current.segments,
                     "word_segments": current.word_segments,
+                    "reconstruction_status": current.reconstruction_status.value,
                 },
                 ensure_ascii=False,
             )

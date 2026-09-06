@@ -386,7 +386,7 @@ def test_reconstruct_queues_independent_job_and_force_only_clears_its_cache(
         )
         assert transcript is not None
         assert transcript.input_fingerprint == "asr-fingerprint"
-        assert transcript.reconstruction_fingerprint == ""
+        assert transcript.reconstruction_fingerprint == "reconstruction-fingerprint"
 
     transcript_response = test_client.get(f"/api/sources/{source['id']}/transcript")
     assert transcript_response.status_code == 200
@@ -430,4 +430,4 @@ def test_retranscribe_queues_a_transcription_job(
             select(Transcript).where(Transcript.source_video_id == UUID(source["id"]))
         )
         assert transcript is not None
-        assert transcript.input_fingerprint == ""
+        assert transcript.input_fingerprint == "cached"

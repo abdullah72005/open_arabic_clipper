@@ -10,5 +10,6 @@ def test_transcript_declares_separate_stage_2_7_derived_fields() -> None:
     assert "contextual_reconstructed_text" in columns
     assert "reconstruction_fingerprint" in columns
     assert "reconstruction_metadata" in columns
+    assert "reconstruction_status" in columns
     assert PipelineStage.CONTEXTUAL_RECONSTRUCTION.value == "CONTEXTUAL_RECONSTRUCTION"
     assert JobKind.RECONSTRUCTION.value == "RECONSTRUCTION"

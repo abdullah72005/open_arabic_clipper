@@ -10,6 +10,7 @@ from time import monotonic
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
+from app.core.enums import ReconstructionStatus
 from app.core.settings import get_settings
 from app.media.analysis import parse_silencedetect, silence_ratio, windowed_rms
 from app.media.audio import AudioExtractor
@@ -25,6 +26,7 @@ from app.transcription.engine import TranscriptionResult, WhisperEngine
 from app.transcription.normalization import normalize_transcript
 from app.transcription.reconstruction import ContextualReconstructor
 from app.transcription.reconstruction.service import select_final_text
+from app.transcription.reconstruction.status import aggregate_reconstruction_status
 from app.transcription.reconstruction.types import SegmentReconstruction
 from app.transcription.service import TranscriptionOptions
 
@@ -302,6 +304,7 @@ class ContextualReconstructionExecutor:
             return transcript
 
         persisted_segments: list[dict[str, object]] = []
+        statuses: list[ReconstructionStatus] = []
         for segment, reconstruction in zip(transcript.segments, result.segments, strict=True):
             raw = str(segment.get("raw_text", segment.get("text", "")))
             corrected = str(segment.get("corrected_text", raw))
@@ -315,6 +318,8 @@ class ContextualReconstructionExecutor:
                 corrected=corrected,
                 raw=raw,
             )
+            status = _segment_reconstruction_status(segment, reconstruction)
+            statuses.append(status)
             persisted_segments.append(
                 {
                     **segment,
@@ -326,6 +331,8 @@ class ContextualReconstructionExecutor:
                     "reconstruction_quality_flags": [
                         flag.value for flag in reconstruction.quality_flags
                     ],
+                    "reconstruction_status": status.value,
+                    "reconstruction_method": reconstruction.reconstruction_method,
                     "final_text": final_text,
                     "normalized_text": normalize_transcript(final_text),
                 }
@@ -341,18 +348,39 @@ class ContextualReconstructionExecutor:
         applied = [item for item in result.segments if item.applied]
         flags = sorted({flag.value for item in result.segments for flag in item.quality_flags})
         transcript.reconstruction_fingerprint = result.fingerprint
+        transcript.reconstruction_status = aggregate_reconstruction_status(statuses)
         transcript.reconstruction_confidence = (
             sum(item.confidence for item in applied) / len(applied) if applied else 0.0
         )
         transcript.reconstructed_segment_ratio = len(applied) / total if total else 0.0
-        transcript.reconstruction_method = _reconstruction_method(result.segments)
+        transcript.reconstruction_method = _reconstruction_method(result.segments, result.metadata)
         transcript.reconstruction_version = "stage2.7-v1"
         transcript.reconstruction_processing_duration = monotonic() - started_at
-        transcript.reconstruction_metadata = {
+        status_counts = {status.value: statuses.count(status) for status in set(statuses)}
+        metadata = {
             "segments": total,
             "applied_segments": len(applied),
+            "routed_segments": sum(
+                1 for item in result.segments if getattr(item, "routing_score", None) is not None
+            ),
+            "unresolved_segments": sum(
+                1 for status in statuses
+                if status is ReconstructionStatus.LOW_CONFIDENCE_UNRESOLVED
+            ),
+            "batch_count": 1 if total else 0,
+            "status_counts": status_counts,
             "quality_flags": flags,
+            "provider_availability": (
+                "UNAVAILABLE"
+                if any(status is ReconstructionStatus.PROVIDER_UNAVAILABLE for status in statuses)
+                else "AVAILABLE"
+            ),
+            "model": result.metadata.get("model", transcript.reconstruction_method),
+            "model_digest": result.metadata.get("model_digest"),
+            "algorithm_versions": {"reconstruction": "stage2.7-v1"},
         }
+        metadata.update(result.metadata)
+        transcript.reconstruction_metadata = metadata
         self._session.execute(
             delete(TranscriptChunk).where(TranscriptChunk.transcript_id == transcript.id)
         )
@@ -374,7 +402,14 @@ class ContextualReconstructionExecutor:
         return transcript
 
 
-def _reconstruction_method(segments: tuple[SegmentReconstruction, ...]) -> str:
+def _reconstruction_method(
+    segments: tuple[SegmentReconstruction, ...], metadata: dict[str, object] | None = None
+) -> str:
+    if metadata and isinstance(metadata.get("reconstruction_method"), str):
+        return str(metadata["reconstruction_method"])
+    methods = {item.reconstruction_method for item in segments if item.reconstruction_method}
+    if len(methods) == 1:
+        return next(iter(methods))
     if all(getattr(segment, "candidate_text", None) is None for segment in segments):
         return "stage2_5_fallback"
     if any(
@@ -384,6 +419,29 @@ def _reconstruction_method(segments: tuple[SegmentReconstruction, ...]) -> str:
     ):
         return "provider_fallback"
     return "contextual_reconstruction"
+
+
+def _segment_reconstruction_status(
+    segment: dict[str, object], reconstruction: SegmentReconstruction
+) -> ReconstructionStatus:
+    operator_text = segment.get("operator_text")
+    if operator_text:
+        return ReconstructionStatus.MANUAL_OVERRIDE
+    value = getattr(reconstruction, "status", None)
+    if isinstance(value, ReconstructionStatus):
+        return value
+    if isinstance(value, str):
+        try:
+            return ReconstructionStatus(value)
+        except ValueError:
+            pass
+    if any(flag.value == "RECONSTRUCTION_PROVIDER_ERROR" for flag in reconstruction.quality_flags):
+        return ReconstructionStatus.PROVIDER_UNAVAILABLE
+    if reconstruction.applied:
+        return ReconstructionStatus.APPLIED
+    if reconstruction.confidence_level.value == "LOW":
+        return ReconstructionStatus.LOW_CONFIDENCE_UNRESOLVED
+    return ReconstructionStatus.UNCHANGED_HIGH_CONFIDENCE
 
 
 def _raw_transcript_confidence(segments: list[dict[str, object]]) -> float:
