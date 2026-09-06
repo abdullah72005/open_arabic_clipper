@@ -20,7 +20,7 @@ from app.pipeline.runner import StageExecutionError
 from app.pipeline.executor import StageExecutionResult
 from app.pipeline.fingerprints import canonical_fingerprint
 from app.services.source_adapters import YtDlpAdapter
-from app.services.source_quality import assess_source
+from app.services.source_quality import assess_source, quality_input_fingerprint
 from app.services.storage import StorageCategory, StorageService
 from app.transcription.chunking import ChunkConfig, build_chunks
 from app.transcription.correction import ContextualCorrector
@@ -381,6 +381,17 @@ class ContextualReconstructionExecutor:
                     "reconstruction_quality_flags": [
                         flag.value for flag in reconstruction.quality_flags
                     ],
+                    "routing_score": reconstruction.routing_score,
+                    "routing_reasons": list(reconstruction.routing_reasons),
+                    "focus_spans": [
+                        {
+                            "word": word.text,
+                            "start": word.start,
+                            "end": word.end,
+                            "probability": word.probability,
+                        }
+                        for word in reconstruction.focus_spans
+                    ],
                     "reconstruction_status": status.value,
                     "reconstruction_method": reconstruction.reconstruction_method,
                     "final_text": final_text,
@@ -559,6 +570,29 @@ class AudioAnalysisExecutor:
         )
         current_input = self.input_fingerprint(source)
         if existing is not None and existing.input_fingerprint == current_input and not force:
+            quality = source.quality_assessment
+            if (
+                quality is not None
+                and quality.input_fingerprint == quality_input_fingerprint(transcript, existing)
+            ):
+                return StageExecutionResult(current_input, existing)
+            duration = max(artifact.duration, transcript.duration)
+            existing.speech_rate = (
+                len(transcript.word_segments) * 60.0 / duration if duration else 0.0
+            )
+            self._session.commit()
+            self._session.refresh(existing)
+            assess_source(self._session, source, transcript, existing)
+            return StageExecutionResult(current_input, existing)
+        if existing is not None and existing.audio_hash == artifact.content_hash and not force:
+            duration = max(artifact.duration, transcript.duration)
+            existing.input_fingerprint = current_input
+            existing.speech_rate = (
+                len(transcript.word_segments) * 60.0 / duration if duration else 0.0
+            )
+            self._session.commit()
+            self._session.refresh(existing)
+            assess_source(self._session, source, transcript, existing)
             return StageExecutionResult(current_input, existing)
         audio_path = self._storage.resolve(StorageCategory.SOURCES, artifact.output_path)
         args = [
