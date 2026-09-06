@@ -92,6 +92,12 @@ class ResolutionScores:
     entity_consistency: float
     selection_confidence: float
 
+    @property
+    def score(self) -> float:
+        return (0.35 * self.semantic_coherence + 0.25 * self.egyptian_naturalness
+                + 0.15 * self.discourse_continuity + 0.10 * self.entity_consistency
+                + 0.15 * self.selection_confidence)
+
 
 @dataclass(frozen=True)
 class SegmentReconstruction:
@@ -104,6 +110,14 @@ class SegmentReconstruction:
     confidence: float
     confidence_level: ConfidenceLevel
     quality_flags: tuple[QualityFlag, ...]
+    status: object | None = None
+    routing_score: float | None = None
+    routing_reasons: tuple[str, ...] = ()
+    focus_spans: tuple[WordEvidence, ...] = ()
+    validated_changes: tuple[dict[str, object], ...] = ()
+    reconstruction_method: str | None = None
+    candidate_id: str | None = None
+    confidence_margin: float = 0.0
 
 
 @dataclass(frozen=True)

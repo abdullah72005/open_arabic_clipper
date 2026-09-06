@@ -121,6 +121,13 @@ class ResolutionRequest:
 class ResolutionChoice:
     candidate_id: str
     scores: ResolutionScores
+    candidate_scores: dict[str, ResolutionScores] | None = None
+
+    @property
+    def margin(self) -> float:
+        scores = self.candidate_scores or {self.candidate_id: self.scores}
+        ranked = sorted(((value.score, key) for key, value in scores.items()), reverse=True)
+        return ranked[0][0] - ranked[1][0] if len(ranked) > 1 else ranked[0][0]
 
 
 class ReconstructionProvider(Protocol):
@@ -211,7 +218,7 @@ class OpenAICompatibleReconstructionProvider:
 
     def resolve_candidates(self, requests: list[ResolutionRequest]) -> dict[int, ResolutionChoice]:
         content = self._call(
-            "Select only one supplied candidate per segment using Egyptian naturalness, "
+            "Score every supplied candidate, then select one supplied candidate per segment using Egyptian naturalness, "
             "semantic coherence, and local discourse. Raw is always allowed.",
             {
                 "targets": [
@@ -351,17 +358,37 @@ def _parse_resolutions(
         if not isinstance(entry, dict) or not isinstance(entry.get("segment_id"), int):
             raise ProviderResponseError("provider resolution has invalid segment ID")
         index = entry["segment_id"]
-        candidate_id = entry.get("candidate_id")
-        values = [entry.get(name) for name in _SCORE_NAMES]
+        candidate_id = entry.get("selected_candidate_id", entry.get("candidate_id"))
+        score_entries = entry.get("candidate_scores")
+        if score_entries is None:
+            # Accept the pre-Task-5 response shape during rolling upgrades.
+            score_entries = [{"candidate_id": candidate_id, **dict(zip(_SCORE_NAMES, [entry.get(name) for name in _SCORE_NAMES]))}]
+        score_map: dict[str, ResolutionScores] = {}
+        if not isinstance(score_entries, list):
+            raise ProviderResponseError("provider candidate scores must be a list")
+        for scored in score_entries:
+            if not isinstance(scored, dict) or not isinstance(scored.get("candidate_id"), str):
+                raise ProviderResponseError("provider candidate score has invalid ID")
+            sid = scored["candidate_id"]
+            values = [scored.get(name) for name in _SCORE_NAMES]
+            if sid in score_map or sid not in allowed.get(index, set()) or any(not isinstance(value, int | float) or not 0 <= value <= 1 for value in values):
+                raise ProviderResponseError("provider candidate score has invalid ID or values")
+            score_map[sid] = ResolutionScores(*map(float, values))
+        if index in allowed and set(score_map) != allowed[index]:
+            raise ProviderResponseError("provider candidate scores are incomplete")
+        selected = score_map.get(candidate_id)
+        values = ([getattr(selected, name) for name in _SCORE_NAMES] if selected is not None
+                  else [entry.get(name) for name in _SCORE_NAMES])
         if (
             index not in allowed
             or index in result
             or not isinstance(candidate_id, str)
             or candidate_id not in allowed[index]
-            or any(not isinstance(value, int | float) or not 0 <= value <= 1 for value in values)
+            or (score_map.get(candidate_id) is None and any(not isinstance(value, int | float) or not 0 <= value <= 1 for value in values))
         ):
             raise ProviderResponseError("provider resolution has invalid candidate ID or scores")
-        result[index] = ResolutionChoice(candidate_id, ResolutionScores(*map(float, values)))
+        selected_scores = score_map.get(candidate_id, ResolutionScores(*map(float, values)))
+        result[index] = ResolutionChoice(candidate_id, selected_scores, score_map)
     if set(result) != set(allowed):
         raise ProviderResponseError("provider omitted one or more target segments")
     return result
@@ -387,7 +414,7 @@ def _generation_schema() -> dict[str, object]:
 def _resolution_schema() -> dict[str, object]:
     return {
         "type": "object",
-        "properties": {"resolutions": {"type": "array"}},
+        "properties": {"resolutions": {"type": "array", "items": {"type": "object", "required": ["segment_id", "selected_candidate_id", "candidate_scores"]}}},
         "required": ["resolutions"],
     }
 

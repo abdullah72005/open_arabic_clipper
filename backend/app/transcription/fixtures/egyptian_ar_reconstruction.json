@@ -9,5 +9,8 @@
     {"id":"filler-repetition","category":"filler","previous":"خلينا نفكر","raw":"بص يعني يعني الموضوع كده","next":"محتاج وقت","expected":"بص يعني يعني الموضوع كده","semantic_review":"Do not remove authentic speech fillers.","must_change":false,"protected_tokens":[]},
     {"id":"code-switch","category":"code_switching","previous":"في الاجتماع","raw":"هنعمل deploy بعد الـ review","next":"وبعدين نراقب logs","expected":"هنعمل deploy بعد الـ review","semantic_review":"Preserve technical code switching.","must_change":false,"protected_tokens":["deploy","review","logs"]},
     {"id":"unfamiliar-name","category":"entities","previous":"في المؤتمر امبارح","raw":"نورهان جرجس قدمت الورقة","next":"والناس صفقت","expected":"نورهان جرجس قدمت الورقة","semantic_review":"Do not normalize or invent an unfamiliar name.","must_change":false,"protected_tokens":[]}
+    ,{"id":"temporary-clearance","category":"multiword","previous":"اتأجلت الخطة","raw":"عملية إخلاق مؤقت","next":"لحد إشعار تاني","expected":"عملية إخلاء مؤقت","semantic_review":"Restore a multi-word Egyptian phrase.","must_change":true,"protected_tokens":[]}
+    ,{"id":"three-days","category":"multiword","previous":"استنوا شوية","raw":"ثلاث يام بس لتطهير النطقة","next":"وبعدين نمشي","expected":"تلات أيام بس لتطهير المنطقة","semantic_review":"Repair several low-probability words without realignment.","must_change":true,"protected_tokens":[]}
+    ,{"id":"no-excuse","category":"multiword","previous":"متقلقوش","raw":"يا جماعة مفيش دقل للزعو","next":"خلاص الموضوع بسيط","expected":"يا جماعة مفيش داعي للذعر","semantic_review":"Restore a contextual multi-word phrase.","must_change":true,"protected_tokens":[]}
   ]
 }

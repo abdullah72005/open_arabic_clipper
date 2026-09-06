@@ -26,6 +26,7 @@ from app.transcription.reconstruction.types import (
 )
 from app.transcription.reconstruction.validation import validate_candidate
 from app.transcription.reconstruction.windows import acoustic_evidence, build_reconstruction_window
+from app.core.enums import ReconstructionStatus
 
 
 class ContextualReconstructor:
@@ -50,8 +51,13 @@ class ContextualReconstructor:
                 self._fallback(index, segment) for index, segment in enumerate(segments)
             )
             return ReconstructionResult(results, _joined(results), fingerprint)
-        result: ReconstructionResult
+        result: ReconstructionResult = ReconstructionResult((), "", fingerprint)
         try:
+            health = self._provider.health()
+            if health.availability.value != "AVAILABLE":
+                results = tuple(self._fallback(index, segment, provider_error=True, status=ReconstructionStatus.PROVIDER_UNAVAILABLE, method=f"{health.provider}:{health.model or 'unknown'}") for index, segment in enumerate(segments))
+                result = ReconstructionResult(results, _joined(results), fingerprint)
+                return result
             memory = build_entity_memory(segments)
             requests = [
                 _generation_request(segments, index, language, tuple(memory.occurrences))
@@ -84,7 +90,7 @@ class ContextualReconstructor:
             result = ReconstructionResult(results, _joined(results), fingerprint)
         except (OSError, ProviderResponseError):
             results = tuple(
-                self._fallback(index, segment, provider_error=True)
+                self._fallback(index, segment, provider_error=True, status=ReconstructionStatus.PROVIDER_UNAVAILABLE)
                 for index, segment in enumerate(segments)
             )
             result = ReconstructionResult(results, _joined(results), fingerprint)
@@ -97,14 +103,20 @@ class ContextualReconstructor:
         return result
 
     def _fallback(
-        self, index: int, segment: Mapping[str, object], provider_error: bool = False
+        self, index: int, segment: Mapping[str, object], provider_error: bool = False,
+        status: ReconstructionStatus | None = None, method: str | None = None,
     ) -> SegmentReconstruction:
         raw = str(segment.get("raw_text", segment.get("text", "")))
         corrected = str(segment.get("corrected_text", raw))
+        operator_text = segment.get("operator_text")
+        if operator_text:
+            return SegmentReconstruction(index, raw, corrected, str(operator_text), None, False,
+                1.0, ConfidenceLevel.HIGH, (), ReconstructionStatus.MANUAL_OVERRIDE,
+                reconstruction_method="operator:manual")
         flags = (QualityFlag.RECONSTRUCTION_PROVIDER_ERROR,) if provider_error else ()
-        return SegmentReconstruction(
-            index, raw, corrected, corrected, None, False, 0.0, ConfidenceLevel.LOW, flags
-        )
+        return SegmentReconstruction(index, raw, corrected, corrected, None, False, 0.0,
+            ConfidenceLevel.LOW, flags, status or (ReconstructionStatus.PROVIDER_UNAVAILABLE if provider_error else ReconstructionStatus.UNCHANGED_HIGH_CONFIDENCE),
+            reconstruction_method=method)
 
     def _decide(
         self,
@@ -124,20 +136,28 @@ class ContextualReconstructor:
             ),
             None,
         )
+        routing = route_segment(build_reconstruction_window([segment], 0))
         if candidate is None or candidate.candidate_id in {"raw", "stage25"}:
-            return self._fallback(index, segment)
+            return SegmentReconstruction(index, raw, corrected, corrected, None, False, 0.0,
+                ConfidenceLevel.HIGH, (), ReconstructionStatus.NOT_REQUIRED if routing.priority.value == "leave" else ReconstructionStatus.LOW_CONFIDENCE_UNRESOLVED,
+                routing_score=routing.evidence.score, routing_reasons=(routing.reason,), focus_spans=routing.focus_spans)
         validation = validate_candidate(raw, candidate, memory)
         if not validation.accepted:
-            return self._fallback(index, segment)
+            return SegmentReconstruction(index, raw, corrected, corrected, candidate.text, False, 0.0,
+                ConfidenceLevel.LOW, (QualityFlag.LOW_CONFIDENCE_UNRESOLVED,), ReconstructionStatus.LOW_CONFIDENCE_UNRESOLVED,
+                routing_score=routing.evidence.score, routing_reasons=(routing.reason,), focus_spans=routing.focus_spans,
+                validated_changes=candidate.changes, candidate_id=candidate.candidate_id)
         decision = decide_candidate(
             phonetic_similarity=validation.phonetic_similarity,
             resolution=choice.scores,
             raw_acoustic_confidence=acoustic_evidence(segment).confidence,
             edit_ratio=validation.edit_ratio,
-            margin=0.12,
+            margin=choice.margin,
             token_delta=validation.token_delta,
         )
         text = candidate.text if decision.applied else corrected
+        flags = (QualityFlag.MULTIWORD_RECONSTRUCTION,) if len(raw.split()) > 1 or len(candidate.text.split()) > 1 else ()
+        status = ReconstructionStatus.APPLIED if decision.applied else ReconstructionStatus.LOW_CONFIDENCE_UNRESOLVED
         return SegmentReconstruction(
             index,
             raw,
@@ -147,7 +167,10 @@ class ContextualReconstructor:
             decision.applied,
             decision.score,
             decision.level,
-            (),
+            flags, status, routing_score=routing.evidence.score, routing_reasons=(routing.reason,),
+            focus_spans=routing.focus_spans, validated_changes=candidate.changes,
+            reconstruction_method=f"provider:{getattr(self._provider, 'model', 'unknown')}",
+            candidate_id=candidate.candidate_id, confidence_margin=choice.margin,
         )
 
 

@@ -8,8 +8,11 @@ from app.transcription.reconstruction.providers import (
     OpenAICompatibleReconstructionProvider,
     ProviderResponseError,
     ResolutionRequest,
+    _parse_resolutions,
 )
-from app.transcription.reconstruction.types import ProviderAvailability, ProviderHealth
+from app.transcription.reconstruction.types import (
+    ProviderAvailability, ProviderHealth, ReconstructionCandidate,
+)
 
 
 def test_provider_uses_structured_two_pass_contract() -> None:
@@ -89,6 +92,25 @@ def test_provider_rejects_missing_target_response() -> None:
 
     with pytest.raises(ProviderResponseError, match="omitted"):
         provider.generate_candidates([GenerationRequest(4, "raw", (), ())])
+
+
+def test_resolution_returns_scores_for_every_candidate() -> None:
+    request = ResolutionRequest(
+        4, "raw", (), (),
+        (ReconstructionCandidate("raw", "raw"), ReconstructionCandidate("provider-0", "new")),
+    )
+    result = _parse_resolutions({"resolutions": [{
+        "segment_id": 4,
+        "selected_candidate_id": "provider-0",
+        "candidate_scores": [
+            {"candidate_id": "raw", "semantic_coherence": 0.4, "egyptian_naturalness": 0.4,
+             "discourse_continuity": 0.4, "entity_consistency": 0.4, "selection_confidence": 0.4},
+            {"candidate_id": "provider-0", "semantic_coherence": 1, "egyptian_naturalness": 1,
+             "discourse_continuity": 1, "entity_consistency": 1, "selection_confidence": 1},
+        ],
+    }]}, [request])
+    assert result[4].candidate_id == "provider-0"
+    assert result[4].candidate_scores["raw"].semantic_coherence == 0.4
 
 
 def test_openai_compatible_health_requires_exact_model_id() -> None:
