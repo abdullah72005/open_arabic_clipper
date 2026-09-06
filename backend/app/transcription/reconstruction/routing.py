@@ -41,7 +41,9 @@ def route_segment(segment: ReconstructionWindow | Mapping[str, object], config: 
     ratio = len(low) / len(probs) if probs else 0.0
     focus = tuple(w for w in low if w.probability is not None and w.probability < config.very_low_probability_threshold)
     score = 0.50 * (1 - (avg if avg is not None else config.low_probability_threshold)) + 0.25 * ratio + 0.25 * bool(focus)
-    if len(low) >= 2 and ratio >= config.high_ratio_threshold and score >= config.score_threshold:
+    # Explicit OR routing rule: multiple weak words are sufficient evidence even
+    # when the aggregate score is diluted by one confident neighboring word.
+    if (len(low) >= 2 and ratio >= config.high_ratio_threshold) or score >= config.score_threshold:
         priority, reason = RoutingPriority.RECONSTRUCT, "multiple_low_probability_words"
     elif language == "ar" and (avg is None or avg >= config.low_probability_threshold) and not low:
         priority, reason = RoutingPriority.CONTEXT_CHECK, "high_confidence_arabic_context_check"
