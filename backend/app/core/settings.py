@@ -122,12 +122,15 @@ class Settings(BaseSettings):
             config=self.correction_config(), provider=self.correction_provider_instance()
         )
 
-    def reconstruction_provider_instance(self) -> ReconstructionProvider | None:
+    def reconstruction_provider_instance(
+        self, model: str | None = None
+    ) -> ReconstructionProvider | None:
         """Return a local Stage 2.7 provider only when explicitly configured."""
 
         if self.reconstruction_provider == "disabled":
             return None
-        if not self.reconstruction_provider_base_url or not self.reconstruction_provider_model:
+        resolved_model = model or self.reconstruction_provider_model
+        if not self.reconstruction_provider_base_url or not resolved_model:
             raise ValueError(
                 "reconstruction_provider_base_url and reconstruction_provider_model are required "
                 "for an openai_compatible reconstruction provider"
@@ -135,13 +138,13 @@ class Settings(BaseSettings):
         if self.reconstruction_provider == "ollama":
             return OllamaReconstructionProvider(
                 base_url=self.reconstruction_provider_base_url,
-                model=self.reconstruction_provider_model,
+                model=resolved_model,
                 timeout_seconds=self.reconstruction_provider_timeout_seconds,
                 release_after_run=self.reconstruction_release_after_run,
             )
         return OpenAICompatibleReconstructionProvider(
             base_url=self.reconstruction_provider_base_url,
-            model=self.reconstruction_provider_model,
+            model=resolved_model,
             timeout_seconds=self.reconstruction_provider_timeout_seconds,
         )
 

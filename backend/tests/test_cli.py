@@ -19,6 +19,14 @@ def test_stage_2_transcript_commands_are_exposed() -> None:
     assert "transcript" in result.stdout
 
 
+def test_benchmark_reconstruction_exposes_model_and_regression_flags() -> None:
+    result = CliRunner().invoke(app, ["benchmark-reconstruction", "--help"])
+
+    assert result.exit_code == 0
+    assert "--model" in result.stdout
+    assert "--allow-known-regression-set" in result.stdout
+
+
 def test_reconstruction_health_prints_provider_identity_and_digest(monkeypatch) -> None:
     health = ProviderHealth(
         ProviderAvailability.AVAILABLE,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import asdict
 from pathlib import Path
 from uuid import UUID
 
@@ -17,10 +18,12 @@ from app.services.storage import StorageCategory, StorageService
 from app.transcription.benchmark import benchmark_transcription
 from app.transcription.engine import WhisperEngine
 from app.transcription.reconstruction.benchmark import (
+    BenchmarkRunner,
     evaluate_completion_gate,
     load_benchmark_manifest,
-    run_reconstruction_benchmark,
+    prompt_settings_fingerprint,
 )
+from app.transcription.reconstruction.service import ContextualReconstructor
 from app.transcription.reconstruction.types import ProviderAvailability, ProviderHealth
 from app.workers.tasks import run_pipeline_stage
 
@@ -174,21 +177,69 @@ def benchmark(audio_path: Path) -> None:
 
 
 @app.command("benchmark-reconstruction")
-def benchmark_reconstruction(manifest_name: str) -> None:
-    """Evaluate a private, human-reviewed unseen-audio reconstruction manifest."""
+def benchmark_reconstruction(
+    manifest_name: str,
+    model: str | None = typer.Option(None, "--model"),
+    allow_known_regression_set: bool = typer.Option(False, "--allow-known-regression-set"),
+) -> None:
+    """Run a private, authorized reconstruction benchmark through production stages."""
 
-    manifest_path = _storage().resolve(StorageCategory.BENCHMARKS, manifest_name)
-    manifest = load_benchmark_manifest(manifest_path)
-    report = run_reconstruction_benchmark(manifest)
-    passed, reasons = evaluate_completion_gate(report)
+    settings = get_settings()
+    storage = _storage()
+    manifest_path = storage.resolve(StorageCategory.BENCHMARKS, manifest_name)
+    manifest = load_benchmark_manifest(
+        manifest_path, allow_known_regression_set=allow_known_regression_set
+    )
+    provider = settings.reconstruction_provider_instance(model=model)
+    health = provider.health() if provider is not None else None
+    whisper_options = asdict(settings.transcription_options())
+    fingerprint = prompt_settings_fingerprint(
+        provider=settings.reconstruction_provider,
+        model=health.model if health is not None else None,
+        digest=health.model_digest if health is not None else None,
+        whisper_options=whisper_options,
+    )
+    runner = BenchmarkRunner(
+        storage=storage,
+        whisper_engine=WhisperEngine(),
+        corrector=settings.contextual_corrector(),
+        reconstructor=ContextualReconstructor(provider),
+        transcription_options=settings.transcription_options(),
+        provider_health=health,
+        prompt_settings_fingerprint=fingerprint,
+    )
+    report = runner.run(manifest)
+    passed, reasons = evaluate_completion_gate(
+        report, expected_prompt_settings_fingerprint=fingerprint
+    )
     typer.echo(
         json.dumps(
             {
-                "report": report.model_dump(mode="json"),
+                "model": report.model_identifier,
+                "model_digest": report.model_digest,
+                "provider_available": report.provider_available,
+                "human_labels_complete": report.human_labels_complete,
+                "model_feasible": report.model_feasible,
+                "semantic_correct_stage25": report.semantic_correct_stage25,
+                "semantic_correct_stage27": report.semantic_correct_stage27,
+                "improved": report.improved,
+                "unchanged_correct": report.unchanged_correct,
+                "unchanged_wrong": report.unchanged_wrong,
+                "regressed": report.regressed,
+                "hallucinated": report.hallucinated,
+                "unresolved": report.unresolved,
+                "source_audio_seconds": report.source_audio_seconds,
+                "wall_clock_seconds": report.wall_clock_seconds,
+                "peak_ram_bytes": report.peak_ram_bytes,
+                "peak_vram_bytes": report.peak_vram_bytes,
+                "comparison_path": str(report.comparison_path) if report.comparison_path else None,
+                "report_path": str(report.report_path) if report.report_path else None,
+                "worksheet_path": str(report.worksheet_path) if report.worksheet_path else None,
                 "passed": passed,
                 "reasons": reasons,
                 "status": "READY FOR STAGE 3" if passed else "STAGE 2.7 MUST CONTINUE",
-            }
+            },
+            ensure_ascii=False,
         )
     )
 
