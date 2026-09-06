@@ -43,6 +43,11 @@ class HighConfidenceProvider:
         }
 
 
+class ReleaseFailingProvider(HighConfidenceProvider):
+    def release(self) -> None:
+        raise RuntimeError("release failed")
+
+
 def test_reconstructor_applies_only_high_contextual_candidate() -> None:
     """A high-scoring source-supported candidate becomes automatic final text."""
 
@@ -60,6 +65,21 @@ def test_reconstructor_applies_only_high_contextual_candidate() -> None:
     assert segment.applied is True
     assert result.contextual_reconstructed_text == "ضخمة"
     assert provider.release_calls == 1
+
+
+def test_reconstructor_preserves_result_when_release_fails_after_success() -> None:
+    """Cleanup failures stay out of the result path and only add bounded metadata."""
+
+    result = ContextualReconstructor(ReleaseFailingProvider()).reconstruct(
+        [{"start": 0.0, "end": 1.0, "text": "دخم", "corrected_text": "دخم"}],
+        language="ar",
+        transcription_fingerprint="asr-v1",
+        correction_version="egyptian-ar-v1",
+    )
+
+    assert result.segments[0].contextual_reconstructed_text == "ضخمة"
+    assert result.contextual_reconstructed_text == "ضخمة"
+    assert result.metadata["release_warning"] == "provider_release_failed"
 
 
 def test_reconstructor_without_provider_preserves_stage_2_5_text() -> None:

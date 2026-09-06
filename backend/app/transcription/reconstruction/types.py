@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 
 
@@ -101,3 +101,4 @@ class ReconstructionResult:
     segments: tuple[SegmentReconstruction, ...]
     contextual_reconstructed_text: str
     fingerprint: str
+    metadata: dict[str, object] = field(default_factory=dict)

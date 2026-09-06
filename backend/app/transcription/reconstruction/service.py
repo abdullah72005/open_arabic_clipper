@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 
 from app.transcription.reconstruction.confidence import decide_candidate
 from app.transcription.reconstruction.entities import SourceEntityMemory, build_entity_memory
@@ -48,6 +49,7 @@ class ContextualReconstructor:
                 self._fallback(index, segment) for index, segment in enumerate(segments)
             )
             return ReconstructionResult(results, _joined(results), fingerprint)
+        result: ReconstructionResult
         try:
             requests = [_generation_request(segments, index) for index in range(len(segments))]
             generated = self._provider.generate_candidates(requests)
@@ -74,15 +76,20 @@ class ContextualReconstructor:
                 self._decide(index, segment, generated[index], resolved[index], memory)
                 for index, segment in enumerate(segments)
             )
-            return ReconstructionResult(results, _joined(results), fingerprint)
+            result = ReconstructionResult(results, _joined(results), fingerprint)
         except (OSError, ProviderResponseError):
             results = tuple(
                 self._fallback(index, segment, provider_error=True)
                 for index, segment in enumerate(segments)
             )
-            return ReconstructionResult(results, _joined(results), fingerprint)
+            result = ReconstructionResult(results, _joined(results), fingerprint)
         finally:
-            self._provider.release()
+            try:
+                self._provider.release()
+            except Exception:
+                # Cleanup is best effort; never replace valid or fallback output.
+                result = replace(result, metadata={"release_warning": "provider_release_failed"})
+        return result
 
     def _fallback(
         self, index: int, segment: Mapping[str, object], provider_error: bool = False
