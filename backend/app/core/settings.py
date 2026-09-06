@@ -8,6 +8,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from app.transcription.correction import ContextualCorrector, CorrectionConfig
 from app.transcription.providers import CorrectionProvider, OpenAICompatibleCorrectionProvider
 from app.transcription.reconstruction import ContextualReconstructor
+from app.transcription.reconstruction.ollama import OllamaReconstructionProvider
 from app.transcription.reconstruction.providers import (
     OpenAICompatibleReconstructionProvider,
     ReconstructionProvider,
@@ -55,10 +56,13 @@ class Settings(BaseSettings):
     correction_provider_model: str | None = Field(default=None, max_length=256)
     correction_provider_api_key: str | None = Field(default=None, max_length=4_096)
     correction_provider_timeout_seconds: float = Field(default=30.0, gt=0, le=300)
-    reconstruction_provider: Literal["disabled", "openai_compatible"] = "disabled"
-    reconstruction_provider_base_url: str | None = Field(default=None, max_length=2_048)
-    reconstruction_provider_model: str | None = Field(default=None, max_length=256)
-    reconstruction_provider_timeout_seconds: float = Field(default=30.0, gt=0, le=300)
+    reconstruction_provider: Literal["disabled", "openai_compatible", "ollama"] = "ollama"
+    reconstruction_provider_base_url: str | None = Field(
+        default="http://ollama:11434", max_length=2_048
+    )
+    reconstruction_provider_model: str | None = Field(default="qwen3:8b", max_length=256)
+    reconstruction_provider_timeout_seconds: float = Field(default=180.0, gt=0, le=300)
+    reconstruction_release_after_run: bool = True
     transcription_queue_concurrency: int = Field(default=1, gt=0)
     cors_origins: list[str] = ["http://localhost:3301"]
 
@@ -125,6 +129,13 @@ class Settings(BaseSettings):
             raise ValueError(
                 "reconstruction_provider_base_url and reconstruction_provider_model are required "
                 "for an openai_compatible reconstruction provider"
+            )
+        if self.reconstruction_provider == "ollama":
+            return OllamaReconstructionProvider(
+                base_url=self.reconstruction_provider_base_url,
+                model=self.reconstruction_provider_model,
+                timeout_seconds=self.reconstruction_provider_timeout_seconds,
+                release_after_run=self.reconstruction_release_after_run,
             )
         return OpenAICompatibleReconstructionProvider(
             base_url=self.reconstruction_provider_base_url,

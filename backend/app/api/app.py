@@ -27,6 +27,7 @@ from app.services.source_adapters import SourceValidationError, normalize_source
 from app.services.storage import StorageCategory, StorageService
 from app.transcription.chunking import ChunkConfig, build_chunks
 from app.transcription.normalization import normalize_transcript
+from app.transcription.reconstruction.providers import ReconstructionProvider
 from app.workers.tasks import run_pipeline_stage
 
 UPLOAD_CHUNK_BYTES = 1024 * 1024
@@ -134,7 +135,11 @@ def create_app(
     task_dispatcher = dispatcher or CeleryDispatcher()
     upload_limit = max_upload_bytes or settings.max_upload_bytes
     health_service = health or _default_health(
-        storage_service, factory, settings.ffmpeg_binary, settings.ffprobe_binary
+        storage_service,
+        factory,
+        settings.ffmpeg_binary,
+        settings.ffprobe_binary,
+        settings.reconstruction_provider_instance(),
     )
     app = FastAPI(title="ClipFactory API")
     app.add_middleware(
@@ -591,7 +596,11 @@ def _duplicate_response(source: SourceVideo) -> SourceResponse:
 
 
 def _default_health(
-    storage: StorageService, factory: sessionmaker[Session], ffmpeg: str, ffprobe: str
+    storage: StorageService,
+    factory: sessionmaker[Session],
+    ffmpeg: str,
+    ffprobe: str,
+    reconstruction_provider: ReconstructionProvider | None,
 ) -> HealthService:
     def database() -> tuple[CheckStatus, str]:
         with factory() as session:
@@ -612,14 +621,21 @@ def _default_health(
             return CheckStatus.FAILED, str(err)
         return CheckStatus.HEALTHY, f"{report.free_bytes} bytes free"
 
+    checks = {
+        "database": database,
+        "redis": lambda: (CheckStatus.DEGRADED, "not checked"),
+        "worker": lambda: (CheckStatus.DEGRADED, "heartbeat unavailable"),
+        "ffmpeg": lambda: binary(ffmpeg),
+        "ffprobe": lambda: binary(ffprobe),
+        "storage": storage_check,
+    }
+    if reconstruction_provider is None:
+        checks["reconstruction_provider"] = lambda: (
+            CheckStatus.DEGRADED,
+            "reconstruction provider is disabled",
+        )
     return HealthService(
         storage,
-        {
-            "database": database,
-            "redis": lambda: (CheckStatus.DEGRADED, "not checked"),
-            "worker": lambda: (CheckStatus.DEGRADED, "heartbeat unavailable"),
-            "ffmpeg": lambda: binary(ffmpeg),
-            "ffprobe": lambda: binary(ffprobe),
-            "storage": storage_check,
-        },
+        checks,
+        reconstruction_provider=reconstruction_provider,
     )

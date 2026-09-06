@@ -1,4 +1,5 @@
 import json
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -8,6 +9,7 @@ from app.transcription.reconstruction.providers import (
     ProviderResponseError,
     ResolutionRequest,
 )
+from app.transcription.reconstruction.types import ProviderAvailability, ProviderHealth
 
 
 def test_provider_uses_structured_two_pass_contract() -> None:
@@ -15,7 +17,16 @@ def test_provider_uses_structured_two_pass_contract() -> None:
 
     captured: list[dict[str, object]] = []
 
-    def request(_url: str, body: bytes, _headers: dict[str, str], _timeout: float) -> bytes:
+    def request(
+        method: str,
+        url: str,
+        body: bytes | None,
+        _headers: dict[str, str],
+        _timeout: float,
+    ) -> bytes:
+        assert method == "POST"
+        assert urlsplit(url).path == "/v1/chat/completions"
+        assert body is not None
         payload = json.loads(body)
         captured.append(payload)
         if len(captured) == 1:
@@ -78,6 +89,70 @@ def test_provider_rejects_missing_target_response() -> None:
 
     with pytest.raises(ProviderResponseError, match="omitted"):
         provider.generate_candidates([GenerationRequest(4, "raw", (), ())])
+
+
+def test_openai_compatible_health_requires_exact_model_id() -> None:
+    def request(
+        method: str,
+        url: str,
+        body: bytes | None,
+        _headers: dict[str, str],
+        _timeout: float,
+    ) -> bytes:
+        assert method == "GET"
+        assert urlsplit(url).path == "/v1/models"
+        assert body is None
+        return b'{"data":[{"id":"qwen3:8b"}]}'
+
+    provider = OpenAICompatibleReconstructionProvider(
+        base_url="http://provider:11434",
+        model="qwen3:8b",
+        timeout_seconds=3,
+        request=request,
+    )
+
+    assert provider.health() == ProviderHealth(
+        ProviderAvailability.AVAILABLE,
+        "openai_compatible",
+        "qwen3:8b",
+        None,
+        "model available",
+    )
+
+
+def test_openai_compatible_health_reports_missing_model_without_response_content() -> None:
+    provider = OpenAICompatibleReconstructionProvider(
+        base_url="http://provider:11434",
+        model="secret-model",
+        timeout_seconds=3,
+        request=lambda *_args: b'{"data":[{"id":"other-model"}],"secret":"do-not-leak"}',
+    )
+
+    result = provider.health()
+
+    assert result.availability is ProviderAvailability.UNAVAILABLE
+    assert result.detail == "configured model secret-model is not available"
+    assert "do-not-leak" not in result.detail
+
+
+def test_openai_compatible_release_is_a_no_op() -> None:
+    calls = 0
+
+    def request(*_args: object) -> bytes:
+        nonlocal calls
+        calls += 1
+        return b"{}"
+
+    provider = OpenAICompatibleReconstructionProvider(
+        base_url="http://provider:11434",
+        model="qwen3:8b",
+        timeout_seconds=3,
+        request=request,
+    )
+
+    provider.release()
+
+    assert calls == 0
 
 
 def _response(content: dict[str, object]) -> bytes:

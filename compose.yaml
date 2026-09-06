@@ -24,6 +24,12 @@ services:
       timeout: 3s
       retries: 20
 
+  ollama:
+    image: ollama/ollama
+    profiles: ["reconstruction"]
+    volumes:
+      - ollama_models:/root/.ollama
+
   backend:
     build: ./backend
     env_file:
@@ -70,3 +76,4 @@ volumes:
   postgres_data:
   redis_data:
   whisper_model_cache:
+  ollama_models:

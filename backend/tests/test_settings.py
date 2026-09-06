@@ -4,6 +4,8 @@ import pytest
 from pydantic import ValidationError
 
 from app.core.settings import Settings
+from app.transcription.reconstruction.ollama import OllamaReconstructionProvider
+from app.transcription.reconstruction.providers import OpenAICompatibleReconstructionProvider
 
 
 def test_settings_uses_storage_root_from_explicit_environment(
@@ -92,3 +94,34 @@ def test_settings_builds_opt_in_local_correction_provider(monkeypatch: pytest.Mo
     assert settings.correction_config().provider_batch_size == 8
     provider = settings.correction_provider_instance()
     assert provider is not None
+
+
+def test_reconstruction_defaults_to_managed_local_provider() -> None:
+    settings = Settings(_env_file=None)
+
+    assert settings.reconstruction_provider == "ollama"
+    assert settings.reconstruction_provider_base_url == "http://ollama:11434"
+    assert settings.reconstruction_provider_model == "qwen3:8b"
+    assert settings.reconstruction_provider_timeout_seconds == 180
+    assert settings.reconstruction_release_after_run is True
+    assert isinstance(settings.reconstruction_provider_instance(), OllamaReconstructionProvider)
+
+
+def test_reconstruction_retains_explicit_disabled_mode() -> None:
+    settings = Settings(_env_file=None, reconstruction_provider="disabled")
+
+    assert settings.reconstruction_provider_instance() is None
+
+
+def test_reconstruction_retains_explicit_openai_compatible_mode() -> None:
+    settings = Settings(
+        _env_file=None,
+        reconstruction_provider="openai_compatible",
+        reconstruction_provider_base_url="http://provider:8080",
+        reconstruction_provider_model="local-model",
+    )
+
+    assert isinstance(
+        settings.reconstruction_provider_instance(),
+        OpenAICompatibleReconstructionProvider,
+    )

@@ -21,6 +21,7 @@ from app.transcription.reconstruction.benchmark import (
     load_benchmark_manifest,
     run_reconstruction_benchmark,
 )
+from app.transcription.reconstruction.types import ProviderAvailability, ProviderHealth
 from app.workers.tasks import run_pipeline_stage
 
 app = typer.Typer(no_args_is_help=True)
@@ -34,6 +35,38 @@ def _storage() -> StorageService:
 def health() -> None:
     report = HealthService(_storage()).report()
     typer.echo(report.status.value)
+
+
+@app.command("reconstruction-health")
+def reconstruction_health() -> None:
+    """Verify configured reconstruction endpoint and exact model availability."""
+
+    settings = get_settings()
+    provider = settings.reconstruction_provider_instance()
+    report = (
+        provider.health()
+        if provider is not None
+        else ProviderHealth(
+            ProviderAvailability.MISCONFIGURED,
+            settings.reconstruction_provider,
+            settings.reconstruction_provider_model,
+            None,
+            "reconstruction provider is disabled",
+        )
+    )
+    typer.echo(
+        json.dumps(
+            {
+                "availability": report.availability.value,
+                "provider": report.provider,
+                "model": report.model,
+                "digest": report.model_digest,
+                "detail": report.detail,
+            }
+        )
+    )
+    if report.availability is not ProviderAvailability.AVAILABLE:
+        raise typer.Exit(1)
 
 
 @app.command()

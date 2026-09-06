@@ -51,6 +51,21 @@ class QualityFlag(str, Enum):
     RECONSTRUCTION_PROVIDER_ERROR = "RECONSTRUCTION_PROVIDER_ERROR"
 
 
+class ProviderAvailability(str, Enum):
+    AVAILABLE = "AVAILABLE"
+    UNAVAILABLE = "UNAVAILABLE"
+    MISCONFIGURED = "MISCONFIGURED"
+
+
+@dataclass(frozen=True)
+class ProviderHealth:
+    availability: ProviderAvailability
+    provider: str
+    model: str | None
+    model_digest: str | None
+    detail: str
+
+
 @dataclass(frozen=True)
 class ReconstructionCandidate:
     candidate_id: str

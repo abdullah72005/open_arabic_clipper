@@ -5,10 +5,15 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Protocol, cast
 from urllib.request import Request, urlopen
 
-from app.transcription.reconstruction.types import ReconstructionCandidate, ResolutionScores
+from app.transcription.reconstruction.types import (
+    ProviderAvailability,
+    ProviderHealth,
+    ReconstructionCandidate,
+    ResolutionScores,
+)
 
 
 class ProviderResponseError(ValueError):
@@ -39,6 +44,8 @@ class ResolutionChoice:
 
 
 class ReconstructionProvider(Protocol):
+    def health(self) -> ProviderHealth: ...
+
     def generate_candidates(
         self, requests: list[GenerationRequest]
     ) -> dict[int, list[ReconstructionCandidate]]: ...
@@ -47,8 +54,10 @@ class ReconstructionProvider(Protocol):
         self, requests: list[ResolutionRequest]
     ) -> dict[int, ResolutionChoice]: ...
 
+    def release(self) -> None: ...
 
-HttpRequest = Callable[[str, bytes, dict[str, str], float], bytes]
+
+HttpRequest = Callable[[str, str, bytes | None, dict[str, str], float], bytes]
 
 
 class OpenAICompatibleReconstructionProvider:
@@ -62,10 +71,47 @@ class OpenAICompatibleReconstructionProvider:
         timeout_seconds: float,
         request: HttpRequest | None = None,
     ) -> None:
-        self._url = f"{base_url.rstrip('/')}/v1/chat/completions"
-        self._model = model
+        self._base_url = base_url.rstrip("/")
+        self.model = model
         self._timeout = timeout_seconds
         self._request = request or _request_bytes
+
+    def health(self) -> ProviderHealth:
+        try:
+            payload = self._json_request("GET", "/v1/models", None)
+            models = payload.get("data")
+            if not isinstance(models, list):
+                raise ProviderResponseError("provider response is missing models")
+        except ProviderResponseError:
+            return ProviderHealth(
+                ProviderAvailability.UNAVAILABLE,
+                "openai_compatible",
+                self.model,
+                None,
+                "provider health check failed",
+            )
+        match = next(
+            (item for item in models if isinstance(item, dict) and item.get("id") == self.model),
+            None,
+        )
+        if match is None:
+            return ProviderHealth(
+                ProviderAvailability.UNAVAILABLE,
+                "openai_compatible",
+                self.model,
+                None,
+                f"configured model {self.model} is not available",
+            )
+        return ProviderHealth(
+            ProviderAvailability.AVAILABLE,
+            "openai_compatible",
+            self.model,
+            None,
+            "model available",
+        )
+
+    def release(self) -> None:
+        """Generic OpenAI-compatible endpoints have no portable unload operation."""
 
     def generate_candidates(
         self, requests: list[GenerationRequest]
@@ -115,7 +161,7 @@ class OpenAICompatibleReconstructionProvider:
         self, instruction: str, payload: dict[str, object], schema: dict[str, object]
     ) -> dict[str, object]:
         body = {
-            "model": self._model,
+            "model": self.model,
             "temperature": 0,
             "response_format": {
                 "type": "json_schema",
@@ -126,15 +172,17 @@ class OpenAICompatibleReconstructionProvider:
                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
             ],
         }
+        parsed = self._json_request("POST", "/v1/chat/completions", body)
         try:
-            response = self._request(
-                self._url,
-                json.dumps(body, ensure_ascii=False).encode(),
-                {"Content-Type": "application/json"},
-                self._timeout,
-            )
-            parsed = json.loads(response.decode())
-            content = parsed["choices"][0]["message"]["content"]
+            choices = parsed["choices"]
+            if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+                raise TypeError
+            message = choices[0]["message"]
+            if not isinstance(message, dict):
+                raise TypeError
+            content = message["content"]
+            if not isinstance(content, str):
+                raise TypeError
             result = json.loads(content)
         except (
             KeyError,
@@ -148,6 +196,29 @@ class OpenAICompatibleReconstructionProvider:
         if not isinstance(result, dict):
             raise ProviderResponseError("provider response must be an object")
         return result
+
+    def _json_request(
+        self,
+        method: str,
+        path: str,
+        payload: dict[str, object] | None,
+    ) -> dict[str, object]:
+        body = None if payload is None else json.dumps(payload, ensure_ascii=False).encode()
+        headers = {} if body is None else {"Content-Type": "application/json"}
+        try:
+            response = self._request(
+                method,
+                f"{self._base_url}/{path.lstrip('/')}",
+                body,
+                headers,
+                self._timeout,
+            )
+            parsed = json.loads(response.decode())
+        except (UnicodeDecodeError, json.JSONDecodeError, OSError) as error:
+            raise ProviderResponseError("provider request failed") from error
+        if not isinstance(parsed, dict):
+            raise ProviderResponseError("provider response must be an object")
+        return parsed
 
 
 def _parse_generations(
@@ -242,8 +313,14 @@ def _resolution_schema() -> dict[str, object]:
     }
 
 
-def _request_bytes(url: str, body: bytes, headers: dict[str, str], timeout: float) -> bytes:
+def _request_bytes(
+    method: str,
+    url: str,
+    body: bytes | None,
+    headers: dict[str, str],
+    timeout: float,
+) -> bytes:
     with urlopen(
-        Request(url, data=body, headers=headers, method="POST"), timeout=timeout
+        Request(url, data=body, headers=headers, method=method), timeout=timeout
     ) as response:  # noqa: S310
-        return response.read()
+        return cast(bytes, response.read())
