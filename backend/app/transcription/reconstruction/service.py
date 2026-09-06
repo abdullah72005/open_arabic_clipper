@@ -16,6 +16,7 @@ from app.transcription.reconstruction.providers import (
     ResolutionChoice,
     ResolutionRequest,
 )
+from app.transcription.reconstruction.routing import route_segment
 from app.transcription.reconstruction.types import (
     ConfidenceLevel,
     QualityFlag,
@@ -51,7 +52,11 @@ class ContextualReconstructor:
             return ReconstructionResult(results, _joined(results), fingerprint)
         result: ReconstructionResult
         try:
-            requests = [_generation_request(segments, index) for index in range(len(segments))]
+            memory = build_entity_memory(segments)
+            requests = [
+                _generation_request(segments, index, language, tuple(memory.occurrences))
+                for index in range(len(segments))
+            ]
             generated = self._provider.generate_candidates(requests)
             resolved = self._provider.resolve_candidates(
                 [
@@ -189,17 +194,18 @@ def reconstruction_fingerprint(
     ).hexdigest()
 
 
-def _generation_request(segments: Sequence[Mapping[str, object]], index: int) -> GenerationRequest:
+def _generation_request(
+    segments: Sequence[Mapping[str, object]],
+    index: int,
+    language: str | None = None,
+    entity_forms: tuple[str, ...] = (),
+) -> GenerationRequest:
     window = build_reconstruction_window(segments, index)
-    current = next(item for item in window.segments if item.segment_index == index)
-    position = next(
-        position for position, item in enumerate(window.segments) if item.segment_index == index
-    )
     return GenerationRequest(
-        index,
-        current.raw_text,
-        tuple(item.raw_text for item in window.segments[:position]),
-        tuple(item.raw_text for item in window.segments[position + 1 :]),
+        window=window,
+        language=language,
+        entity_forms=entity_forms,
+        routing_decision=route_segment(window, language=language),
     )
 
 

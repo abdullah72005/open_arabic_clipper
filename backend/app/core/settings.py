@@ -63,6 +63,8 @@ class Settings(BaseSettings):
     reconstruction_provider_model: str | None = Field(default="qwen3:8b", max_length=256)
     reconstruction_provider_timeout_seconds: float = Field(default=180.0, gt=0, le=300)
     reconstruction_release_after_run: bool = True
+    reconstruction_provider_batch_windows: int = Field(default=8, gt=0, le=16)
+    reconstruction_provider_batch_characters: int = Field(default=24_000, gt=0, le=48_000)
     transcription_queue_concurrency: int = Field(default=1, gt=0)
     cors_origins: list[str] = ["http://localhost:3301"]
 

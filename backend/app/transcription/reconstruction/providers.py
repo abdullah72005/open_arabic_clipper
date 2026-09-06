@@ -12,6 +12,7 @@ from app.transcription.reconstruction.types import (
     ProviderAvailability,
     ProviderHealth,
     ReconstructionCandidate,
+    ReconstructionWindow,
     ResolutionScores,
 )
 
@@ -22,10 +23,89 @@ class ProviderResponseError(ValueError):
 
 @dataclass(frozen=True)
 class GenerationRequest:
-    segment_index: int
-    raw_text: str
-    previous: tuple[str, ...]
-    following: tuple[str, ...]
+    segment_index: int | None = None
+    raw_text: str = ""
+    previous: tuple[str, ...] = ()
+    following: tuple[str, ...] = ()
+    window: ReconstructionWindow | None = None
+    language: str | None = None
+    entity_forms: tuple[str, ...] = ()
+    routing_decision: object | None = None
+
+    def __post_init__(self) -> None:
+        if self.window is not None:
+            current = next(
+                item
+                for item in self.window.segments
+                if item.segment_index == self.window.target_segment_index
+            )
+            object.__setattr__(self, "segment_index", self.window.target_segment_index)
+            object.__setattr__(self, "raw_text", current.raw_text)
+
+    def to_payload(self) -> dict[str, object]:
+        if self.window is None:
+            items: list[dict[str, object]] = [
+                {
+                    "segment_id": self.segment_index,
+                    "raw_text": self.raw_text,
+                    "corrected_text": self.raw_text,
+                    "previous_raw": list(self.previous),
+                    "following_raw": list(self.following),
+                }
+            ]
+        else:
+            target = self.window.target_segment_index
+            ordered = self.window.segments
+            position = next(i for i, item in enumerate(ordered) if item.segment_index == target)
+            items = [
+                {
+                    "segment_id": item.segment_index,
+                    "start": item.start,
+                    "end": item.end,
+                    "raw_text": item.raw_text,
+                    "corrected_text": item.corrected_text,
+                    "previous_raw": [entry.raw_text for entry in ordered[:position]],
+                    "previous_corrected": [entry.corrected_text for entry in ordered[:position]],
+                    "following_raw": [entry.raw_text for entry in ordered[position + 1 :]],
+                    "following_corrected": [
+                        entry.corrected_text for entry in ordered[position + 1 :]
+                    ],
+                    "word_evidence": [
+                        {
+                            "text": word.text,
+                            "start": word.start,
+                            "end": word.end,
+                            "probability": word.probability,
+                        }
+                        for word in item.word_evidence
+                    ],
+                }
+                for item in self.window.segments
+            ]
+        routing = self.routing_decision
+        reason = getattr(routing, "reason", "") if routing is not None else ""
+        reasons = list(getattr(routing, "reasons", (reason,))) if routing is not None else []
+        focus = getattr(routing, "focus_spans", ()) if routing is not None else ()
+        return {
+            "segment_id": self.segment_index,
+            "window": items,
+            "language": self.language,
+            "entities": list(self.entity_forms),
+            "routing": {
+                "priority": getattr(getattr(routing, "priority", None), "value", None),
+                "reason": reason,
+                "reasons": reasons,
+                "focus_spans": [
+                    {
+                        "text": span.text,
+                        "start": span.start,
+                        "end": span.end,
+                        "probability": span.probability,
+                    }
+                    for span in focus
+                ],
+            },
+        }
 
 
 @dataclass(frozen=True)
@@ -75,6 +155,7 @@ class OpenAICompatibleReconstructionProvider:
         self.model = model
         self._timeout = timeout_seconds
         self._request = request or _request_bytes
+        self.provider_name = "openai_compatible"
 
     def health(self) -> ProviderHealth:
         try:
@@ -117,19 +198,13 @@ class OpenAICompatibleReconstructionProvider:
         self, requests: list[GenerationRequest]
     ) -> dict[int, list[ReconstructionCandidate]]:
         content = self._call(
-            "Generate no more than two spoken Egyptian Arabic reconstructions per segment. "
-            "Do not add facts, translate, formalize, or change numbers or Latin text.",
-            {
-                "targets": [
-                    {
-                        "segment_id": item.segment_index,
-                        "raw_text": item.raw_text,
-                        "previous": item.previous,
-                        "following": item.following,
-                    }
-                    for item in requests
-                ]
-            },
+            "Reconstruct only what was most plausibly spoken in the target segment. "
+            "Preserve Egyptian Arabic; do not rewrite into MSA. "
+            "Do not summarize, paraphrase stylistically, translate, add facts, names, numbers, "
+            "or clauses. Use focus_spans and surrounding raw/corrected evidence. Return zero "
+            "candidates when unchanged is safer. "
+            "Generate no more than two spoken Egyptian Arabic reconstructions per segment.",
+            {"targets": [item.to_payload() for item in requests]},
             _generation_schema(),
         )
         return _parse_generations(content, {item.segment_index for item in requests})
@@ -172,6 +247,10 @@ class OpenAICompatibleReconstructionProvider:
                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
             ],
         }
+        if self.provider_name == "ollama":
+            body["reasoning_effort"] = "none"
+            if self.model.startswith("qwen3"):
+                body["messages"][0]["content"] = instruction + " /no_think"
         parsed = self._json_request("POST", "/v1/chat/completions", body)
         try:
             choices = parsed["choices"]
@@ -324,3 +403,40 @@ def _request_bytes(
         Request(url, data=body, headers=headers, method=method), timeout=timeout
     ) as response:  # noqa: S310
         return cast(bytes, response.read())
+
+
+def batch_generation_requests(
+    requests: list[GenerationRequest], *, max_windows: int = 8, max_characters: int = 24_000
+) -> list[list[GenerationRequest]]:
+    """Group deterministic UTF-8 payloads, prioritizing reconstruction work."""
+    if not 1 <= max_windows <= 16:
+        raise ValueError("max_windows exceeds hard maximum 16")
+    if not 1 <= max_characters <= 48_000:
+        raise ValueError("max_characters exceeds hard maximum 48000")
+    ordered = sorted(
+        enumerate(requests),
+        key=lambda pair: (
+            0
+            if getattr(getattr(pair[1].routing_decision, "priority", None), "value", "")
+            == "reconstruct"
+            else 1,
+            pair[0],
+        ),
+    )
+    batches: list[list[GenerationRequest]] = []
+    current: list[GenerationRequest] = []
+    for _, request in ordered:
+        candidate = [*current, request]
+        encoded = json.dumps(
+            [item.to_payload() for item in candidate], ensure_ascii=False, sort_keys=True
+        ).encode("utf-8")
+        if current and (len(candidate) > max_windows or len(encoded) > max_characters):
+            batches.append(current)
+            current = [request]
+        elif not current and len(encoded) > max_characters:
+            raise ValueError("single generation request exceeds character bound")
+        else:
+            current = candidate
+    if current:
+        batches.append(current)
+    return batches

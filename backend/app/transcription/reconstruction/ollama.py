@@ -24,6 +24,7 @@ class OllamaReconstructionProvider(OpenAICompatibleReconstructionProvider):
             timeout_seconds=timeout_seconds,
             request=request,
         )
+        self.provider_name = "ollama"
         self.release_after_run = release_after_run
 
     def health(self) -> ProviderHealth:
