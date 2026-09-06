@@ -7,12 +7,23 @@ from app.transcription.reconstruction.providers import (
 from app.transcription.reconstruction.service import ContextualReconstructor, select_final_text
 from app.transcription.reconstruction.types import (
     ConfidenceLevel,
+    ProviderAvailability,
+    ProviderHealth,
     ReconstructionCandidate,
     ResolutionScores,
 )
 
 
 class HighConfidenceProvider:
+    def __init__(self) -> None:
+        self.release_calls = 0
+
+    def health(self) -> ProviderHealth:
+        return ProviderHealth(ProviderAvailability.AVAILABLE, "test", "test", "sha256:x", "ok")
+
+    def release(self) -> None:
+        self.release_calls += 1
+
     def generate_candidates(
         self, requests: list[GenerationRequest]
     ) -> dict[int, list[ReconstructionCandidate]]:
@@ -35,7 +46,8 @@ class HighConfidenceProvider:
 def test_reconstructor_applies_only_high_contextual_candidate() -> None:
     """A high-scoring source-supported candidate becomes automatic final text."""
 
-    result = ContextualReconstructor(HighConfidenceProvider()).reconstruct(
+    provider = HighConfidenceProvider()
+    result = ContextualReconstructor(provider).reconstruct(
         [{"start": 0.0, "end": 1.0, "text": "دخم", "corrected_text": "دخم"}],
         language="ar",
         transcription_fingerprint="asr-v1",
@@ -47,6 +59,7 @@ def test_reconstructor_applies_only_high_contextual_candidate() -> None:
     assert segment.confidence_level is ConfidenceLevel.HIGH
     assert segment.applied is True
     assert result.contextual_reconstructed_text == "ضخمة"
+    assert provider.release_calls == 1
 
 
 def test_reconstructor_without_provider_preserves_stage_2_5_text() -> None:
@@ -64,7 +77,13 @@ def test_reconstructor_without_provider_preserves_stage_2_5_text() -> None:
 
 
 def test_reconstructor_falls_back_only_for_expected_provider_failures() -> None:
-    class BrokenProvider:
+    class ReleasingBrokenProvider:
+        def __init__(self) -> None:
+            self.release_calls = 0
+
+        def health(self) -> ProviderHealth:
+            return ProviderHealth(ProviderAvailability.AVAILABLE, "test", "test", "sha256:x", "ok")
+
         def generate_candidates(
             self, requests: list[GenerationRequest]
         ) -> dict[int, list[ReconstructionCandidate]]:
@@ -75,7 +94,11 @@ def test_reconstructor_falls_back_only_for_expected_provider_failures() -> None:
         ) -> dict[int, ResolutionChoice]:
             raise AssertionError("resolution must not run")
 
-    result = ContextualReconstructor(BrokenProvider()).reconstruct(
+        def release(self) -> None:
+            self.release_calls += 1
+
+    provider = ReleasingBrokenProvider()
+    result = ContextualReconstructor(provider).reconstruct(
         [{"start": 0.0, "end": 1.0, "text": "خطي بالك", "corrected_text": "خلي بالك"}],
         language="ar",
         transcription_fingerprint="asr-v1",
@@ -84,6 +107,7 @@ def test_reconstructor_falls_back_only_for_expected_provider_failures() -> None:
 
     assert result.segments[0].contextual_reconstructed_text == "خلي بالك"
     assert result.segments[0].quality_flags[0].value == "RECONSTRUCTION_PROVIDER_ERROR"
+    assert provider.release_calls == 1
 
 
 def test_final_text_priority_keeps_manual_text_above_reconstruction() -> None:

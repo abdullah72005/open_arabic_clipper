@@ -48,8 +48,8 @@ class ContextualReconstructor:
                 self._fallback(index, segment) for index, segment in enumerate(segments)
             )
             return ReconstructionResult(results, _joined(results), fingerprint)
-        requests = [_generation_request(segments, index) for index in range(len(segments))]
         try:
+            requests = [_generation_request(segments, index) for index in range(len(segments))]
             generated = self._provider.generate_candidates(requests)
             resolved = self._provider.resolve_candidates(
                 [
@@ -69,18 +69,20 @@ class ContextualReconstructor:
                     for request in requests
                 ]
             )
+            memory = build_entity_memory(segments)
+            results = tuple(
+                self._decide(index, segment, generated[index], resolved[index], memory)
+                for index, segment in enumerate(segments)
+            )
+            return ReconstructionResult(results, _joined(results), fingerprint)
         except (OSError, ProviderResponseError):
             results = tuple(
                 self._fallback(index, segment, provider_error=True)
                 for index, segment in enumerate(segments)
             )
             return ReconstructionResult(results, _joined(results), fingerprint)
-        memory = build_entity_memory(segments)
-        results = tuple(
-            self._decide(index, segment, generated[index], resolved[index], memory)
-            for index, segment in enumerate(segments)
-        )
-        return ReconstructionResult(results, _joined(results), fingerprint)
+        finally:
+            self._provider.release()
 
     def _fallback(
         self, index: int, segment: Mapping[str, object], provider_error: bool = False

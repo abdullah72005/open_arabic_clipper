@@ -1,5 +1,7 @@
+from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 from sqlalchemy.orm import Session
 
@@ -37,6 +39,19 @@ class FakeModel:
         assert path == "speech.wav"
         assert kwargs["word_timestamps"] is True
         return [FakeSegment()], FakeInfo()
+
+
+class LazyWhisperModel:
+    exhausted = False
+
+    def transcribe(self, path: str, **kwargs: object) -> tuple[Iterator[object], object]:
+        del path, kwargs
+
+        def rows() -> Iterator[object]:
+            yield SimpleNamespace(start=0.0, end=1.0, text=" كلام", words=[])
+            self.exhausted = True
+
+        return rows(), SimpleNamespace(language="ar", language_probability=0.99, duration=1.0)
 
 
 def test_transcription_fingerprint_changes_for_material_settings_only() -> None:
@@ -94,6 +109,28 @@ def test_engine_falls_back_to_cpu_int8_and_preserves_word_timestamps() -> None:
     assert result.segments[0]["start"] == 0.0
     assert result.segments[0]["end"] == 1.25
     assert result.segments[0]["words"][0]["start"] == 0.0
+
+
+def test_whisper_materializes_segments_before_collecting_model() -> None:
+    """Model cleanup happens only after the lazy Whisper stream is exhausted."""
+
+    from app.transcription.engine import WhisperEngine
+
+    model = LazyWhisperModel()
+    collected: list[bool] = []
+    engine = WhisperEngine(
+        model_factory=lambda *_: model,
+        cuda_available=lambda: False,
+        collect_garbage=lambda: collected.append(model.exhausted) or 0,
+    )
+
+    result = engine.transcribe(
+        Path("speech.wav"),
+        TranscriptionOptions(model="small", device="cpu", compute_type="int8", beam_size=5),
+    )
+
+    assert result.segments
+    assert collected == [True]
 
 
 def test_engine_passes_explicit_safe_decoding_options() -> None:
