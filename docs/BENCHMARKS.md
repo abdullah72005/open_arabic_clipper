@@ -127,3 +127,15 @@ The runner's safety gates reject unreviewed, unauthorized, or out-of-storage
 inputs; a known regression set can run but can never pass the unseen readiness
 gate. Until a feasible model and a completed unseen-audio evaluation pass every
 gate, Stage 2.7 remains open.
+
+## Heavy-model lifecycle validation (2026-09-07)
+
+The operator applied the `[wsl2] memory=11GB swap=4GB` configuration; the WSL
+VM now reports about 10.69 GiB (`diagnose-memory`). Three sequential
+transcription-plus-reconstruction trials ran on an authorized 51.5 s source with
+`large-v3-turbo` (int8 CPU) and `qwen3.5:4b`. The Redis heavy-model lease
+serialized Whisper and Ollama: the Whisper spawned child exited and was reaped
+before Ollama loaded, `ollama ps` was empty after every reconstruction, unload
+was confirmed in under a second, swap growth was effectively zero, and no OOM
+occurred. See `docs/STAGE_2_7_OPERATIONS.md` for the per-trial memory table.
+This validates the lifecycle, not model quality; no quality claim is made.

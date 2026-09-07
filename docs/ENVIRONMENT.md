@@ -72,3 +72,24 @@ then runs `wsl --shutdown` from Windows, restarts Docker Desktop, and reruns
 headroom while allowing a practical quantized 8B trial. Twelve GiB is acceptable
 only as an operator-selected alternative after measuring that Windows pressure
 stays safe. The repository never edits `.wslconfig` or restarts WSL itself.
+
+### After applying the WSL configuration (measured 2026-09-07)
+
+The operator applied the `memory=11GB swap=4GB` configuration. `diagnose-memory`
+now reports:
+
+| Layer | Value |
+| --- | --- |
+| Linux `MemTotal` | 11,212,972 kB ≈ 10.69 GiB |
+| Docker `MemTotal` | 11,482,083,328 bytes ≈ 10.69 GiB |
+| Linux `MemAvailable` | ≈ 8.2 GiB at rest |
+| Swap | 4 GiB total, ≈ 0 used at rest |
+| cgroup limit | `max` (unlimited) |
+
+The heavy-model lifecycle was then measured over three sequential
+transcription-plus-reconstruction trials. In every trial the Whisper model ran
+in a spawned child process that exited and was reaped before the Ollama
+reconstruction began (the Redis `clipfactory:heavy-model` lease serializes
+them). `ollama ps` was empty before and after each reconstruction, and the
+`unload_outcome` metadata confirmed the unload within a second. See
+`docs/STAGE_2_7_OPERATIONS.md` for the per-trial memory table.

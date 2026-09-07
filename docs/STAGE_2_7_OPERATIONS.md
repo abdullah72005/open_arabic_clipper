@@ -35,6 +35,38 @@ default 50% of a 16 GB host). Raising it requires the operator to write
 repository never performs that change itself. See `docs/ENVIRONMENT.md` for the
 measured values and conclusion.
 
+## Measured sequential lifecycle (2026-09-07, 10.69 GiB envelope)
+
+Three sequential transcription-plus-reconstruction trials ran on an
+operator-authorized 51.5 s source (`ca6cb88a…`) with `large-v3-turbo` (int8,
+CPU) and `qwen3.5:4b` through the managed Ollama provider. The worker runs
+Celery with `--pool=solo --concurrency=1 --max-tasks-per-child=1` and
+`PYTHONPATH=/app`; the pre-fork pool is not used because its daemonic workers
+cannot spawn the Whisper child process. A Redis-backed heavy-model lease
+(`clipfactory:heavy-model`) serializes Whisper and Ollama.
+
+Per-trial container RSS peaks (`docker stats --no-stream`, GiB):
+
+| Trial | Whisper child peak | Whisper after child exit | Ollama peak | Ollama after unload | `ollama ps` after |
+| --- | ---: | ---: | ---: | ---: | --- |
+| 1 | 1.97 | ≈ 0.17 | n/a (observed 0.33 idle) | 0.33 | empty |
+| 2 | 2.46 | ≈ 0.26 | 5.85 | runtime empty (2.2 page cache) | empty |
+| 3 | 3.36 | ≈ 0.47 | 5.93 | runtime empty (2.3 page cache) | empty |
+
+Observations across all three trials:
+
+- No Whisper/Ollama overlap: the lease serialized them, and the Whisper child
+  exited before Ollama began loading.
+- No OOM event; `MemAvailable` never fell below about 4.6 GiB.
+- Swap growth per run was effectively zero (4 GiB swap, `SwapFree` stayed above
+  3.99 GiB throughout).
+- `ollama ps` was empty after every reconstruction; the persisted
+  `unload_outcome` metadata recorded `requested=true`, `confirmed=true`, and
+  sub-second elapsed time. The Ollama container's residual ≈ 2.2 GiB RSS is
+  kernel page cache attributed to the container, not a resident model runtime.
+- The worker process itself stayed small; the container RSS includes the
+  spawned child and reclaimable page cache.
+
 The health command and API expose provider availability, provider name, model,
 and model digest only. They do not expose provider response bodies, prompts,
 transcript text, credentials, or API keys. If the provider is unavailable,

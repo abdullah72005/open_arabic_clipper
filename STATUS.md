@@ -60,5 +60,24 @@ new model or threshold decision.
 See the task report for the latest local verification evidence. Copy
 `.env.example` to `.env` before starting Compose.
 
+## Heavy-model lifecycle status (2026-09-07)
+
+The memory and heavy-model lifecycle plan is implemented and its checkpoint
+passed: a read-only `diagnose-memory` command and `scripts/diagnose-memory.sh`
+label host/WSL/cgroup/process/container/swap memory; a Redis-backed
+`clipfactory:heavy-model` lease serializes Whisper and Ollama across workers and
+the CLI; Whisper runs in a spawned child process that is reaped before the lease
+releases; Ollama unload is verified by polling `/api/ps` and recorded as
+`unload_outcome`; and Celery runs `--pool=solo` (pre-fork daemonic workers
+cannot spawn the child) with concurrency 1 and `PYTHONPATH=/app`.
+
+The operator applied `[wsl2] memory=11GB swap=4GB`; Linux/Docker now report
+about 10.69 GiB effective capacity. Three sequential measured trials passed:
+Whisper and Ollama never overlapped, `ollama ps` was empty after each
+reconstruction, unload confirmed in under a second, swap growth was effectively
+zero, and no OOM occurred. This validates the lifecycle only; no model-quality
+or unseen-readiness claim is made. The 8B model has not been downloaded or
+benchmarked.
+
 STAGE 2.7 MUST CONTINUE
 
