@@ -32,3 +32,43 @@ faster-whisper and the running services triggers an out-of-memory kill.
 `qwen3.5:4b` (~3.4 GiB) loads but did not apply a reconstruction during the
 diagnostic because its unbatched request exceeded the model context; see
 `docs/BENCHMARKS.md` for measured results.
+
+## Stage 2.7 memory ceiling (measured 2026-09-07)
+
+`scripts/diagnose-memory.sh` is a read-only diagnostic that prints these facts.
+The measured values below distinguish host RAM, the WSL VM limit, the container
+cgroup limit, process/container usage, and swap.
+
+| Layer | Measurement | Value |
+| --- | --- | --- |
+| Host physical RAM | `Win32_ComputerSystem.TotalPhysicalMemory` | 16,506,011,648 bytes ≈ 15.37 GiB |
+| WSL config | `%UserProfile%\.wslconfig` | absent (no explicit limit) |
+| WSL default | `wsl --status` | WSL2, Ubuntu-22.04 |
+| Linux total | `/proc/meminfo MemTotal` | 7,803,048 kB ≈ 7.44 GiB |
+| Linux available | `/proc/meminfo MemAvailable` | ≈ 4.34 GiB at measurement |
+| Swap total / used | `swapon --show --bytes` | 2 GiB total, ≈ 1.3 GiB used |
+| cgroup limit | `/sys/fs/cgroup/memory.max` | `max` (no container cgroup limit) |
+| cgroup current / peak | `memory.current` / `memory.peak` | ≈ 383 MB / 504 MB |
+| Docker host view | `docker info MemTotal` | 7,990,321,152 bytes ≈ 7.44 GiB |
+| Worker container limit | `docker inspect .HostConfig.Memory` | 0 (unlimited) |
+| Ollama residency | `ollama ps` | no model loaded at measurement |
+
+**Conclusion:** the narrowest active ceiling is the WSL2 virtual-machine
+allocation. With no `.wslconfig`, WSL2 defaults to 50% of host RAM (about 8 GB),
+which the guest reports as 7.44 GiB of `MemTotal`. Container cgroup limits are
+unlimited and are not the cause. This is a WSL/Docker VM capacity limit, not an
+application limit.
+
+To raise the ceiling, the operator writes `%UserProfile%\.wslconfig`:
+
+```ini
+[wsl2]
+memory=11GB
+swap=4GB
+```
+
+then runs `wsl --shutdown` from Windows, restarts Docker Desktop, and reruns
+`scripts/diagnose-memory.sh`. Eleven GiB leaves roughly five GiB of host
+headroom while allowing a practical quantized 8B trial. Twelve GiB is acceptable
+only as an operator-selected alternative after measuring that Windows pressure
+stays safe. The repository never edits `.wslconfig` or restarts WSL itself.

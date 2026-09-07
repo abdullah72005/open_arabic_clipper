@@ -17,6 +17,24 @@ docker compose exec ollama ollama pull qwen3:8b
 docker compose exec backend python -m app.cli reconstruction-health
 ```
 
+## Memory diagnostics
+
+`scripts/diagnose-memory.sh` is a read-only host/container diagnostic that
+labels host RAM, the WSL VM limit, the container cgroup limit, process and
+container usage, and Ollama residency. It never edits configuration. Run it
+before any heavy-model trial and after any WSL/Docker change:
+
+```bash
+./scripts/diagnose-memory.sh
+```
+
+The current machine ceiling is the WSL2 VM allocation (about 7.44 GiB with the
+default 50% of a 16 GB host). Raising it requires the operator to write
+`%UserProfile%\.wslconfig` with `memory=11GB` and `swap=4GB`, run
+`wsl --shutdown`, restart Docker Desktop, and rerun the diagnostic; the
+repository never performs that change itself. See `docs/ENVIRONMENT.md` for the
+measured values and conclusion.
+
 The health command and API expose provider availability, provider name, model,
 and model digest only. They do not expose provider response bodies, prompts,
 transcript text, credentials, or API keys. If the provider is unavailable,
