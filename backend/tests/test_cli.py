@@ -149,9 +149,7 @@ def test_benchmark_cli_cannot_enter_when_heavy_lease_busy(monkeypatch, tmp_path)
         ],
         "known_regression_set": True,
     }
-    (manifest_dir / "chernobyl-reference-v1.json").write_text(
-        json.dumps(manifest), encoding="utf-8"
-    )
+    (manifest_dir / "known-regression-v1.json").write_text(json.dumps(manifest), encoding="utf-8")
 
     class FakeSettings:
         storage_root = root
@@ -175,7 +173,7 @@ def test_benchmark_cli_cannot_enter_when_heavy_lease_busy(monkeypatch, tmp_path)
         app,
         [
             "benchmark-reconstruction",
-            "stage-2-7/chernobyl-reference-v1.json",
+            "stage-2-7/known-regression-v1.json",
             "--allow-known-regression-set",
         ],
     )

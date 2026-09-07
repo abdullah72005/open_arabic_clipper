@@ -31,7 +31,7 @@ from app.transcription.reconstruction.types import ProviderAvailability, Provide
 from app.workers.tasks import run_pipeline_stage
 
 app = typer.Typer(no_args_is_help=True)
-_KNOWN_REGRESSION_MANIFEST_NAME = "stage-2-7/chernobyl-reference-v1.json"
+_KNOWN_REGRESSION_MANIFEST_NAME = "stage-2-7/known-regression-v1.json"
 
 
 def _storage() -> StorageService:
