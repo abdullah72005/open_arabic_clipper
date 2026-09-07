@@ -394,8 +394,8 @@ class BenchmarkRunner:
                 correction_version="benchmark",
             )
             reconstruction_wall_seconds += max(
-                reconstruction.metadata.get("wall_seconds", 0.0), 0.0
-            )  # type: ignore[arg-type]
+                float(cast(float, reconstruction.metadata.get("wall_seconds", 0.0))), 0.0
+            )
             prompt_diag = reconstruction.metadata.get("prompt_diagnostics")
             if isinstance(prompt_diag, dict):
                 for key, value in prompt_diag.items():
