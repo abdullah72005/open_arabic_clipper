@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import resource
@@ -21,6 +22,11 @@ from app.pipeline.fingerprints import canonical_fingerprint
 from app.services.storage import StorageCategory, StorageService, StorageValidationError
 from app.transcription.correction import SegmentCorrection, normalize_for_comparison
 from app.transcription.engine import TranscriptionResult
+from app.transcription.reconstruction.capture import (
+    ASRCapture,
+    CaptureValidationError,
+    build_capture,
+)
 from app.transcription.reconstruction.types import (
     ProviderAvailability,
     ProviderHealth,
@@ -238,7 +244,7 @@ class BenchmarkRunner:
         self,
         storage: StorageService,
         *,
-        whisper_engine: Transcriber,
+        whisper_engine: Transcriber | None,
         corrector: Corrector,
         reconstructor: Reconstructor,
         transcription_options: TranscriptionOptions,
@@ -267,8 +273,17 @@ class BenchmarkRunner:
         self._peak_vram_bytes = peak_vram_bytes
         self._prompt_settings_fingerprint = prompt_settings_fingerprint
 
-    def run(self, manifest: BenchmarkManifest) -> BenchmarkReport:
-        """Run the private benchmark and write deterministic artifacts via storage."""
+    def run(
+        self,
+        manifest: BenchmarkManifest,
+        *,
+        capture: ASRCapture | None = None,
+    ) -> BenchmarkReport:
+        """Run the private benchmark and write deterministic artifacts via storage.
+
+        When a capture is supplied, raw ASR segments and language come from the
+        capture and the transcriber is never constructed or invoked.
+        """
 
         started = self._monotonic()
         swap_before = self._swap_bytes()
@@ -287,6 +302,7 @@ class BenchmarkRunner:
         model_digest = health.model_digest or "" if health is not None else ""
 
         source_map = {source.id: source for source in manifest.sources}
+        captured_by_id = {clip.clip_id: clip for clip in capture.clips} if capture else {}
         rows: list[dict[str, object]] = []
         counts: Counter[str] = Counter()
         exact_counts: Counter[str] = Counter()
@@ -295,17 +311,28 @@ class BenchmarkRunner:
         unreviewed = 0
 
         for clip in manifest.clips:
-            source_path = self._storage.resolve(
-                StorageCategory.SOURCES, source_map[clip.source_id].path
-            )
-            if not source_path.is_file():
-                raise StorageValidationError(
-                    f"benchmark source media is missing from storage: {clip.source_id}"
+            if capture is not None:
+                captured = captured_by_id.get(clip.id)
+                if captured is None:
+                    raise CaptureValidationError(f"capture is missing clip {clip.id}")
+                raw_segments = [dict(segment) for segment in captured.segments]
+                clip_language = captured.language
+            else:
+                assert self._whisper_engine is not None
+                source_path = self._storage.resolve(
+                    StorageCategory.SOURCES, source_map[clip.source_id].path
                 )
-            audio_path = clip_directory / f"{clip.id}.wav"
-            self._extract_clip(source_path, clip.start_seconds, clip.end_seconds, audio_path)
-            raw_result = self._whisper_engine.transcribe(audio_path, self._transcription_options)
-            raw_segments = [dict(segment) for segment in raw_result.segments]
+                if not source_path.is_file():
+                    raise StorageValidationError(
+                        f"benchmark source media is missing from storage: {clip.source_id}"
+                    )
+                audio_path = clip_directory / f"{clip.id}.wav"
+                self._extract_clip(source_path, clip.start_seconds, clip.end_seconds, audio_path)
+                raw_result = self._whisper_engine.transcribe(
+                    audio_path, self._transcription_options
+                )
+                raw_segments = [dict(segment) for segment in raw_result.segments]
+                clip_language = raw_result.language
             identity = [
                 (index, segment.get("start"), segment.get("end"))
                 for index, segment in enumerate(raw_segments)
@@ -324,7 +351,7 @@ class BenchmarkRunner:
                 raise ValueError("Stage 2.5 changed raw segment IDs or timestamps")
             reconstruction = self._reconstructor.reconstruct(
                 stage25,
-                language=raw_result.language,
+                language=clip_language,
                 transcription_fingerprint="benchmark",
                 correction_version="benchmark",
             )
@@ -478,6 +505,44 @@ class BenchmarkRunner:
                 "16000",
                 str(destination),
             ]
+        )
+
+    def capture_asr(self, manifest: BenchmarkManifest) -> ASRCapture:
+        """Run Whisper exactly once per clip and return an immutable capture."""
+
+        if self._whisper_engine is None:
+            raise CaptureValidationError("capture mode requires a transcriber")
+        started = self._monotonic()
+        source_map = {source.id: source for source in manifest.sources}
+        work_dir = self._storage.resolve(StorageCategory.BENCHMARKS, "stage-2-7/captures/work")
+        work_dir.mkdir(parents=True, exist_ok=True)
+        results: dict[str, TranscriptionResult] = {}
+        source_hashes: dict[str, str] = {}
+        for clip in manifest.clips:
+            source_path = self._storage.resolve(
+                StorageCategory.SOURCES, source_map[clip.source_id].path
+            )
+            if not source_path.is_file():
+                raise StorageValidationError(
+                    f"benchmark source media is missing from storage: {clip.source_id}"
+                )
+            audio_path = work_dir / f"{clip.id}.wav"
+            self._extract_clip(source_path, clip.start_seconds, clip.end_seconds, audio_path)
+            source_hashes[clip.source_id] = hashlib.sha256(audio_path.read_bytes()).hexdigest()
+            results[clip.id] = self._whisper_engine.transcribe(
+                audio_path, self._transcription_options
+            )
+        clips = [
+            (clip.id, clip.source_id, clip.start_seconds, clip.end_seconds)
+            for clip in manifest.clips
+        ]
+        return build_capture(
+            capture_id=uuid.uuid4().hex,
+            clips=clips,
+            source_hashes=source_hashes,
+            results=results,
+            options=self._transcription_options,
+            wall_clock_seconds=self._monotonic() - started,
         )
 
 

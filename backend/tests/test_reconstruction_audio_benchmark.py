@@ -23,6 +23,7 @@ from app.transcription.reconstruction.benchmark import (
     load_benchmark_manifest,
     load_review_worksheet,
 )
+from app.transcription.reconstruction.capture import build_capture
 from app.transcription.reconstruction.types import (
     ConfidenceLevel,
     ProviderAvailability,
@@ -705,6 +706,57 @@ def _small_known_manifest(reference_segments: list[dict[str, object]]) -> Benchm
         "known_regression_set": True,
     }
     return cast(BenchmarkManifest, BenchmarkManifest.model_validate(payload))
+
+
+def test_runner_replays_capture_without_a_transcriber(tmp_path: Path) -> None:
+    """Replay mode never constructs or invokes a transcriber."""
+
+    storage = _RecordingStorage(tmp_path / "storage")
+    manifest = _small_known_manifest([_reference(0, "unchanged_correct", text="corrected-0-0")])
+    _seed_sources(storage, manifest)
+    events: list[str] = []
+    capture = build_capture(
+        capture_id="cap-replay",
+        clips=[("mini-0000-0030", "source-a", 0.0, 30.0)],
+        source_hashes={"source-a": "abc123"},
+        results={
+            "mini-0000-0030": TranscriptionResult(
+                language="ar",
+                language_probability=0.99,
+                raw_text="raw",
+                duration=30.0,
+                segments=[
+                    {
+                        "start": 0.0,
+                        "end": 1.0,
+                        "text": "raw-0-0",
+                        "avg_logprob": -0.1,
+                        "no_speech_prob": 0.0,
+                        "words": [],
+                    }
+                ],
+                word_segments=[],
+            )
+        },
+        options=_options(),
+        wall_clock_seconds=1.0,
+    )
+    runner = BenchmarkRunner(
+        storage=storage,
+        whisper_engine=None,
+        corrector=_Corrector(events),
+        reconstructor=_Reconstructor(events),
+        provider_health=_available_health(),
+        transcription_options=_options(),
+        command_runner=lambda args: _write_clip(args),
+        prompt_settings_fingerprint="production-fingerprint",
+    )
+
+    result = runner.run(manifest, capture=capture)
+
+    assert "asr:" not in events
+    assert events[:2] == ["stage25", "stage27"]
+    assert result.unchanged_correct == 1
 
 
 def test_runner_rejects_missing_source_media(tmp_path: Path) -> None:

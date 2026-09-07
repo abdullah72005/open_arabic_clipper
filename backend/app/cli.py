@@ -25,6 +25,7 @@ from app.transcription.reconstruction.benchmark import (
     load_benchmark_manifest,
     prompt_settings_fingerprint,
 )
+from app.transcription.reconstruction.capture import capture_hash, load_capture, save_capture
 from app.transcription.reconstruction.service import ContextualReconstructor
 from app.transcription.reconstruction.types import ProviderAvailability, ProviderHealth
 from app.workers.tasks import run_pipeline_stage
@@ -220,6 +221,10 @@ def benchmark_reconstruction(
     manifest_name: str,
     model: str | None = typer.Option(None, "--model"),
     allow_known_regression_set: bool = typer.Option(False, "--allow-known-regression-set"),
+    capture_asr: bool = typer.Option(False, "--capture-asr", help="Capture immutable ASR only."),
+    from_capture: str | None = typer.Option(
+        None, "--from-capture", help="Replay a stored capture without a transcriber."
+    ),
 ) -> None:
     """Run a private, authorized reconstruction benchmark through production stages."""
 
@@ -248,7 +253,7 @@ def benchmark_reconstruction(
     )
     runner = BenchmarkRunner(
         storage=storage,
-        whisper_engine=WhisperEngine(),
+        whisper_engine=WhisperEngine() if from_capture is None else None,
         corrector=settings.contextual_corrector(),
         reconstructor=ContextualReconstructor(provider),
         transcription_options=settings.transcription_options(),
@@ -256,9 +261,31 @@ def benchmark_reconstruction(
         prompt_settings_fingerprint=fingerprint,
     )
     lease_factory = settings.heavy_model_lease_factory()
+    if capture_asr:
+        try:
+            with lease_factory.acquire(purpose="benchmark-asr") as _heavy_lease:
+                capture = runner.capture_asr(manifest)
+        except HeavyModelLeaseBusy as error:
+            typer.echo(json.dumps({"error": str(error)}, ensure_ascii=False))
+            raise typer.Exit(code=1) from error
+        path = save_capture(storage, capture, name=capture.capture_id)
+        typer.echo(
+            json.dumps(
+                {
+                    "capture_id": capture.capture_id,
+                    "capture_hash": capture_hash(capture),
+                    "path": str(path),
+                    "status": "CAPTURED",
+                },
+                ensure_ascii=False,
+            )
+        )
+        return
     try:
         with lease_factory.acquire(purpose="benchmark") as _heavy_lease:
-            report = runner.run(manifest)
+            report = runner.run(
+                manifest, capture=load_capture(storage, from_capture) if from_capture else None
+            )
     except HeavyModelLeaseBusy as error:
         typer.echo(json.dumps({"error": str(error)}, ensure_ascii=False))
         raise typer.Exit(code=1) from error
