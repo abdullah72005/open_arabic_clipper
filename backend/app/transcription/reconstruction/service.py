@@ -51,9 +51,16 @@ class ContextualReconstructor:
             return ReconstructionResult(results, _joined(results), fingerprint)
         result: ReconstructionResult = ReconstructionResult((), "", fingerprint)
         try:
-            health = self._provider.health()
-            provider_method = f"{health.provider}:{health.model or 'unknown'}"
-            if health.availability.value != "AVAILABLE":
+            try:
+                health = self._provider.health()
+            except (OSError, ProviderResponseError):
+                health = None
+            provider_method = (
+                f"{health.provider}:{health.model or 'unknown'}"
+                if health is not None
+                else "unknown"
+            )
+            if health is None or health.availability.value != "AVAILABLE":
                 results = tuple(
                     self._fallback(
                         index,
@@ -81,10 +88,23 @@ class ContextualReconstructor:
                 for index in routed_indexes
             ]
             generated: dict[int, ReconstructionCandidate] = {}
+            failed_targets: set[int] = set()
             for batch in _batch_requests(requests, max_windows=1):
-                generated.update(self._provider.reconstruct_segments(batch))
+                for request in batch:
+                    try:
+                        generated.update(self._provider.reconstruct_segments([request]))
+                    except (OSError, ProviderResponseError):
+                        failed_targets.add(request.segment_index)
             results = tuple(
-                self._decide(
+                self._fallback(
+                    index,
+                    segment,
+                    provider_error=True,
+                    status=ReconstructionStatus.PROVIDER_UNAVAILABLE,
+                    method=provider_method,
+                )
+                if index in failed_targets
+                else self._decide(
                     index,
                     segment,
                     generated.get(
@@ -97,17 +117,6 @@ class ContextualReconstructor:
                     memory,
                     provider_method,
                     routing=routing_decisions[index],
-                )
-                for index, segment in enumerate(segments)
-            )
-            result = ReconstructionResult(results, _joined(results), fingerprint)
-        except (OSError, ProviderResponseError):
-            results = tuple(
-                self._fallback(
-                    index,
-                    segment,
-                    provider_error=True,
-                    status=ReconstructionStatus.PROVIDER_UNAVAILABLE,
                 )
                 for index, segment in enumerate(segments)
             )

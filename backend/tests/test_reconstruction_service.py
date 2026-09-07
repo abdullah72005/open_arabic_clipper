@@ -216,6 +216,96 @@ def test_unchanged_candidate_text_remains_unchanged() -> None:
     assert segment.contextual_reconstructed_text == "خلي بالك"
 
 
+class ScriptedTargetProvider:
+    """Emit a fixed candidate per target and raise a recoverable failure for one target."""
+
+    def __init__(
+        self,
+        candidates: dict[int, ReconstructionCandidate],
+        fail_segment: int,
+        failure: type[Exception],
+    ) -> None:
+        self.candidates = candidates
+        self.fail_segment = fail_segment
+        self.failure = failure
+        self.requests: list[ReconstructionRequest] = []
+
+    def health(self) -> ProviderHealth:
+        return ProviderHealth(
+            ProviderAvailability.AVAILABLE, "ollama", "qwen3.5:4b", "sha256:x", "ok"
+        )
+
+    def reconstruct_segments(
+        self, requests: list[ReconstructionRequest]
+    ) -> dict[int, ReconstructionCandidate]:
+        self.requests.extend(requests)
+        for request in requests:
+            if request.segment_index == self.fail_segment:
+                raise self.failure("target failure")
+        return {
+            request.segment_index: self.candidates[request.segment_index] for request in requests
+        }
+
+    def release(self) -> None:
+        pass
+
+
+def test_one_segment_failure_does_not_erase_successful_targets() -> None:
+    """A per-target provider failure falls back only that segment."""
+
+    provider = ScriptedTargetProvider(
+        {
+            0: ReconstructionCandidate("provider-0", "ضخمة", provider_confidence=1.0),
+            2: ReconstructionCandidate("provider-0", "صحيح", provider_confidence=0.99),
+        },
+        fail_segment=1,
+        failure=ProviderResponseError,
+    )
+    result = ContextualReconstructor(provider).reconstruct(
+        [
+            {"start": 0.0, "end": 1.0, "text": "دخم", "corrected_text": "دخم"},
+            {"start": 1.0, "end": 2.0, "text": "خطي بالك", "corrected_text": "خلي بالك"},
+            {"start": 2.0, "end": 3.0, "text": "صحيح", "corrected_text": "صحيح"},
+        ],
+        language="ar",
+        transcription_fingerprint="asr-v1",
+        correction_version="egyptian-ar-v1",
+    )
+
+    assert result.segments[0].applied is True
+    assert result.segments[0].contextual_reconstructed_text == "ضخمة"
+    assert result.segments[1].status is ReconstructionStatus.PROVIDER_UNAVAILABLE
+    assert result.segments[1].contextual_reconstructed_text == "خلي بالك"
+    assert result.segments[2].contextual_reconstructed_text == "صحيح"
+
+
+def test_oserror_on_one_segment_falls_back_only_that_segment() -> None:
+    """Network timeouts are per-target recoverable failures too."""
+
+    provider = ScriptedTargetProvider(
+        {
+            0: ReconstructionCandidate("provider-0", "ضخمة", provider_confidence=1.0),
+            2: ReconstructionCandidate("provider-0", "صحيح", provider_confidence=0.99),
+        },
+        fail_segment=1,
+        failure=OSError,
+    )
+    result = ContextualReconstructor(provider).reconstruct(
+        [
+            {"start": 0.0, "end": 1.0, "text": "دخم", "corrected_text": "دخم"},
+            {"start": 1.0, "end": 2.0, "text": "خطي بالك", "corrected_text": "خلي بالك"},
+            {"start": 2.0, "end": 3.0, "text": "صحيح", "corrected_text": "صحيح"},
+        ],
+        language="ar",
+        transcription_fingerprint="asr-v1",
+        correction_version="egyptian-ar-v1",
+    )
+
+    assert result.segments[0].applied is True
+    assert result.segments[1].status is ReconstructionStatus.PROVIDER_UNAVAILABLE
+    assert result.segments[2].contextual_reconstructed_text == "صحيح"
+
+
 def test_reconstructor_sends_small_context_window() -> None:
     """The provider receives only local context, not the full transcript."""
 
