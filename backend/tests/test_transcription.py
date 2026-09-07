@@ -282,7 +282,9 @@ def test_transcription_executor_persists_raw_timestamped_result(
     from app.transcription.engine import TranscriptionResult
 
     class FakeEngine:
-        def transcribe(self, path: Path, options: TranscriptionOptions) -> TranscriptionResult:
+        def transcribe(
+            self, path: Path, options: TranscriptionOptions, cancel_event: object = None
+        ) -> TranscriptionResult:
             return TranscriptionResult(
                 language="ar",
                 language_probability=0.9,
@@ -494,7 +496,9 @@ def test_benchmark_reports_actual_transcription_throughput(tmp_path: Path) -> No
         def resolved_hardware(self, _options: TranscriptionOptions) -> tuple[str, str]:
             return "cpu", "int8"
 
-        def transcribe(self, _path: Path, _options: TranscriptionOptions) -> TranscriptionResult:
+        def transcribe(
+            self, _path: Path, _options: TranscriptionOptions, cancel_event: object = None
+        ) -> TranscriptionResult:
             return TranscriptionResult(
                 language="ar",
                 language_probability=0.9,

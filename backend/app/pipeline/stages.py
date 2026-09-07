@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import subprocess
+import threading
 from collections.abc import Callable
 from dataclasses import asdict
 from pathlib import Path
@@ -89,8 +90,11 @@ class TranscriptionExecutor:
             audio_path = storage.resolve(StorageCategory.SOURCES, audio_path)
         started_at = monotonic()
         self._emit_snapshot("before_load")
-        with self._lease_factory.acquire(purpose="whisper") as heavy_lease:
-            result = self._engine.transcribe(audio_path, self._options)
+        cancel_event = threading.Event()
+        with self._lease_factory.acquire(
+            purpose="whisper", on_ownership_lost=cancel_event.set
+        ) as heavy_lease:
+            result = self._engine.transcribe(audio_path, self._options, cancel_event=cancel_event)
             if heavy_lease.ownership_lost:
                 raise HeavyModelLeaseBusy(
                     "heavy-model lease was lost during Whisper work; retry the stage"
@@ -120,6 +124,7 @@ class TranscriptionExecutor:
 
     def _emit_snapshot(self, label: str, child_peak_rss: int | None = None) -> None:
         snapshot = self._snapshotter()
+        peak_reported = child_peak_rss if child_peak_rss is not None else "UNKNOWN"
         _logger.info(
             "transcription_memory_snapshot",
             extra={
@@ -129,7 +134,7 @@ class TranscriptionExecutor:
                 "linux_available": snapshot.linux_available,
                 "cgroup_current": snapshot.cgroup_current,
                 "cgroup_peak": snapshot.cgroup_peak,
-                "child_peak_rss": child_peak_rss,
+                "child_peak_rss": peak_reported,
             },
         )
 

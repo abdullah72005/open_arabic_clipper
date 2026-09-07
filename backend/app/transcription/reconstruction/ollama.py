@@ -133,3 +133,13 @@ class OllamaReconstructionProvider(OpenAICompatibleReconstructionProvider):
             )
             for item in models
         )
+
+    def is_model_resident(self) -> bool:
+        """Public residency probe used by operator recovery and diagnostics.
+
+        Polling failures are conservative: an unreadable process listing counts
+        as resident so a recovery decision never clears unsafe state while the
+        model might still be loaded.
+        """
+
+        return self._model_resident()

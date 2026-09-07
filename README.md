@@ -81,10 +81,10 @@ Stage 2.7 runs after Stage 2.5 and before audio analysis. It retains raw ASR,
 Stage 2.5, Stage 2.7, and manual text separately; final text is always manual
 override, then an applied HIGH-confidence reconstruction, then Stage 2.5, then
 raw ASR. The default provider configuration is local Ollama at
-`http://ollama:11434` with `qwen3:8b`; it never downloads a model implicitly.
+`http://ollama:11434` with `qwen3.5:4b`; it never downloads a model implicitly.
 Start the optional service with `docker compose --profile reconstruction up -d
 ollama`, then have the operator explicitly pull the selected model (for example,
-`docker compose exec ollama ollama pull qwen3:8b`). Set
+`docker compose exec ollama ollama pull qwen3.5:4b`). Set
 `CLIPFACTORY_RECONSTRUCTION_PROVIDER=disabled` to run without a provider, or
 use `openai_compatible` with an operator-configured local endpoint. Invalid,
 unavailable, or release-failed providers preserve Stage 2.5 output and do not
@@ -92,6 +92,10 @@ block `READY_FOR_ANALYSIS`; their status is recorded for review. Use
 `python -m app.cli reconstruction-health` to inspect safe provider/model
 metadata, and `POST /api/sources/{id}/reconstruct` or
 `python -m app.cli reconstruct SOURCE_ID --force` to queue reconstruction.
+If an unload fails or a heavy-model lease is lost, unsafe state is recorded in
+Redis with no TTL and blocks new heavy work; run
+`python -m app.cli recover-heavy-model` to clear it after confirming the model
+is no longer resident.
 
 Stage 2.7 cache reuse is dependency-aware: stage runs persist canonical input
 and output fingerprints, and changed upstream evidence reruns downstream work.

@@ -161,3 +161,29 @@ Cuba clip (`e0f06a86…`, phrases `فيور 25 نوفمبر`, `آخره يشيل
 
 No unseen-corpus human references were available, so no quality or readiness
 claim is made. The private known corpus is regression evidence only.
+
+## Small practical acceptance review (2026-09-08)
+
+After the infrastructure fixes (persistent unsafe state, lease-loss handling,
+capture provenance, child memory telemetry), a small real-world review ran on
+two authorized Arabic sources transcribed with the production `large-v3-turbo`
+and reconstructed with `qwen3.5:4b`. The third authorized Arabic source
+(Guatemala narrative) was transcribed with the obsolete `small` model and is not
+evidence for the current stack.
+
+| Source | Duration | Segments | Usable | Minor dialect variant | Meaning-changing | Nonsense/garbage | Number/name/fact |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Chernobyl narrative | 159 s | 76 | 45 | 12 | 1 | 18 | 0 |
+| Cuba/Granma narrative | 122 s | 61 | 38 | 8 | 0 | 13 | 2 |
+| **Total** | | **137** | **83** | **20** | **1** | **31** | **2** |
+
+The transcript is semantically usable: a downstream Stage 3 model can recover
+the speaker's meaning without the audio for the large majority of segments, and
+meaning-changing errors are rare (1 of 137). The one meaning-changing error is
+the known `إخلاء` → `إخلاق` regression; the two fact errors are the known Cuba
+number regressions (`اتناشر` → `نصر`, `70` → `71`). Nonsense/garbage segments
+are localized unedited ASR fragments in heavy dialectal speech. This review is
+practical acceptance evidence, not the unseen-readiness gate: the strict
+human-reviewed unseen-audio benchmark remains open.
+
+READY FOR STAGE 2.7.1

@@ -209,7 +209,7 @@ class _RecordingEngine:
     def __init__(self) -> None:
         self.calls: list[str] = []
 
-    def transcribe(self, _path: object, _options: object) -> object:
+    def transcribe(self, _path: object, _options: object, cancel_event: object = None) -> object:
         self.calls.append("transcribe")
         from app.transcription.engine import TranscriptionResult
 
@@ -367,7 +367,7 @@ def test_heavy_lease_ownership_loss_fails_closed(sqlite_engine: object) -> None:
             pass
 
     class LostLeaseFactory:
-        def acquire(self, *, purpose: str) -> LostLease:
+        def acquire(self, *, purpose: str, on_ownership_lost: object = None) -> LostLease:
             return LostLease()
 
     Base.metadata.create_all(sqlite_engine)

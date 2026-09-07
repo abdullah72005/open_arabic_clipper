@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gc
+import threading
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -60,11 +61,17 @@ class WhisperEngine:
 
         return self._last_outcome.child_peak_rss_bytes if self._last_outcome is not None else None
 
-    def transcribe(self, audio_path: Path, options: TranscriptionOptions) -> TranscriptionResult:
+    def transcribe(
+        self,
+        audio_path: Path,
+        options: TranscriptionOptions,
+        cancel_event: threading.Event | None = None,
+    ) -> TranscriptionResult:
         """Transcribe a WAV path without changing Whisper text or timestamps.
 
         The native model is loaded and run inside a spawned child so process exit,
-        not Python garbage collection, is the hard reclamation boundary.
+        not Python garbage collection, is the hard reclamation boundary. When
+        ``cancel_event`` is set (lease loss), the child is terminated and reaped.
         """
 
         device, compute_type = self._resolve_hardware(options)
@@ -79,6 +86,7 @@ class WhisperEngine:
                 options,
                 self._collect_garbage,
             ),
+            cancel_event=cancel_event,
         )
         self._last_outcome = outcome
         if not outcome.ok:

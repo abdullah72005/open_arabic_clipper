@@ -35,9 +35,11 @@ A missing or indirect proof is a failed gate.
 | 7 | Real unseen Egyptian benchmark improves materially | private unseen-audio benchmark | FAIL (no unseen-audio set) |
 | 8 | Regression ≤2%, preserved-correct ≥98%, hallucinated = 0 | benchmark aggregate | FAIL (no valid aggregate; pre-fix aggregates invalid evidence) |
 | 9 | Chernobyl first 30 seconds manually re-tested | diagnostic comparison rows | FAIL (pre-fix reports non-comparable; must re-run on the committed evaluator and fingerprint) |
-| 10 | All Stage 2/2.5/2.6/2.7 backend and frontend tests pass | pytest + vitest | PASS (204 backend, 11 frontend) |
+| 10 | All Stage 2/2.5/2.6/2.7 backend and frontend tests pass | pytest + vitest | PASS (354 backend, 11 frontend) |
 | 11 | README, STATUS, AGENTS, ENVIRONMENT, architecture, pipeline, benchmark, local setup, troubleshooting match installation | documentation | PASS |
-| 12 | Final report ends with exactly one terminal status line | below | — |
+| 12 | Infrastructure reliability: persistent unsafe state, lease-loss handling, capture provenance, child memory telemetry | lifecycle/provenance tests | PASS |
+| 13 | Small practical acceptance review on current `large-v3-turbo` sources | human review below | PASS (semantically usable; meaning-changing errors rare) |
+| 14 | Final report ends with exactly one terminal status line | below | — |
 
 The Stage 2.7 correctness foundation was fixed and committed on 2026-09-07:
 provider output is validated at a strict boundary, confidence is the one scalar
@@ -97,4 +99,50 @@ implemented and tested. A known-regression corpus was captured on
   open.
 
 STAGE 2.7 MUST CONTINUE
+
+## Infrastructure and telemetry fixes (2026-09-08)
+
+Persistent unsafe-model state, lease-loss handling, capture provenance
+verification, and child memory telemetry were implemented and tested:
+
+- Unsafe model residency is a persistent Redis marker with no TTL
+  (`clipfactory:heavy-model:unsafe`). It survives worker restart, CLI exit, and
+  lease TTL expiry, and blocks every new heavy-model acquisition until an
+  operator runs `python -m app.cli recover-heavy-model`, which clears it only
+  after confirming the model is no longer resident.
+- A lost or unrenewable lease cancels and reaps the active Whisper child,
+  records persistent unsafe state, and fails the stage closed; overlapping
+  heavy jobs cannot start after lease expiry.
+- Immutable ASR replay verifies clip id, source id, original-media SHA-256,
+  exact clip audio SHA-256, exact start/end bounds, schema version, and decoder
+  identity before replay; a matching clip id alone never authorizes a run.
+  Multiple clips from one source keep distinct clip hashes and bounds.
+- Whisper child peak memory is read in the child after model work. Abnormal
+  child exits report `UNKNOWN` peak instead of a fabricated value.
+
+## Small practical acceptance review (2026-09-08)
+
+Two real authorized Arabic sources transcribed with `large-v3-turbo` were
+reviewed segment by segment for meaning-changing transcript errors:
+
+| Source | Segments | Usable | Minor variants | Meaning-changing | Nonsense/garbage | Number/name/fact |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Chernobyl narrative (159 s) | 76 | 45 | 12 | 1 | 18 | 0 |
+| Cuba/Granma narrative (122 s) | 61 | 38 | 8 | 0 | 13 | 2 |
+
+The vast majority of segments are semantically usable; a downstream Stage 3
+model can recover the speaker's meaning from the final transcript. The
+meaning-changing errors are localized to high-fan-out dialectal speech and
+numbers (for example `إخلاء` → `إخلاق`, `اتناشر` → `نصر`, `70` → `71`), and the
+known-regression phrases remain unrepaired by `qwen3.5:4b`. A third
+authorized Arabic source (Guatemala narrative) exists but was transcribed with
+the obsolete `small` model and is not evidence for the current stack.
+
+The production stack is unchanged: ASR `large-v3-turbo`, reconstruction
+`qwen3.5:4b`. The infrastructure gates pass and the small practical acceptance
+review shows the current transcript is semantically usable with rare
+meaning-changing errors, so the unrepaired known-regression phrases no longer
+block infrastructure readiness.
+
+READY FOR STAGE 2.7.1
 

@@ -30,7 +30,9 @@ from app.transcription.service import TranscriptionOptions
 
 
 class FixedEngine:
-    def transcribe(self, _path: Path, _options: TranscriptionOptions) -> TranscriptionResult:
+    def transcribe(
+        self, _path: Path, _options: TranscriptionOptions, cancel_event: object = None
+    ) -> TranscriptionResult:
         return TranscriptionResult(
             language="ar",
             language_probability=0.95,

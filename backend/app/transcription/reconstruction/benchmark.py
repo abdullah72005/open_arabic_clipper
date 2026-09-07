@@ -26,6 +26,8 @@ from app.transcription.reconstruction.capture import (
     ASRCapture,
     CaptureValidationError,
     build_capture,
+    build_decoder_identity,
+    verify_replay_provenance,
 )
 from app.transcription.reconstruction.types import (
     ProviderAvailability,
@@ -353,6 +355,27 @@ class BenchmarkRunner:
                 captured = captured_by_id.get(clip.id)
                 if captured is None:
                     raise CaptureValidationError(f"capture is missing clip {clip.id}")
+                source_path = self._storage.resolve(
+                    StorageCategory.SOURCES, source_map[clip.source_id].path
+                )
+                if not source_path.is_file():
+                    raise StorageValidationError(
+                        f"benchmark source media is missing from storage: {clip.source_id}"
+                    )
+                source_hash = hashlib.sha256(source_path.read_bytes()).hexdigest()
+                clip_hash = _capture_clip_audio_hash(
+                    self._storage, self._ffmpeg_binary, source_path, clip, self._command_runner
+                )
+                verify_replay_provenance(
+                    capture,
+                    clip_id=clip.id,
+                    source_id=clip.source_id,
+                    source_hash=source_hash,
+                    clip_hash=clip_hash,
+                    start_seconds=clip.start_seconds,
+                    end_seconds=clip.end_seconds,
+                    expected_decoder=build_decoder_identity(self._transcription_options),
+                )
                 raw_segments = [dict(segment) for segment in captured.segments]
                 clip_language = captured.language
             else:
@@ -594,6 +617,7 @@ class BenchmarkRunner:
         work_dir.mkdir(parents=True, exist_ok=True)
         results: dict[str, TranscriptionResult] = {}
         source_hashes: dict[str, str] = {}
+        clip_hashes: dict[str, str] = {}
         for clip in manifest.clips:
             source_path = self._storage.resolve(
                 StorageCategory.SOURCES, source_map[clip.source_id].path
@@ -602,9 +626,11 @@ class BenchmarkRunner:
                 raise StorageValidationError(
                     f"benchmark source media is missing from storage: {clip.source_id}"
                 )
+            if clip.source_id not in source_hashes:
+                source_hashes[clip.source_id] = hashlib.sha256(source_path.read_bytes()).hexdigest()
             audio_path = work_dir / f"{clip.id}.wav"
             self._extract_clip(source_path, clip.start_seconds, clip.end_seconds, audio_path)
-            source_hashes[clip.source_id] = hashlib.sha256(audio_path.read_bytes()).hexdigest()
+            clip_hashes[clip.id] = hashlib.sha256(audio_path.read_bytes()).hexdigest()
             results[clip.id] = self._whisper_engine.transcribe(
                 audio_path, self._transcription_options
             )
@@ -615,6 +641,7 @@ class BenchmarkRunner:
         return build_capture(
             capture_id=uuid.uuid4().hex,
             clips=clips,
+            clip_hashes=clip_hashes,
             source_hashes=source_hashes,
             results=results,
             options=self._transcription_options,
@@ -857,6 +884,44 @@ def prompt_settings_fingerprint(
 
 def _run_command(args: list[str]) -> None:
     subprocess.run(args, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+
+
+def _capture_clip_audio_hash(
+    storage: StorageService,
+    ffmpeg_binary: str,
+    source_path: Path,
+    clip: BenchmarkClip,
+    command_runner: Callable[[list[str]], None],
+) -> str:
+    """Extract the exact clip audio into a temp path and return its SHA-256.
+
+    This reproduces the deterministic ``-ss``/``-t`` extraction used at capture
+    time so replay proves the stored raw segments came from the same audio.
+    """
+
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as temporary:
+        destination = Path(temporary) / f"{clip.id}.wav"
+        command_runner(
+            [
+                ffmpeg_binary,
+                "-y",
+                "-ss",
+                str(clip.start_seconds),
+                "-i",
+                str(source_path),
+                "-t",
+                str(clip.end_seconds - clip.start_seconds),
+                "-vn",
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                str(destination),
+            ]
+        )
+        return hashlib.sha256(destination.read_bytes()).hexdigest()
 
 
 def _swap_bytes() -> int:

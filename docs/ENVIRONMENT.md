@@ -93,3 +93,23 @@ reconstruction began (the Redis `clipfactory:heavy-model` lease serializes
 them). `ollama ps` was empty before and after each reconstruction, and the
 `unload_outcome` metadata confirmed the unload within a second. See
 `docs/STAGE_2_7_OPERATIONS.md` for the per-trial memory table.
+
+## Unsafe heavy-model state and operator recovery (2026-09-08)
+
+Unsafe model residency is recorded in a separate persistent Redis marker
+(`clipfactory:heavy-model:unsafe`) that carries no TTL. It is written when an
+Ollama unload fails or when a heavy-model lease is lost while work is active.
+Because it has no expiry, the marker survives worker restart, CLI exit, and the
+lease TTL, so no new heavy-model work may start until an operator clears it.
+
+Recovery is explicit and conservative. `recover-heavy-model` only clears the
+marker after confirming the configured model is no longer resident (it polls
+Ollama `/api/ps` and treats an unreadable listing as resident):
+
+```bash
+docker compose exec backend python -m app.cli recover-heavy-model
+```
+
+A worker or CLI that finds the marker refuses to acquire the heavy-model lease
+(`HeavyModelUnsafe`) until recovery succeeds. This behavior is covered by the
+heavy-model lease lifecycle tests.

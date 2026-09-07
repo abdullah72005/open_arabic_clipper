@@ -32,7 +32,15 @@
   `contextual_reconstructed_text` joins each segment's actual Stage 2.7 output;
   manual overrides change only `final_text`. Rights/provenance are tracked
   throughout the pipeline but do not block local analysis; publishing eligibility
-  is evaluated separately.
+  is evaluated separately. Unsafe heavy-model residency is a persistent
+  Redis marker with no TTL that survives restart, CLI exit, and lease TTL
+  expiry; `python -m app.cli recover-heavy-model` clears it only after
+  confirming the model is no longer resident. A lost heavy-model lease cancels
+  the active Whisper child and records unsafe state so overlapping jobs cannot
+  start. Immutable ASR capture replay verifies clip id, source id,
+  original-media SHA-256, exact clip audio SHA-256, exact bounds, schema, and
+  decoder identity. Whisper child peak memory is measured in the child after
+  model work; abnormal exits report UNKNOWN.
 
 ## Local development facts (not product requirements)
 

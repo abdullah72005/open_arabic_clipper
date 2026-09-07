@@ -31,7 +31,78 @@ def test_stage_2_transcript_commands_are_exposed() -> None:
     assert "reconstruct" in help_text
     assert "benchmark-reconstruction" in help_text
     assert "reconstruction-health" in help_text
+    assert "recover-heavy-model" in help_text
     assert "transcript" in help_text
+
+
+def test_recover_heavy_model_reports_clear_when_no_unsafe_state(monkeypatch) -> None:
+    class Factory:
+        def unsafe_recorded(self) -> bool:
+            return False
+
+    class Settings:
+        def heavy_model_lease_factory(self) -> Factory:
+            return Factory()
+
+    monkeypatch.setattr("app.cli.get_settings", lambda: Settings())
+    result = CliRunner().invoke(app, ["recover-heavy-model"])
+    assert result.exit_code == 0
+    assert json.loads(result.stdout)["status"] == "CLEAR"
+
+
+def test_recover_heavy_model_blocks_while_model_still_resident(monkeypatch) -> None:
+    class Factory:
+        def unsafe_recorded(self) -> bool:
+            return True
+
+        def unsafe_reason(self) -> str:
+            return "model still resident after unload timeout"
+
+    class Provider:
+        def is_model_resident(self) -> bool:
+            return True
+
+    class Settings:
+        reconstruction_provider_model = "qwen3.5:4b"
+
+        def heavy_model_lease_factory(self) -> Factory:
+            return Factory()
+
+        def reconstruction_provider_instance(self) -> Provider:
+            return Provider()
+
+    monkeypatch.setattr("app.cli.get_settings", lambda: Settings())
+    result = CliRunner().invoke(app, ["recover-heavy-model"])
+    assert result.exit_code == 1
+    assert json.loads(result.stdout)["status"] == "UNSAFE"
+
+
+def test_recover_heavy_model_clears_only_after_confirmed_not_resident(monkeypatch) -> None:
+    cleared: list[str] = []
+
+    class Factory:
+        def unsafe_recorded(self) -> bool:
+            return True
+
+        def recover(self) -> None:
+            cleared.append("recovered")
+
+    class Provider:
+        def is_model_resident(self) -> bool:
+            return False
+
+    class Settings:
+        def heavy_model_lease_factory(self) -> Factory:
+            return Factory()
+
+        def reconstruction_provider_instance(self) -> Provider:
+            return Provider()
+
+    monkeypatch.setattr("app.cli.get_settings", lambda: Settings())
+    result = CliRunner().invoke(app, ["recover-heavy-model"])
+    assert result.exit_code == 0
+    assert json.loads(result.stdout)["status"] == "RECOVERED"
+    assert cleared == ["recovered"]
 
 
 def test_benchmark_reconstruction_exposes_model_and_regression_flags() -> None:

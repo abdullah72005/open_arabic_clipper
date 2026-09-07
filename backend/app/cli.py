@@ -13,7 +13,7 @@ from app.core.enums import JobKind, PipelineStage
 from app.core.settings import get_settings
 from app.db.session import create_session_factory
 from app.models import ProcessingJob, SourceVideo, Transcript
-from app.runtime.heavy_model_lease import HeavyModelLeaseBusy
+from app.runtime.heavy_model_lease import HeavyModelLeaseBusy, HeavyModelUnsafe
 from app.runtime.memory import MemoryReadError, capture_memory
 from app.services.health import HealthService
 from app.services.storage import StorageCategory, StorageService
@@ -110,6 +110,32 @@ def reconstruction_health() -> None:
     )
     if report.availability is not ProviderAvailability.AVAILABLE:
         raise typer.Exit(1)
+
+
+@app.command("recover-heavy-model")
+def recover_heavy_model() -> None:
+    """Clear unsafe heavy-model state only after the model is no longer resident."""
+
+    settings = get_settings()
+    factory = settings.heavy_model_lease_factory()
+    if not factory.unsafe_recorded():
+        typer.echo(json.dumps({"status": "CLEAR", "detail": "no unsafe heavy-model state"}))
+        return
+    provider = settings.reconstruction_provider_instance()
+    resident = provider.is_model_resident() if provider is not None else True
+    if resident:
+        typer.echo(
+            json.dumps(
+                {
+                    "status": "UNSAFE",
+                    "detail": factory.unsafe_reason(),
+                    "model": settings.reconstruction_provider_model,
+                }
+            )
+        )
+        raise typer.Exit(1)
+    factory.recover()
+    typer.echo(json.dumps({"status": "RECOVERED", "detail": "model confirmed not resident"}))
 
 
 @app.command()
@@ -268,6 +294,9 @@ def benchmark_reconstruction(
         except HeavyModelLeaseBusy as error:
             typer.echo(json.dumps({"error": str(error)}, ensure_ascii=False))
             raise typer.Exit(code=1) from error
+        except HeavyModelUnsafe as error:
+            typer.echo(json.dumps({"error": str(error)}, ensure_ascii=False))
+            raise typer.Exit(code=1) from error
         path = save_capture(storage, capture, name=capture.capture_id)
         typer.echo(
             json.dumps(
@@ -287,6 +316,9 @@ def benchmark_reconstruction(
                 manifest, capture=load_capture(storage, from_capture) if from_capture else None
             )
     except HeavyModelLeaseBusy as error:
+        typer.echo(json.dumps({"error": str(error)}, ensure_ascii=False))
+        raise typer.Exit(code=1) from error
+    except HeavyModelUnsafe as error:
         typer.echo(json.dumps({"error": str(error)}, ensure_ascii=False))
         raise typer.Exit(code=1) from error
     passed, reasons = evaluate_completion_gate(

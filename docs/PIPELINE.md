@@ -31,7 +31,7 @@ with stable IDs and may only approve a declared lexicon candidate; invalid,
 missing, unsafe, or low-confidence output falls back to raw/lexicon text. Manual
 operator text is feedback data only and does not train a model online.
 
-Reconstruction defaults to the managed local Ollama provider (`qwen3:8b`) with
+Reconstruction defaults to the managed local Ollama provider (`qwen3.5:4b`) with
 routing-driven, schema-validated two-pass candidates and per-candidate scores.
 An unavailable or misconfigured provider persists a truthful status and leaves
 Stage 2.5 final; it never blocks `READY_FOR_ANALYSIS`.

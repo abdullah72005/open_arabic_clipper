@@ -1,4 +1,5 @@
 import os
+import threading
 import time
 
 from app.runtime.model_process import DirectRunner, ModelProcessRunner
@@ -105,3 +106,47 @@ def test_child_peak_rss_is_reported() -> None:
 
     assert outcome.ok
     assert outcome.child_peak_rss_bytes > 0
+
+
+def test_timeout_reports_unknown_peak_rather_than_invented_zero() -> None:
+    """A child that cannot report its peak yields UNKNOWN (None), never 0."""
+
+    runner = ModelProcessRunner(timeout_seconds=1)
+
+    outcome = runner.run(target=_sleep_target, args=(30,))
+
+    assert outcome.ok is False
+    assert "timed out" in (outcome.error or "")
+    assert outcome.child_peak_rss_bytes is None
+
+
+def test_abnormal_exit_reports_unknown_peak_rather_than_invented_zero() -> None:
+    """A child that dies without an envelope yields UNKNOWN (None), never 0."""
+
+    runner = ModelProcessRunner(timeout_seconds=60)
+
+    outcome = runner.run(target=_exit_without_envelope_target)
+
+    assert outcome.ok is False
+    assert outcome.child_peak_rss_bytes is None
+
+
+def test_cancel_event_terminates_and_reaps_child_immediately() -> None:
+    """Lease-loss cancellation stops the active child and reports the reason."""
+
+    runner = ModelProcessRunner(timeout_seconds=60)
+    cancel = threading.Event()
+
+    def trigger() -> None:
+        time.sleep(0.2)
+        cancel.set()
+
+    threading.Thread(target=trigger).start()
+    started = time.monotonic()
+    outcome = runner.run(target=_sleep_target, args=(60,), cancel_event=cancel)
+    elapsed = time.monotonic() - started
+
+    assert outcome.ok is False
+    assert "lease loss" in (outcome.error or "")
+    assert outcome.child_peak_rss_bytes is None
+    assert elapsed < 10.0

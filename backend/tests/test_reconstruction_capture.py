@@ -15,6 +15,7 @@ from app.transcription.reconstruction.capture import (
     parse_capture,
     save_capture,
     serialize_capture,
+    verify_replay_provenance,
 )
 from app.transcription.service import TranscriptionOptions
 
@@ -54,6 +55,7 @@ def _capture() -> ASRCapture:
     return build_capture(
         capture_id="cap-1",
         clips=[("clip-0", "source-a", 0.0, 30.0), ("clip-1", "source-a", 30.0, 60.0)],
+        clip_hashes={"clip-0": "clip0hash", "clip-1": "clip1hash"},
         source_hashes={"source-a": "abc123"},
         results={"clip-0": _result("clip-0"), "clip-1": _result("clip-1")},
         options=_options(),
@@ -154,3 +156,101 @@ def test_save_and_load_capture_roundtrip_via_storage(tmp_path: Path) -> None:
 
     assert capture_hash(loaded) == capture_hash(capture)
     assert path.is_relative_to(storage.category_root(StorageCategory.BENCHMARKS))
+
+
+def _provenance_kwargs() -> dict[str, object]:
+    return {
+        "clip_id": "clip-0",
+        "source_id": "source-a",
+        "source_hash": "abc123",
+        "clip_hash": "clip0hash",
+        "start_seconds": 0.0,
+        "end_seconds": 30.0,
+        "expected_decoder": build_decoder_identity(_options()),
+    }
+
+
+def test_replay_provenance_accepts_exact_matching_identity() -> None:
+    verify_replay_provenance(_capture(), **_provenance_kwargs())  # type: ignore[arg-type]
+
+
+def test_replay_provenance_rejects_wrong_source_id() -> None:
+    kwargs = _provenance_kwargs()
+    kwargs["source_id"] = "source-b"
+    with pytest.raises(CaptureValidationError, match="source"):
+        verify_replay_provenance(_capture(), **kwargs)  # type: ignore[arg-type]
+
+
+def test_replay_provenance_rejects_wrong_original_media_hash() -> None:
+    kwargs = _provenance_kwargs()
+    kwargs["source_hash"] = "different"
+    with pytest.raises(CaptureValidationError, match="original-media hash"):
+        verify_replay_provenance(_capture(), **kwargs)  # type: ignore[arg-type]
+
+
+def test_replay_provenance_rejects_wrong_clip_audio_hash() -> None:
+    kwargs = _provenance_kwargs()
+    kwargs["clip_hash"] = "different"
+    with pytest.raises(CaptureValidationError, match="clip audio hash"):
+        verify_replay_provenance(_capture(), **kwargs)  # type: ignore[arg-type]
+
+
+def test_replay_provenance_rejects_wrong_start_or_end_bounds() -> None:
+    kwargs = _provenance_kwargs()
+    kwargs["start_seconds"] = 5.0
+    with pytest.raises(CaptureValidationError, match="bounds"):
+        verify_replay_provenance(_capture(), **kwargs)  # type: ignore[arg-type]
+
+    kwargs = _provenance_kwargs()
+    kwargs["end_seconds"] = 40.0
+    with pytest.raises(CaptureValidationError, match="bounds"):
+        verify_replay_provenance(_capture(), **kwargs)  # type: ignore[arg-type]
+
+
+def test_replay_provenance_rejects_missing_clip_in_capture() -> None:
+    kwargs = _provenance_kwargs()
+    kwargs["clip_id"] = "clip-9"
+    with pytest.raises(CaptureValidationError, match="missing or duplicated"):
+        verify_replay_provenance(_capture(), **kwargs)  # type: ignore[arg-type]
+
+
+def test_replay_provenance_rejects_decoder_identity_drift() -> None:
+    import dataclasses
+
+    changed = dataclasses.replace(_options(), model="large-v3")
+    kwargs = _provenance_kwargs()
+    kwargs["expected_decoder"] = build_decoder_identity(changed)
+    with pytest.raises(CaptureValidationError, match="decoder identity"):
+        verify_replay_provenance(_capture(), **kwargs)  # type: ignore[arg-type]
+
+
+def test_replay_provenance_rejects_unsupported_schema_version() -> None:
+    kwargs = _provenance_kwargs()
+    base = _capture()
+    altered = ASRCapture(
+        schema_version="asr-capture-v2",
+        capture_id=base.capture_id,
+        decoder=base.decoder,
+        clips=base.clips,
+        wall_clock_seconds=base.wall_clock_seconds,
+        memory_snapshots=base.memory_snapshots,
+    )
+    with pytest.raises(CaptureValidationError, match="schema"):
+        verify_replay_provenance(altered, **kwargs)  # type: ignore[arg-type]
+
+
+def test_multi_clip_same_source_keeps_distinct_clip_hashes_and_bounds() -> None:
+    """Multiple clips from one source never share or overwrite clip identity."""
+
+    capture = _capture()
+    first, second = capture.clips
+
+    assert first.clip_id == "clip-0"
+    assert second.clip_id == "clip-1"
+    assert first.source_id == second.source_id == "source-a"
+    assert first.source_hash == second.source_hash == "abc123"
+    assert first.clip_hash == "clip0hash"
+    assert second.clip_hash == "clip1hash"
+    assert first.clip_hash != second.clip_hash
+    assert first.start_seconds == 0.0 and first.end_seconds == 30.0
+    assert second.start_seconds == 30.0 and second.end_seconds == 60.0

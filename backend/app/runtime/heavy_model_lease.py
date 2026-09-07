@@ -3,10 +3,17 @@
 Worker and CLI processes coordinate through a single key so Whisper and Ollama
 can never be resident concurrently. Release is an atomic compare-and-delete so a
 lease is never deleted by a token that does not own it.
+
+Unsafe model residency is a separate, persistent Redis marker. It is written
+when unload fails or lease ownership is lost while a heavy model may still be
+resident, and it survives worker restart, CLI exit, and the lease TTL. No new
+heavy-model work may acquire the lease while the marker is present; an operator
+must confirm the model is no longer resident and clear the marker explicitly.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import threading
 import time
@@ -17,6 +24,7 @@ from typing import Literal
 from app.runtime.memory import MemorySnapshot, capture_memory
 
 _LEASE_KEY = "clipfactory:heavy-model"
+_UNSAFE_KEY = "clipfactory:heavy-model:unsafe"
 
 _RELEASE_LUA = """
 if redis.call('get', KEYS[1]) == ARGV[1] then
@@ -39,6 +47,12 @@ class HeavyModelLeaseBusy(RuntimeError):
     retryable = True
 
 
+class HeavyModelUnsafe(RuntimeError):
+    """Unsafe heavy-model residency is recorded; heavy work is blocked until cleared."""
+
+    retryable = False
+
+
 class HeavyModelLease:
     """A bounded, renewing, ownership-checked lease for one heavy model slot."""
 
@@ -57,6 +71,10 @@ class HeavyModelLease:
         renewal_sleep: Callable[[float], None] = time.sleep,
         on_acquire: Callable[[float, str], None] | None = None,
         on_release: Callable[[], None] | None = None,
+        on_ownership_lost: Callable[[], None] | None = None,
+        on_unsafe: Callable[[str], None] | None = None,
+        on_unsafe_clear: Callable[[], None] | None = None,
+        unsafe_guard: Callable[[], bool] | None = None,
     ) -> None:
         self._redis = redis
         self._ttl_seconds = ttl_seconds
@@ -70,6 +88,10 @@ class HeavyModelLease:
         self._renewal_sleep = renewal_sleep
         self._on_acquire = on_acquire
         self._on_release = on_release
+        self._on_ownership_lost = on_ownership_lost
+        self._on_unsafe = on_unsafe
+        self._on_unsafe_clear = on_unsafe_clear
+        self._unsafe_guard = unsafe_guard
         self._acquired = False
         self._renewer: threading.Thread | None = None
         self._retained = False
@@ -112,8 +134,14 @@ class HeavyModelLease:
         return False
 
     def acquire(self) -> "HeavyModelLease":
-        """Acquire the lease within a bounded deadline or raise HeavyModelLeaseBusy."""
+        """Acquire the lease within a bounded deadline or raise HeavyModelLeaseBusy.
 
+        An active unsafe marker blocks every acquisition, including this token:
+        unsafe residency must be operator-cleared before any heavy-model work.
+        """
+
+        if self._unsafe_guard is not None and self._unsafe_guard():
+            raise HeavyModelUnsafe("unsafe model residency is recorded; run the recovery command")
         started = self._monotonic()
         deadline = started + self._acquisition_timeout_seconds
         while True:
@@ -176,14 +204,24 @@ class HeavyModelLease:
             self._on_release()
 
     def retain(self) -> None:
-        """Hold the lease across release so another heavy model is blocked."""
+        """Hold the lease across release so another heavy model is blocked.
+
+        Retaining also records persistent unsafe state so the block survives a
+        worker restart, CLI exit, or lease TTL expiry until an operator clears it.
+        """
 
         self._retained = True
         if self._renewer is None:
             self._start_renewer()
+        if self._on_unsafe is not None:
+            self._on_unsafe(self._purpose)
 
     def clear_retained(self) -> None:
-        """Operator recovery: end the unsafe block and release the lease."""
+        """Operator recovery: end the unsafe block and release the lease.
+
+        The caller must confirm the model is no longer resident before invoking
+        this; clearing the retained block also clears the persistent unsafe marker.
+        """
 
         self._retained = False
         self._acquired = False
@@ -193,11 +231,17 @@ class HeavyModelLease:
         self._redis.eval(  # type: ignore[attr-defined]
             _RELEASE_LUA, 1, _LEASE_KEY, self._token
         )
+        if self._on_unsafe_clear is not None:
+            self._on_unsafe_clear()
         if self._on_release is not None:
             self._on_release()
 
     def _mark_ownership_lost(self) -> None:
         self._ownership_lost = True
+        if self._on_ownership_lost is not None:
+            self._on_ownership_lost()
+        if self._on_unsafe is not None:
+            self._on_unsafe(self._purpose)
 
     def _start_renewer(self) -> None:
         if self._renewer is not None:
@@ -234,7 +278,68 @@ class HeavyModelLeaseFactory:
         self._snapshotter = snapshotter
         self.events: list[dict[str, object]] = []
 
-    def acquire(self, *, purpose: str) -> HeavyModelLease:
+    def mark_unsafe(self, *, reason: str, owner_pid: int | None = None) -> None:
+        """Persist unsafe heavy-model residency with no TTL.
+
+        The marker is intentionally written without an expiry so it survives
+        worker restart, CLI exit, and the lease TTL. Only an operator recovery
+        that first confirms the model is no longer resident clears it.
+        """
+
+        self._redis.set(  # type: ignore[attr-defined]
+            _UNSAFE_KEY,
+            json.dumps(
+                {
+                    "reason": reason,
+                    "owner_pid": owner_pid or os.getpid(),
+                    "recorded_at": time.time(),
+                },
+                sort_keys=True,
+            ),
+        )
+
+    def unsafe_recorded(self) -> bool:
+        """Return True when an unsafe marker is currently persisted."""
+
+        return bool(self._redis.get(_UNSAFE_KEY))  # type: ignore[attr-defined]
+
+    def unsafe_reason(self) -> str | None:
+        """Return the persisted unsafe reason, or None when no marker exists."""
+
+        try:
+            raw = self._redis.get(_UNSAFE_KEY)  # type: ignore[attr-defined]
+        except Exception:
+            return None
+        if not raw:
+            return None
+        try:
+            payload = json.loads(str(raw))
+        except ValueError:
+            return str(raw)
+        if isinstance(payload, dict):
+            return str(payload.get("reason", "unsafe model residency recorded"))
+        return str(raw)
+
+    def clear_unsafe(self) -> None:
+        """Clear the persistent unsafe marker; caller must confirm not-resident first."""
+
+        self._redis.delete(_UNSAFE_KEY)  # type: ignore[attr-defined]
+
+    def recover(self) -> None:
+        """Operator recovery: clear unsafe state and any stale lease key.
+
+        This must only be called after the model is confirmed no longer
+        resident. The lease key is deleted unconditionally because the unsafe
+        guard blocks every new acquisition and confirmed-not-resident means no
+        legitimate heavy holder can remain.
+        """
+
+        self.clear_unsafe()
+        self._redis.delete(_LEASE_KEY)  # type: ignore[attr-defined]
+
+    def acquire(
+        self, *, purpose: str, on_ownership_lost: Callable[[], None] | None = None
+    ) -> HeavyModelLease:
         """Return a configured, not-yet-acquired lease for the caller to hold."""
 
         owner_pid = os.getpid()
@@ -270,7 +375,14 @@ class HeavyModelLeaseFactory:
             owner_pid=owner_pid,
             on_acquire=record_acquired,
             on_release=record_released,
+            on_ownership_lost=on_ownership_lost,
+            on_unsafe=self._record_unsafe,
+            on_unsafe_clear=self.clear_unsafe,
+            unsafe_guard=self.unsafe_recorded,
         )
+
+    def _record_unsafe(self, purpose: str) -> None:
+        self.mark_unsafe(reason=f"lease retained for {purpose}")
 
 
 class NoopHeavyModelLease:
@@ -302,6 +414,8 @@ class NoopHeavyModelLease:
         return self.acquired or self._retained
 
     def acquire(self) -> "NoopHeavyModelLease":
+        if self._factory._unsafe:
+            raise HeavyModelUnsafe("unsafe model residency is recorded; run the recovery command")
         self.acquired = True
         self._factory._record("heavy_model_acquired", self._purpose)
         return self
@@ -311,6 +425,7 @@ class NoopHeavyModelLease:
 
     def retain(self) -> None:
         self._retained = True
+        self._factory._unsafe = True
 
     def release(self) -> None:
         self.acquired = False
@@ -321,6 +436,7 @@ class NoopHeavyModelLease:
     def clear_retained(self) -> None:
         self._retained = False
         self.acquired = False
+        self._factory._unsafe = False
         self._factory._record("heavy_model_released", self._purpose)
 
 
@@ -329,9 +445,27 @@ class NoopHeavyModelLeaseFactory:
 
     def __init__(self) -> None:
         self.events: list[dict[str, object]] = []
+        self._unsafe = False
 
-    def acquire(self, *, purpose: str) -> NoopHeavyModelLease:
+    def acquire(
+        self, *, purpose: str, on_ownership_lost: Callable[[], None] | None = None
+    ) -> NoopHeavyModelLease:
         return NoopHeavyModelLease(self, purpose)
+
+    def mark_unsafe(self, *, reason: str, owner_pid: int | None = None) -> None:
+        self._unsafe = True
+
+    def unsafe_recorded(self) -> bool:
+        return self._unsafe
+
+    def unsafe_reason(self) -> str | None:
+        return "lease retained for heavy-model work" if self._unsafe else None
+
+    def clear_unsafe(self) -> None:
+        self._unsafe = False
+
+    def recover(self) -> None:
+        self._unsafe = False
 
     def _record(self, event: str, purpose: str) -> None:
         self.events.append(

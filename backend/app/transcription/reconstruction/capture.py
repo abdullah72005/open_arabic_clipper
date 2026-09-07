@@ -47,11 +47,18 @@ class DecoderIdentity:
 
 @dataclass(frozen=True)
 class CaptureClip:
-    """One immutable decoded clip inside an ASR capture."""
+    """One immutable decoded clip inside an ASR capture.
+
+    ``clip_hash`` is the SHA-256 of the exact extracted mono 16 kHz audio this
+    clip's segments came from; ``source_hash`` is the SHA-256 of the original
+    source media file. Both are per-identity: multiple clips of one source keep
+    the same ``source_hash`` but distinct ``clip_hash`` and exact bounds.
+    """
 
     clip_id: str
     source_id: str
     source_hash: str
+    clip_hash: str
     start_seconds: float
     end_seconds: float
     language: str | None
@@ -112,19 +119,25 @@ def build_capture(
     *,
     capture_id: str,
     clips: Sequence[tuple[str, str, float, float]],
+    clip_hashes: Mapping[str, str],
     source_hashes: Mapping[str, str],
     results: Mapping[str, TranscriptionResult],
     options: TranscriptionOptions,
     wall_clock_seconds: float,
     memory_snapshots: dict[str, object] | None = None,
 ) -> ASRCapture:
-    """Build an immutable capture from one Whisper pass over each clip."""
+    """Build an immutable capture from one Whisper pass over each clip.
+
+    Each clip carries its own audio hash and exact start/end bounds so a
+    replay can prove it targets the correct media, not just a matching id.
+    """
 
     captured_clips = tuple(
         CaptureClip(
             clip_id=clip_id,
             source_id=source_id,
             source_hash=source_hashes.get(source_id, ""),
+            clip_hash=clip_hashes.get(clip_id, ""),
             start_seconds=start,
             end_seconds=end,
             language=results[clip_id].language,
@@ -160,6 +173,7 @@ def _capture_payload(capture: ASRCapture) -> dict[str, object]:
                 "clip_id": clip.clip_id,
                 "source_id": clip.source_id,
                 "source_hash": clip.source_hash,
+                "clip_hash": clip.clip_hash,
                 "start_seconds": clip.start_seconds,
                 "end_seconds": clip.end_seconds,
                 "language": clip.language,
@@ -188,6 +202,7 @@ def parse_capture(text: str) -> ASRCapture:
             clip_id=item["clip_id"],
             source_id=item["source_id"],
             source_hash=item["source_hash"],
+            clip_hash=item.get("clip_hash", ""),
             start_seconds=item["start_seconds"],
             end_seconds=item["end_seconds"],
             language=item["language"],
@@ -227,6 +242,8 @@ def validate_capture(capture: ASRCapture) -> None:
             raise CaptureValidationError(f"clip {clip.clip_id} has no source id")
         if not clip.source_hash:
             raise CaptureValidationError(f"clip {clip.clip_id} has no source hash")
+        if not clip.clip_hash:
+            raise CaptureValidationError(f"clip {clip.clip_id} has no clip audio hash")
         if not clip.segments:
             raise CaptureValidationError(f"clip {clip.clip_id} has no raw segments")
         previous_end = None
@@ -242,6 +259,58 @@ def validate_capture(capture: ASRCapture) -> None:
                     f"clip {clip.clip_id} segment {index} overlaps the previous segment"
                 )
             previous_end = end
+
+
+def verify_replay_provenance(
+    capture: ASRCapture,
+    *,
+    clip_id: str,
+    source_id: str,
+    source_hash: str,
+    clip_hash: str,
+    start_seconds: float,
+    end_seconds: float,
+    expected_decoder: DecoderIdentity,
+) -> None:
+    """Verify a capture clip against the exact media/identity it must replay.
+
+    A replay is rejected unless every identity attribute matches: clip id,
+    source id, original-media SHA-256, clip audio SHA-256, exact start/end
+    bounds, schema version, and decoder identity. A matching clip id alone
+    never authorizes a replay.
+    """
+
+    if capture.schema_version != _SCHEMA_VERSION:
+        raise CaptureValidationError(
+            f"replay rejects capture schema {capture.schema_version}; expected {_SCHEMA_VERSION}"
+        )
+    matches = [clip for clip in capture.clips if clip.clip_id == clip_id]
+    if len(matches) != 1:
+        raise CaptureValidationError(
+            f"replay clip {clip_id} is missing or duplicated in the capture"
+        )
+    clip = matches[0]
+    if clip.source_id != source_id:
+        raise CaptureValidationError(
+            f"replay clip {clip_id} source {clip.source_id} does not match expected {source_id}"
+        )
+    if clip.source_hash != source_hash:
+        raise CaptureValidationError(
+            f"replay clip {clip_id} original-media hash mismatch (expected {source_hash})"
+        )
+    if clip.clip_hash != clip_hash:
+        raise CaptureValidationError(
+            f"replay clip {clip_id} clip audio hash mismatch (expected {clip_hash})"
+        )
+    if clip.start_seconds != start_seconds or clip.end_seconds != end_seconds:
+        raise CaptureValidationError(
+            f"replay clip {clip_id} bounds [{clip.start_seconds}, {clip.end_seconds}] "
+            f"do not match expected [{start_seconds}, {end_seconds}]"
+        )
+    if capture.decoder != expected_decoder:
+        raise CaptureValidationError(
+            f"replay clip {clip_id} decoder identity does not match current transcription options"
+        )
 
 
 def save_capture(storage: StorageService, capture: ASRCapture, *, name: str) -> Path:

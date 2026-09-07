@@ -1,10 +1,18 @@
+from types import SimpleNamespace
+
 import pytest
 from pydantic import ValidationError
 
 from app.core.settings import Settings
-from app.runtime.heavy_model_lease import HeavyModelLease, HeavyModelLeaseBusy
+from app.runtime.heavy_model_lease import (
+    HeavyModelLease,
+    HeavyModelLeaseBusy,
+    HeavyModelLeaseFactory,
+    HeavyModelUnsafe,
+)
 
 _LEASE_KEY = "clipfactory:heavy-model"
+_UNSAFE_KEY = "clipfactory:heavy-model:unsafe"
 
 
 class FakeClock:
@@ -40,6 +48,13 @@ class FakeRedis:
             return False
         self.expires_at[name] = self._now() + ttl_seconds
         return True
+
+    def delete(self, name: str) -> int:
+        if name in self.data:
+            del self.data[name]
+            del self.expires_at[name]
+            return 1
+        return 0
 
     def eval(self, script: str, numkeys: int, *args: object) -> int:
         self.eval_scripts.append(script)
@@ -239,3 +254,120 @@ def test_retained_lease_keeps_renewing_after_release() -> None:
 
     assert redis.get(_LEASE_KEY) is None
     assert lease.renewing is False
+
+
+def test_factory_retain_persists_unsafe_marker_without_ttl() -> None:
+    """Retaining records a persistent unsafe marker that survives lease expiry."""
+
+    now = FakeClock()
+    redis = FakeRedis(now)
+    factory = HeavyModelLeaseFactory(
+        redis=redis,
+        ttl_seconds=300,
+        renewal_interval_seconds=60,
+        acquisition_timeout_seconds=5,
+        snapshotter=lambda: SimpleNamespace(effective_capacity=1),
+    )
+    lease = factory.acquire(purpose="ollama")
+    lease.acquire()
+    lease.retain()
+    lease.release()
+
+    assert factory.unsafe_recorded() is True
+    assert factory.unsafe_reason() == "lease retained for ollama"
+
+    now.now += 10_000
+
+    assert factory.unsafe_recorded() is True
+
+
+def test_unsafe_marker_blocks_new_acquisition_until_recovered() -> None:
+    """No heavy-model work may start while the unsafe marker is present."""
+
+    now = FakeClock()
+    redis = FakeRedis(now)
+    factory = HeavyModelLeaseFactory(
+        redis=redis,
+        ttl_seconds=300,
+        renewal_interval_seconds=60,
+        acquisition_timeout_seconds=5,
+        snapshotter=lambda: SimpleNamespace(effective_capacity=1),
+    )
+    factory.mark_unsafe(reason="unload failed")
+
+    with pytest.raises(HeavyModelUnsafe):
+        with factory.acquire(purpose="whisper"):
+            pass
+
+
+def test_unsafe_marker_persists_across_factory_and_process_boundary() -> None:
+    """A fresh factory (new worker/CLI process) still sees the persisted marker."""
+
+    now = FakeClock()
+    redis = FakeRedis(now)
+    first = HeavyModelLeaseFactory(
+        redis=redis,
+        ttl_seconds=300,
+        renewal_interval_seconds=60,
+        acquisition_timeout_seconds=5,
+        snapshotter=lambda: SimpleNamespace(effective_capacity=1),
+    )
+    first.mark_unsafe(reason="model still resident after unload timeout")
+
+    second = HeavyModelLeaseFactory(
+        redis=redis,
+        ttl_seconds=300,
+        renewal_interval_seconds=60,
+        acquisition_timeout_seconds=5,
+        snapshotter=lambda: SimpleNamespace(effective_capacity=1),
+    )
+
+    assert second.unsafe_recorded() is True
+    assert second.unsafe_reason() == "model still resident after unload timeout"
+    with pytest.raises(HeavyModelUnsafe):
+        second.acquire(purpose="whisper").acquire()
+
+
+def test_recovery_only_clears_marker_and_lease_after_confirming_not_resident() -> None:
+    """recover() clears the persistent marker and the stale lease key."""
+
+    now = FakeClock()
+    redis = FakeRedis(now)
+    factory = HeavyModelLeaseFactory(
+        redis=redis,
+        ttl_seconds=300,
+        renewal_interval_seconds=60,
+        acquisition_timeout_seconds=5,
+        snapshotter=lambda: SimpleNamespace(effective_capacity=1),
+    )
+    factory.mark_unsafe(reason="lease retained for ollama")
+    redis.set(_LEASE_KEY, "stale-token", nx=True, px=300000)
+
+    factory.recover()
+
+    assert factory.unsafe_recorded() is False
+    assert redis.get(_LEASE_KEY) is None
+
+
+def test_ownership_loss_callback_fires_and_persists_unsafe() -> None:
+    """Lease loss notifies the caller and records persistent unsafe state."""
+
+    now = FakeClock()
+    redis = FakeRedis(now)
+    factory = HeavyModelLeaseFactory(
+        redis=redis,
+        ttl_seconds=300,
+        renewal_interval_seconds=60,
+        acquisition_timeout_seconds=5,
+        snapshotter=lambda: SimpleNamespace(effective_capacity=1),
+    )
+    events: list[str] = []
+    lease = factory.acquire(purpose="whisper", on_ownership_lost=lambda: events.append("lost"))
+    lease.acquire()
+    redis.data[_LEASE_KEY] = "intruder"
+    redis.expires_at[_LEASE_KEY] = now.now + 300
+
+    assert lease.renew() is False
+    assert lease.ownership_lost is True
+    assert events == ["lost"]
+    assert factory.unsafe_recorded() is True

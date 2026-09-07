@@ -7,13 +7,13 @@ Stage 2.5 evidence.
 ## Provider operation
 
 The default configuration is the optional local Ollama provider at
-`http://ollama:11434` using `qwen3:8b`. Starting the Compose profile does not
+`http://ollama:11434` using `qwen3.5:4b`. Starting the Compose profile does not
 pull any model. An operator must explicitly obtain the configured model before
 reconstruction is available.
 
 ```bash
 docker compose --profile reconstruction up -d ollama
-docker compose exec ollama ollama pull qwen3:8b
+docker compose exec ollama ollama pull qwen3.5:4b
 docker compose exec backend python -m app.cli reconstruction-health
 ```
 
@@ -53,6 +53,12 @@ Per-trial container RSS peaks (`docker stats --no-stream`, GiB):
 | 2 | 2.46 | ≈ 0.26 | 5.85 | runtime empty (2.2 page cache) | empty |
 | 3 | 3.36 | ≈ 0.47 | 5.93 | runtime empty (2.3 page cache) | empty |
 
+Whisper child peak memory is measured inside the spawned child after the model
+work finishes (`ru_maxrss`), never from pre-load parent RSS. If the child exits
+abnormally (timeout, cancellation, or death without a result envelope) and no
+trustworthy peak exists, the peak is reported as `UNKNOWN` rather than a
+fabricated value.
+
 Observations across all three trials:
 
 - No Whisper/Ollama overlap: the lease serialized them, and the Whisper child
@@ -72,6 +78,36 @@ and model digest only. They do not expose provider response bodies, prompts,
 transcript text, credentials, or API keys. If the provider is unavailable,
 misconfigured, or fails during release, reconstruction persists a truthful
 status and falls back safely to earlier evidence.
+
+## Persistent unsafe state and recovery
+
+Unsafe model residency (an Ollama unload that is not confirmed, or a heavy-model
+lease lost while a model may still be resident) is recorded in a persistent
+Redis marker, `clipfactory:heavy-model:unsafe`, with no TTL. The marker survives
+worker restart, CLI exit, and the lease TTL, so no new heavy-model work can
+start until an operator explicitly clears it. A worker or CLI that finds the
+marker raises `HeavyModelUnsafe` instead of acquiring the lease.
+
+Recovery clears the marker only after confirming the model is no longer
+resident:
+
+```bash
+docker compose exec backend python -m app.cli recover-heavy-model
+```
+
+The command polls Ollama `/api/ps`; a resident model or an unreadable listing
+keeps the marker in place. When the model is confirmed gone, it clears the
+marker and any stale lease key. See `docs/ENVIRONMENT.md`.
+
+## Lease-loss handling
+
+If the Redis lease renewal fails or ownership is lost while Whisper work is
+active, the spawned child is cancelled and reaped immediately and the lease loss
+is recorded as persistent unsafe state; the stage fails closed and no other
+heavy task can start until recovery. Reconstruction (Ollama HTTP calls) records
+the same persistent unsafe block on ownership loss. Overlapping Whisper/Ollama
+jobs cannot start after a lease expiry because the unsafe marker blocks the next
+acquisition.
 
 ## Provider confidence contract
 
@@ -189,3 +225,11 @@ read-only capture under `storage/benchmarks/stage-2-7/captures/`.
 `--from-capture` replays a stored capture and never constructs a transcriber.
 Whisper and reconstruction runs always hold the `clipfactory:heavy-model`
 lease, so models never overlap.
+
+A replay is accepted only after full provenance verification. For every clip the
+runner verifies the clip id, source id, original-media SHA-256, the exact
+extracted clip audio SHA-256, the exact start/end bounds, the capture schema
+version, and the decoder identity against the current transcription options. A
+matching clip id alone never authorizes a replay; a stale media file, wrong
+source, drifted bounds, or changed decoder identity rejects the run. Multiple
+clips from the same source each keep their own clip audio hash and bounds.

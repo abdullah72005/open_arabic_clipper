@@ -23,7 +23,7 @@ download a model; the operator must pull the configured model explicitly:
 
 ```bash
 docker compose --profile reconstruction up -d ollama
-docker compose exec ollama ollama pull qwen3:8b
+docker compose exec ollama ollama pull qwen3.5:4b
 docker compose exec backend python -m app.cli reconstruction-health
 ```
 
