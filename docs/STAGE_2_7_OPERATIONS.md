@@ -170,3 +170,22 @@ Automated changed-but-wrong output is `changed_wrong`; `hallucinated` is a human
 safety label. Human labels override semantic/safety counts only and never
 override exact counts. Unknown human labels are rejected when loading a manifest
 or review worksheet.
+
+## Immutable ASR capture and replay
+
+`benchmark-reconstruction` supports capturing immutable ASR once and replaying
+it so reconstruction models are compared on identical raw segments:
+
+```bash
+docker compose exec backend python -m app.cli benchmark-reconstruction \
+  stage-2-7/known-regression-v1.json --allow-known-regression-set --capture-asr
+docker compose exec backend python -m app.cli benchmark-reconstruction \
+  stage-2-7/known-regression-v1.json --allow-known-regression-set \
+  --model qwen3:8b --from-capture <capture-id>
+```
+
+`--capture-asr` runs Whisper exactly once per clip and writes a hashed,
+read-only capture under `storage/benchmarks/stage-2-7/captures/`.
+`--from-capture` replays a stored capture and never constructs a transcriber.
+Whisper and reconstruction runs always hold the `clipfactory:heavy-model`
+lease, so models never overlap.

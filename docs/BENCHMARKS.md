@@ -139,3 +139,25 @@ before Ollama loaded, `ollama ps` was empty after every reconstruction, unload
 was confirmed in under a second, swap growth was effectively zero, and no OOM
 occurred. See `docs/STAGE_2_7_OPERATIONS.md` for the per-trial memory table.
 This validates the lifecycle, not model quality; no quality claim is made.
+
+## Model and ASR quality validation (2026-09-07)
+
+The immutable ASR capture contract (`--capture-asr` / `--from-capture`) was
+added and validated. A known-regression manifest was built from the operator-added
+Cuba clip (`e0f06a86…`, phrases `فيور 25 نوفمبر`, `آخره يشيلت نصر واحد`,
+`فيه 71`) and the existing Chernobyl clip. Measured evidence:
+
+- **4B baseline** (`qwen3.5:4b`, one replay of the frozen capture): repaired 0
+  of the three known phrases; `فيور 25 نوفمبر`, `آخره يشيلت نصر واحد`, and
+  `فيه 71` all remained unchanged.
+- **8B feasibility**: `qwen3:8b` (Q4_K_M) loaded without OOM under the 10.69 GiB
+  envelope (it was OOM-killed at the old 7.44 GiB). A full 8B replay run hung
+  (the process forked a child and blocked in `wait`), producing no report; the
+  three-run 8B reliability gate was not met.
+- **`large-v3` versus `large-v3-turbo`** on the ASR_AUDIO windows: full `large-v3`
+  recovered `فيور` that turbo dropped (one human-confirmed ASR_AUDIO fix) but
+  still missed `آخره … اتناشر`; both kept `70 واحد` as `سبعين واحد`. One fix is
+  below the two-fix promotion gate, so `large-v3-turbo` remains the default.
+
+No unseen-corpus human references were available, so no quality or readiness
+claim is made. The private known corpus is regression evidence only.

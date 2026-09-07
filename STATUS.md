@@ -79,5 +79,22 @@ zero, and no OOM occurred. This validates the lifecycle only; no model-quality
 or unseen-readiness claim is made. The 8B model has not been downloaded or
 benchmarked.
 
+## Stage 2.7 model and ASR quality status (2026-09-07)
+
+The immutable ASR capture contract and complete benchmark evidence recording were
+implemented and tested. A known-regression corpus was captured on
+`large-v3-turbo`. Findings:
+
+- `qwen3:8b` (Q4_K_M) now loads without OOM under 10.69 GiB (it was OOM-killed
+  at 7.44 GiB), but a full 8B replay hung, so the three-run reliability gate is
+  not met.
+- `qwen3.5:4b` repaired 0 of the three known phrases (`فيور 25 نوفمبر`,
+  `آخره يشيلت نصر واحد`, `فيه 71`) on the frozen capture.
+- Full `large-v3` recovered `فيور` (one ASR_AUDIO fix) but missed `اتناشر`;
+  below the two-fix gate, so `large-v3-turbo` remains the default.
+- The unseen-corpus human references are not yet available; Stage 2.7.1 cannot
+  be authorized. A stricter 8B/ASR reliability and quality evaluation remains
+  open.
+
 STAGE 2.7 MUST CONTINUE
 
