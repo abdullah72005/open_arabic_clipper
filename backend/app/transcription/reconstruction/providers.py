@@ -27,6 +27,10 @@ class ProviderResponseError(ValueError):
     """Provider output cannot safely map to requested stable segment IDs."""
 
 
+class ModelNotFoundError(ProviderResponseError):
+    """The configured model is absent from the provider's model listing."""
+
+
 @dataclass(frozen=True)
 class ReconstructionRequest:
     """Small local context for a single target segment reconstruction."""
@@ -87,9 +91,13 @@ class ReconstructionRequest:
         chat_framing_reserve: int = 0,
         safety_reserve: int = 0,
     ) -> int:
-        """Conservative estimate of the complete chat envelope, not only the payload."""
+        """Conservative estimate of the complete chat envelope, not only the payload.
 
-        payload = json.dumps(self.to_payload(), ensure_ascii=False)
+        The estimate counts the exact serialized ``{"targets": [...]}`` wrapper
+        that is sent as the user message.
+        """
+
+        payload = json.dumps({"targets": [self.to_payload()]}, ensure_ascii=False)
         return (
             estimate_tokens(system_instruction)
             + estimate_tokens(payload)
@@ -109,6 +117,8 @@ class ReconstructionProvider(Protocol):
     def release(self) -> None: ...
 
     def runtime_identity(self) -> dict[str, object]: ...
+
+    def refresh_runtime_identity(self) -> dict[str, object]: ...
 
 
 HttpRequest = Callable[[str, str, bytes | None, dict[str, str], float], bytes]
@@ -163,12 +173,43 @@ class OpenAICompatibleReconstructionProvider:
             "validation_version": VALIDATION_VERSION,
         }
 
+    def refresh_runtime_identity(self) -> dict[str, object]:
+        """Resolve the live model digest now and return the refreshed identity.
+
+        A failed lookup is represented as ``digest_unavailable``; a successful
+        lookup always overwrites any previously cached digest.
+        """
+
+        try:
+            self._model_digest = self._fetch_live_digest()
+        except ProviderResponseError:
+            self._model_digest = None
+        return self.runtime_identity()
+
+    def _fetch_live_digest(self) -> str | None:
+        payload = self._json_request("GET", "/v1/models", None)
+        models = payload.get("data")
+        if not isinstance(models, list):
+            raise ProviderResponseError("provider response is missing models")
+        match = next(
+            (item for item in models if isinstance(item, dict) and item.get("id") == self.model),
+            None,
+        )
+        if match is None:
+            raise ModelNotFoundError(f"configured model {self.model} is not available")
+        return str(match.get("digest") or "") or None
+
     def health(self) -> ProviderHealth:
         try:
-            payload = self._json_request("GET", "/v1/models", None)
-            models = payload.get("data")
-            if not isinstance(models, list):
-                raise ProviderResponseError("provider response is missing models")
+            digest = self._fetch_live_digest()
+        except ModelNotFoundError as error:
+            return ProviderHealth(
+                ProviderAvailability.UNAVAILABLE,
+                "openai_compatible",
+                self.model,
+                None,
+                str(error),
+            )
         except ProviderResponseError:
             return ProviderHealth(
                 ProviderAvailability.UNAVAILABLE,
@@ -177,24 +218,12 @@ class OpenAICompatibleReconstructionProvider:
                 None,
                 "provider health check failed",
             )
-        match = next(
-            (item for item in models if isinstance(item, dict) and item.get("id") == self.model),
-            None,
-        )
-        if match is None:
-            return ProviderHealth(
-                ProviderAvailability.UNAVAILABLE,
-                "openai_compatible",
-                self.model,
-                None,
-                f"configured model {self.model} is not available",
-            )
-        self._model_digest = str(match.get("digest") or "") or None
+        self._model_digest = digest
         return ProviderHealth(
             ProviderAvailability.AVAILABLE,
             "openai_compatible",
             self.model,
-            self._model_digest,
+            digest,
             "model available",
         )
 
@@ -225,7 +254,9 @@ class OpenAICompatibleReconstructionProvider:
             RequestSizeDiagnostics(
                 segment_index=request.segment_index,
                 serialized_bytes=len(
-                    json.dumps(request.to_payload(), ensure_ascii=False).encode("utf-8")
+                    json.dumps({"targets": [request.to_payload()]}, ensure_ascii=False).encode(
+                        "utf-8"
+                    )
                 ),
                 estimated_input_tokens=self._envelope_estimate(system_instruction)(request),
             )

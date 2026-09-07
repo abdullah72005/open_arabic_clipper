@@ -390,7 +390,7 @@ class ContextualReconstructionExecutor:
                 "normalization_fingerprint": transcript.normalization_fingerprint,
                 "transcription_revision": transcript.transcription_revision,
                 "correction_version": transcript.correction_version,
-                "runtime_identity": self._reconstructor.runtime_identity(),
+                "runtime_identity": self._reconstructor.refresh_runtime_identity(),
             },
         )
 

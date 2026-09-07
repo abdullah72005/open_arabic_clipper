@@ -5,6 +5,7 @@ from urllib.parse import urlsplit
 import pytest
 
 from app.transcription.reconstruction.providers import (
+    _SYSTEM_INSTRUCTION,
     OpenAICompatibleReconstructionProvider,
     ProviderResponseError,
     ReconstructionRequest,
@@ -16,6 +17,7 @@ from app.transcription.reconstruction.types import (
     ProviderAvailability,
     ProviderHealth,
     WordEvidence,
+    estimate_tokens,
 )
 
 
@@ -264,6 +266,41 @@ def test_irreducible_request_raises_before_http_dispatch() -> None:
     assert calls == 0
 
 
+def test_wrapped_user_content_exceeds_budget_before_http_dispatch() -> None:
+    """The targets wrapper counts toward the budget: bare payload fits, wrapped does not."""
+
+    calls = 0
+
+    def request(*_args: object) -> bytes:
+        nonlocal calls
+        calls += 1
+        return b"{}"
+
+    request_obj = ReconstructionRequest(segment_index=4, raw_text="هدف", corrected_text="هدف")
+    framing = 64
+    output = 256
+    safety = 128
+    bare_payload = estimate_tokens(json.dumps(request_obj.to_payload(), ensure_ascii=False))
+    wrapped_payload = estimate_tokens(
+        json.dumps({"targets": [request_obj.to_payload()]}, ensure_ascii=False)
+    )
+    assert wrapped_payload > bare_payload
+    bare_full = estimate_tokens(_SYSTEM_INSTRUCTION) + bare_payload + framing + output + safety
+
+    provider = OpenAICompatibleReconstructionProvider(
+        base_url="http://ollama:11434",
+        model="qwen3.5:4b",
+        timeout_seconds=12,
+        max_context_tokens=bare_full,
+        request=request,
+    )
+
+    with pytest.raises(ProviderResponseError, match="context budget"):
+        provider.reconstruct_segments([request_obj])
+
+    assert calls == 0
+
+
 def test_provider_records_request_size_diagnostics() -> None:
     """The provider stores measured serialized bytes and estimated input tokens."""
 
@@ -286,22 +323,21 @@ def test_provider_records_request_size_diagnostics() -> None:
         request=request,
     )
 
-    provider.reconstruct_segments(
-        [
-            ReconstructionRequest(
-                segment_index=4,
-                raw_text="هدف",
-                corrected_text="هدف",
-                previous=("قبل",),
-                following=("بعد",),
-            )
-        ]
+    sent = ReconstructionRequest(
+        segment_index=4,
+        raw_text="هدف",
+        corrected_text="هدف",
+        previous=("قبل",),
+        following=("بعد",),
     )
+    provider.reconstruct_segments([sent])
 
     diagnostics = provider.last_request_sizes()
     assert len(diagnostics) == 1
     assert diagnostics[0].segment_index == 4
-    assert diagnostics[0].serialized_bytes > 0
+    assert diagnostics[0].serialized_bytes == len(
+        json.dumps({"targets": [sent.to_payload()]}, ensure_ascii=False).encode("utf-8")
+    )
     assert diagnostics[0].estimated_input_tokens > 0
 
 

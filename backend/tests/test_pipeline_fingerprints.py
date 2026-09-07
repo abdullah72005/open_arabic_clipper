@@ -42,6 +42,9 @@ class IdentityProvider:
     def runtime_identity(self) -> dict[str, object]:
         return dict(self._identity)
 
+    def refresh_runtime_identity(self) -> dict[str, object]:
+        return dict(self._identity)
+
     def reconstruct_segments(
         self, requests: list[ReconstructionRequest]
     ) -> dict[int, ReconstructionCandidate]:

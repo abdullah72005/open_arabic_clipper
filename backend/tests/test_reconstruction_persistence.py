@@ -1,3 +1,5 @@
+import json
+
 import pytest
 from sqlalchemy.orm import Session
 
@@ -124,6 +126,9 @@ class IdentityProvider:
         )
 
     def runtime_identity(self) -> dict[str, object]:
+        return dict(self._identity)
+
+    def refresh_runtime_identity(self) -> dict[str, object]:
         return dict(self._identity)
 
     def reconstruct_segments(
@@ -278,3 +283,147 @@ def test_executor_persists_actual_stage27_and_manual_only_affects_final(
         assert transcript.final_text == "ضخمة يدوي"
         assert transcript.reconstruction_metadata["provider_available"] is True
         assert transcript.reconstruction_metadata["runtime_identity"]["model"] == "qwen3.5:4b"
+
+
+class LiveDigestTransport:
+    def __init__(self, digest: str) -> None:
+        self.digest = digest
+        self.urls: list[str] = []
+
+    def __call__(
+        self, method: str, url: str, body: bytes | None, headers: dict[str, str], timeout: float
+    ) -> bytes:
+        self.urls.append(url)
+        if url.endswith("/api/tags"):
+            return json.dumps({"models": [{"name": "qwen3.5:4b", "digest": self.digest}]}).encode()
+        if url.endswith("/v1/chat/completions"):
+            chat_body = json.loads(body)
+            targets = json.loads(chat_body["messages"][1]["content"])["targets"]
+            content = {
+                "reconstructions": [
+                    {
+                        "segment_id": target["segment_id"],
+                        "corrected_text": target["corrected_text"],
+                        "unchanged": True,
+                    }
+                    for target in targets
+                ]
+            }
+            return json.dumps(
+                {"choices": [{"message": {"content": json.dumps(content, ensure_ascii=False)}}]}
+            ).encode()
+        return b"{}"
+
+
+def _ollama_provider(transport: LiveDigestTransport) -> OllamaReconstructionProvider:
+    return OllamaReconstructionProvider(
+        base_url="http://ollama:11434",
+        model="qwen3.5:4b",
+        timeout_seconds=3,
+        release_after_run=False,
+        request=transport,
+    )
+
+
+def test_same_tag_digest_replacement_invalidates_output_fingerprint() -> None:
+    """A model replaced under the same tag changes the output fingerprint immediately."""
+
+    transport = LiveDigestTransport("sha256:old")
+    provider = _ollama_provider(transport)
+    segments = [{"start": 0.0, "end": 1.0, "text": "دخم", "corrected_text": "دخم"}]
+
+    first = ContextualReconstructor(provider).reconstruct(
+        segments,
+        language="ar",
+        transcription_fingerprint="asr-v1",
+        correction_version="egyptian-ar-v1",
+    )
+    transport.digest = "sha256:new"
+    second = ContextualReconstructor(provider).reconstruct(
+        segments,
+        language="ar",
+        transcription_fingerprint="asr-v1",
+        correction_version="egyptian-ar-v1",
+    )
+
+    assert first.metadata["runtime_identity"]["digest"] == "sha256:old"
+    assert second.metadata["runtime_identity"]["digest"] == "sha256:new"
+    assert first.fingerprint != second.fingerprint
+
+
+def test_executor_input_fingerprint_refreshes_live_digest(sqlite_engine: object) -> None:
+    """The pipeline reads the live digest before deciding whether Stage 2.7 is current."""
+
+    Base.metadata.create_all(sqlite_engine)
+    with Session(sqlite_engine) as session:
+        source = SourceVideo(
+            source_uri="file:///tmp/source.mp4", content_hash="h", rights_status=RightsStatus.OWNED
+        )
+        session.add(source)
+        session.commit()
+        session.add(
+            Transcript(
+                source_video_id=source.id,
+                whisper_model="large-v3-turbo",
+                input_fingerprint="asr-fp",
+                normalization_fingerprint="norm-fp",
+                transcription_revision=1,
+                correction_version="egyptian-ar-v1",
+            )
+        )
+        session.commit()
+
+        transport = LiveDigestTransport("sha256:old")
+        executor = ContextualReconstructionExecutor(
+            session=session, reconstructor=ContextualReconstructor(_ollama_provider(transport))
+        )
+        fp_old = executor.input_fingerprint(source)
+        transport.digest = "sha256:new"
+        fp_new = executor.input_fingerprint(source)
+
+        assert fp_old != fp_new
+
+
+def test_forced_reconstruction_run_uses_refreshed_digest(sqlite_engine: object) -> None:
+    """A forced rerun after a same-tag model replacement persists the new digest."""
+
+    Base.metadata.create_all(sqlite_engine)
+    with Session(sqlite_engine) as session:
+        source = SourceVideo(
+            source_uri="file:///tmp/source.mp4", content_hash="h", rights_status=RightsStatus.OWNED
+        )
+        session.add(source)
+        session.commit()
+        transcript = Transcript(
+            source_video_id=source.id,
+            whisper_model="large-v3-turbo",
+            input_fingerprint="asr-fp",
+            normalization_fingerprint="norm-fp",
+            transcription_revision=1,
+            correction_version="egyptian-ar-v1",
+            language="ar",
+            segments=[
+                {
+                    "start": 0.0,
+                    "end": 1.0,
+                    "text": "دخم",
+                    "raw_text": "دخم",
+                    "corrected_text": "دخم",
+                }
+            ],
+        )
+        session.add(transcript)
+        session.commit()
+
+        transport = LiveDigestTransport("sha256:old")
+        executor = ContextualReconstructionExecutor(
+            session=session, reconstructor=ContextualReconstructor(_ollama_provider(transport))
+        )
+        executor.execute(source, force=True)
+        session.refresh(transcript)
+        assert transcript.reconstruction_metadata["runtime_identity"]["digest"] == "sha256:old"
+
+        transport.digest = "sha256:new"
+        executor.execute(source, force=True)
+        session.refresh(transcript)
+        assert transcript.reconstruction_metadata["runtime_identity"]["digest"] == "sha256:new"

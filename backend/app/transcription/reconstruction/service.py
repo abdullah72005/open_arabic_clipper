@@ -39,6 +39,13 @@ class ContextualReconstructor:
             return {"provider": "disabled"}
         return dict(self._provider.runtime_identity())
 
+    def refresh_runtime_identity(self) -> dict[str, object]:
+        """Resolve the live model digest and return the refreshed runtime identity."""
+
+        if self._provider is None:
+            return {"provider": "disabled"}
+        return dict(self._provider.refresh_runtime_identity())
+
     def reconstruct(
         self,
         segments: Sequence[Mapping[str, object]],
@@ -47,10 +54,9 @@ class ContextualReconstructor:
         transcription_fingerprint: str,
         correction_version: str,
     ) -> ReconstructionResult:
-        identity = self.runtime_identity()
         if self._provider is None:
             fingerprint = reconstruction_output_fingerprint(
-                provider_identity=identity,
+                provider_identity={"provider": "disabled"},
                 provider_available=False,
                 segments=segments,
                 language=language,
@@ -73,6 +79,7 @@ class ContextualReconstructor:
                 else "unknown"
             )
             provider_available = health is not None and health.availability.value == "AVAILABLE"
+            identity = self.runtime_identity()
             fingerprint = reconstruction_output_fingerprint(
                 provider_identity=identity,
                 provider_available=provider_available,

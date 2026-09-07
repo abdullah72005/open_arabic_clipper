@@ -65,7 +65,6 @@ _VALID_HUMAN_LABELS = frozenset(
         "regressed",
         "changed_wrong",
         "hallucinated",
-        "unresolved",
     }
 )
 _EXACT_WHITESPACE = re.compile(r"\s+")

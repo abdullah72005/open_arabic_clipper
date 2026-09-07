@@ -2,6 +2,7 @@
 
 from app.transcription.reconstruction.providers import (
     HttpRequest,
+    ModelNotFoundError,
     OpenAICompatibleReconstructionProvider,
     ProviderResponseError,
 )
@@ -35,12 +36,30 @@ class OllamaReconstructionProvider(OpenAICompatibleReconstructionProvider):
         self.provider_name = "ollama"
         self.release_after_run = release_after_run
 
+    def _fetch_live_digest(self) -> str | None:
+        payload = self._json_request("GET", "/api/tags", None)
+        models = payload.get("models")
+        if not isinstance(models, list):
+            raise ProviderResponseError("provider response is missing models")
+        match = next(
+            (item for item in models if isinstance(item, dict) and item.get("name") == self.model),
+            None,
+        )
+        if match is None:
+            raise ModelNotFoundError(f"configured model {self.model} is not installed")
+        return str(match.get("digest") or "") or None
+
     def health(self) -> ProviderHealth:
         try:
-            payload = self._json_request("GET", "/api/tags", None)
-            models = payload.get("models")
-            if not isinstance(models, list):
-                raise ProviderResponseError("provider response is missing models")
+            digest = self._fetch_live_digest()
+        except ModelNotFoundError as error:
+            return ProviderHealth(
+                ProviderAvailability.UNAVAILABLE,
+                "ollama",
+                self.model,
+                None,
+                str(error),
+            )
         except ProviderResponseError:
             return ProviderHealth(
                 ProviderAvailability.UNAVAILABLE,
@@ -49,24 +68,12 @@ class OllamaReconstructionProvider(OpenAICompatibleReconstructionProvider):
                 None,
                 "provider health check failed",
             )
-        match = next(
-            (item for item in models if isinstance(item, dict) and item.get("name") == self.model),
-            None,
-        )
-        if match is None:
-            return ProviderHealth(
-                ProviderAvailability.UNAVAILABLE,
-                "ollama",
-                self.model,
-                None,
-                f"configured model {self.model} is not installed",
-            )
-        self._model_digest = str(match.get("digest") or "") or None
+        self._model_digest = digest
         return ProviderHealth(
             ProviderAvailability.AVAILABLE,
             "ollama",
             self.model,
-            self._model_digest,
+            digest,
             "model available",
         )
 

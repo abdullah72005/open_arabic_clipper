@@ -42,6 +42,9 @@ class OnePassProvider:
             "validation_version": "stage-2-7-validation-v1",
         }
 
+    def refresh_runtime_identity(self) -> dict[str, object]:
+        return self.runtime_identity()
+
     def release(self) -> None:
         self.release_calls += 1
 
@@ -133,6 +136,9 @@ def test_reconstructor_falls_back_only_for_expected_provider_failures() -> None:
         def runtime_identity(self) -> dict[str, object]:
             return {"provider": "test", "model": "test", "digest": "sha256:x"}
 
+        def refresh_runtime_identity(self) -> dict[str, object]:
+            return self.runtime_identity()
+
         def reconstruct_segments(
             self, requests: list[ReconstructionRequest]
         ) -> dict[int, ReconstructionCandidate]:
@@ -163,6 +169,9 @@ def test_reconstructor_surfaces_provider_unavailable_when_model_cannot_run() -> 
 
         def runtime_identity(self) -> dict[str, object]:
             return {"provider": "ollama", "model": "qwen3:8b", "digest": "digest_unavailable"}
+
+        def refresh_runtime_identity(self) -> dict[str, object]:
+            return self.runtime_identity()
 
         def reconstruct_segments(
             self, requests: list[ReconstructionRequest]
@@ -270,6 +279,9 @@ class ScriptedTargetProvider:
             "confidence_policy_version": "one-pass-provider-confidence-v1",
             "validation_version": "stage-2-7-validation-v1",
         }
+
+    def refresh_runtime_identity(self) -> dict[str, object]:
+        return self.runtime_identity()
 
     def reconstruct_segments(
         self, requests: list[ReconstructionRequest]

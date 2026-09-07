@@ -262,10 +262,30 @@ def test_manifest_rejects_unknown_human_label() -> None:
         BenchmarkManifest.model_validate(payload)
 
 
+def test_manifest_rejects_unresolved_as_a_human_label() -> None:
+    """A referenced row cannot be removed from correctness via a human label."""
+
+    payload = _manifest().model_dump(mode="json")
+    payload["clips"][0]["reference_segments"][0]["human_label"] = "unresolved"
+    with pytest.raises(ValueError, match="human label"):
+        BenchmarkManifest.model_validate(payload)
+
+
 def test_load_review_worksheet_rejects_unknown_human_label(tmp_path: Path) -> None:
     worksheet = tmp_path / "review-worksheet.jsonl"
     worksheet.write_text(
         json.dumps({"clip_id": "clip-0", "segment_index": 0, "human_label": "wrong-label"}) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="human label"):
+        load_review_worksheet(worksheet)
+
+
+def test_load_review_worksheet_rejects_unresolved_human_label(tmp_path: Path) -> None:
+    worksheet = tmp_path / "review-worksheet.jsonl"
+    worksheet.write_text(
+        json.dumps({"clip_id": "clip-0", "segment_index": 0, "human_label": "unresolved"}) + "\n",
         encoding="utf-8",
     )
 
@@ -564,6 +584,54 @@ def test_referenced_unresolved_row_stays_in_correctness_denominators(tmp_path: P
     assert result.stage25_correct == 0
     assert result.semantic_correct_stage25 == 0.0
     assert result.semantic_correct_stage27 == 0.0
+
+
+def test_referenced_unresolved_correct_row_stays_in_correct_denominator(
+    tmp_path: Path,
+) -> None:
+    """A runtime-unresolved row whose Stage 2.5 text is correct stays in stage25_correct."""
+
+    storage = _RecordingStorage(tmp_path / "storage")
+    manifest = _small_known_manifest([_reference(0, "unchanged_correct", text="corrected-0-0")])
+    _seed_sources(storage, manifest)
+    events: list[str] = []
+
+    class UnresolvedReconstructor(_Reconstructor):
+        def reconstruct(self, segments, **kwargs) -> ReconstructionResult:
+            segment = segments[0]
+            corrected = str(segment["corrected_text"])
+            row = SegmentReconstruction(
+                0,
+                str(segment["raw_text"]),
+                corrected,
+                corrected,
+                None,
+                False,
+                0.0,
+                ConfidenceLevel.LOW,
+                (),
+                ReconstructionStatus.LOW_CONFIDENCE_UNRESOLVED,
+                reconstruction_method="ollama:qwen3:8b",
+            )
+            return ReconstructionResult((row,), corrected, "fingerprint")
+
+    runner = BenchmarkRunner(
+        storage=storage,
+        whisper_engine=_Engine(events, counts={0: 1}),
+        corrector=_Corrector(events),
+        reconstructor=UnresolvedReconstructor(events),
+        provider_health=_available_health(),
+        transcription_options=_options(),
+        command_runner=lambda args: _write_clip(args),
+        prompt_settings_fingerprint="production-fingerprint",
+    )
+
+    result = runner.run(manifest)
+
+    assert result.unresolved == 1
+    assert result.unchanged_correct == 1
+    assert result.stage25_correct == 1
+    assert result.reviewed_denominator == 1
 
 
 def test_unreferenced_row_is_reported_unreviewed_not_implicitly_safe(tmp_path: Path) -> None:
