@@ -263,6 +263,18 @@ def test_manifest_rejects_unknown_human_label() -> None:
         BenchmarkManifest.model_validate(payload)
 
 
+def test_manifest_rejects_invalid_safety_label_and_root_cause() -> None:
+    payload = _manifest().model_dump(mode="json")
+    payload["clips"][0]["reference_segments"][0]["human_safety_label"] = "unknown"
+    with pytest.raises(ValueError, match="safety label"):
+        BenchmarkManifest.model_validate(payload)
+
+    payload = _manifest().model_dump(mode="json")
+    payload["clips"][0]["reference_segments"][0]["root_cause"] = "NOT_A_CAUSE"
+    with pytest.raises(ValueError, match="root cause"):
+        BenchmarkManifest.model_validate(payload)
+
+
 def test_manifest_rejects_unresolved_as_a_human_label() -> None:
     """A referenced row cannot be removed from correctness via a human label."""
 
@@ -408,7 +420,20 @@ class _Reconstructor:
                     reconstruction_method="ollama:qwen3:8b",
                 )
             )
-        return ReconstructionResult(tuple(rows), "joined", "fingerprint")
+        return ReconstructionResult(
+            tuple(rows),
+            "joined",
+            "fingerprint",
+            metadata={
+                "wall_seconds": 1.5,
+                "prompt_diagnostics": {
+                    "average_serialized_bytes": 100.0,
+                    "max_serialized_bytes": 120,
+                    "average_input_tokens": 50.0,
+                    "max_input_tokens": 60,
+                },
+            },
+        )
 
 
 def _available_health() -> ProviderHealth:
@@ -757,6 +782,86 @@ def test_runner_replays_capture_without_a_transcriber(tmp_path: Path) -> None:
     assert "asr:" not in events
     assert events[:2] == ["stage25", "stage27"]
     assert result.unchanged_correct == 1
+
+
+def test_report_rows_satisfy_evidence_invariants(tmp_path: Path) -> None:
+    """Row totals, references, candidates, and exact metrics stay internally consistent."""
+
+    storage = _RecordingStorage(tmp_path / "storage")
+    _seed_sources(storage, _manifest())
+    events: list[str] = []
+    runner = BenchmarkRunner(
+        storage=storage,
+        whisper_engine=_Engine(events),
+        corrector=_Corrector(events),
+        reconstructor=_Reconstructor(events),
+        provider_health=_available_health(),
+        transcription_options=_options(),
+        command_runner=lambda args: _write_clip(args),
+        prompt_settings_fingerprint="production-fingerprint",
+    )
+    result = runner.run(_manifest())
+    rows = [json.loads(line) for line in result.comparison_path.read_text().splitlines()]  # type: ignore[union-attr]
+
+    assert len(rows) == 10
+    for clip in _manifest().clips:
+        for reference in clip.reference_segments:
+            assert any(
+                row["clip_id"] == clip.id and row["segment_index"] == reference.segment_index
+                for row in rows
+            )
+    for row in rows:
+        assert "reconstruction_applied" in row
+        assert "candidate" in row
+        assert "validation_outcome" in row
+        assert "apply_reason" in row
+        assert "reference_present" in row
+        assert "human_safety_label" in row
+        assert "root_cause" in row
+    exact = {row["exact_status"] for row in rows}
+    assert exact <= {
+        "improved",
+        "unchanged_correct",
+        "unchanged_wrong",
+        "regressed",
+        "changed_wrong",
+        "unreviewed",
+    }
+    assert result.exact_improved == sum(1 for row in rows if row["exact_status"] == "improved")
+    assert result.exact_changed_wrong == sum(
+        1 for row in rows if row["exact_status"] == "changed_wrong"
+    )
+
+
+def test_report_exposes_operational_evidence_fields(tmp_path: Path) -> None:
+    """Operational metrics are explicit, present, and null rather than hidden zeros."""
+
+    storage = _RecordingStorage(tmp_path / "storage")
+    _seed_sources(storage, _manifest())
+    events: list[str] = []
+    runner = BenchmarkRunner(
+        storage=storage,
+        whisper_engine=_Engine(events),
+        corrector=_Corrector(events),
+        reconstructor=_Reconstructor(events),
+        provider_health=_available_health(),
+        transcription_options=_options(),
+        command_runner=lambda args: _write_clip(args),
+        prompt_settings_fingerprint="production-fingerprint",
+    )
+    result = runner.run(_manifest())
+
+    assert result.reconstruction_wall_seconds is not None
+    assert result.reconstruction_wall_seconds == pytest.approx(7.5)
+    assert result.average_serialized_prompt_bytes == pytest.approx(100.0)
+    assert result.max_serialized_prompt_bytes == 120
+    assert result.average_estimated_input_tokens == pytest.approx(50.0)
+    assert result.max_estimated_input_tokens == 60
+    assert "oom_evidence" in result.model_dump()
+    assert result.model_quantization is None
+    assert result.model_size_bytes is None
+    assert result.model_load_seconds is None
+    assert result.peak_effective_ram_bytes is None
 
 
 def test_runner_rejects_missing_source_media(tmp_path: Path) -> None:

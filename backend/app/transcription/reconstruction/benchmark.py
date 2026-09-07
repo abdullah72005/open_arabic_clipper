@@ -73,6 +73,17 @@ _VALID_HUMAN_LABELS = frozenset(
         "hallucinated",
     }
 )
+_VALID_SAFETY_LABELS = frozenset({"safe", "hallucinated", "unsafe"})
+_VALID_ROOT_CAUSES = frozenset(
+    {
+        "ASR_AUDIO",
+        "STAGE25",
+        "MODEL_CANDIDATE",
+        "VALIDATION_OR_GATE",
+        "PERSISTENCE",
+        "EVALUATOR",
+    }
+)
 _EXACT_WHITESPACE = re.compile(r"\s+")
 
 
@@ -100,6 +111,8 @@ class ReferenceSegment(BaseModel):
     text: str = Field(min_length=1)
     reviewed: bool = False
     human_label: str | None = None
+    human_safety_label: str | None = None
+    root_cause: str | None = None
 
     @model_validator(mode="after")  # type: ignore[untyped-decorator]
     def _validate(self) -> "ReferenceSegment":
@@ -107,6 +120,13 @@ class ReferenceSegment(BaseModel):
             raise ValueError("every benchmark reference must be reviewed")
         if self.human_label is not None and self.human_label not in _VALID_HUMAN_LABELS:
             raise ValueError(f"unknown human label: {self.human_label}")
+        if (
+            self.human_safety_label is not None
+            and self.human_safety_label not in _VALID_SAFETY_LABELS
+        ):
+            raise ValueError(f"unknown human safety label: {self.human_safety_label}")
+        if self.root_cause is not None and self.root_cause not in _VALID_ROOT_CAUSES:
+            raise ValueError(f"unknown root cause: {self.root_cause}")
         return self
 
 
@@ -216,6 +236,18 @@ class BenchmarkReport(BaseModel):
     exact_unchanged_wrong: int = Field(default=0, ge=0)
     exact_regressed: int = Field(default=0, ge=0)
     exact_changed_wrong: int = Field(default=0, ge=0)
+    reconstruction_wall_seconds: float | None = Field(default=None, ge=0)
+    model_quantization: str | None = None
+    model_size_bytes: int | None = Field(default=None, ge=0)
+    model_load_seconds: float | None = Field(default=None, ge=0)
+    average_serialized_prompt_bytes: float | None = Field(default=None, ge=0)
+    max_serialized_prompt_bytes: int | None = Field(default=None, ge=0)
+    average_estimated_input_tokens: float | None = Field(default=None, ge=0)
+    max_estimated_input_tokens: int | None = Field(default=None, ge=0)
+    peak_effective_ram_bytes: int | None = Field(default=None, ge=0)
+    unload_confirmed: bool | None = None
+    unload_warning: str | None = None
+    oom_evidence: bool | None = None
     source_audio_seconds: float = Field(gt=0)
     wall_clock_seconds: float = Field(gt=0)
     peak_ram_bytes: int = Field(ge=0)
@@ -309,6 +341,12 @@ class BenchmarkRunner:
         provider_died = False
         unresolved = 0
         unreviewed = 0
+        reconstruction_wall_seconds = 0.0
+        unload_confirmed: bool | None = None
+        unload_warning: str | None = None
+        prompt_sums: dict[str, float] = {}
+        prompt_maxes: dict[str, float] = {}
+        prompt_counts: dict[str, int] = {}
 
         for clip in manifest.clips:
             if capture is not None:
@@ -355,6 +393,21 @@ class BenchmarkRunner:
                 transcription_fingerprint="benchmark",
                 correction_version="benchmark",
             )
+            reconstruction_wall_seconds += max(
+                reconstruction.metadata.get("wall_seconds", 0.0), 0.0
+            )  # type: ignore[arg-type]
+            prompt_diag = reconstruction.metadata.get("prompt_diagnostics")
+            if isinstance(prompt_diag, dict):
+                for key, value in prompt_diag.items():
+                    if isinstance(value, (int, float)):
+                        prompt_sums[key] = prompt_sums.get(key, 0.0) + float(value)
+                        prompt_maxes[key] = max(prompt_maxes.get(key, 0.0), float(value))
+                        prompt_counts[key] = prompt_counts.get(key, 0) + 1
+            unload_outcome = reconstruction.metadata.get("unload_outcome")
+            if isinstance(unload_outcome, dict):
+                unload_confirmed = bool(unload_outcome.get("confirmed"))
+                if "release_warning" in reconstruction.metadata:
+                    unload_warning = str(reconstruction.metadata.get("release_warning"))
             results = {item.segment_index: item for item in reconstruction.segments}
             references = {segment.segment_index: segment for segment in clip.reference_segments}
             for index, segment in enumerate(stage25):
@@ -366,6 +419,10 @@ class BenchmarkRunner:
                 human_label = (
                     reference_segment.human_label or "" if reference_segment is not None else ""
                 )
+                human_safety_label = (
+                    reference_segment.human_safety_label if reference_segment is not None else None
+                )
+                root_cause = reference_segment.root_cause if reference_segment is not None else None
                 status, exact_status = comparison_status(
                     item.status if item is not None else None, corrected, final, reference
                 )
@@ -387,8 +444,14 @@ class BenchmarkRunner:
                         "segment_index": index,
                         "raw": str(segment.get("raw_text", segment.get("text", ""))),
                         "stage25": corrected,
+                        "candidate": item.candidate_text if item is not None else None,
+                        "candidate_confidence": item.confidence if item is not None else None,
+                        "validation_outcome": item.validation_reason if item is not None else None,
+                        "apply_reason": item.decision_reason if item is not None else None,
+                        "reconstruction_applied": item.applied if item is not None else None,
                         "stage27": final,
                         "reference": reference,
+                        "reference_present": bool(reference),
                         "status": status,
                         "exact_status": exact_status,
                         "confidence": item.confidence if item is not None else None,
@@ -397,6 +460,8 @@ class BenchmarkRunner:
                         "model": model_identifier,
                         "model_digest": model_digest,
                         "human_label": human_label,
+                        "human_safety_label": human_safety_label,
+                        "root_cause": root_cause,
                     }
                 )
 
@@ -442,6 +507,17 @@ class BenchmarkRunner:
             exact_unchanged_wrong=exact_counts["unchanged_wrong"],
             exact_regressed=exact_counts["regressed"],
             exact_changed_wrong=exact_counts["changed_wrong"],
+            reconstruction_wall_seconds=reconstruction_wall_seconds or None,
+            average_serialized_prompt_bytes=_mean(
+                prompt_sums, prompt_counts, "average_serialized_bytes"
+            ),
+            max_serialized_prompt_bytes=_optional_int(prompt_maxes.get("max_serialized_bytes")),
+            average_estimated_input_tokens=_mean(
+                prompt_sums, prompt_counts, "average_input_tokens"
+            ),
+            max_estimated_input_tokens=_optional_int(prompt_maxes.get("max_input_tokens")),
+            unload_confirmed=unload_confirmed,
+            unload_warning=unload_warning,
             source_audio_seconds=sum(
                 clip.end_seconds - clip.start_seconds for clip in manifest.clips
             ),
@@ -667,8 +743,26 @@ def load_review_worksheet(path: Path) -> list[dict[str, object]]:
         label = row.get("human_label")
         if label is not None and label not in _VALID_HUMAN_LABELS:
             raise ValueError(f"unknown human label in review worksheet: {label}")
+        safety = row.get("human_safety_label")
+        if safety is not None and safety not in _VALID_SAFETY_LABELS:
+            raise ValueError(f"unknown human safety label in review worksheet: {safety}")
+        cause = row.get("root_cause")
+        if cause is not None and cause not in _VALID_ROOT_CAUSES:
+            raise ValueError(f"unknown root cause in review worksheet: {cause}")
         rows.append(row)
     return rows
+
+
+def _mean(sums: dict[str, float], counts: dict[str, int], key: str) -> float | None:
+    if counts.get(key):
+        return sums[key] / counts[key]
+    return None
+
+
+def _optional_int(value: object) -> int | None:
+    if isinstance(value, (int, float)):
+        return int(value)
+    return None
 
 
 def evaluate_completion_gate(

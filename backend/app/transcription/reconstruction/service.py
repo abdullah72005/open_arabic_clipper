@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 
@@ -47,6 +48,17 @@ class ContextualReconstructor:
             return {"provider": "disabled"}
         return dict(self._provider.refresh_runtime_identity())
 
+    def _prompt_diagnostics(self) -> dict[str, object]:
+        sizes = getattr(self._provider, "last_request_sizes", lambda: ())()
+        serialized = [item.serialized_bytes for item in sizes]
+        tokens = [item.estimated_input_tokens for item in sizes]
+        return {
+            "average_serialized_bytes": sum(serialized) / len(serialized) if serialized else None,
+            "max_serialized_bytes": max(serialized) if serialized else None,
+            "average_input_tokens": sum(tokens) / len(tokens) if tokens else None,
+            "max_input_tokens": max(tokens) if tokens else None,
+        }
+
     def reconstruct(
         self,
         segments: Sequence[Mapping[str, object]],
@@ -68,6 +80,7 @@ class ContextualReconstructor:
                 self._fallback(index, segment) for index, segment in enumerate(segments)
             )
             return ReconstructionResult(results, _joined(results), fingerprint)
+        started_at = time.monotonic()
         result: ReconstructionResult = ReconstructionResult((), "", "")
         try:
             try:
@@ -159,7 +172,12 @@ class ContextualReconstructor:
                 results,
                 _joined(results),
                 fingerprint,
-                metadata={"runtime_identity": identity, "provider_available": True},
+                metadata={
+                    "runtime_identity": identity,
+                    "provider_available": True,
+                    "wall_seconds": time.monotonic() - started_at,
+                    "prompt_diagnostics": self._prompt_diagnostics(),
+                },
             )
         finally:
             try:
