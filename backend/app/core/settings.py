@@ -5,6 +5,7 @@ from typing import Literal
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.runtime.heavy_model_lease import HeavyModelLeaseFactory
 from app.transcription.correction import ContextualCorrector, CorrectionConfig
 from app.transcription.providers import CorrectionProvider, OpenAICompatibleCorrectionProvider
 from app.transcription.reconstruction import ContextualReconstructor
@@ -176,6 +177,18 @@ class Settings(BaseSettings):
         """Build Stage 2.7 reconstruction with safe local fallback by default."""
 
         return ContextualReconstructor(self.reconstruction_provider_instance())
+
+    def heavy_model_lease_factory(self) -> HeavyModelLeaseFactory:
+        """Build the Redis-backed lease factory that serializes heavy models."""
+
+        from redis import Redis
+
+        return HeavyModelLeaseFactory(
+            redis=Redis.from_url(self.redis_url),
+            ttl_seconds=self.heavy_model_lease_ttl_seconds,
+            renewal_interval_seconds=self.heavy_model_lease_renewal_interval_seconds,
+            acquisition_timeout_seconds=self.heavy_model_lease_acquisition_timeout_seconds,
+        )
 
 
 @lru_cache

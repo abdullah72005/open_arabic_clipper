@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 
 from app.core.enums import JobKind, JobStatus, PipelineRunStatus, PipelineStage, RightsStatus
 from app.db.base import Base
-from app.models import PipelineRun, ProcessingJob, SourceVideo
+from app.models import PipelineRun, ProcessingJob, SourceVideo, Transcript
 from app.pipeline.authorization import AutopilotAuthorizationError, require_autopilot_authorization
 from app.pipeline.runner import PipelineRunner
 
@@ -203,3 +203,163 @@ def test_reconstruction_stage_uses_its_own_job_and_advances_to_audio_analysis(
         assert job is not None
         assert job.kind is JobKind.RECONSTRUCTION
         assert source.lifecycle_state is PipelineStage.AUDIO_ANALYSIS
+
+
+class _RecordingEngine:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def transcribe(self, _path: object, _options: object) -> object:
+        self.calls.append("transcribe")
+        from app.transcription.engine import TranscriptionResult
+
+        return TranscriptionResult(
+            language="ar",
+            language_probability=0.9,
+            raw_text="raw",
+            segments=[],
+            word_segments=[],
+            duration=1.0,
+        )
+
+
+def test_transcription_stage_holds_heavy_lease_around_whisper(
+    sqlite_engine: object,
+) -> None:
+    """The transcription stage holds the heavy-model lease around Whisper work."""
+
+    from app.models import AudioArtifact
+    from app.pipeline.stages import TranscriptionExecutor
+    from app.runtime.heavy_model_lease import NoopHeavyModelLeaseFactory
+    from app.transcription.service import TranscriptionOptions
+
+    Base.metadata.create_all(sqlite_engine)
+    with Session(sqlite_engine) as session:
+        source = SourceVideo(
+            source_uri=f"file:///tmp/{uuid.uuid4()}.mp4",
+            content_hash="h",
+            rights_status=RightsStatus.OWNED,
+        )
+        session.add(source)
+        session.commit()
+        session.add(
+            AudioArtifact(
+                source_video_id=source.id,
+                output_path="/tmp/audio.wav",
+                content_hash="h",
+                sample_rate=16000,
+                duration=1.0,
+            )
+        )
+        session.commit()
+
+        engine = _RecordingEngine()
+        lease_factory = NoopHeavyModelLeaseFactory()
+        executor = TranscriptionExecutor(
+            session=session,
+            engine=engine,  # type: ignore[arg-type]
+            options=TranscriptionOptions("small", "cpu", "int8", 5),
+            lease_factory=lease_factory,
+        )
+
+        executor.execute(source)
+
+        events = lease_factory.events
+        assert [event["event"] for event in events] == [
+            "heavy_model_acquired",
+            "heavy_model_released",
+        ]
+        assert events[0]["purpose"] == "whisper"
+        assert engine.calls == ["transcribe"]
+
+
+def test_reconstruction_stage_holds_heavy_lease_around_ollama(
+    sqlite_engine: object,
+) -> None:
+    """The reconstruction stage holds the heavy-model lease around the model call."""
+
+    from app.pipeline.stages import ContextualReconstructionExecutor
+    from app.runtime.heavy_model_lease import NoopHeavyModelLeaseFactory
+    from app.transcription.reconstruction.service import ContextualReconstructor
+
+    Base.metadata.create_all(sqlite_engine)
+    with Session(sqlite_engine) as session:
+        source = SourceVideo(
+            source_uri=f"file:///tmp/{uuid.uuid4()}.mp4",
+            content_hash="h",
+            rights_status=RightsStatus.OWNED,
+        )
+        session.add(source)
+        session.commit()
+        session.add(
+            Transcript(
+                source_video_id=source.id,
+                whisper_model="large-v3-turbo",
+                input_fingerprint="fp",
+                normalization_fingerprint="nf",
+                transcription_revision=1,
+                correction_version="v1",
+                segments=[],
+            )
+        )
+        session.commit()
+
+        lease_factory = NoopHeavyModelLeaseFactory()
+        executor = ContextualReconstructionExecutor(
+            session=session,
+            reconstructor=ContextualReconstructor(None),
+            lease_factory=lease_factory,
+        )
+
+        executor.execute(source, force=True)
+
+        events = lease_factory.events
+        assert [event["event"] for event in events] == [
+            "heavy_model_acquired",
+            "heavy_model_released",
+        ]
+        assert events[0]["purpose"] == "ollama"
+
+
+def test_heavy_lease_contention_raises_retryable_busy(sqlite_engine: object) -> None:
+    """A contended lease surfaces as a retryable error before any model starts."""
+
+    from app.pipeline.stages import ContextualReconstructionExecutor
+    from app.runtime.heavy_model_lease import HeavyModelLeaseBusy
+    from app.transcription.reconstruction.service import ContextualReconstructor
+
+    class BusyLeaseFactory:
+        def acquire(self, *, purpose: str) -> object:
+            raise HeavyModelLeaseBusy("heavy-model lease busy")
+
+    Base.metadata.create_all(sqlite_engine)
+    with Session(sqlite_engine) as session:
+        source = SourceVideo(
+            source_uri=f"file:///tmp/{uuid.uuid4()}.mp4",
+            content_hash="h",
+            rights_status=RightsStatus.OWNED,
+        )
+        session.add(source)
+        session.commit()
+        session.add(
+            Transcript(
+                source_video_id=source.id,
+                whisper_model="large-v3-turbo",
+                input_fingerprint="fp",
+                normalization_fingerprint="nf",
+                transcription_revision=1,
+                correction_version="v1",
+                segments=[],
+            )
+        )
+        session.commit()
+        executor = ContextualReconstructionExecutor(
+            session=session,
+            reconstructor=ContextualReconstructor(None),
+            lease_factory=BusyLeaseFactory(),  # type: ignore[arg-type]
+        )
+
+        with pytest.raises(HeavyModelLeaseBusy, match="busy") as excinfo:
+            executor.execute(source, force=True)
+
+        assert getattr(excinfo.value, "retryable", False) is True

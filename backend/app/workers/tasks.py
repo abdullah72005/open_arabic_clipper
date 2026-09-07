@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from typing import Final
 from uuid import UUID
 
-from celery import Task  # type: ignore[import-not-found]
+from celery import Task  # type: ignore[import-untyped]
 from sqlalchemy.orm import Session
 
 from app.core.enums import JobKind, PipelineStage
@@ -50,6 +50,7 @@ def _stage_executors(session: Session) -> dict[PipelineStage, StageExecutor]:
     """Build worker-local Stage 2 executors while retaining test/Stage 1 registrations."""
     settings = get_settings()
     storage = StorageService(settings.storage_root)
+    lease_factory = settings.heavy_model_lease_factory()
     defaults: dict[PipelineStage, StageExecutor] = {
         PipelineStage.INGEST: IngestExecutor(),
         PipelineStage.PROBE: ProbeExecutor(FFprobe(binary=settings.ffprobe_binary)),
@@ -61,12 +62,15 @@ def _stage_executors(session: Session) -> dict[PipelineStage, StageExecutor]:
             engine=WhisperEngine(),
             options=settings.transcription_options(),
             storage=storage,
+            lease_factory=lease_factory,
         ),
         PipelineStage.TRANSCRIPT_NORMALIZATION: TranscriptNormalizationExecutor(
             session=session, corrector=settings.contextual_corrector()
         ),
         PipelineStage.CONTEXTUAL_RECONSTRUCTION: ContextualReconstructionExecutor(
-            session=session, reconstructor=settings.contextual_reconstructor()
+            session=session,
+            reconstructor=settings.contextual_reconstructor(),
+            lease_factory=lease_factory,
         ),
         PipelineStage.AUDIO_ANALYSIS: AudioAnalysisExecutor(
             session=session, storage=storage, ffmpeg_binary=settings.ffmpeg_binary

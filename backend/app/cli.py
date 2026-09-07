@@ -13,6 +13,7 @@ from app.core.enums import JobKind, PipelineStage
 from app.core.settings import get_settings
 from app.db.session import create_session_factory
 from app.models import ProcessingJob, SourceVideo, Transcript
+from app.runtime.heavy_model_lease import HeavyModelLeaseBusy
 from app.runtime.memory import MemoryReadError, capture_memory
 from app.services.health import HealthService
 from app.services.storage import StorageCategory, StorageService
@@ -254,7 +255,13 @@ def benchmark_reconstruction(
         provider_health=health,
         prompt_settings_fingerprint=fingerprint,
     )
-    report = runner.run(manifest)
+    lease_factory = settings.heavy_model_lease_factory()
+    try:
+        with lease_factory.acquire(purpose="benchmark") as _heavy_lease:
+            report = runner.run(manifest)
+    except HeavyModelLeaseBusy as error:
+        typer.echo(json.dumps({"error": str(error)}, ensure_ascii=False))
+        raise typer.Exit(code=1) from error
     passed, reasons = evaluate_completion_gate(
         report, expected_prompt_settings_fingerprint=fingerprint
     )

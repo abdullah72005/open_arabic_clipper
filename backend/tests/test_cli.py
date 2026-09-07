@@ -121,6 +121,69 @@ def test_diagnose_memory_exits_nonzero_when_required_inputs_unreadable(monkeypat
     assert "meminfo unreadable" in result.stdout
 
 
+def test_benchmark_cli_cannot_enter_when_heavy_lease_busy(monkeypatch, tmp_path) -> None:
+    from app.runtime.heavy_model_lease import HeavyModelLeaseBusy
+    from app.transcription.service import TranscriptionOptions
+
+    class BusyLeaseFactory:
+        def acquire(self, *, purpose: str) -> object:
+            raise HeavyModelLeaseBusy("heavy-model lease is busy")
+
+    root = tmp_path / "storage"
+    manifest_dir = root / "benchmarks" / "stage-2-7"
+    manifest_dir.mkdir(parents=True)
+    manifest = {
+        "version": "stage-2-7-private-v1",
+        "split": "test",
+        "sources": [{"id": "s", "path": "s/v.webm", "authorized": True}],
+        "clips": [
+            {
+                "id": "c1",
+                "source_id": "s",
+                "topic": "h",
+                "start_seconds": 0,
+                "end_seconds": 30,
+                "categories": ["narrative"],
+                "reference_segments": [{"segment_index": 0, "text": "x", "reviewed": True}],
+            }
+        ],
+        "known_regression_set": True,
+    }
+    (manifest_dir / "chernobyl-reference-v1.json").write_text(
+        json.dumps(manifest), encoding="utf-8"
+    )
+
+    class FakeSettings:
+        storage_root = root
+        reconstruction_provider = "ollama"
+
+        def reconstruction_provider_instance(self, model: str | None = None) -> None:
+            return None
+
+        def transcription_options(self) -> TranscriptionOptions:
+            return TranscriptionOptions("large-v3-turbo", "cpu", "int8", 5)
+
+        def contextual_corrector(self) -> None:
+            return None
+
+        def heavy_model_lease_factory(self) -> BusyLeaseFactory:
+            return BusyLeaseFactory()
+
+    monkeypatch.setattr("app.cli.get_settings", lambda: FakeSettings())
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "benchmark-reconstruction",
+            "stage-2-7/chernobyl-reference-v1.json",
+            "--allow-known-regression-set",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "busy" in result.stdout
+
+
 class _Provider:
     def __init__(self, health: ProviderHealth) -> None:
         self._health = health

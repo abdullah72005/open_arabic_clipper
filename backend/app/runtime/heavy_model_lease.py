@@ -14,6 +14,8 @@ import uuid
 from collections.abc import Callable
 from typing import Literal
 
+from app.runtime.memory import MemorySnapshot, capture_memory
+
 _LEASE_KEY = "clipfactory:heavy-model"
 
 _RELEASE_LUA = """
@@ -34,6 +36,8 @@ return 0
 class HeavyModelLeaseBusy(RuntimeError):
     """Another process owns the heavy-model lease; retryable by the caller."""
 
+    retryable = True
+
 
 class HeavyModelLease:
     """A bounded, renewing, ownership-checked lease for one heavy model slot."""
@@ -50,6 +54,8 @@ class HeavyModelLease:
         token: str | None = None,
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
+        on_acquire: Callable[[float, str], None] | None = None,
+        on_release: Callable[[], None] | None = None,
     ) -> None:
         self._redis = redis
         self._ttl_seconds = ttl_seconds
@@ -60,6 +66,8 @@ class HeavyModelLease:
         self._token = token or uuid.uuid4().hex
         self._monotonic = monotonic
         self._sleep = sleep
+        self._on_acquire = on_acquire
+        self._on_release = on_release
         self._acquired = False
         self._renewer: threading.Thread | None = None
 
@@ -90,12 +98,15 @@ class HeavyModelLease:
     def acquire(self) -> "HeavyModelLease":
         """Acquire the lease within a bounded deadline or raise HeavyModelLeaseBusy."""
 
-        deadline = self._monotonic() + self._acquisition_timeout_seconds
+        started = self._monotonic()
+        deadline = started + self._acquisition_timeout_seconds
         while True:
             if self._redis.set(  # type: ignore[attr-defined]
                 _LEASE_KEY, self._token, nx=True, px=int(self._ttl_seconds * 1000)
             ):
                 self._acquired = True
+                if self._on_acquire is not None:
+                    self._on_acquire(self._monotonic() - started, self._token)
                 self._start_renewer()
                 return self
             if self._monotonic() >= deadline:
@@ -123,6 +134,8 @@ class HeavyModelLease:
         self._redis.eval(  # type: ignore[attr-defined]
             _RELEASE_LUA, 1, _LEASE_KEY, self._token
         )
+        if self._on_release is not None:
+            self._on_release()
 
     def _start_renewer(self) -> None:
         if self._renewer is not None:
@@ -137,3 +150,112 @@ class HeavyModelLease:
 
         self._renewer = threading.Thread(target=loop, name="heavy-model-lease-renewer", daemon=True)
         self._renewer.start()
+
+
+class HeavyModelLeaseFactory:
+    """Builds configured leases and records structured acquire/release events."""
+
+    def __init__(
+        self,
+        *,
+        redis: object,
+        ttl_seconds: float,
+        renewal_interval_seconds: float,
+        acquisition_timeout_seconds: float,
+        snapshotter: Callable[[], MemorySnapshot] = capture_memory,
+    ) -> None:
+        self._redis = redis
+        self._ttl_seconds = ttl_seconds
+        self._renewal_interval_seconds = renewal_interval_seconds
+        self._acquisition_timeout_seconds = acquisition_timeout_seconds
+        self._snapshotter = snapshotter
+        self.events: list[dict[str, object]] = []
+
+    def acquire(self, *, purpose: str) -> HeavyModelLease:
+        """Return a configured, not-yet-acquired lease for the caller to hold."""
+
+        owner_pid = os.getpid()
+
+        def record_acquired(wait_seconds: float, token: str) -> None:
+            self.events.append(
+                {
+                    "event": "heavy_model_acquired",
+                    "purpose": purpose,
+                    "owner_pid": owner_pid,
+                    "token": token,
+                    "wait_seconds": round(wait_seconds, 3),
+                    "effective_capacity": self._snapshotter().effective_capacity,
+                }
+            )
+
+        def record_released() -> None:
+            self.events.append(
+                {
+                    "event": "heavy_model_released",
+                    "purpose": purpose,
+                    "owner_pid": owner_pid,
+                    "effective_capacity": self._snapshotter().effective_capacity,
+                }
+            )
+
+        return HeavyModelLease(
+            redis=self._redis,
+            ttl_seconds=self._ttl_seconds,
+            renewal_interval_seconds=self._renewal_interval_seconds,
+            acquisition_timeout_seconds=self._acquisition_timeout_seconds,
+            purpose=purpose,
+            owner_pid=owner_pid,
+            on_acquire=record_acquired,
+            on_release=record_released,
+        )
+
+
+class NoopHeavyModelLease:
+    """Acquires instantly, never contends; used by tests and disabled providers."""
+
+    def __init__(self, factory: "NoopHeavyModelLeaseFactory", purpose: str) -> None:
+        self._factory = factory
+        self._purpose = purpose
+        self.token = "noop"
+        self.owner_pid = os.getpid()
+        self.acquired = False
+
+    def __enter__(self) -> "NoopHeavyModelLease":
+        self.acquire()
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> Literal[False]:
+        self.release()
+        return False
+
+    def acquire(self) -> "NoopHeavyModelLease":
+        self.acquired = True
+        self._factory._record("heavy_model_acquired", self._purpose)
+        return self
+
+    def renew(self) -> None:
+        return None
+
+    def release(self) -> None:
+        self.acquired = False
+        self._factory._record("heavy_model_released", self._purpose)
+
+
+class NoopHeavyModelLeaseFactory:
+    """In-memory lease factory that never contends; the safe default."""
+
+    def __init__(self) -> None:
+        self.events: list[dict[str, object]] = []
+
+    def acquire(self, *, purpose: str) -> NoopHeavyModelLease:
+        return NoopHeavyModelLease(self, purpose)
+
+    def _record(self, event: str, purpose: str) -> None:
+        self.events.append(
+            {
+                "event": event,
+                "purpose": purpose,
+                "owner_pid": os.getpid(),
+                "wait_seconds": 0.0,
+            }
+        )

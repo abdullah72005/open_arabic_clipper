@@ -20,6 +20,7 @@ from app.models import AudioAnalysis, AudioArtifact, SourceVideo, Transcript, Tr
 from app.pipeline.executor import StageExecutionResult
 from app.pipeline.fingerprints import canonical_fingerprint
 from app.pipeline.runner import StageExecutionError
+from app.runtime.heavy_model_lease import HeavyModelLeaseFactory, NoopHeavyModelLeaseFactory
 from app.services.source_adapters import YtDlpAdapter
 from app.services.source_quality import assess_source, quality_input_fingerprint
 from app.services.storage import StorageCategory, StorageService
@@ -44,11 +45,13 @@ class TranscriptionExecutor:
         engine: WhisperEngine,
         options: TranscriptionOptions | None = None,
         storage: StorageService | None = None,
+        lease_factory: HeavyModelLeaseFactory | NoopHeavyModelLeaseFactory | None = None,
     ) -> None:
         self._session = session
         self._engine = engine
         self._options = options or get_settings().transcription_options()
         self._storage = storage
+        self._lease_factory = lease_factory or NoopHeavyModelLeaseFactory()
 
     def input_fingerprint(self, source: SourceVideo) -> str:
         artifact = self._session.scalar(
@@ -75,7 +78,8 @@ class TranscriptionExecutor:
             storage = self._storage or StorageService(get_settings().storage_root)
             audio_path = storage.resolve(StorageCategory.SOURCES, audio_path)
         started_at = monotonic()
-        result = self._engine.transcribe(audio_path, self._options)
+        with self._lease_factory.acquire(purpose="whisper") as _heavy_lease:
+            result = self._engine.transcribe(audio_path, self._options)
         transcript = existing or Transcript(source_video_id=source.id)
         self._apply(transcript, result, fingerprint, monotonic() - started_at)
         transcript.transcription_revision = (transcript.transcription_revision or 0) + 1
@@ -373,9 +377,16 @@ class TranscriptNormalizationExecutor:
 class ContextualReconstructionExecutor:
     """Persist bounded Stage 2.7 derivations without rewriting prior transcript evidence."""
 
-    def __init__(self, *, session: Session, reconstructor: ContextualReconstructor) -> None:
+    def __init__(
+        self,
+        *,
+        session: Session,
+        reconstructor: ContextualReconstructor,
+        lease_factory: HeavyModelLeaseFactory | NoopHeavyModelLeaseFactory | None = None,
+    ) -> None:
         self._session = session
         self._reconstructor = reconstructor
+        self._lease_factory = lease_factory or NoopHeavyModelLeaseFactory()
 
     def input_fingerprint(self, source: SourceVideo) -> str:
         transcript = self._session.scalar(
@@ -401,12 +412,13 @@ class ContextualReconstructionExecutor:
         if transcript is None:
             raise StageExecutionError("normalized transcript is missing")
         started_at = monotonic()
-        result = self._reconstructor.reconstruct(
-            transcript.segments,
-            language=transcript.language,
-            transcription_fingerprint=transcript.input_fingerprint,
-            correction_version=transcript.correction_version,
-        )
+        with self._lease_factory.acquire(purpose="ollama") as _heavy_lease:
+            result = self._reconstructor.reconstruct(
+                transcript.segments,
+                language=transcript.language,
+                transcription_fingerprint=transcript.input_fingerprint,
+                correction_version=transcript.correction_version,
+            )
         if transcript.reconstruction_fingerprint == result.fingerprint and not force:
             return StageExecutionResult(result.fingerprint, transcript)
 
