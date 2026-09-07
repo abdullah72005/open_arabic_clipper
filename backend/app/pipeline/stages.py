@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import subprocess
 from collections.abc import Callable
 from dataclasses import asdict
@@ -21,6 +22,7 @@ from app.pipeline.executor import StageExecutionResult
 from app.pipeline.fingerprints import canonical_fingerprint
 from app.pipeline.runner import StageExecutionError
 from app.runtime.heavy_model_lease import HeavyModelLeaseFactory, NoopHeavyModelLeaseFactory
+from app.runtime.memory import MemorySnapshot, capture_memory
 from app.services.source_adapters import YtDlpAdapter
 from app.services.source_quality import assess_source, quality_input_fingerprint
 from app.services.storage import StorageCategory, StorageService
@@ -34,6 +36,8 @@ from app.transcription.reconstruction.status import aggregate_reconstruction_sta
 from app.transcription.reconstruction.types import SegmentReconstruction
 from app.transcription.service import TranscriptionOptions
 
+_logger = logging.getLogger("clipfactory.stages")
+
 
 class TranscriptionExecutor:
     """Run local Whisper once per cache fingerprint and persist raw evidence."""
@@ -46,12 +50,14 @@ class TranscriptionExecutor:
         options: TranscriptionOptions | None = None,
         storage: StorageService | None = None,
         lease_factory: HeavyModelLeaseFactory | NoopHeavyModelLeaseFactory | None = None,
+        snapshotter: Callable[[], MemorySnapshot] = capture_memory,
     ) -> None:
         self._session = session
         self._engine = engine
         self._options = options or get_settings().transcription_options()
         self._storage = storage
         self._lease_factory = lease_factory or NoopHeavyModelLeaseFactory()
+        self._snapshotter = snapshotter
 
     def input_fingerprint(self, source: SourceVideo) -> str:
         artifact = self._session.scalar(
@@ -78,10 +84,13 @@ class TranscriptionExecutor:
             storage = self._storage or StorageService(get_settings().storage_root)
             audio_path = storage.resolve(StorageCategory.SOURCES, audio_path)
         started_at = monotonic()
+        self._emit_snapshot("before_load")
         with self._lease_factory.acquire(purpose="whisper") as _heavy_lease:
             result = self._engine.transcribe(audio_path, self._options)
+        self._emit_snapshot("after_transcribe")
         transcript = existing or Transcript(source_video_id=source.id)
         self._apply(transcript, result, fingerprint, monotonic() - started_at)
+        self._emit_snapshot("after_cleanup")
         transcript.transcription_revision = (transcript.transcription_revision or 0) + 1
         if existing is None:
             self._session.add(transcript)
@@ -99,6 +108,18 @@ class TranscriptionExecutor:
                 },
             ),
             transcript,
+        )
+
+    def _emit_snapshot(self, label: str) -> None:
+        snapshot = self._snapshotter()
+        _logger.info(
+            "transcription_memory_snapshot",
+            extra={
+                "snapshot": label,
+                "effective_capacity": snapshot.effective_capacity,
+                "process_rss": snapshot.process_rss,
+                "linux_available": snapshot.linux_available,
+            },
         )
 
     def _apply(

@@ -1,6 +1,6 @@
 """Conservative Celery configuration for local media work."""
 
-from celery import Celery  # type: ignore[import-not-found]
+from celery import Celery  # type: ignore[import-untyped]
 
 from app.core.enums import PipelineStage
 from app.core.settings import get_settings
@@ -31,6 +31,7 @@ celery_app.conf.update(
     task_acks_late=True,
     worker_prefetch_multiplier=1,
     worker_concurrency=1,
+    worker_max_tasks_per_child=1,
     task_default_queue="media",
     task_routes=_route_pipeline_stage,
     task_track_started=True,

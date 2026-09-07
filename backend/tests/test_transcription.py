@@ -3,8 +3,10 @@ from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 from sqlalchemy.orm import Session
 
+from app.runtime.model_process import DirectRunner
 from app.transcription.service import TranscriptionOptions
 from app.workers.celery_app import celery_app
 
@@ -96,9 +98,9 @@ def test_engine_falls_back_to_cpu_int8_and_preserves_word_timestamps() -> None:
         created.append((model, device, compute_type))
         return FakeModel()
 
-    result = WhisperEngine(model_factory=model_factory, cuda_available=lambda: False).transcribe(
-        Path("speech.wav"), TranscriptionOptions("small", "auto", "auto", 5)
-    )
+    result = WhisperEngine(
+        model_factory=model_factory, cuda_available=lambda: False, runner=DirectRunner()
+    ).transcribe(Path("speech.wav"), TranscriptionOptions("small", "auto", "auto", 5))
 
     assert created == [("small", "cpu", "int8")]
     assert result.language == "ar"
@@ -122,6 +124,7 @@ def test_whisper_materializes_segments_before_collecting_model() -> None:
         model_factory=lambda *_: model,
         cuda_available=lambda: False,
         collect_garbage=lambda: collected.append(model.exhausted) or 0,
+        runner=DirectRunner(),
     )
 
     result = engine.transcribe(
@@ -146,7 +149,9 @@ def test_engine_passes_explicit_safe_decoding_options() -> None:
             return [FakeSegment()], FakeInfo()
 
     WhisperEngine(
-        model_factory=lambda *_args: RecordingModel(), cuda_available=lambda: False
+        model_factory=lambda *_args: RecordingModel(),
+        cuda_available=lambda: False,
+        runner=DirectRunner(),
     ).transcribe(
         Path("speech.wav"),
         TranscriptionOptions(
@@ -167,6 +172,103 @@ def test_engine_passes_explicit_safe_decoding_options() -> None:
     assert received["vad_filter"] is True
     assert received["initial_prompt"] == "مصري"
     assert received["hotwords"] == "خلي بالك"
+
+
+class _ChildSegment:
+    start = 0.0
+    end = 1.0
+    text = " كلام"
+    tokens = [1, 2]
+    avg_logprob = -0.1
+    compression_ratio = 1.1
+    no_speech_prob = 0.0
+    temperature = 0.0
+    words = [SimpleNamespace(start=0.0, end=0.5, word="كلام", probability=0.9)]
+
+
+class _ChildInfo:
+    language = "ar"
+    language_probability = 0.98
+    duration = 1.0
+
+
+class _ChildModel:
+    def __init__(self) -> None:
+        self.exhausted = False
+
+    def transcribe(self, path: str, **kwargs: object) -> tuple[Iterator[object], object]:
+        del path, kwargs
+
+        def rows() -> Iterator[object]:
+            yield _ChildSegment()
+            self.exhausted = True
+
+        return rows(), _ChildInfo()
+
+
+def _child_fake_model_factory(model: str, device: str, compute_type: str) -> _ChildModel:
+    return _ChildModel()
+
+
+def test_engine_spawned_child_materializes_full_result_before_reply() -> None:
+    """The child consumes the generator so the parent receives a materialized result."""
+
+    from app.runtime.model_process import ModelProcessRunner
+    from app.transcription.engine import WhisperEngine
+
+    engine = WhisperEngine(
+        model_factory=_child_fake_model_factory,
+        cuda_available=lambda: False,
+        runner=ModelProcessRunner(timeout_seconds=30),
+    )
+
+    result = engine.transcribe(Path("speech.wav"), TranscriptionOptions("small", "cpu", "int8", 5))
+
+    assert result.segments == [
+        {
+            "start": 0.0,
+            "end": 1.0,
+            "text": " كلام",
+            "tokens": [1, 2],
+            "avg_logprob": -0.1,
+            "compression_ratio": 1.1,
+            "no_speech_prob": 0.0,
+            "temperature": 0.0,
+            "words": [{"start": 0.0, "end": 0.5, "word": "كلام", "probability": 0.9}],
+        }
+    ]
+    assert result.raw_text == "كلام"
+
+
+def test_engine_collects_garbage_on_exception() -> None:
+    """Cleanup still runs when transcription raises inside the child call."""
+
+    from app.transcription.engine import SpawnedProcessError, WhisperEngine
+
+    class ExplodingModel:
+        def transcribe(self, _path: str, **_kwargs: object) -> tuple[list[object], object]:
+            raise RuntimeError("boom")
+
+    collected: list[int] = []
+    engine = WhisperEngine(
+        model_factory=lambda *_args: ExplodingModel(),
+        cuda_available=lambda: False,
+        collect_garbage=lambda: collected.append(1) or 0,
+        runner=DirectRunner(),
+    )
+
+    with pytest.raises(SpawnedProcessError, match="RuntimeError"):
+        engine.transcribe(Path("speech.wav"), TranscriptionOptions("small", "cpu", "int8", 5))
+
+    assert collected == [1]
+
+
+def test_celery_worker_uses_single_concurrency_prefetch_and_child_recycling() -> None:
+    """Effective Celery values enforce sequential heavy-model execution."""
+
+    assert celery_app.conf.worker_concurrency == 1
+    assert celery_app.conf.worker_prefetch_multiplier == 1
+    assert celery_app.conf.worker_max_tasks_per_child == 1
 
 
 def test_transcription_executor_persists_raw_timestamped_result(

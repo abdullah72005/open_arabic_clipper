@@ -6,8 +6,9 @@ import gc
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
+from app.runtime.model_process import ModelProcessRunner, SpawnedProcessError
 from app.transcription.service import TranscriptionOptions
 
 
@@ -34,7 +35,7 @@ class TranscriptionResult:
 
 
 class WhisperEngine:
-    """Load faster-whisper only in workers and convert its public result shape."""
+    """Load faster-whisper only in a spawned child and convert its public result shape."""
 
     def __init__(
         self,
@@ -42,41 +43,36 @@ class WhisperEngine:
         model_factory: ModelFactory | None = None,
         cuda_available: CudaAvailability | None = None,
         collect_garbage: Callable[[], int] = gc.collect,
+        runner: Any | None = None,
     ) -> None:
         self._model_factory = model_factory or _default_model_factory
         self._cuda_available = cuda_available or _cuda_available
         self._collect_garbage = collect_garbage
+        self._runner = runner or ModelProcessRunner(timeout_seconds=7_200.0)
 
     def transcribe(self, audio_path: Path, options: TranscriptionOptions) -> TranscriptionResult:
-        """Transcribe a WAV path without changing Whisper text or timestamps."""
+        """Transcribe a WAV path without changing Whisper text or timestamps.
+
+        The native model is loaded and run inside a spawned child so process exit,
+        not Python garbage collection, is the hard reclamation boundary.
+        """
 
         device, compute_type = self._resolve_hardware(options)
-        model = self._model_factory(options.model, device, compute_type)
-        try:
-            segments, info = model.transcribe(
+        outcome = self._runner.run(
+            target=_run_transcription_child,
+            args=(
+                self._model_factory,
+                options.model,
+                device,
+                compute_type,
                 str(audio_path),
-                beam_size=options.beam_size,
-                language=options.language,
-                word_timestamps=options.word_timestamps,
-                temperature=options.temperature,
-                condition_on_previous_text=options.condition_on_previous_text,
-                vad_filter=options.vad_filter,
-                initial_prompt=options.initial_prompt,
-                hotwords=options.hotwords,
-            )
-            serialized_segments = [_serialize_segment(segment) for segment in segments]
-            words = [word for segment in serialized_segments for word in segment["words"]]
-            return TranscriptionResult(
-                language=_optional_str(getattr(info, "language", None)),
-                language_probability=_optional_float(getattr(info, "language_probability", None)),
-                raw_text="".join(str(segment["text"]) for segment in serialized_segments).strip(),
-                duration=float(getattr(info, "duration", 0.0) or 0.0),
-                segments=serialized_segments,
-                word_segments=words,
-            )
-        finally:
-            del model
-            self._collect_garbage()
+                options,
+                self._collect_garbage,
+            ),
+        )
+        if not outcome.ok:
+            raise SpawnedProcessError(outcome.error or "transcription child failed")
+        return cast(TranscriptionResult, outcome.result)
 
     def resolved_hardware(self, options: TranscriptionOptions) -> tuple[str, str]:
         """Expose the effective device policy for operational reporting."""
@@ -100,18 +96,68 @@ class WhisperEngine:
 
 def _default_model_factory(model: str, device: str, compute_type: str) -> WhisperModel:
     try:
-        from faster_whisper import WhisperModel as FasterWhisperModel
+        from faster_whisper import (
+            WhisperModel as FasterWhisperModel,  # type: ignore[import-untyped]
+        )
     except ImportError as err:
         raise RuntimeError("faster-whisper is not installed") from err
-    return FasterWhisperModel(model, device=device, compute_type=compute_type)
+    return cast(WhisperModel, FasterWhisperModel(model, device=device, compute_type=compute_type))
+
+
+def _run_transcription_child(
+    model_factory: ModelFactory,
+    model: str,
+    device: str,
+    compute_type: str,
+    audio_path_str: str,
+    options: TranscriptionOptions,
+    collect_garbage: Callable[[], int],
+) -> TranscriptionResult:
+    """Load the model and transcribe entirely inside the spawned child.
+
+    Generators are fully consumed here so the picklable result sent to the parent
+    is already materialized. The child drops local references and collects
+    garbage on both success and exceptions before it exits.
+    """
+
+    model_obj = model_factory(model, device, compute_type)
+    try:
+        segments, info = model_obj.transcribe(
+            audio_path_str,
+            beam_size=options.beam_size,
+            language=options.language,
+            word_timestamps=options.word_timestamps,
+            temperature=options.temperature,
+            condition_on_previous_text=options.condition_on_previous_text,
+            vad_filter=options.vad_filter,
+            initial_prompt=options.initial_prompt,
+            hotwords=options.hotwords,
+        )
+        serialized_segments = [_serialize_segment(segment) for segment in segments]
+        words = [
+            word
+            for segment in serialized_segments
+            for word in cast(list[dict[str, object]], segment["words"])
+        ]
+        return TranscriptionResult(
+            language=_optional_str(getattr(info, "language", None)),
+            language_probability=_optional_float(getattr(info, "language_probability", None)),
+            raw_text="".join(str(segment["text"]) for segment in serialized_segments).strip(),
+            duration=float(getattr(info, "duration", 0.0) or 0.0),
+            segments=serialized_segments,
+            word_segments=words,
+        )
+    finally:
+        del model_obj
+        collect_garbage()
 
 
 def _cuda_available() -> bool:
     try:
-        import ctranslate2
+        import ctranslate2  # type: ignore[import-untyped]
     except ImportError:
         return False
-    return ctranslate2.get_cuda_device_count() > 0
+    return bool(ctranslate2.get_cuda_device_count() > 0)
 
 
 def _serialize_segment(segment: object) -> dict[str, object]:

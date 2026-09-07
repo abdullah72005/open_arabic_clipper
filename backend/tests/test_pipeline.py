@@ -273,6 +273,56 @@ def test_transcription_stage_holds_heavy_lease_around_whisper(
         assert engine.calls == ["transcribe"]
 
 
+def test_transcription_stage_emits_labeled_memory_snapshots(
+    sqlite_engine: object, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The stage records before-load, after-transcribe, and after-cleanup snapshots."""
+
+    import logging
+
+    from app.models import AudioArtifact
+    from app.pipeline.stages import TranscriptionExecutor
+    from app.runtime.memory import MemorySnapshot
+    from app.transcription.service import TranscriptionOptions
+
+    Base.metadata.create_all(sqlite_engine)
+    with Session(sqlite_engine) as session:
+        source = SourceVideo(
+            source_uri=f"file:///tmp/{uuid.uuid4()}.mp4",
+            content_hash="h",
+            rights_status=RightsStatus.OWNED,
+        )
+        session.add(source)
+        session.commit()
+        session.add(
+            AudioArtifact(
+                source_video_id=source.id,
+                output_path="/tmp/audio.wav",
+                content_hash="h",
+                sample_rate=16000,
+                duration=1.0,
+            )
+        )
+        session.commit()
+        snapshot = MemorySnapshot(0.0, 8 * 1024**3, 1, 1, 1, None, None, None, 1)
+        executor = TranscriptionExecutor(
+            session=session,
+            engine=_RecordingEngine(),  # type: ignore[arg-type]
+            options=TranscriptionOptions("small", "cpu", "int8", 5),
+            snapshotter=lambda: snapshot,
+        )
+
+        with caplog.at_level(logging.INFO, logger="clipfactory.stages"):
+            executor.execute(source)
+
+        labels = [
+            record.__dict__.get("snapshot")
+            for record in caplog.records
+            if record.msg == "transcription_memory_snapshot"
+        ]
+        assert labels == ["before_load", "after_transcribe", "after_cleanup"]
+
+
 def test_reconstruction_stage_holds_heavy_lease_around_ollama(
     sqlite_engine: object,
 ) -> None:
