@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 from urllib.parse import urlsplit
 
 import pytest
@@ -8,6 +9,7 @@ from app.transcription.reconstruction.providers import (
     ProviderResponseError,
     ReconstructionRequest,
     _parse_reconstructions,
+    _shrink_request_to_budget,
 )
 from app.transcription.reconstruction.types import (
     AcousticEvidence,
@@ -124,34 +126,183 @@ def test_provider_shrinks_over_budget_context_deterministically() -> None:
         assert body is not None
         captured.append(json.loads(body))
         return _response(
-            {"reconstructions": [{"segment_id": 4, "corrected_text": "was", "unchanged": True}]}
+            {"reconstructions": [{"segment_id": 4, "corrected_text": "هدف", "unchanged": True}]}
         )
 
     provider = OpenAICompatibleReconstructionProvider(
         base_url="http://ollama:11434",
         model="qwen3.5:4b",
         timeout_seconds=12,
-        max_context_tokens=150,
+        max_context_tokens=2048,
         request=request,
     )
 
-    long_context = " ".join(["word"] * 40)
+    word = WordEvidence("كلمة", 0.0, 1.0, 0.5)
     result = provider.reconstruct_segments(
         [
             ReconstructionRequest(
                 segment_index=4,
-                raw_text="was",
-                corrected_text="was",
-                previous=(long_context,),
-                following=(long_context,),
+                raw_text="هدف",
+                corrected_text="هدف",
+                previous=("سياق",) * 60,
+                following=("سياق",) * 60,
+                entities=("جهة",) * 60,
+                word_evidence=(word,) * 60,
             )
         ]
     )
 
-    assert result[4].text == "was"
+    assert result[4].text == "هدف"
     payload = json.loads(captured[0]["messages"][1]["content"])
     target = payload["targets"][0]
-    assert len(target["previous"]) + len(target["following"]) < 2
+    assert target["segment_id"] == 4
+    assert target["raw_text"] == "هدف"
+    assert target["corrected_text"] == "هدف"
+    assert len(target["following"]) < 60
+    assert len(target["previous"]) < 60
+    assert len(target["entities"]) < 60
+    assert len(target["words"]) < 60
+
+
+def test_shrinking_drops_following_fully_before_previous_context() -> None:
+    """Context is removed in documented order while target text always survives."""
+
+    base = ReconstructionRequest(segment_index=4, raw_text="هدف", corrected_text="هدف")
+    item = "سياق"
+
+    def envelope(request: ReconstructionRequest) -> int:
+        return request.estimated_tokens(
+            system_instruction="stable system instruction",
+            output_tokens=256,
+            chat_framing_reserve=64,
+            safety_reserve=128,
+        )
+
+    budget = envelope(replace(base, previous=(item,) * 20))
+    request = replace(base, previous=(item,) * 50, following=(item,) * 50)
+
+    shrunk = _shrink_request_to_budget(request, budget, envelope=envelope)
+
+    assert shrunk.following == ()
+    assert len(shrunk.previous) == 20
+    assert shrunk.segment_index == 4
+    assert shrunk.raw_text == "هدف"
+    assert shrunk.corrected_text == "هدف"
+
+
+def test_shrinking_drops_entities_fully_before_word_evidence() -> None:
+    """Entity evidence is exhausted before word evidence shrinks."""
+
+    base = ReconstructionRequest(segment_index=4, raw_text="هدف", corrected_text="هدف")
+    entity = "جهة"
+    word = WordEvidence("كلمة", 0.0, 1.0, 0.5)
+
+    def envelope(request: ReconstructionRequest) -> int:
+        return request.estimated_tokens(
+            system_instruction="stable system instruction",
+            output_tokens=256,
+            chat_framing_reserve=64,
+            safety_reserve=128,
+        )
+
+    budget = envelope(replace(base, word_evidence=(word,) * 8))
+    request = replace(base, entities=(entity,) * 40, word_evidence=(word,) * 40)
+
+    shrunk = _shrink_request_to_budget(request, budget, envelope=envelope)
+
+    assert shrunk.entities == ()
+    assert len(shrunk.word_evidence) == 8
+    assert shrunk.segment_index == 4
+    assert shrunk.raw_text == "هدف"
+    assert shrunk.corrected_text == "هدف"
+
+
+def test_estimated_tokens_budgets_the_complete_chat_envelope() -> None:
+    """The estimate covers system instruction, user wrapper, framing, output, and reserve."""
+
+    request = ReconstructionRequest(segment_index=4, raw_text="هدف", corrected_text="هدف")
+    system = "stable system instruction"
+    framing = 64
+    output = 256
+    safety = 128
+
+    payload_only = request.estimated_tokens()
+    total = request.estimated_tokens(
+        system_instruction=system,
+        output_tokens=output,
+        chat_framing_reserve=framing,
+        safety_reserve=safety,
+    )
+
+    assert total > payload_only
+    assert total - payload_only == len(system.encode("utf-8")) // 2 + framing + output + safety
+
+
+def test_irreducible_request_raises_before_http_dispatch() -> None:
+    """A request that cannot fit after full shrink fails before any transport call."""
+
+    calls = 0
+
+    def request(*_args: object) -> bytes:
+        nonlocal calls
+        calls += 1
+        return b"{}"
+
+    provider = OpenAICompatibleReconstructionProvider(
+        base_url="http://ollama:11434",
+        model="qwen3.5:4b",
+        timeout_seconds=12,
+        max_context_tokens=10,
+        request=request,
+    )
+
+    with pytest.raises(ProviderResponseError, match="context budget"):
+        provider.reconstruct_segments(
+            [ReconstructionRequest(segment_index=4, raw_text="هدف", corrected_text="هدف")]
+        )
+
+    assert calls == 0
+
+
+def test_provider_records_request_size_diagnostics() -> None:
+    """The provider stores measured serialized bytes and estimated input tokens."""
+
+    def request(
+        _method: str,
+        _url: str,
+        body: bytes | None,
+        _headers: dict[str, str],
+        _timeout: float,
+    ) -> bytes:
+        assert body is not None
+        return _response(
+            {"reconstructions": [{"segment_id": 4, "corrected_text": "هدف", "unchanged": True}]}
+        )
+
+    provider = OpenAICompatibleReconstructionProvider(
+        base_url="http://ollama:11434",
+        model="qwen3.5:4b",
+        timeout_seconds=12,
+        request=request,
+    )
+
+    provider.reconstruct_segments(
+        [
+            ReconstructionRequest(
+                segment_index=4,
+                raw_text="هدف",
+                corrected_text="هدف",
+                previous=("قبل",),
+                following=("بعد",),
+            )
+        ]
+    )
+
+    diagnostics = provider.last_request_sizes()
+    assert len(diagnostics) == 1
+    assert diagnostics[0].segment_index == 4
+    assert diagnostics[0].serialized_bytes > 0
+    assert diagnostics[0].estimated_input_tokens > 0
 
 
 def test_openai_compatible_health_requires_exact_model_id() -> None:

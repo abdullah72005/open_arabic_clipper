@@ -17,6 +17,9 @@ class OllamaReconstructionProvider(OpenAICompatibleReconstructionProvider):
         timeout_seconds: float,
         release_after_run: bool = True,
         max_context_tokens: int | None = None,
+        output_tokens: int = 256,
+        chat_framing_reserve: int = 64,
+        safety_reserve: int = 128,
         request: HttpRequest | None = None,
     ) -> None:
         super().__init__(
@@ -24,6 +27,9 @@ class OllamaReconstructionProvider(OpenAICompatibleReconstructionProvider):
             model=model,
             timeout_seconds=timeout_seconds,
             max_context_tokens=max_context_tokens,
+            output_tokens=output_tokens,
+            chat_framing_reserve=chat_framing_reserve,
+            safety_reserve=safety_reserve,
             request=request,
         )
         self.provider_name = "ollama"

@@ -14,7 +14,9 @@ from app.transcription.reconstruction.types import (
     ProviderAvailability,
     ProviderHealth,
     ReconstructionCandidate,
+    RequestSizeDiagnostics,
     WordEvidence,
+    estimate_tokens,
 )
 
 
@@ -74,10 +76,24 @@ class ReconstructionRequest:
             "language": self.language,
         }
 
-    def estimated_tokens(self) -> int:
-        """Rough token count for prompt budgeting; 1 token ~= 2 UTF-8 chars for Arabic."""
+    def estimated_tokens(
+        self,
+        *,
+        system_instruction: str = "",
+        output_tokens: int = 0,
+        chat_framing_reserve: int = 0,
+        safety_reserve: int = 0,
+    ) -> int:
+        """Conservative estimate of the complete chat envelope, not only the payload."""
+
         payload = json.dumps(self.to_payload(), ensure_ascii=False)
-        return len(payload) // 2
+        return (
+            estimate_tokens(system_instruction)
+            + estimate_tokens(payload)
+            + chat_framing_reserve
+            + output_tokens
+            + safety_reserve
+        )
 
 
 class ReconstructionProvider(Protocol):
@@ -103,14 +119,26 @@ class OpenAICompatibleReconstructionProvider:
         model: str,
         timeout_seconds: float,
         max_context_tokens: int | None = None,
+        output_tokens: int = 256,
+        chat_framing_reserve: int = 64,
+        safety_reserve: int = 128,
         request: HttpRequest | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self.model = model
         self._timeout = timeout_seconds
         self._max_context_tokens = max_context_tokens
+        self._output_tokens = output_tokens
+        self._chat_framing_reserve = chat_framing_reserve
+        self._safety_reserve = safety_reserve
         self._request = request or _request_bytes
         self.provider_name = "openai_compatible"
+        self._last_request_sizes: tuple[RequestSizeDiagnostics, ...] = ()
+
+    def last_request_sizes(self) -> tuple[RequestSizeDiagnostics, ...]:
+        """Return measured serialized prompt sizes for the most recent call."""
+
+        return self._last_request_sizes
 
     def health(self) -> ProviderHealth:
         try:
@@ -152,45 +180,63 @@ class OpenAICompatibleReconstructionProvider:
     def reconstruct_segments(
         self, requests: list[ReconstructionRequest]
     ) -> dict[int, ReconstructionCandidate]:
+        system_instruction = self._system_instruction()
         if self._max_context_tokens is not None:
             requests = [
-                _shrink_request_to_budget(request, self._max_context_tokens) for request in requests
+                _shrink_request_to_budget(
+                    request,
+                    self._max_context_tokens,
+                    envelope=self._envelope_estimate(system_instruction),
+                )
+                for request in requests
             ]
             for request in requests:
-                if request.estimated_tokens() > self._max_context_tokens:
+                estimated = self._envelope_estimate(system_instruction)(request)
+                if estimated > self._max_context_tokens:
                     raise ProviderResponseError(
                         f"request for segment {request.segment_index} exceeds context budget "
-                        f"({request.estimated_tokens()} > {self._max_context_tokens} tokens)"
+                        f"({estimated} > {self._max_context_tokens} tokens)"
                     )
+        self._last_request_sizes = tuple(
+            RequestSizeDiagnostics(
+                segment_index=request.segment_index,
+                serialized_bytes=len(
+                    json.dumps(request.to_payload(), ensure_ascii=False).encode("utf-8")
+                ),
+                estimated_input_tokens=self._envelope_estimate(system_instruction)(request),
+            )
+            for request in requests
+        )
         content = self._call(
-            "You are a conservative Arabic ASR post-processor for Egyptian Arabic speech. "
-            "For the target segment, return the most plausible SPOKEN EGYPTIAN ARABIC text. "
-            "Preserve Egyptian colloquial word choices, pronunciation-driven spelling, "
-            "and dialect. "
-            "Do NOT standardize into Modern Standard Arabic (MSA). "
-            "Example: ASR 'ثلاثة يام' should become 'تلات أيام' (spoken Egyptian), "
-            "not 'ثلاثة أيام' (MSA). "
-            "Preserve all names, numbers, Latin tokens, and digits exactly as they appear. "
-            "Do not add facts, clauses, or change entities. "
-            "Use only the small local context provided. "
-            "If the raw text is already correct, return it unchanged and set unchanged=true. "
-            "Output ONLY a JSON object with this exact shape: "
-            '{"reconstructions": [{"segment_id": int, "corrected_text": string, '
-            '"unchanged": bool, "confidence": number, "explanation": string, "changes": []}]}.',
+            system_instruction,
             {"targets": [item.to_payload() for item in requests]},
         )
         return _parse_reconstructions(content, requests)
 
-    def _call(self, instruction: str, payload: dict[str, object]) -> dict[str, object]:
-        system_content = instruction
+    def _system_instruction(self) -> str:
+        instruction = _SYSTEM_INSTRUCTION
         if self.provider_name == "ollama" and self.model.startswith("qwen3"):
-            system_content = instruction + " /no_think"
+            instruction = instruction + " /no_think"
+        return instruction
+
+    def _envelope_estimate(self, system_instruction: str) -> Callable[[ReconstructionRequest], int]:
+        def estimate(request: ReconstructionRequest) -> int:
+            return request.estimated_tokens(
+                system_instruction=system_instruction,
+                output_tokens=self._output_tokens,
+                chat_framing_reserve=self._chat_framing_reserve,
+                safety_reserve=self._safety_reserve,
+            )
+
+        return estimate
+
+    def _call(self, instruction: str, payload: dict[str, object]) -> dict[str, object]:
         body = {
             "model": self.model,
             "temperature": 0,
-            "max_tokens": 256,
+            "max_tokens": self._output_tokens,
             "messages": [
-                {"role": "system", "content": system_content},
+                {"role": "system", "content": instruction},
                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
             ],
         }
@@ -245,8 +291,29 @@ class OpenAICompatibleReconstructionProvider:
         return parsed
 
 
+_SYSTEM_INSTRUCTION = (
+    "You are a conservative Arabic ASR post-processor for Egyptian Arabic speech. "
+    "For the target segment, return the most plausible SPOKEN EGYPTIAN ARABIC text. "
+    "Preserve Egyptian colloquial word choices, pronunciation-driven spelling, "
+    "and dialect. "
+    "Do NOT standardize into Modern Standard Arabic (MSA). "
+    "Example: ASR 'ثلاثة يام' should become 'تلات أيام' (spoken Egyptian), "
+    "not 'ثلاثة أيام' (MSA). "
+    "Preserve all names, numbers, Latin tokens, and digits exactly as they appear. "
+    "Do not add facts, clauses, or change entities. "
+    "Use only the small local context provided. "
+    "If the raw text is already correct, return it unchanged and set unchanged=true. "
+    "Output ONLY a JSON object with this exact shape: "
+    '{"reconstructions": [{"segment_id": int, "corrected_text": string, '
+    '"unchanged": bool, "confidence": number, "explanation": string, "changes": []}]}.'
+)
+
+
 def _shrink_request_to_budget(
-    request: ReconstructionRequest, max_tokens: int
+    request: ReconstructionRequest,
+    max_tokens: int,
+    *,
+    envelope: Callable[[ReconstructionRequest], int],
 ) -> ReconstructionRequest:
     """Drop surrounding context deterministically until the request fits the budget."""
 
@@ -254,7 +321,7 @@ def _shrink_request_to_budget(
     following = list(request.following)
     entities = list(request.entities)
     word_evidence = list(request.word_evidence)
-    while request.estimated_tokens() > max_tokens and (previous or following):
+    while envelope(request) > max_tokens and (previous or following):
         if following:
             following.pop()
         elif previous:
@@ -262,10 +329,10 @@ def _shrink_request_to_budget(
         request = replace(
             request, previous=tuple(previous), following=tuple(following), entities=tuple(entities)
         )
-    while request.estimated_tokens() > max_tokens and entities:
+    while envelope(request) > max_tokens and entities:
         entities.pop()
         request = replace(request, entities=tuple(entities))
-    while request.estimated_tokens() > max_tokens and len(word_evidence) > 1:
+    while envelope(request) > max_tokens and len(word_evidence) > 1:
         word_evidence.pop()
         request = replace(request, word_evidence=tuple(word_evidence))
     return request

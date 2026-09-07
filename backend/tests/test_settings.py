@@ -126,3 +126,20 @@ def test_reconstruction_retains_explicit_openai_compatible_mode() -> None:
         settings.reconstruction_provider_instance(),
         OpenAICompatibleReconstructionProvider,
     )
+
+
+def test_reconstruction_prompt_budget_settings_have_positive_bounded_defaults() -> None:
+    settings = Settings(_env_file=None)
+
+    assert settings.reconstruction_provider_output_tokens == 256
+    assert settings.reconstruction_chat_framing_reserve > 0
+    assert settings.reconstruction_safety_reserve > 0
+
+
+def test_reconstruction_prompt_budget_settings_reject_zero() -> None:
+    with pytest.raises(ValidationError, match="greater than 0"):
+        Settings(_env_file=None, reconstruction_provider_output_tokens=0)
+    with pytest.raises(ValidationError, match="greater than 0"):
+        Settings(_env_file=None, reconstruction_chat_framing_reserve=0)
+    with pytest.raises(ValidationError, match="greater than 0"):
+        Settings(_env_file=None, reconstruction_safety_reserve=0)

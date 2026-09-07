@@ -117,3 +117,18 @@ class ReconstructionResult:
     contextual_reconstructed_text: str
     fingerprint: str
     metadata: dict[str, object] = field(default_factory=dict)
+
+
+def estimate_tokens(text: str) -> int:
+    """Conservative UTF-8 token estimate; roughly two UTF-8 bytes per token."""
+
+    return len(text.encode("utf-8")) // 2
+
+
+@dataclass(frozen=True)
+class RequestSizeDiagnostics:
+    """Measured serialized prompt size for one reconstruction target."""
+
+    segment_index: int
+    serialized_bytes: int
+    estimated_input_tokens: int

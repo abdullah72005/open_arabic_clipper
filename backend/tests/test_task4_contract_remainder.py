@@ -45,7 +45,7 @@ def test_reconstruction_request_estimates_tokens_for_budgeting() -> None:
     request = _request(4)
     tokens = request.estimated_tokens()
     payload = json.dumps(request.to_payload(), ensure_ascii=False)
-    assert tokens == len(payload) // 2
+    assert tokens == len(payload.encode("utf-8")) // 2
     assert tokens > 0
 
 
