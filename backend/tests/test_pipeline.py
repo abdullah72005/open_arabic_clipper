@@ -222,6 +222,9 @@ class _RecordingEngine:
             duration=1.0,
         )
 
+    def last_child_peak_rss(self) -> int | None:
+        return 1_000_000
+
 
 def test_transcription_stage_holds_heavy_lease_around_whisper(
     sqlite_engine: object,
@@ -321,6 +324,80 @@ def test_transcription_stage_emits_labeled_memory_snapshots(
             if record.msg == "transcription_memory_snapshot"
         ]
         assert labels == ["before_load", "after_transcribe", "after_cleanup"]
+        after = next(
+            record
+            for record in caplog.records
+            if record.msg == "transcription_memory_snapshot"
+            and record.__dict__.get("snapshot") == "after_transcribe"
+        )
+        assert after.__dict__["child_peak_rss"] == 1_000_000
+        assert "cgroup_current" in after.__dict__
+        assert "cgroup_peak" in after.__dict__
+
+
+def test_heavy_lease_ownership_loss_fails_closed(sqlite_engine: object) -> None:
+    """A lost lease aborts the stage with a retryable error instead of proceeding."""
+
+    from app.models import AudioArtifact
+    from app.pipeline.stages import TranscriptionExecutor
+    from app.runtime.heavy_model_lease import HeavyModelLeaseBusy
+    from app.transcription.service import TranscriptionOptions
+
+    class LostLease:
+        token = "t"
+        owner_pid = 1
+        ownership_lost = True
+
+        def __enter__(self) -> "LostLease":
+            return self
+
+        def __exit__(self, exc_type: object, exc: object, traceback: object) -> bool:
+            return False
+
+        def acquire(self) -> "LostLease":
+            return self
+
+        def renew(self) -> bool:
+            return False
+
+        def retain(self) -> None:
+            pass
+
+        def release(self) -> None:
+            pass
+
+    class LostLeaseFactory:
+        def acquire(self, *, purpose: str) -> LostLease:
+            return LostLease()
+
+    Base.metadata.create_all(sqlite_engine)
+    with Session(sqlite_engine) as session:
+        source = SourceVideo(
+            source_uri=f"file:///tmp/{uuid.uuid4()}.mp4",
+            content_hash="h",
+            rights_status=RightsStatus.OWNED,
+        )
+        session.add(source)
+        session.commit()
+        session.add(
+            AudioArtifact(
+                source_video_id=source.id,
+                output_path="/tmp/audio.wav",
+                content_hash="h",
+                sample_rate=16000,
+                duration=1.0,
+            )
+        )
+        session.commit()
+        executor = TranscriptionExecutor(
+            session=session,
+            engine=_RecordingEngine(),  # type: ignore[arg-type]
+            options=TranscriptionOptions("small", "cpu", "int8", 5),
+            lease_factory=LostLeaseFactory(),  # type: ignore[arg-type]
+        )
+
+        with pytest.raises(HeavyModelLeaseBusy, match="lease was lost"):
+            executor.execute(source)
 
 
 def test_reconstruction_stage_holds_heavy_lease_around_ollama(
@@ -456,6 +533,7 @@ def test_reconstruction_retains_lease_when_unload_times_out(sqlite_engine: objec
             self.owner_pid = 1
             self.retained = False
             self.released = False
+            self.ownership_lost = False
 
         def __enter__(self) -> "RecordingLease":
             return self

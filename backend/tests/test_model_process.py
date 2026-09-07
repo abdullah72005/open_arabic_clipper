@@ -21,6 +21,10 @@ def _sleep_target(seconds: float) -> str:
     return "done"
 
 
+def _exit_without_envelope_target() -> None:
+    os._exit(1)
+
+
 def test_model_factory_runs_in_child_pid() -> None:
     runner = ModelProcessRunner(timeout_seconds=10)
 
@@ -77,3 +81,27 @@ def test_direct_runner_executes_in_process() -> None:
 
     assert outcome.ok
     assert outcome.result == os.getpid()
+
+
+def test_child_exit_without_envelope_is_detected_promptly() -> None:
+    """SIGKILL/OOM child death is reaped promptly, not after the full timeout."""
+
+    runner = ModelProcessRunner(timeout_seconds=60)
+    started = time.monotonic()
+
+    outcome = runner.run(target=_exit_without_envelope_target)
+    elapsed = time.monotonic() - started
+
+    assert outcome.ok is False
+    assert "without a result" in (outcome.error or "")
+    assert outcome.exit_code == 1
+    assert elapsed < 10.0
+
+
+def test_child_peak_rss_is_reported() -> None:
+    runner = ModelProcessRunner(timeout_seconds=10)
+
+    outcome = runner.run(target=_return_pid_target)
+
+    assert outcome.ok
+    assert outcome.child_peak_rss_bytes > 0

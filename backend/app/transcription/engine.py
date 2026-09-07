@@ -8,7 +8,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, cast
 
-from app.runtime.model_process import ModelProcessRunner, SpawnedProcessError
+from app.runtime.model_process import (
+    ModelProcessRunner,
+    ProcessOutcome,
+    SpawnedProcessError,
+)
 from app.transcription.service import TranscriptionOptions
 
 
@@ -49,6 +53,12 @@ class WhisperEngine:
         self._cuda_available = cuda_available or _cuda_available
         self._collect_garbage = collect_garbage
         self._runner = runner or ModelProcessRunner(timeout_seconds=7_200.0)
+        self._last_outcome: ProcessOutcome | None = None
+
+    def last_child_peak_rss(self) -> int | None:
+        """Return the peak RSS measured inside the last spawned child, in bytes."""
+
+        return self._last_outcome.child_peak_rss_bytes if self._last_outcome is not None else None
 
     def transcribe(self, audio_path: Path, options: TranscriptionOptions) -> TranscriptionResult:
         """Transcribe a WAV path without changing Whisper text or timestamps.
@@ -70,6 +80,7 @@ class WhisperEngine:
                 self._collect_garbage,
             ),
         )
+        self._last_outcome = outcome
         if not outcome.ok:
             raise SpawnedProcessError(outcome.error or "transcription child failed")
         return cast(TranscriptionResult, outcome.result)

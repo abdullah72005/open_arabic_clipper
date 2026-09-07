@@ -21,7 +21,11 @@ from app.models import AudioAnalysis, AudioArtifact, SourceVideo, Transcript, Tr
 from app.pipeline.executor import StageExecutionResult
 from app.pipeline.fingerprints import canonical_fingerprint
 from app.pipeline.runner import StageExecutionError
-from app.runtime.heavy_model_lease import HeavyModelLeaseFactory, NoopHeavyModelLeaseFactory
+from app.runtime.heavy_model_lease import (
+    HeavyModelLeaseBusy,
+    HeavyModelLeaseFactory,
+    NoopHeavyModelLeaseFactory,
+)
 from app.runtime.memory import MemorySnapshot, capture_memory
 from app.services.source_adapters import YtDlpAdapter
 from app.services.source_quality import assess_source, quality_input_fingerprint
@@ -85,9 +89,13 @@ class TranscriptionExecutor:
             audio_path = storage.resolve(StorageCategory.SOURCES, audio_path)
         started_at = monotonic()
         self._emit_snapshot("before_load")
-        with self._lease_factory.acquire(purpose="whisper") as _heavy_lease:
+        with self._lease_factory.acquire(purpose="whisper") as heavy_lease:
             result = self._engine.transcribe(audio_path, self._options)
-        self._emit_snapshot("after_transcribe")
+            if heavy_lease.ownership_lost:
+                raise HeavyModelLeaseBusy(
+                    "heavy-model lease was lost during Whisper work; retry the stage"
+                )
+        self._emit_snapshot("after_transcribe", child_peak_rss=self._engine.last_child_peak_rss())
         transcript = existing or Transcript(source_video_id=source.id)
         self._apply(transcript, result, fingerprint, monotonic() - started_at)
         self._emit_snapshot("after_cleanup")
@@ -110,7 +118,7 @@ class TranscriptionExecutor:
             transcript,
         )
 
-    def _emit_snapshot(self, label: str) -> None:
+    def _emit_snapshot(self, label: str, child_peak_rss: int | None = None) -> None:
         snapshot = self._snapshotter()
         _logger.info(
             "transcription_memory_snapshot",
@@ -119,6 +127,9 @@ class TranscriptionExecutor:
                 "effective_capacity": snapshot.effective_capacity,
                 "process_rss": snapshot.process_rss,
                 "linux_available": snapshot.linux_available,
+                "cgroup_current": snapshot.cgroup_current,
+                "cgroup_peak": snapshot.cgroup_peak,
+                "child_peak_rss": child_peak_rss,
             },
         )
 
@@ -440,6 +451,10 @@ class ContextualReconstructionExecutor:
                 transcription_fingerprint=transcript.input_fingerprint,
                 correction_version=transcript.correction_version,
             )
+            if heavy_lease.ownership_lost:
+                raise HeavyModelLeaseBusy(
+                    "heavy-model lease was lost during reconstruction; retry the stage"
+                )
             if result.metadata.get("release_warning"):
                 heavy_lease.retain()
         if transcript.reconstruction_fingerprint == result.fingerprint and not force:

@@ -54,6 +54,7 @@ class HeavyModelLease:
         token: str | None = None,
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
+        renewal_sleep: Callable[[float], None] = time.sleep,
         on_acquire: Callable[[float, str], None] | None = None,
         on_release: Callable[[], None] | None = None,
     ) -> None:
@@ -66,11 +67,13 @@ class HeavyModelLease:
         self._token = token or uuid.uuid4().hex
         self._monotonic = monotonic
         self._sleep = sleep
+        self._renewal_sleep = renewal_sleep
         self._on_acquire = on_acquire
         self._on_release = on_release
         self._acquired = False
         self._renewer: threading.Thread | None = None
         self._retained = False
+        self._ownership_lost = False
 
     @property
     def token(self) -> str:
@@ -87,6 +90,18 @@ class HeavyModelLease:
     @property
     def acquired(self) -> bool:
         return self._acquired
+
+    @property
+    def ownership_lost(self) -> bool:
+        """True once a renewal failed or the ownership check returned zero."""
+
+        return self._ownership_lost
+
+    @property
+    def renewing(self) -> bool:
+        """True while the background renewer keeps the lease alive."""
+
+        return self._renewer is not None and self._renewer.is_alive()
 
     def __enter__(self) -> "HeavyModelLease":
         self.acquire()
@@ -116,28 +131,44 @@ class HeavyModelLease:
                 )
             self._sleep(min(0.1, self._acquisition_timeout_seconds))
 
-    def renew(self) -> None:
-        """Extend the TTL only while this token still owns the lease."""
+    def renew(self) -> bool:
+        """Extend the TTL and report ownership.
 
-        if not self._acquired:
-            return
-        self._redis.eval(  # type: ignore[attr-defined]
-            _RENEW_LUA, 1, _LEASE_KEY, self._token, int(self._ttl_seconds * 1000)
-        )
+        A Redis exception or a Lua return value of zero is lease loss, never
+        success: the caller must stop heavy work and fail closed.
+        """
+
+        if self._ownership_lost:
+            return False
+        if not (self._acquired or self._retained):
+            return True
+        try:
+            renewed = self._redis.eval(  # type: ignore[attr-defined]
+                _RENEW_LUA, 1, _LEASE_KEY, self._token, int(self._ttl_seconds * 1000)
+            )
+        except Exception:
+            renewed = 0
+        if not renewed:
+            self._mark_ownership_lost()
+        return bool(renewed)
 
     def release(self) -> None:
         """Atomically delete the lease only when this token still owns it.
 
-        A retained lease is not deleted, so another heavy model cannot start
-        until the TTL expires or an operator clears the unsafe unload state.
+        A retained lease is an unsafe-residency block: it keeps renewing so the
+        key never expires and another heavy model cannot start until an operator
+        explicitly clears the block with ``clear_retained``.
         """
 
+        if self._retained:
+            self._acquired = False
+            if self._renewer is None:
+                self._start_renewer()
+            return
         self._acquired = False
         if self._renewer is not None:
             self._renewer.join(timeout=0.5)
             self._renewer = None
-        if self._retained:
-            return
         self._redis.eval(  # type: ignore[attr-defined]
             _RELEASE_LUA, 1, _LEASE_KEY, self._token
         )
@@ -148,6 +179,25 @@ class HeavyModelLease:
         """Hold the lease across release so another heavy model is blocked."""
 
         self._retained = True
+        if self._renewer is None:
+            self._start_renewer()
+
+    def clear_retained(self) -> None:
+        """Operator recovery: end the unsafe block and release the lease."""
+
+        self._retained = False
+        self._acquired = False
+        if self._renewer is not None:
+            self._renewer.join(timeout=0.5)
+            self._renewer = None
+        self._redis.eval(  # type: ignore[attr-defined]
+            _RELEASE_LUA, 1, _LEASE_KEY, self._token
+        )
+        if self._on_release is not None:
+            self._on_release()
+
+    def _mark_ownership_lost(self) -> None:
+        self._ownership_lost = True
 
     def _start_renewer(self) -> None:
         if self._renewer is not None:
@@ -155,10 +205,11 @@ class HeavyModelLease:
 
         def loop() -> None:
             while True:
-                time.sleep(self._renewal_interval_seconds)
-                if not self._acquired:
+                self._renewal_sleep(self._renewal_interval_seconds)
+                if not (self._acquired or self._retained):
                     return
-                self.renew()
+                if not self.renew():
+                    return
 
         self._renewer = threading.Thread(target=loop, name="heavy-model-lease-renewer", daemon=True)
         self._renewer.start()
@@ -232,6 +283,7 @@ class NoopHeavyModelLease:
         self.owner_pid = os.getpid()
         self.acquired = False
         self._retained = False
+        self._ownership_lost = False
 
     def __enter__(self) -> "NoopHeavyModelLease":
         self.acquire()
@@ -241,13 +293,21 @@ class NoopHeavyModelLease:
         self.release()
         return False
 
+    @property
+    def ownership_lost(self) -> bool:
+        return self._ownership_lost
+
+    @property
+    def renewing(self) -> bool:
+        return self.acquired or self._retained
+
     def acquire(self) -> "NoopHeavyModelLease":
         self.acquired = True
         self._factory._record("heavy_model_acquired", self._purpose)
         return self
 
-    def renew(self) -> None:
-        return None
+    def renew(self) -> bool:
+        return not self._ownership_lost
 
     def retain(self) -> None:
         self._retained = True
@@ -256,6 +316,11 @@ class NoopHeavyModelLease:
         self.acquired = False
         if self._retained:
             return
+        self._factory._record("heavy_model_released", self._purpose)
+
+    def clear_retained(self) -> None:
+        self._retained = False
+        self.acquired = False
         self._factory._record("heavy_model_released", self._purpose)
 
 

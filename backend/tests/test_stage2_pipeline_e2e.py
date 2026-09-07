@@ -40,6 +40,9 @@ class FixedEngine:
             duration=1.0,
         )
 
+    def last_child_peak_rss(self) -> int | None:
+        return None
+
 
 def test_generated_owned_media_reaches_ready_for_analysis(
     sqlite_engine: object, tmp_path: Path

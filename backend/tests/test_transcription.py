@@ -292,6 +292,9 @@ def test_transcription_executor_persists_raw_timestamped_result(
                 word_segments=[],
             )
 
+        def last_child_peak_rss(self) -> int | None:
+            return None
+
     Base.metadata.create_all(sqlite_engine)
     with Session(sqlite_engine) as session:
         source = SourceVideo(source_uri=str(tmp_path / "source.mp4"), content_hash="source")

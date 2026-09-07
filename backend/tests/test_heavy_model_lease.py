@@ -192,3 +192,50 @@ def test_lease_context_marks_acquired_and_released() -> None:
         assert redis.get(_LEASE_KEY) == active.token
 
     assert redis.get(_LEASE_KEY) is None
+
+
+def test_renewal_ownership_loss_is_detected() -> None:
+    now = FakeClock()
+    redis = FakeRedis(now)
+    lease = _lease(redis, now)
+    lease.acquire()
+    redis.data[_LEASE_KEY] = "intruder"
+    redis.expires_at[_LEASE_KEY] = now.now + 300
+
+    assert lease.renew() is False
+    assert lease.ownership_lost is True
+    assert lease.renew() is False
+
+
+def test_renewal_redis_exception_marks_ownership_lost() -> None:
+    class ExplodingRedis(FakeRedis):
+        def eval(self, script: str, numkeys: int, *args: object) -> int:
+            raise ConnectionError("redis unavailable")
+
+    now = FakeClock()
+    redis = ExplodingRedis(now)
+    lease = _lease(redis, now)
+    lease.acquire()
+
+    assert lease.renew() is False
+    assert lease.ownership_lost is True
+
+
+def test_retained_lease_keeps_renewing_after_release() -> None:
+    """An unsafe unload block survives the normal TTL; only operator recovery ends it."""
+
+    now = FakeClock()
+    redis = FakeRedis(now)
+    lease = _lease(redis, now)
+    lease.acquire()
+    lease.retain()
+
+    lease.release()
+
+    assert redis.get(_LEASE_KEY) == lease.token
+    assert lease.renewing is True
+
+    lease.clear_retained()
+
+    assert redis.get(_LEASE_KEY) is None
+    assert lease.renewing is False

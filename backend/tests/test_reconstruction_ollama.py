@@ -145,6 +145,7 @@ def test_ollama_release_unloads_configured_model() -> None:
     assert json.loads(request.calls[0].body or b"{}") == {
         "model": "qwen3:8b",
         "keep_alive": 0,
+        "stream": False,
     }
     assert outcome.requested is True
     assert outcome.confirmed is True

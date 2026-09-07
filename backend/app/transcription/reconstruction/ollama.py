@@ -102,7 +102,7 @@ class OllamaReconstructionProvider(OpenAICompatibleReconstructionProvider):
             self._json_request(
                 "POST",
                 "/api/generate",
-                {"model": self.model, "keep_alive": 0},
+                {"model": self.model, "keep_alive": 0, "stream": False},
             )
         except (OSError, ProviderResponseError):
             return UnloadOutcome(False, False, 0.0, "unload request failed")
