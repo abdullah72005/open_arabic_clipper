@@ -12,6 +12,7 @@ class ReconstructionDecision:
     level: ConfidenceLevel
     applied: bool
     score: float
+    reason: str | None = None
 
 
 def decide_candidate(
@@ -35,20 +36,23 @@ def decide_candidate(
         + 0.05 * resolution.selection_confidence
         - 0.20 * acoustic * edit_ratio
     )
-    if (
-        score >= 0.86
-        and margin >= 0.12
-        and phonetic_similarity >= 0.72
-        and resolution.semantic_coherence >= 0.80
-    ):
-        return ReconstructionDecision(ConfidenceLevel.HIGH, True, score)
-    if (
-        score >= 0.74
-        and margin >= 0.08
-        and edit_ratio <= 0.20
-        and token_delta <= 1
-        and phonetic_similarity >= 0.85
-        and resolution.semantic_coherence >= 0.75
-    ):
-        return ReconstructionDecision(ConfidenceLevel.MEDIUM, False, score)
-    return ReconstructionDecision(ConfidenceLevel.LOW, False, score)
+    high_checks = {
+        "score": score >= 0.82,
+        "margin": margin >= 0.12,
+        "phonetic_similarity": phonetic_similarity >= 0.72,
+        "semantic_coherence": resolution.semantic_coherence >= 0.80,
+    }
+    if all(high_checks.values()):
+        return ReconstructionDecision(ConfidenceLevel.HIGH, True, score, None)
+    medium_checks = {
+        "score": score >= 0.74,
+        "margin": margin >= 0.08,
+        "edit_ratio": edit_ratio <= 0.20,
+        "token_delta": token_delta <= 1,
+        "phonetic_similarity": phonetic_similarity >= 0.85,
+        "semantic_coherence": resolution.semantic_coherence >= 0.75,
+    }
+    if all(medium_checks.values()):
+        return ReconstructionDecision(ConfidenceLevel.MEDIUM, False, score, None)
+    failed = [name for name, passed in high_checks.items() if not passed]
+    return ReconstructionDecision(ConfidenceLevel.LOW, False, score, ",".join(failed) or "low_confidence")

@@ -16,12 +16,14 @@ class OllamaReconstructionProvider(OpenAICompatibleReconstructionProvider):
         model: str,
         timeout_seconds: float,
         release_after_run: bool = True,
+        max_context_tokens: int | None = None,
         request: HttpRequest | None = None,
     ) -> None:
         super().__init__(
             base_url=base_url,
             model=model,
             timeout_seconds=timeout_seconds,
+            max_context_tokens=max_context_tokens,
             request=request,
         )
         self.provider_name = "ollama"

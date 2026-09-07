@@ -40,6 +40,7 @@ services:
       CLIPFACTORY_REDIS_URL: redis://redis:6379/0
       CLIPFACTORY_STORAGE_ROOT: /var/lib/clipfactory
     volumes:
+      - ./backend:/app
       - ./storage:/var/lib/clipfactory
       - whisper_model_cache:/root/.cache/huggingface
     ports: ["${BACKEND_PORT:-8300}:8000"]
@@ -58,6 +59,7 @@ services:
       CLIPFACTORY_REDIS_URL: redis://redis:6379/0
       CLIPFACTORY_STORAGE_ROOT: /var/lib/clipfactory
     volumes:
+      - ./backend:/app
       - ./storage:/var/lib/clipfactory
       - whisper_model_cache:/root/.cache/huggingface
     depends_on:

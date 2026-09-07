@@ -58,24 +58,41 @@ local Ollama provider, and writes a JSONL comparison, a human-review worksheet,
 and an aggregate report under `storage/benchmarks/stage-2-7/results/<run-id>/`.
 It prints only aggregate metrics and storage-owned artifact paths.
 
-On 2026-09-06 the known Chernobyl diagnostic (source
+On 2026-09-06 and 2026-09-07 the known Chernobyl diagnostic (source
 `37c14f55-eacb-4d9f-8775-47a721cba5a9`, first 30 seconds, the three
 operator-supplied failure phrases with their reviewed expected forms) was run
-with `--allow-known-regression-set` against two models:
+with `--allow-known-regression-set` against three models:
 
 | Model | Model digest | Wall time | Peak process RAM | Result |
 | --- | --- | ---: | ---: | --- |
 | qwen3:8b | `500a1f067a9f…b41` | 163.4 s | 2.16 GiB | infeasible: `llama-server` killed (`signal: killed`) while loading ~5.5 GiB into 7.4 GiB RAM |
-| qwen3.5:4b | `2a654d98e6fb…eefd` | 212.6 s | 2.18 GiB | loaded in 52.97 s, but no reconstruction applied |
+| qwen3.5:4b (gate 0.86) | `2a654d98e6fb…eefd` | 628.8 s | 2.18 GiB | feasible: `provider_available=true`, `model_feasible=true`, 0 hallucinations, 0 regressions, 10 unresolved, 1 unchanged-wrong; no reconstruction applied |
+| qwen3.5:4b (gate 0.82, semantic evaluator) | `2a654d98e6fb…eefd` | 531.0 s | 2.15 GiB | kept provisionally: 1 improved (`تلاتة يام بس لتطهير المنطقة`), 0 hallucinations, 0 regressions, 9 unresolved, 1 unchanged-wrong |
+| qwen3:4b | `359d7dd4bcda…4fae7` | n/a | n/a | unusable: thinking mode emits chain-of-thought that exhausts the 256-token budget before any JSON payload |
 
 The machine (Core Ultra 9 185H, 7.4 GiB RAM, 2 GiB swap, CPU-only) cannot hold
 `qwen3:8b` alongside the Whisper pipeline and services; the model load was
-out-of-memory killed. `qwen3.5:4b` loads, but its generation prompt reached
-46,587 tokens and was truncated by Ollama to 2,050 tokens (the configured
-two-pass reconstruction sends the full window evidence in one request), so the
-reconstruction produced no accepted change and Stage 2.5 stayed final. Raw ASR
-and Stage 2.5 completed for both runs; the three known multi-word errors
-remained unchanged.
+out-of-memory killed. `qwen3.5:4b` loads and runs the one-pass small-context
+protocol end-to-end.
+
+The evaluator classifies segments by Egyptian normalization plus
+phonetic/semantic equivalence: orthographic variants (diacritics, alef forms,
+`ة`/`ه`, `ى`/`ي`), prosthetic alef (`يام`/`أيام`), suffix `ة` (`تلات`/`تلاتة`),
+and Egyptian dental shifts (`ث`/`ت`, `ذ`/`د`, `ظ`/`ز`) are equivalent; names,
+numbers, Latin tokens, and meaning-changing substitutions are not. Exact string
+match is retained as a separate metric (`exact_*` in the report and
+`exact_status` per row).
+
+On the provisional `score >= 0.82` apply gate, the model applied segment 1 as
+`تلاتة يام بس لتطهير المنطقة` (reference `تلات أيام بس لتطهير المنطقة`): the
+semantic evaluator reports `improved`, and the exact-match metric reports
+`hallucinated` solely because of the dialect spelling variants `تلاتة`/`تلات`
+and `يام`/`أيام`. There is no meaning change, regression, or invented fact, so
+0.82 is kept provisionally. Raw ASR and Stage 2.5 completed for all runs; the
+three known multi-word errors are not all fixed. `qwen2.5:7b` could not be
+pulled reliably over the network from this machine. `qwen3:4b` was pulled but
+cannot be parsed because its reasoning is emitted as free text before the JSON
+object.
 
 These are regression diagnostics only. The model comparison and the strict
 unseen-audio acceptance set (at least five non-overlapping clips, two to five

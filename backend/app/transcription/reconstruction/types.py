@@ -82,6 +82,8 @@ class ReconstructionCandidate:
     text: str
     changes: tuple[dict[str, object], ...] = ()
     evidence_segment_ids: tuple[int, ...] = ()
+    scores: ResolutionScores | None = None
+    explanation: str = ""
 
 
 @dataclass(frozen=True)
@@ -118,6 +120,9 @@ class SegmentReconstruction:
     reconstruction_method: str | None = None
     candidate_id: str | None = None
     confidence_margin: float = 0.0
+    validation_reason: str | None = None
+    decision_reason: str | None = None
+    explanation: str = ""
 
 
 @dataclass(frozen=True)

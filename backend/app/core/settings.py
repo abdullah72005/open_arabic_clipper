@@ -60,9 +60,10 @@ class Settings(BaseSettings):
     reconstruction_provider_base_url: str | None = Field(
         default="http://ollama:11434", max_length=2_048
     )
-    reconstruction_provider_model: str | None = Field(default="qwen3:8b", max_length=256)
+    reconstruction_provider_model: str | None = Field(default="qwen3.5:4b", max_length=256)
     reconstruction_provider_timeout_seconds: float = Field(default=180.0, gt=0, le=300)
     reconstruction_release_after_run: bool = True
+    reconstruction_provider_max_context_tokens: int = Field(default=4_096, gt=0, le=32_768)
     reconstruction_provider_batch_windows: int = Field(default=8, gt=0, le=16)
     reconstruction_provider_batch_characters: int = Field(default=24_000, gt=0, le=48_000)
     transcription_queue_concurrency: int = Field(default=1, gt=0)
@@ -141,11 +142,13 @@ class Settings(BaseSettings):
                 model=resolved_model,
                 timeout_seconds=self.reconstruction_provider_timeout_seconds,
                 release_after_run=self.reconstruction_release_after_run,
+                max_context_tokens=self.reconstruction_provider_max_context_tokens,
             )
         return OpenAICompatibleReconstructionProvider(
             base_url=self.reconstruction_provider_base_url,
             model=resolved_model,
             timeout_seconds=self.reconstruction_provider_timeout_seconds,
+            max_context_tokens=self.reconstruction_provider_max_context_tokens,
         )
 
     def contextual_reconstructor(self) -> ContextualReconstructor:

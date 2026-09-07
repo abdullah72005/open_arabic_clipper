@@ -2,10 +2,7 @@ import json
 
 import pytest
 
-from app.transcription.reconstruction.providers import (
-    GenerationRequest,
-    batch_generation_requests,
-)
+from app.transcription.reconstruction.providers import ReconstructionRequest
 from app.transcription.reconstruction.routing import (
     RoutingDecision,
     RoutingEvidence,
@@ -13,69 +10,56 @@ from app.transcription.reconstruction.routing import (
 )
 from app.transcription.reconstruction.types import (
     AcousticEvidence,
-    ReconstructionWindow,
-    WindowSegment,
+    WordEvidence,
 )
 
 
-def _request(index: int, text: str = "هدف") -> GenerationRequest:
-    window = ReconstructionWindow(
-        index,
-        (
-            WindowSegment(
-                index,
-                1.0,
-                2.0,
-                text,
-                "تصحيح",
-                AcousticEvidence(0.5, 0.5, -0.5, 0.1),
-                word_evidence=(),
-            ),
+def _request(index: int, text: str = "هدف") -> ReconstructionRequest:
+    return ReconstructionRequest(
+        segment_index=index,
+        raw_text=text,
+        corrected_text="تصحيح",
+        previous=("قبل",),
+        following=("بعد",),
+        word_evidence=(
+            WordEvidence("word1", 1.0, 2.0, 0.45),
+            WordEvidence("word2", 2.0, 3.0, 0.95),
         ),
-    )
-    decision = RoutingDecision(
-        RoutingPriority.RECONSTRUCT,
-        RoutingEvidence(0.9, 0.8, (), "multiple_low_probability_words"),
-        (),
-        "multiple_low_probability_words",
-    )
-    return GenerationRequest(
-        window=window, language="ar", entity_forms=("أحمد",), routing_decision=decision
+        acoustic=AcousticEvidence(0.5, 0.5, -0.5, 0.1),
+        entities=("أحمد",),
+        routing_reasons=("multiple_low_probability_words",),
+        focus_spans=(WordEvidence("word1", 1.0, 2.0, 0.45),),
+        language="ar",
     )
 
 
-def test_generation_request_serializes_complete_immutable_evidence() -> None:
+def test_reconstruction_request_serializes_small_local_context() -> None:
     request = _request(4)
     payload = request.to_payload()
     assert payload["segment_id"] == 4
     assert payload["language"] == "ar"
     assert payload["entities"] == ["أحمد"]
-    assert payload["routing"]["reason"] == "multiple_low_probability_words"
-    assert "start" in payload["window"][0] and "end" in payload["window"][0]
-    assert payload["window"][0]["raw_text"] == "هدف"
-    assert payload["window"][0]["corrected_text"] == "تصحيح"
+    assert payload["routing_reasons"] == ["multiple_low_probability_words"]
+    assert payload["raw_text"] == "هدف"
+    assert payload["corrected_text"] == "تصحيح"
+    assert payload["previous"] == ["قبل"]
+    assert payload["following"] == ["بعد"]
+    assert len(payload["words"]) == 2
+    assert payload["focus_spans"][0]["text"] == "word1"
 
 
-def test_batch_generation_requests_is_utf8_bounded_and_priority_ordered() -> None:
-    requests = [_request(9, "ب" * 20), _request(2, "أ" * 20)]
-    requests[1] = GenerationRequest(
-        window=requests[1].window,
-        language="ar",
-        entity_forms=(),
-        routing_decision=RoutingDecision(
-            RoutingPriority.CONTEXT_CHECK, RoutingEvidence(0, 0, (), "check"), (), "check"
-        ),
-    )
-    batches = batch_generation_requests(requests, max_windows=2, max_characters=10_000)
-    assert [item.segment_index for item in batches[0]] == [9, 2]
-    encoded = json.dumps(
-        [item.to_payload() for item in batches[0]], ensure_ascii=False, sort_keys=True
-    ).encode()
-    assert len(encoded) <= 10_000
+def test_reconstruction_request_estimates_tokens_for_budgeting() -> None:
+    request = _request(4)
+    tokens = request.estimated_tokens()
+    payload = json.dumps(request.to_payload(), ensure_ascii=False)
+    assert tokens == len(payload) // 2
+    assert tokens > 0
 
 
-def test_batch_generation_requests_rejects_values_above_hard_maxima() -> None:
-    with pytest.raises(ValueError):
-        batch_generation_requests([], max_windows=17)
-    with pytest.raises(ValueError):
-        batch_generation_requests([], max_characters=48_001)
+def test_reconstruction_request_payload_does_not_include_full_transcript() -> None:
+    request = _request(4)
+    payload = request.to_payload()
+    assert "window" not in payload
+    assert "full_transcript" not in payload
+    assert len(payload["previous"]) <= 2
+    assert len(payload["following"]) <= 2

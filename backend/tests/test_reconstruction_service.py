@@ -1,8 +1,6 @@
 from app.transcription.reconstruction.providers import (
-    GenerationRequest,
     ProviderResponseError,
-    ResolutionChoice,
-    ResolutionRequest,
+    ReconstructionRequest,
 )
 from app.transcription.reconstruction.service import ContextualReconstructor, select_final_text
 from app.transcription.reconstruction.types import (
@@ -10,48 +8,49 @@ from app.transcription.reconstruction.types import (
     ProviderAvailability,
     ProviderHealth,
     ReconstructionCandidate,
+    ReconstructionWindow,
     ResolutionScores,
+    WindowSegment,
+    WordEvidence,
 )
+from app.transcription.reconstruction.windows import acoustic_evidence
+from app.core.enums import ReconstructionStatus
 
 
-class HighConfidenceProvider:
-    def __init__(self) -> None:
+class OnePassProvider:
+    def __init__(self, candidate: ReconstructionCandidate | None = None) -> None:
         self.release_calls = 0
+        self.requests: list[ReconstructionRequest] = []
+        self._candidate = candidate or ReconstructionCandidate(
+            "provider-0",
+            "ضخمة",
+            scores=ResolutionScores(1.0, 1.0, 1.0, 1.0, 1.0),
+        )
 
     def health(self) -> ProviderHealth:
-        return ProviderHealth(ProviderAvailability.AVAILABLE, "ollama", "qwen3:8b", "sha256:x", "ok")
+        return ProviderHealth(
+            ProviderAvailability.AVAILABLE, "ollama", "qwen3.5:4b", "sha256:x", "ok"
+        )
 
     def release(self) -> None:
         self.release_calls += 1
 
-    def generate_candidates(
-        self, requests: list[GenerationRequest]
-    ) -> dict[int, list[ReconstructionCandidate]]:
-        return {
-            request.segment_index: [
-                ReconstructionCandidate("provider-0", "ضخمة", evidence_segment_ids=(0,))
-            ]
-            for request in requests
-        }
-
-    def resolve_candidates(self, requests: list[ResolutionRequest]) -> dict[int, ResolutionChoice]:
-        return {
-            request.segment_index: ResolutionChoice(
-                "provider-0", ResolutionScores(1.0, 1.0, 1.0, 1.0, 1.0)
-            )
-            for request in requests
-        }
+    def reconstruct_segments(
+        self, requests: list[ReconstructionRequest]
+    ) -> dict[int, ReconstructionCandidate]:
+        self.requests.extend(requests)
+        return {request.segment_index: self._candidate for request in requests}
 
 
-class ReleaseFailingProvider(HighConfidenceProvider):
+class ReleaseFailingProvider(OnePassProvider):
     def release(self) -> None:
         raise RuntimeError("release failed")
 
 
 def test_reconstructor_applies_only_high_contextual_candidate() -> None:
-    """A high-scoring source-supported candidate becomes automatic final text."""
+    """A high-scoring candidate becomes automatic final text."""
 
-    provider = HighConfidenceProvider()
+    provider = OnePassProvider()
     result = ContextualReconstructor(provider).reconstruct(
         [{"start": 0.0, "end": 1.0, "text": "دخم", "corrected_text": "دخم"}],
         language="ar",
@@ -65,13 +64,15 @@ def test_reconstructor_applies_only_high_contextual_candidate() -> None:
     assert segment.applied is True
     assert result.contextual_reconstructed_text == "ضخمة"
     assert provider.release_calls == 1
-    assert segment.reconstruction_method == "ollama:qwen3:8b"
+    assert segment.reconstruction_method == "ollama:qwen3.5:4b"
 
 
 def test_operator_text_precedes_provider_candidate_and_is_manual_override() -> None:
-    result = ContextualReconstructor(HighConfidenceProvider()).reconstruct(
+    result = ContextualReconstructor(OnePassProvider()).reconstruct(
         [{"start": 0.0, "end": 1.0, "text": "دخم", "corrected_text": "دخم", "operator_text": "يدوي"}],
-        language="ar", transcription_fingerprint="asr-v1", correction_version="egyptian-ar-v1",
+        language="ar",
+        transcription_fingerprint="asr-v1",
+        correction_version="egyptian-ar-v1",
     )
     assert result.segments[0].contextual_reconstructed_text == "يدوي"
     assert result.segments[0].status.value == "MANUAL_OVERRIDE"
@@ -107,27 +108,21 @@ def test_reconstructor_without_provider_preserves_stage_2_5_text() -> None:
 
 
 def test_reconstructor_falls_back_only_for_expected_provider_failures() -> None:
-    class ReleasingBrokenProvider:
-        def __init__(self) -> None:
-            self.release_calls = 0
-
+    class BrokenProvider:
         def health(self) -> ProviderHealth:
-            return ProviderHealth(ProviderAvailability.AVAILABLE, "test", "test", "sha256:x", "ok")
+            return ProviderHealth(
+                ProviderAvailability.AVAILABLE, "test", "test", "sha256:x", "ok"
+            )
 
-        def generate_candidates(
-            self, requests: list[GenerationRequest]
-        ) -> dict[int, list[ReconstructionCandidate]]:
+        def reconstruct_segments(
+            self, requests: list[ReconstructionRequest]
+        ) -> dict[int, ReconstructionCandidate]:
             raise ProviderResponseError("invalid JSON")
 
-        def resolve_candidates(
-            self, requests: list[ResolutionRequest]
-        ) -> dict[int, ResolutionChoice]:
-            raise AssertionError("resolution must not run")
-
         def release(self) -> None:
-            self.release_calls += 1
+            pass
 
-    provider = ReleasingBrokenProvider()
+    provider = BrokenProvider()
     result = ContextualReconstructor(provider).reconstruct(
         [{"start": 0.0, "end": 1.0, "text": "خطي بالك", "corrected_text": "خلي بالك"}],
         language="ar",
@@ -137,7 +132,32 @@ def test_reconstructor_falls_back_only_for_expected_provider_failures() -> None:
 
     assert result.segments[0].contextual_reconstructed_text == "خلي بالك"
     assert result.segments[0].quality_flags[0].value == "RECONSTRUCTION_PROVIDER_ERROR"
-    assert provider.release_calls == 1
+
+
+def test_reconstructor_surfaces_provider_unavailable_when_model_cannot_run() -> None:
+    class UnavailableProvider:
+        def health(self) -> ProviderHealth:
+            return ProviderHealth(
+                ProviderAvailability.UNAVAILABLE, "ollama", "qwen3:8b", None, "OOM"
+            )
+
+        def reconstruct_segments(
+            self, requests: list[ReconstructionRequest]
+        ) -> dict[int, ReconstructionCandidate]:
+            raise AssertionError("must not call provider when unavailable")
+
+        def release(self) -> None:
+            pass
+
+    result = ContextualReconstructor(UnavailableProvider()).reconstruct(
+        [{"start": 0.0, "end": 1.0, "text": "raw", "corrected_text": "corrected"}],
+        language="ar",
+        transcription_fingerprint="asr-v1",
+        correction_version="egyptian-ar-v1",
+    )
+
+    assert result.segments[0].status is ReconstructionStatus.PROVIDER_UNAVAILABLE
+    assert result.segments[0].contextual_reconstructed_text == "corrected"
 
 
 def test_final_text_priority_keeps_manual_text_above_reconstruction() -> None:
@@ -154,3 +174,27 @@ def test_final_text_priority_keeps_manual_text_above_reconstruction() -> None:
         )
         == "manual"
     )
+
+
+def test_reconstructor_sends_small_context_window() -> None:
+    """The provider receives only local context, not the full transcript."""
+
+    provider = OnePassProvider()
+    ContextualReconstructor(provider).reconstruct(
+        [
+            {"start": 0.0, "end": 1.0, "text": "a", "corrected_text": "a"},
+            {"start": 1.0, "end": 2.0, "text": "b", "corrected_text": "b"},
+            {"start": 2.0, "end": 3.0, "text": "c", "corrected_text": "c"},
+            {"start": 3.0, "end": 4.0, "text": "d", "corrected_text": "d"},
+            {"start": 4.0, "end": 5.0, "text": "e", "corrected_text": "e"},
+        ],
+        language="ar",
+        transcription_fingerprint="asr-v1",
+        correction_version="egyptian-ar-v1",
+    )
+
+    assert len(provider.requests) == 5
+    for request in provider.requests:
+        assert len(request.previous) <= 2
+        assert len(request.following) <= 2
+        assert request.segment_index is not None

@@ -101,9 +101,10 @@ def test_reconstruction_defaults_to_managed_local_provider() -> None:
 
     assert settings.reconstruction_provider == "ollama"
     assert settings.reconstruction_provider_base_url == "http://ollama:11434"
-    assert settings.reconstruction_provider_model == "qwen3:8b"
+    assert settings.reconstruction_provider_model == "qwen3.5:4b"
     assert settings.reconstruction_provider_timeout_seconds == 180
     assert settings.reconstruction_release_after_run is True
+    assert settings.reconstruction_provider_max_context_tokens == 4096
     assert isinstance(settings.reconstruction_provider_instance(), OllamaReconstructionProvider)
 
 

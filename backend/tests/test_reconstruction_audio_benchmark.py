@@ -19,6 +19,7 @@ from app.transcription.reconstruction.benchmark import (
     classify_comparison,
     comparison_status,
     evaluate_completion_gate,
+    exact_classify_comparison,
     load_benchmark_manifest,
 )
 from app.transcription.reconstruction.types import (
@@ -127,14 +128,35 @@ def test_classify_comparison_assigns_all_six_string_statuses() -> None:
     assert classify_comparison("wrong", "invented 999", "right") == "hallucinated"
 
 
+def test_classify_comparison_accepts_egyptian_dialect_spelling_variants() -> None:
+    stage25 = " ثلاثة يام بس لتطهير النطقة"
+    candidate = "تلاتة يام بس لتطهير المنطقة"
+    reference = "تلات أيام بس لتطهير المنطقة"
+    assert classify_comparison(stage25, candidate, reference) == "improved"
+    assert classify_comparison(stage25, stage25, reference) == "unchanged_wrong"
+    assert exact_classify_comparison(stage25, candidate, reference) == "hallucinated"
+
+
+def test_classify_comparison_keeps_real_meaning_changes_as_errors() -> None:
+    stage25 = "بعد كارثة شرنوبل، الحكومة هتمر السكان بعمل عملية إخلاق مؤقت"
+    reference = "وقت كارثة شرنوبل الحكومة هتمر السكان بعمل عملية إخلاء مؤقت"
+    assert classify_comparison(stage25, stage25, reference) == "unchanged_wrong"
+    changed = stage25.replace("بعد", "خلاف")
+    assert classify_comparison(stage25, changed, reference) == "hallucinated"
+
+
 def test_comparison_status_treats_unresolved_reconstruction_and_missing_reference() -> None:
     assert (
         comparison_status(ReconstructionStatus.LOW_CONFIDENCE_UNRESOLVED, "a", "b", "c")
-        == "unresolved"
+        == ("unresolved", "unresolved")
     )
-    assert comparison_status(ReconstructionStatus.APPLIED, "a", "b", "") == "unresolved"
+    assert comparison_status(ReconstructionStatus.APPLIED, "a", "b", "") == (
+        "unresolved",
+        "unresolved",
+    )
     assert comparison_status(ReconstructionStatus.APPLIED, "right", "right", "right") == (
-        "unchanged_correct"
+        "unchanged_correct",
+        "unchanged_correct",
     )
 
 
@@ -394,6 +416,7 @@ def test_runner_executes_pipeline_in_order_and_writes_deterministic_artifacts(
         "stage27",
         "reference",
         "status",
+        "exact_status",
         "confidence",
         "wer",
         "cer",
@@ -402,6 +425,13 @@ def test_runner_executes_pipeline_in_order_and_writes_deterministic_artifacts(
         "human_label",
     }
     assert all(required <= row.keys() for row in comparison)
+    assert {
+        result.exact_improved,
+        result.exact_unchanged_correct,
+        result.exact_unchanged_wrong,
+        result.exact_regressed,
+        result.exact_hallucinated,
+    } == {result.improved, result.unchanged_correct, result.unchanged_wrong, result.regressed, result.hallucinated}
     assert result.report_path is not None
     assert result.report_path.is_relative_to(storage.category_root(StorageCategory.BENCHMARKS))
 

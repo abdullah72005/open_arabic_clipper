@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import resource
 import subprocess
 import time
@@ -17,7 +18,7 @@ from pydantic import BaseModel, Field, model_validator
 from app.core.enums import ReconstructionStatus
 from app.pipeline.fingerprints import canonical_fingerprint
 from app.services.storage import StorageCategory, StorageService, StorageValidationError
-from app.transcription.correction import SegmentCorrection
+from app.transcription.correction import SegmentCorrection, normalize_for_comparison
 from app.transcription.engine import TranscriptionResult
 from app.transcription.reconstruction.types import (
     ProviderAvailability,
@@ -188,6 +189,11 @@ class BenchmarkReport(BaseModel):
     hallucinated: int = Field(ge=0)
     comprehensibility_stage25: dict[str, float] = Field(default_factory=dict)
     comprehensibility_stage27: dict[str, float] = Field(default_factory=dict)
+    exact_improved: int = Field(default=0, ge=0)
+    exact_unchanged_correct: int = Field(default=0, ge=0)
+    exact_unchanged_wrong: int = Field(default=0, ge=0)
+    exact_regressed: int = Field(default=0, ge=0)
+    exact_hallucinated: int = Field(default=0, ge=0)
     source_audio_seconds: float = Field(gt=0)
     wall_clock_seconds: float = Field(gt=0)
     peak_ram_bytes: int = Field(ge=0)
@@ -261,6 +267,7 @@ class BenchmarkRunner:
         source_map = {source.id: source for source in manifest.sources}
         rows: list[dict[str, object]] = []
         counts: Counter[str] = Counter()
+        exact_counts: Counter[str] = Counter()
         provider_died = False
 
         for clip in manifest.clips:
@@ -308,12 +315,13 @@ class BenchmarkRunner:
                 human_label = (
                     reference_segment.human_label or "" if reference_segment is not None else ""
                 )
-                status = comparison_status(
+                status, exact_status = comparison_status(
                     item.status if item is not None else None, corrected, final, reference
                 )
                 if item is not None and item.status is ReconstructionStatus.PROVIDER_UNAVAILABLE:
                     provider_died = True
                 counts[human_label or status] += 1
+                exact_counts[human_label or exact_status] += 1
                 rows.append(
                     {
                         "clip_id": clip.id,
@@ -323,6 +331,7 @@ class BenchmarkRunner:
                         "stage27": final,
                         "reference": reference,
                         "status": status,
+                        "exact_status": exact_status,
                         "confidence": item.confidence if item is not None else None,
                         "wer": _word_error_rate(reference, final),
                         "cer": _character_error_rate(reference, final),
@@ -367,6 +376,11 @@ class BenchmarkRunner:
             regressed=regressed,
             preserved=unchanged_correct,
             hallucinated=hallucinated,
+            exact_improved=exact_counts["improved"],
+            exact_unchanged_correct=exact_counts["unchanged_correct"],
+            exact_unchanged_wrong=exact_counts["unchanged_wrong"],
+            exact_regressed=exact_counts["regressed"],
+            exact_hallucinated=exact_counts["hallucinated"],
             source_audio_seconds=sum(
                 clip.end_seconds - clip.start_seconds for clip in manifest.clips
             ),
@@ -433,32 +447,119 @@ class BenchmarkRunner:
         )
 
 
-def classify_comparison(stage25: str, stage27: str, reference: str) -> str:
-    """Classify one segment by deterministic string comparison to its reference."""
+_EGYPTIAN_DENTAL_SHIFTS = frozenset(
+    {
+        ("ث", "ت"),
+        ("ت", "ث"),
+        ("ذ", "د"),
+        ("د", "ذ"),
+        ("ظ", "ز"),
+        ("ز", "ظ"),
+    }
+)
+_PROTECTED_TOKEN = re.compile(r"[A-Za-z0-9٠-٩]")
 
-    stage25_correct = _normalize(stage25) == _normalize(reference)
-    stage27_correct = _normalize(stage27) == _normalize(reference)
+
+def classify_comparison(stage25: str, stage27: str, reference: str) -> str:
+    """Classify one segment by semantic/phonetic equivalence to its reference.
+
+    Egyptian dialect spelling variants (prosthetic alef like ``يام``/``أيام``,
+    suffix ``ة`` like ``تلات``/``تلاتة``, dental shifts like ``تلات``/``ثلاثة``)
+    are equivalent. Names, numbers, Latin tokens, and meaning-changing
+    substitutions are not. Exact string equality is tracked separately via
+    ``exact_classify_comparison``.
+    """
+
+    return _six_way_classification(
+        stage25_correct=_segment_equivalent(stage25, reference),
+        stage27_correct=_segment_equivalent(stage27, reference),
+        unchanged=_canonical(stage27) == _canonical(stage25),
+    )
+
+
+def exact_classify_comparison(stage25: str, stage27: str, reference: str) -> str:
+    """Classify one segment by exact normalized string equality to its reference."""
+
+    return _six_way_classification(
+        stage25_correct=_canonical(stage25) == _canonical(reference),
+        stage27_correct=_canonical(stage27) == _canonical(reference),
+        unchanged=_canonical(stage27) == _canonical(stage25),
+    )
+
+
+def _six_way_classification(
+    *, stage25_correct: bool, stage27_correct: bool, unchanged: bool
+) -> str:
     if stage25_correct and stage27_correct:
         return "unchanged_correct"
     if stage25_correct and not stage27_correct:
         return "regressed"
     if not stage25_correct and stage27_correct:
         return "improved"
-    if _normalize(stage27) == _normalize(stage25):
+    if unchanged:
         return "unchanged_wrong"
     return "hallucinated"
 
 
+def _canonical(text: str) -> str:
+    """Normalize Arabic spelling/layout only for benchmark comparison."""
+
+    return normalize_for_comparison(text)
+
+
+def _segment_equivalent(candidate: str, reference: str) -> bool:
+    candidate_words = _canonical(candidate).split()
+    reference_words = _canonical(reference).split()
+    if not reference_words:
+        return not candidate_words
+    if len(candidate_words) != len(reference_words):
+        return False
+    return all(
+        _word_equivalent(candidate_word, reference_word)
+        for candidate_word, reference_word in zip(candidate_words, reference_words, strict=True)
+    )
+
+
+def _word_equivalent(candidate: str, reference: str) -> bool:
+    if candidate == reference:
+        return True
+    if _PROTECTED_TOKEN.search(candidate) or _PROTECTED_TOKEN.search(reference):
+        return False
+    if abs(len(candidate) - len(reference)) == 1:
+        longer, shorter = (
+            (candidate, reference)
+            if len(candidate) > len(reference)
+            else (reference, candidate)
+        )
+        if longer.startswith(shorter) or longer.endswith(shorter):
+            return True
+    if len(candidate) == len(reference):
+        differences = [
+            (left, right)
+            for left, right in zip(candidate, reference, strict=True)
+            if left != right
+        ]
+        if len(differences) == 1 and differences[0] in _EGYPTIAN_DENTAL_SHIFTS:
+            return True
+    return False
+
+
 def comparison_status(
     reconstruction_status: object | None, stage25: str, stage27: str, reference: str
-) -> str:
-    """Return the six-way comparison outcome, honoring unresolved state."""
+) -> tuple[str, str]:
+    """Return (semantic status, exact status), honoring unresolved state."""
 
     if not reference.strip():
-        return "unresolved"
-    if reconstruction_status is ReconstructionStatus.LOW_CONFIDENCE_UNRESOLVED:
-        return "unresolved"
-    return classify_comparison(stage25, stage27, reference)
+        return ("unresolved", "unresolved")
+    if reconstruction_status in {
+        ReconstructionStatus.LOW_CONFIDENCE_UNRESOLVED,
+        ReconstructionStatus.PROVIDER_UNAVAILABLE,
+    }:
+        return ("unresolved", "unresolved")
+    return (
+        classify_comparison(stage25, stage27, reference),
+        exact_classify_comparison(stage25, stage27, reference),
+    )
 
 
 def evaluate_completion_gate(
@@ -549,10 +650,6 @@ def prompt_settings_fingerprint(
             "whisper": whisper_options,
         },
     )
-
-
-def _normalize(text: str) -> str:
-    return " ".join(str(text).split())
 
 
 def _run_command(args: list[str]) -> None:

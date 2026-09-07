@@ -4,19 +4,23 @@ from urllib.parse import urlsplit
 import pytest
 
 from app.transcription.reconstruction.providers import (
-    GenerationRequest,
     OpenAICompatibleReconstructionProvider,
     ProviderResponseError,
-    ResolutionRequest,
-    _parse_resolutions,
+    ReconstructionRequest,
+    _parse_reconstructions,
 )
 from app.transcription.reconstruction.types import (
-    ProviderAvailability, ProviderHealth, ReconstructionCandidate,
+    AcousticEvidence,
+    ProviderAvailability,
+    ProviderHealth,
+    ReconstructionCandidate,
+    ResolutionScores,
+    WordEvidence,
 )
 
 
-def test_provider_uses_structured_two_pass_contract() -> None:
-    """Passes receive stable IDs and return only schema-validated candidate evidence."""
+def test_provider_uses_structured_one_pass_contract() -> None:
+    """A single request returns the proposed target, scores, and explanation."""
 
     captured: list[dict[str, object]] = []
 
@@ -32,52 +36,70 @@ def test_provider_uses_structured_two_pass_contract() -> None:
         assert body is not None
         payload = json.loads(body)
         captured.append(payload)
-        if len(captured) == 1:
-            return _response(
-                {
-                    "generations": [
-                        {
-                            "segment_id": 4,
-                            "candidates": [
-                                {
-                                    "text": "كان بيقودها الرئيس",
-                                    "changes": [],
-                                    "evidence_segment_ids": [3, 4, 5],
-                                }
-                            ],
-                        }
-                    ]
-                }
-            )
         return _response(
             {
-                "resolutions": [
+                "reconstructions": [
                     {
                         "segment_id": 4,
-                        "candidate_id": "provider-0",
-                        "semantic_coherence": 0.9,
-                        "egyptian_naturalness": 0.9,
-                        "discourse_continuity": 0.9,
-                        "entity_consistency": 1.0,
-                        "selection_confidence": 0.9,
+                        "corrected_text": "كان بيقودها الرئيس",
+                        "unchanged": False,
+                        "confidence": 0.92,
+                        "explanation": "restore likely elided hamza",
+                        "changes": [
+                            {"from": "كان بيقودها الريس", "to": "كان بيقودها الرئيس"}
+                        ],
                     }
                 ]
             }
         )
 
     provider = OpenAICompatibleReconstructionProvider(
-        base_url="http://ollama:11434", model="qwen3:8b", timeout_seconds=12, request=request
+        base_url="http://ollama:11434",
+        model="qwen3.5:4b",
+        timeout_seconds=12,
+        request=request,
     )
-    generated = provider.generate_candidates([GenerationRequest(4, "raw", (), ())])
-    resolved = provider.resolve_candidates(
-        [ResolutionRequest(4, "raw", (), (), tuple(generated[4]))]
+    result = provider.reconstruct_segments(
+        [
+            ReconstructionRequest(
+                segment_index=4,
+                raw_text="كان بيقودها الريس",
+                corrected_text="كان بيقودها الريس",
+                previous=("قبل",),
+                following=("بعد",),
+                word_evidence=(
+                    WordEvidence("كان", 0.0, 1.0, 0.95),
+                    WordEvidence("بيقودها", 1.0, 2.0, 0.55),
+                    WordEvidence("الريس", 2.0, 3.0, 0.42),
+                ),
+                acoustic=AcousticEvidence(0.64, 0.64, None, None),
+                entities=("الريس",),
+                routing_reasons=("low_probability_word",),
+                focus_spans=(WordEvidence("الريس", 2.0, 3.0, 0.42),),
+                language="ar",
+            )
+        ]
     )
 
-    assert generated[4][0].candidate_id == "provider-0"
-    assert resolved[4].candidate_id == "provider-0"
+    candidate = result[4]
+    assert candidate.candidate_id == "provider-0"
+    assert candidate.text == "كان بيقودها الرئيس"
+    assert candidate.scores == ResolutionScores(
+        semantic_coherence=0.92,
+        egyptian_naturalness=0.92,
+        discourse_continuity=0.92,
+        entity_consistency=0.92,
+        selection_confidence=0.92,
+    )
     assert captured[0]["temperature"] == 0
-    assert captured[0]["response_format"]["type"] == "json_schema"
-    assert captured[1]["messages"][1]["content"]
+    assert captured[0]["max_tokens"] == 256
+    assert "response_format" not in captured[0]
+    assert "EGYPTIAN ARABIC" in captured[0]["messages"][0]["content"]
+    assert "Output ONLY a JSON object" in captured[0]["messages"][0]["content"]
+    payload = captured[0]["messages"][1]["content"]
+    assert "كان بيقودها الريس" in payload
+    assert "قبل" in payload
+    assert "بعد" in payload
 
 
 def test_provider_rejects_missing_target_response() -> None:
@@ -85,32 +107,58 @@ def test_provider_rejects_missing_target_response() -> None:
 
     provider = OpenAICompatibleReconstructionProvider(
         base_url="http://ollama:11434",
-        model="qwen3:8b",
+        model="qwen3.5:4b",
         timeout_seconds=12,
-        request=lambda *_args: _response({"generations": []}),
+        request=lambda *_args: _response({"reconstructions": []}),
     )
 
     with pytest.raises(ProviderResponseError, match="omitted"):
-        provider.generate_candidates([GenerationRequest(4, "raw", (), ())])
+        provider.reconstruct_segments(
+            [ReconstructionRequest(segment_index=4, raw_text="raw", corrected_text="raw")]
+        )
 
 
-def test_resolution_returns_scores_for_every_candidate() -> None:
-    request = ResolutionRequest(
-        4, "raw", (), (),
-        (ReconstructionCandidate("raw", "raw"), ReconstructionCandidate("provider-0", "new")),
+def test_provider_shrinks_over_budget_context_deterministically() -> None:
+    """A request that exceeds the model context budget shrinks context, never silently truncates."""
+
+    captured: list[dict[str, object]] = []
+
+    def request(
+        _method: str,
+        _url: str,
+        body: bytes | None,
+        _headers: dict[str, str],
+        _timeout: float,
+    ) -> bytes:
+        assert body is not None
+        captured.append(json.loads(body))
+        return _response({"reconstructions": [{"segment_id": 4, "corrected_text": "was", "unchanged": True}]})
+
+    provider = OpenAICompatibleReconstructionProvider(
+        base_url="http://ollama:11434",
+        model="qwen3.5:4b",
+        timeout_seconds=12,
+        max_context_tokens=150,
+        request=request,
     )
-    result = _parse_resolutions({"resolutions": [{
-        "segment_id": 4,
-        "selected_candidate_id": "provider-0",
-        "candidate_scores": [
-            {"candidate_id": "raw", "semantic_coherence": 0.4, "egyptian_naturalness": 0.4,
-             "discourse_continuity": 0.4, "entity_consistency": 0.4, "selection_confidence": 0.4},
-            {"candidate_id": "provider-0", "semantic_coherence": 1, "egyptian_naturalness": 1,
-             "discourse_continuity": 1, "entity_consistency": 1, "selection_confidence": 1},
-        ],
-    }]}, [request])
-    assert result[4].candidate_id == "provider-0"
-    assert result[4].candidate_scores["raw"].semantic_coherence == 0.4
+
+    long_context = " ".join(["word"] * 40)
+    result = provider.reconstruct_segments(
+        [
+            ReconstructionRequest(
+                segment_index=4,
+                raw_text="was",
+                corrected_text="was",
+                previous=(long_context,),
+                following=(long_context,),
+            )
+        ]
+    )
+
+    assert result[4].text == "was"
+    payload = json.loads(captured[0]["messages"][1]["content"])
+    target = payload["targets"][0]
+    assert len(target["previous"]) + len(target["following"]) < 2
 
 
 def test_openai_compatible_health_requires_exact_model_id() -> None:
@@ -124,11 +172,11 @@ def test_openai_compatible_health_requires_exact_model_id() -> None:
         assert method == "GET"
         assert urlsplit(url).path == "/v1/models"
         assert body is None
-        return b'{"data":[{"id":"qwen3:8b"}]}'
+        return b'{"data":[{"id":"qwen3.5:4b"}]}'
 
     provider = OpenAICompatibleReconstructionProvider(
         base_url="http://provider:11434",
-        model="qwen3:8b",
+        model="qwen3.5:4b",
         timeout_seconds=3,
         request=request,
     )
@@ -136,7 +184,7 @@ def test_openai_compatible_health_requires_exact_model_id() -> None:
     assert provider.health() == ProviderHealth(
         ProviderAvailability.AVAILABLE,
         "openai_compatible",
-        "qwen3:8b",
+        "qwen3.5:4b",
         None,
         "model available",
     )
@@ -167,7 +215,7 @@ def test_openai_compatible_release_is_a_no_op() -> None:
 
     provider = OpenAICompatibleReconstructionProvider(
         base_url="http://provider:11434",
-        model="qwen3:8b",
+        model="qwen3.5:4b",
         timeout_seconds=3,
         request=request,
     )
@@ -175,6 +223,26 @@ def test_openai_compatible_release_is_a_no_op() -> None:
     provider.release()
 
     assert calls == 0
+
+
+def test_parse_reconstructions_propagates_scores() -> None:
+    request = ReconstructionRequest(segment_index=4, raw_text="raw", corrected_text="raw")
+    result = _parse_reconstructions(
+        {
+            "reconstructions": [
+                {
+                    "segment_id": 4,
+                    "corrected_text": "new",
+                    "unchanged": False,
+                    "confidence": 0.88,
+                    "explanation": "fix",
+                }
+            ]
+        },
+        [request],
+    )
+    assert result[4].text == "new"
+    assert result[4].scores.selection_confidence == 0.88
 
 
 def _response(content: dict[str, object]) -> bytes:
