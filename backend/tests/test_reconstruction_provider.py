@@ -244,8 +244,75 @@ def test_parse_reconstructions_propagates_scores() -> None:
     assert result[4].scores.selection_confidence == 0.88
 
 
+@pytest.mark.parametrize(
+    "message_content",
+    [
+        "no json object here",
+        '{"reconstructions": [',
+        json.dumps({"reconstructions": [{"segment_id": 99, "corrected_text": "x"}]}),
+        json.dumps(
+            {
+                "reconstructions": [
+                    {"segment_id": 4, "corrected_text": "a", "confidence": 0.9},
+                    {"segment_id": 4, "corrected_text": "b", "confidence": 0.9},
+                ]
+            }
+        ),
+        json.dumps(
+            {"reconstructions": [{"segment_id": 4, "corrected_text": "x", "confidence": "0.9"}]}
+        ),
+        json.dumps(
+            {"reconstructions": [{"segment_id": 4, "corrected_text": "x", "confidence": True}]}
+        ),
+        json.dumps(
+            {"reconstructions": [{"segment_id": 4, "corrected_text": "x", "confidence": -0.01}]}
+        ),
+        json.dumps(
+            {"reconstructions": [{"segment_id": 4, "corrected_text": "x", "confidence": 1.01}]}
+        ),
+        json.dumps(
+            {
+                "reconstructions": [
+                    {"segment_id": 4, "corrected_text": "x", "confidence": float("nan")}
+                ]
+            }
+        ),
+        json.dumps(
+            {
+                "reconstructions": [
+                    {"segment_id": 4, "corrected_text": "x", "confidence": float("inf")}
+                ]
+            }
+        ),
+        '{"reconstructions": [{"segment_id": 4, "corrected_text": "x", "confidence": 1e309}]}',
+    ],
+)
+def test_provider_rejects_malformed_responses_as_contained_provider_error(
+    message_content: str,
+) -> None:
+    """Malformed provider output must be a contained ProviderResponseError, never a bare
+    ValueError, TypeError, or KeyError."""
+    provider = OpenAICompatibleReconstructionProvider(
+        base_url="http://ollama:11434",
+        model="qwen3.5:4b",
+        timeout_seconds=12,
+        request=lambda *_args: _raw_message(message_content),
+    )
+    with pytest.raises(ProviderResponseError):
+        provider.reconstruct_segments(
+            [ReconstructionRequest(segment_index=4, raw_text="raw", corrected_text="raw")]
+        )
+
+
 def _response(content: dict[str, object]) -> bytes:
     return json.dumps(
         {"choices": [{"message": {"content": json.dumps(content, ensure_ascii=False)}}]},
+        ensure_ascii=False,
+    ).encode()
+
+
+def _raw_message(message_content: str) -> bytes:
+    return json.dumps(
+        {"choices": [{"message": {"content": message_content}}]},
         ensure_ascii=False,
     ).encode()

@@ -134,6 +134,7 @@ def test_reconstructor_falls_back_only_for_expected_provider_failures() -> None:
 
     assert result.segments[0].contextual_reconstructed_text == "خلي بالك"
     assert result.segments[0].quality_flags[0].value == "RECONSTRUCTION_PROVIDER_ERROR"
+    assert result.segments[0].status is ReconstructionStatus.PROVIDER_UNAVAILABLE
 
 
 def test_reconstructor_surfaces_provider_unavailable_when_model_cannot_run() -> None:

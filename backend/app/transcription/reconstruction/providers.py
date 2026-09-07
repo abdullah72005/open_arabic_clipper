@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import Protocol, cast
@@ -289,10 +290,7 @@ def _parse_reconstructions(
         if not isinstance(text, str):
             raise ProviderResponseError("provider reconstruction has invalid text")
         unchanged = bool(entry.get("unchanged"))
-        confidence = entry.get("confidence", 0.0)
-        if not isinstance(confidence, int | float):
-            confidence = 0.0
-        confidence = float(confidence)
+        confidence = _validated_confidence(entry)
         scores = ResolutionScores(
             semantic_coherence=confidence,
             egyptian_naturalness=confidence,
@@ -312,6 +310,18 @@ def _parse_reconstructions(
     if set(result) != requested:
         raise ProviderResponseError("provider omitted one or more target segments")
     return result
+
+
+def _validated_confidence(entry: dict[str, object]) -> float:
+    """Accept only a non-boolean finite real confidence inside the inclusive unit range."""
+
+    value = entry.get("confidence", 0.0)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ProviderResponseError("provider reconstruction has invalid confidence")
+    numeric = float(value)
+    if not math.isfinite(numeric) or not 0.0 <= numeric <= 1.0:
+        raise ProviderResponseError("provider reconstruction has invalid confidence")
+    return numeric
 
 
 def _extract_json_object(text: str) -> dict[str, object]:
@@ -350,7 +360,7 @@ def _extract_json_object(text: str) -> dict[str, object]:
             except json.JSONDecodeError:
                 continue
     if best is None:
-        raise ValueError("no JSON object found in response")
+        raise ProviderResponseError("no JSON object found in response")
     return best
 
 
