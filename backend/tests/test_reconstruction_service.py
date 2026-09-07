@@ -9,6 +9,7 @@ from app.transcription.reconstruction.types import (
     ProviderAvailability,
     ProviderHealth,
     ReconstructionCandidate,
+    UnloadOutcome,
 )
 
 
@@ -112,6 +113,26 @@ def test_reconstructor_preserves_result_when_release_fails_after_success() -> No
     assert result.segments[0].contextual_reconstructed_text == "ضخمة"
     assert result.contextual_reconstructed_text == "ضخمة"
     assert result.metadata["release_warning"] == "provider_release_failed"
+
+
+def test_reconstructor_records_unload_outcome_without_corrupting_text() -> None:
+    """A verified unload warning is recorded; successful reconstruction text stays."""
+
+    class WarningReleaseProvider(OnePassProvider):
+        def release(self) -> UnloadOutcome:
+            return UnloadOutcome(True, False, 1.0, "model still resident after unload timeout")
+
+    result = ContextualReconstructor(WarningReleaseProvider()).reconstruct(
+        [{"start": 0.0, "end": 1.0, "text": "دخم", "corrected_text": "دخم"}],
+        language="ar",
+        transcription_fingerprint="asr-v1",
+        correction_version="egyptian-ar-v1",
+    )
+
+    assert result.segments[0].contextual_reconstructed_text == "ضخمة"
+    assert result.metadata["release_warning"] == "model still resident after unload timeout"
+    assert result.metadata["unload_outcome"]["requested"] is True
+    assert result.metadata["unload_outcome"]["confirmed"] is False
 
 
 def test_reconstructor_without_provider_preserves_stage_2_5_text() -> None:

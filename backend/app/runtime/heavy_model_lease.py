@@ -70,6 +70,7 @@ class HeavyModelLease:
         self._on_release = on_release
         self._acquired = False
         self._renewer: threading.Thread | None = None
+        self._retained = False
 
     @property
     def token(self) -> str:
@@ -125,17 +126,28 @@ class HeavyModelLease:
         )
 
     def release(self) -> None:
-        """Atomically delete the lease only when this token still owns it."""
+        """Atomically delete the lease only when this token still owns it.
+
+        A retained lease is not deleted, so another heavy model cannot start
+        until the TTL expires or an operator clears the unsafe unload state.
+        """
 
         self._acquired = False
         if self._renewer is not None:
             self._renewer.join(timeout=0.5)
             self._renewer = None
+        if self._retained:
+            return
         self._redis.eval(  # type: ignore[attr-defined]
             _RELEASE_LUA, 1, _LEASE_KEY, self._token
         )
         if self._on_release is not None:
             self._on_release()
+
+    def retain(self) -> None:
+        """Hold the lease across release so another heavy model is blocked."""
+
+        self._retained = True
 
     def _start_renewer(self) -> None:
         if self._renewer is not None:
@@ -219,6 +231,7 @@ class NoopHeavyModelLease:
         self.token = "noop"
         self.owner_pid = os.getpid()
         self.acquired = False
+        self._retained = False
 
     def __enter__(self) -> "NoopHeavyModelLease":
         self.acquire()
@@ -236,8 +249,13 @@ class NoopHeavyModelLease:
     def renew(self) -> None:
         return None
 
+    def retain(self) -> None:
+        self._retained = True
+
     def release(self) -> None:
         self.acquired = False
+        if self._retained:
+            return
         self._factory._record("heavy_model_released", self._purpose)
 
 

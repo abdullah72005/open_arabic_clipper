@@ -413,3 +413,110 @@ def test_heavy_lease_contention_raises_retryable_busy(sqlite_engine: object) -> 
             executor.execute(source, force=True)
 
         assert getattr(excinfo.value, "retryable", False) is True
+
+
+def test_reconstruction_retains_lease_when_unload_times_out(sqlite_engine: object) -> None:
+    """An unsafe unload timeout blocks another heavy-model start via the lease."""
+
+    from app.pipeline.stages import ContextualReconstructionExecutor
+    from app.transcription.reconstruction.providers import (
+        ReconstructionCandidate,
+        ReconstructionRequest,
+    )
+    from app.transcription.reconstruction.service import ContextualReconstructor
+    from app.transcription.reconstruction.types import (
+        ProviderAvailability,
+        ProviderHealth,
+        UnloadOutcome,
+    )
+
+    class WarningProvider:
+        def health(self) -> ProviderHealth:
+            return ProviderHealth(
+                ProviderAvailability.AVAILABLE, "ollama", "qwen3.5:4b", "sha256:x", "ok"
+            )
+
+        def runtime_identity(self) -> dict[str, object]:
+            return {"provider": "ollama", "model": "qwen3.5:4b", "digest": "sha256:x"}
+
+        def refresh_runtime_identity(self) -> dict[str, object]:
+            return self.runtime_identity()
+
+        def reconstruct_segments(
+            self, requests: list[ReconstructionRequest]
+        ) -> dict[int, ReconstructionCandidate]:
+            return {}
+
+        def release(self) -> UnloadOutcome:
+            return UnloadOutcome(True, False, 1.0, "model still resident after unload timeout")
+
+    class RecordingLease:
+        def __init__(self) -> None:
+            self.token = "t"
+            self.owner_pid = 1
+            self.retained = False
+            self.released = False
+
+        def __enter__(self) -> "RecordingLease":
+            return self
+
+        def __exit__(self, exc_type: object, exc: object, traceback: object) -> bool:
+            self.release()
+            return False
+
+        def acquire(self) -> "RecordingLease":
+            return self
+
+        def renew(self) -> None:
+            return None
+
+        def retain(self) -> None:
+            self.retained = True
+
+        def release(self) -> None:
+            if self.retained:
+                return
+            self.released = True
+
+    class RecordingLeaseFactory:
+        def __init__(self) -> None:
+            self.leases: list[RecordingLease] = []
+
+        def acquire(self, *, purpose: str) -> RecordingLease:
+            lease = RecordingLease()
+            self.leases.append(lease)
+            return lease
+
+    Base.metadata.create_all(sqlite_engine)
+    with Session(sqlite_engine) as session:
+        source = SourceVideo(
+            source_uri=f"file:///tmp/{uuid.uuid4()}.mp4",
+            content_hash="h",
+            rights_status=RightsStatus.OWNED,
+        )
+        session.add(source)
+        session.commit()
+        session.add(
+            Transcript(
+                source_video_id=source.id,
+                whisper_model="large-v3-turbo",
+                input_fingerprint="fp",
+                normalization_fingerprint="nf",
+                transcription_revision=1,
+                correction_version="v1",
+                segments=[],
+            )
+        )
+        session.commit()
+        factory = RecordingLeaseFactory()
+        executor = ContextualReconstructionExecutor(
+            session=session,
+            reconstructor=ContextualReconstructor(WarningProvider()),
+            lease_factory=factory,  # type: ignore[arg-type]
+        )
+
+        executor.execute(source, force=True)
+
+        lease = factory.leases[0]
+        assert lease.retained is True
+        assert lease.released is False

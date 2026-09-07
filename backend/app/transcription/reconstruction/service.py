@@ -21,6 +21,7 @@ from app.transcription.reconstruction.types import (
     ReconstructionCandidate,
     ReconstructionResult,
     SegmentReconstruction,
+    UnloadOutcome,
 )
 from app.transcription.reconstruction.validation import validate_candidate
 from app.transcription.reconstruction.windows import acoustic_evidence, build_reconstruction_window
@@ -162,13 +163,26 @@ class ContextualReconstructor:
             )
         finally:
             try:
-                self._provider.release()
+                outcome = self._provider.release()
             except Exception:
                 # Cleanup is best effort; never replace valid or fallback output.
                 result = replace(
                     result,
                     metadata={**result.metadata, "release_warning": "provider_release_failed"},
                 )
+            else:
+                if isinstance(outcome, UnloadOutcome):
+                    metadata = {
+                        **result.metadata,
+                        "unload_outcome": {
+                            "requested": outcome.requested,
+                            "confirmed": outcome.confirmed,
+                            "elapsed_seconds": outcome.elapsed_seconds,
+                        },
+                    }
+                    if outcome.warning is not None:
+                        metadata["release_warning"] = outcome.warning
+                    result = replace(result, metadata=metadata)
         return result
 
     def _fallback(

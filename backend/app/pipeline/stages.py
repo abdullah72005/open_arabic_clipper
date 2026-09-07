@@ -433,13 +433,15 @@ class ContextualReconstructionExecutor:
         if transcript is None:
             raise StageExecutionError("normalized transcript is missing")
         started_at = monotonic()
-        with self._lease_factory.acquire(purpose="ollama") as _heavy_lease:
+        with self._lease_factory.acquire(purpose="ollama") as heavy_lease:
             result = self._reconstructor.reconstruct(
                 transcript.segments,
                 language=transcript.language,
                 transcription_fingerprint=transcript.input_fingerprint,
                 correction_version=transcript.correction_version,
             )
+            if result.metadata.get("release_warning"):
+                heavy_lease.retain()
         if transcript.reconstruction_fingerprint == result.fingerprint and not force:
             return StageExecutionResult(result.fingerprint, transcript)
 

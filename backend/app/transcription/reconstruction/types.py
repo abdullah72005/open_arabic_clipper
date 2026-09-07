@@ -126,6 +126,16 @@ def estimate_tokens(text: str) -> int:
 
 
 @dataclass(frozen=True)
+class UnloadOutcome:
+    """Verified result of one model unload attempt."""
+
+    requested: bool
+    confirmed: bool
+    elapsed_seconds: float
+    warning: str | None
+
+
+@dataclass(frozen=True)
 class RequestSizeDiagnostics:
     """Measured serialized prompt size for one reconstruction target."""
 
