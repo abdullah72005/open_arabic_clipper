@@ -96,12 +96,13 @@ class WhisperEngine:
 
 def _default_model_factory(model: str, device: str, compute_type: str) -> WhisperModel:
     try:
-        from faster_whisper import (
-            WhisperModel as FasterWhisperModel,  # type: ignore[import-untyped]
-        )
+        import faster_whisper  # type: ignore[import-untyped]
     except ImportError as err:
         raise RuntimeError("faster-whisper is not installed") from err
-    return cast(WhisperModel, FasterWhisperModel(model, device=device, compute_type=compute_type))
+    return cast(
+        WhisperModel,
+        faster_whisper.WhisperModel(model, device=device, compute_type=compute_type),
+    )
 
 
 def _run_transcription_child(
