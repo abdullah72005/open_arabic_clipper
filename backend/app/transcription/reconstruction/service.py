@@ -7,6 +7,7 @@ import json
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 
+from app.core.enums import ReconstructionStatus
 from app.transcription.reconstruction.confidence import decide_candidate
 from app.transcription.reconstruction.entities import SourceEntityMemory, build_entity_memory
 from app.transcription.reconstruction.providers import (
@@ -22,11 +23,9 @@ from app.transcription.reconstruction.types import (
     ReconstructionResult,
     ResolutionScores,
     SegmentReconstruction,
-    WordEvidence,
 )
 from app.transcription.reconstruction.validation import validate_candidate
 from app.transcription.reconstruction.windows import acoustic_evidence, build_reconstruction_window
-from app.core.enums import ReconstructionStatus
 
 
 class ContextualReconstructor:
@@ -331,7 +330,9 @@ def _reconstruction_request(
         item for item in window.segments if item.segment_index == window.target_segment_index
     )
     position = next(
-        i for i, item in enumerate(window.segments) if item.segment_index == window.target_segment_index
+        i
+        for i, item in enumerate(window.segments)
+        if item.segment_index == window.target_segment_index
     )
     ordered = window.segments
     previous = tuple(item.corrected_text for item in ordered[:position])

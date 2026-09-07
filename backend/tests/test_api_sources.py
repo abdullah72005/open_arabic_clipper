@@ -503,9 +503,7 @@ def test_quality_is_null_until_assessment_exists(
     client: tuple[TestClient, RecordingDispatcher],
 ) -> None:
     test_client, _ = client
-    source = test_client.post(
-        "/sources/upload", files={"file": ("pending.mp4", b"video")}
-    ).json()
+    source = test_client.post("/sources/upload", files={"file": ("pending.mp4", b"video")}).json()
 
     response = test_client.get(f"/api/sources/{source['id']}/quality")
 

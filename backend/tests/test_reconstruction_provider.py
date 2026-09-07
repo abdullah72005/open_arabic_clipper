@@ -13,7 +13,6 @@ from app.transcription.reconstruction.types import (
     AcousticEvidence,
     ProviderAvailability,
     ProviderHealth,
-    ReconstructionCandidate,
     ResolutionScores,
     WordEvidence,
 )
@@ -45,9 +44,7 @@ def test_provider_uses_structured_one_pass_contract() -> None:
                         "unchanged": False,
                         "confidence": 0.92,
                         "explanation": "restore likely elided hamza",
-                        "changes": [
-                            {"from": "كان بيقودها الريس", "to": "كان بيقودها الرئيس"}
-                        ],
+                        "changes": [{"from": "كان بيقودها الريس", "to": "كان بيقودها الرئيس"}],
                     }
                 ]
             }
@@ -132,7 +129,9 @@ def test_provider_shrinks_over_budget_context_deterministically() -> None:
     ) -> bytes:
         assert body is not None
         captured.append(json.loads(body))
-        return _response({"reconstructions": [{"segment_id": 4, "corrected_text": "was", "unchanged": True}]})
+        return _response(
+            {"reconstructions": [{"segment_id": 4, "corrected_text": "was", "unchanged": True}]}
+        )
 
     provider = OpenAICompatibleReconstructionProvider(
         base_url="http://ollama:11434",

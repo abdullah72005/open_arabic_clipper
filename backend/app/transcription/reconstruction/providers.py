@@ -154,8 +154,7 @@ class OpenAICompatibleReconstructionProvider:
     ) -> dict[int, ReconstructionCandidate]:
         if self._max_context_tokens is not None:
             requests = [
-                _shrink_request_to_budget(request, self._max_context_tokens)
-                for request in requests
+                _shrink_request_to_budget(request, self._max_context_tokens) for request in requests
             ]
             for request in requests:
                 if request.estimated_tokens() > self._max_context_tokens:
@@ -166,22 +165,23 @@ class OpenAICompatibleReconstructionProvider:
         content = self._call(
             "You are a conservative Arabic ASR post-processor for Egyptian Arabic speech. "
             "For the target segment, return the most plausible SPOKEN EGYPTIAN ARABIC text. "
-            "Preserve Egyptian colloquial word choices, pronunciation-driven spelling, and dialect. "
+            "Preserve Egyptian colloquial word choices, pronunciation-driven spelling, "
+            "and dialect. "
             "Do NOT standardize into Modern Standard Arabic (MSA). "
-            "Example: ASR 'ثلاثة يام' should become 'تلات أيام' (spoken Egyptian), not 'ثلاثة أيام' (MSA). "
+            "Example: ASR 'ثلاثة يام' should become 'تلات أيام' (spoken Egyptian), "
+            "not 'ثلاثة أيام' (MSA). "
             "Preserve all names, numbers, Latin tokens, and digits exactly as they appear. "
             "Do not add facts, clauses, or change entities. "
             "Use only the small local context provided. "
             "If the raw text is already correct, return it unchanged and set unchanged=true. "
             "Output ONLY a JSON object with this exact shape: "
-            '{"reconstructions": [{"segment_id": int, "corrected_text": string, "unchanged": bool, "confidence": number, "explanation": string, "changes": []}]}.',
+            '{"reconstructions": [{"segment_id": int, "corrected_text": string, '
+            '"unchanged": bool, "confidence": number, "explanation": string, "changes": []}]}.',
             {"targets": [item.to_payload() for item in requests]},
         )
         return _parse_reconstructions(content, requests)
 
-    def _call(
-        self, instruction: str, payload: dict[str, object]
-    ) -> dict[str, object]:
+    def _call(self, instruction: str, payload: dict[str, object]) -> dict[str, object]:
         system_content = instruction
         if self.provider_name == "ollama" and self.model.startswith("qwen3"):
             system_content = instruction + " /no_think"
@@ -315,7 +315,9 @@ def _parse_reconstructions(
 
 
 def _extract_json_object(text: str) -> dict[str, object]:
-    """Extract the payload JSON object from a model response that may include reasoning or markdown."""
+    """Extract the payload JSON object from a model response that may include
+    reasoning or markdown.
+    """
 
     text = text.strip()
     if text.startswith("```"):

@@ -1,8 +1,8 @@
 """Idempotent durable pipeline stage runner."""
 
+import inspect
 from dataclasses import dataclass
 from datetime import datetime, timezone
-import inspect
 from typing import Mapping
 from uuid import UUID
 
@@ -68,7 +68,10 @@ class PipelineRunner:
 
         job = self._load_or_create_job(source.id, stage, job_id)
         now = datetime.now(timezone.utc)
-        if run is None or (run.status is PipelineRunStatus.SUCCEEDED and (force or run.input_fingerprint != input_fingerprint)):
+        if run is None or (
+            run.status is PipelineRunStatus.SUCCEEDED
+            and (force or run.input_fingerprint != input_fingerprint)
+        ):
             run = PipelineRun(source_video_id=source.id, stage=stage)
             if run is not None:
                 latest_attempt = self._session.scalar(

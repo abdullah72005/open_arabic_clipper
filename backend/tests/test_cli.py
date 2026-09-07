@@ -1,4 +1,5 @@
 import json
+import re
 from types import SimpleNamespace
 
 from typer.testing import CliRunner
@@ -6,25 +7,36 @@ from typer.testing import CliRunner
 from app.cli import app
 from app.transcription.reconstruction.types import ProviderAvailability, ProviderHealth
 
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+_HELP_ENV = {"COLUMNS": "120", "LINES": "40"}
+
+
+def _plain_help(stdout: str) -> str:
+    """Strip rich ANSI and wrapping so help assertions survive any terminal width."""
+
+    return re.sub(r"\s+", "", _ANSI.sub("", stdout))
+
+
+def _help(command: list[str]) -> str:
+    result = CliRunner().invoke(app, command, env=_HELP_ENV)
+    assert result.exit_code == 0
+    return _plain_help(result.stdout)
+
 
 def test_stage_2_transcript_commands_are_exposed() -> None:
-    result = CliRunner().invoke(app, ["--help"])
-
-    assert result.exit_code == 0
-    assert "transcribe" in result.stdout
-    assert "retranscribe" in result.stdout
-    assert "reconstruct" in result.stdout
-    assert "benchmark-reconstruction" in result.stdout
-    assert "reconstruction-health" in result.stdout
-    assert "transcript" in result.stdout
+    help_text = _help(["--help"])
+    assert "transcribe" in help_text
+    assert "retranscribe" in help_text
+    assert "reconstruct" in help_text
+    assert "benchmark-reconstruction" in help_text
+    assert "reconstruction-health" in help_text
+    assert "transcript" in help_text
 
 
 def test_benchmark_reconstruction_exposes_model_and_regression_flags() -> None:
-    result = CliRunner().invoke(app, ["benchmark-reconstruction", "--help"])
-
-    assert result.exit_code == 0
-    assert "--model" in result.stdout
-    assert "--allow-known-regression-set" in result.stdout
+    help_text = _help(["benchmark-reconstruction", "--help"])
+    assert "--model" in help_text
+    assert "--allow-known-regression-set" in help_text
 
 
 def test_benchmark_reconstruction_limits_diagnostic_override_to_chernobyl_manifest() -> None:

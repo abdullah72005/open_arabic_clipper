@@ -159,9 +159,7 @@ def test_quality_fingerprint_changes_with_reconstruction_output(sqlite_engine: o
 
         first = assess_source(session, source, transcript, analysis)
         first_fingerprint = first.input_fingerprint
-        transcript.segments = [
-            {**transcript.segments[0], "reconstruction_status": "FAILED"}
-        ]
+        transcript.segments = [{**transcript.segments[0], "reconstruction_status": "FAILED"}]
         transcript.reconstruction_fingerprint = "c" * 64
         second = assess_source(session, source, transcript, analysis)
 
@@ -205,9 +203,7 @@ def test_cached_audio_recomputes_transcript_derived_quality(
         assessment = assess_source(session, source, transcript, analysis)
         original_quality_fingerprint = assessment.input_fingerprint
 
-        transcript.segments = [
-            {**transcript.segments[0], "reconstruction_status": "FAILED"}
-        ]
+        transcript.segments = [{**transcript.segments[0], "reconstruction_status": "FAILED"}]
         transcript.reconstruction_fingerprint = "d" * 64
         result = executor.execute(source)
 

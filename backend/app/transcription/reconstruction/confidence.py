@@ -55,4 +55,6 @@ def decide_candidate(
     if all(medium_checks.values()):
         return ReconstructionDecision(ConfidenceLevel.MEDIUM, False, score, None)
     failed = [name for name, passed in high_checks.items() if not passed]
-    return ReconstructionDecision(ConfidenceLevel.LOW, False, score, ",".join(failed) or "low_confidence")
+    return ReconstructionDecision(
+        ConfidenceLevel.LOW, False, score, ",".join(failed) or "low_confidence"
+    )

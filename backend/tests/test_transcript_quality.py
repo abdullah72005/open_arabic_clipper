@@ -47,9 +47,7 @@ def transcript_with(
 
 
 def test_low_confidence_word_ratio_uses_configured_boundary() -> None:
-    evidence = assess_transcript_quality(
-        transcript_with(probabilities=[0.71, 0.72, 0.90])
-    )
+    evidence = assess_transcript_quality(transcript_with(probabilities=[0.71, 0.72, 0.90]))
 
     assert evidence.low_confidence_word_ratio == pytest.approx(1 / 3)
 
@@ -96,9 +94,7 @@ def test_provider_unavailable_segment_is_uncapped_when_not_routed() -> None:
 
 
 def test_not_required_segments_are_excluded_from_weighted_average() -> None:
-    transcript = transcript_with(
-        probabilities=[0.9], statuses=["NOT_REQUIRED", "FAILED"]
-    )
+    transcript = transcript_with(probabilities=[0.9], statuses=["NOT_REQUIRED", "FAILED"])
 
     evidence = assess_transcript_quality(transcript)
 

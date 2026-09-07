@@ -28,6 +28,11 @@ class TranscriptionOptions:
     def fingerprint(self, audio_hash: str) -> str:
         """Return the deterministic cache key for audio and output-affecting options."""
 
-        return canonical_fingerprint("transcription-input", "1", {
-            "audio_hash": audio_hash, "options": asdict(self),
-        })
+        return canonical_fingerprint(
+            "transcription-input",
+            "1",
+            {
+                "audio_hash": audio_hash,
+                "options": asdict(self),
+            },
+        )

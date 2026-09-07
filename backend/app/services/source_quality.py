@@ -208,8 +208,7 @@ def _weighted_raw_acoustic(transcript: Transcript) -> float:
     values = [
         (_segment_weight(segment), _clamp(acoustic_evidence(segment).confidence or 0.0))
         for segment in _segments(transcript)
-        if _status(segment.get("reconstruction_status"))
-        != ReconstructionStatus.NOT_REQUIRED.value
+        if _status(segment.get("reconstruction_status")) != ReconstructionStatus.NOT_REQUIRED.value
     ]
     return _clamp(_weighted_average(values))
 
@@ -218,11 +217,7 @@ def _weighted_average(values: Sequence[tuple[float, float]]) -> float:
     if len(values) == 1:
         return values[0][1]
     total_weight = sum(weight for weight, _ in values)
-    return (
-        sum(weight * value for weight, value in values) / total_weight
-        if total_weight
-        else 0.0
-    )
+    return sum(weight * value for weight, value in values) / total_weight if total_weight else 0.0
 
 
 def _segment_weight(segment: Mapping[str, object]) -> float:

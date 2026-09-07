@@ -1,3 +1,4 @@
+from app.core.enums import ReconstructionStatus
 from app.transcription.reconstruction.providers import (
     ProviderResponseError,
     ReconstructionRequest,
@@ -8,13 +9,8 @@ from app.transcription.reconstruction.types import (
     ProviderAvailability,
     ProviderHealth,
     ReconstructionCandidate,
-    ReconstructionWindow,
     ResolutionScores,
-    WindowSegment,
-    WordEvidence,
 )
-from app.transcription.reconstruction.windows import acoustic_evidence
-from app.core.enums import ReconstructionStatus
 
 
 class OnePassProvider:
@@ -69,7 +65,15 @@ def test_reconstructor_applies_only_high_contextual_candidate() -> None:
 
 def test_operator_text_precedes_provider_candidate_and_is_manual_override() -> None:
     result = ContextualReconstructor(OnePassProvider()).reconstruct(
-        [{"start": 0.0, "end": 1.0, "text": "دخم", "corrected_text": "دخم", "operator_text": "يدوي"}],
+        [
+            {
+                "start": 0.0,
+                "end": 1.0,
+                "text": "دخم",
+                "corrected_text": "دخم",
+                "operator_text": "يدوي",
+            }
+        ],
         language="ar",
         transcription_fingerprint="asr-v1",
         correction_version="egyptian-ar-v1",
@@ -110,9 +114,7 @@ def test_reconstructor_without_provider_preserves_stage_2_5_text() -> None:
 def test_reconstructor_falls_back_only_for_expected_provider_failures() -> None:
     class BrokenProvider:
         def health(self) -> ProviderHealth:
-            return ProviderHealth(
-                ProviderAvailability.AVAILABLE, "test", "test", "sha256:x", "ok"
-            )
+            return ProviderHealth(ProviderAvailability.AVAILABLE, "test", "test", "sha256:x", "ok")
 
         def reconstruct_segments(
             self, requests: list[ReconstructionRequest]

@@ -15,11 +15,11 @@ from app.core.enums import ReconstructionStatus
 from app.core.settings import get_settings
 from app.media.analysis import parse_silencedetect, silence_ratio, windowed_rms
 from app.media.audio import AudioExtractor
-from app.media.ffprobe import FFprobe, MediaMetadata
+from app.media.ffprobe import FFprobe
 from app.models import AudioAnalysis, AudioArtifact, SourceVideo, Transcript, TranscriptChunk
-from app.pipeline.runner import StageExecutionError
 from app.pipeline.executor import StageExecutionResult
 from app.pipeline.fingerprints import canonical_fingerprint
+from app.pipeline.runner import StageExecutionError
 from app.services.source_adapters import YtDlpAdapter
 from app.services.source_quality import assess_source, quality_input_fingerprint
 from app.services.storage import StorageCategory, StorageService
@@ -51,7 +51,9 @@ class TranscriptionExecutor:
         self._storage = storage
 
     def input_fingerprint(self, source: SourceVideo) -> str:
-        artifact = self._session.scalar(select(AudioArtifact).where(AudioArtifact.source_video_id == source.id))
+        artifact = self._session.scalar(
+            select(AudioArtifact).where(AudioArtifact.source_video_id == source.id)
+        )
         if artifact is None:
             return ""
         return self._options.fingerprint(artifact.content_hash)
@@ -81,10 +83,19 @@ class TranscriptionExecutor:
             self._session.add(transcript)
         self._session.commit()
         self._session.refresh(transcript)
-        return StageExecutionResult(canonical_fingerprint("transcription-output", "1", {
-            "raw_text": transcript.raw_text, "segments": transcript.segments,
-            "word_segments": transcript.word_segments, "revision": transcript.transcription_revision,
-        }), transcript)
+        return StageExecutionResult(
+            canonical_fingerprint(
+                "transcription-output",
+                "1",
+                {
+                    "raw_text": transcript.raw_text,
+                    "segments": transcript.segments,
+                    "word_segments": transcript.word_segments,
+                    "revision": transcript.transcription_revision,
+                },
+            ),
+            transcript,
+        )
 
     def _apply(
         self,
@@ -153,9 +164,17 @@ class IngestExecutor:
             acquired = self._url_adapter.acquire(source.id, source.source_uri)
             source.source_uri = str(acquired.path)
             source.original_filename = acquired.original_filename
-        return StageExecutionResult(canonical_fingerprint("ingest-output", "1", {
-            "source_uri": source.source_uri or "", "original_filename": source.original_filename or "",
-        }), source)
+        return StageExecutionResult(
+            canonical_fingerprint(
+                "ingest-output",
+                "1",
+                {
+                    "source_uri": source.source_uri or "",
+                    "original_filename": source.original_filename or "",
+                },
+            ),
+            source,
+        )
 
 
 class ProbeExecutor:
@@ -165,7 +184,11 @@ class ProbeExecutor:
         self._probe = probe
 
     def input_fingerprint(self, source: SourceVideo) -> str:
-        return canonical_fingerprint("probe-input", "1", {"source_uri": source.source_uri or "", "content_hash": source.content_hash or ""})
+        return canonical_fingerprint(
+            "probe-input",
+            "1",
+            {"source_uri": source.source_uri or "", "content_hash": source.content_hash or ""},
+        )
 
     def execute(self, source: SourceVideo, *, force: bool = False) -> StageExecutionResult:
         source_path = Path(source.source_uri)
@@ -188,13 +211,25 @@ class AudioExtractionExecutor:
         self._extractor = extractor
 
     def input_fingerprint(self, source: SourceVideo) -> str:
-        return canonical_fingerprint("audio-extraction-input", "1", {"source_uri": source.source_uri or "", "content_hash": source.content_hash or ""})
+        return canonical_fingerprint(
+            "audio-extraction-input",
+            "1",
+            {"source_uri": source.source_uri or "", "content_hash": source.content_hash or ""},
+        )
 
     def execute(self, source: SourceVideo, *, force: bool = False) -> StageExecutionResult:
         artifact = self._extractor.extract(source)
-        return StageExecutionResult(canonical_fingerprint("audio-extraction-output", "1", {
-            "content_hash": artifact.content_hash, "output_path": artifact.output_path,
-        }), artifact)
+        return StageExecutionResult(
+            canonical_fingerprint(
+                "audio-extraction-output",
+                "1",
+                {
+                    "content_hash": artifact.content_hash,
+                    "output_path": artifact.output_path,
+                },
+            ),
+            artifact,
+        )
 
 
 class TranscriptNormalizationExecutor:
@@ -205,14 +240,20 @@ class TranscriptNormalizationExecutor:
         self._corrector = corrector or ContextualCorrector.from_default_lexicon()
 
     def input_fingerprint(self, source: SourceVideo) -> str:
-        transcript = self._session.scalar(select(Transcript).where(Transcript.source_video_id == source.id))
+        transcript = self._session.scalar(
+            select(Transcript).where(Transcript.source_video_id == source.id)
+        )
         if transcript is None:
             return ""
-        return canonical_fingerprint("normalization-input", "1", {
-            "transcription_fingerprint": transcript.input_fingerprint,
-            "transcription_revision": transcript.transcription_revision,
-            "correction_version": "egyptian-ar-v1",
-        })
+        return canonical_fingerprint(
+            "normalization-input",
+            "1",
+            {
+                "transcription_fingerprint": transcript.input_fingerprint,
+                "transcription_revision": transcript.transcription_revision,
+                "correction_version": "egyptian-ar-v1",
+            },
+        )
 
     def execute(self, source: SourceVideo, *, force: bool = False) -> StageExecutionResult:
         transcript = self._session.scalar(
@@ -261,9 +302,14 @@ class TranscriptNormalizationExecutor:
             str(segment["final_text"]) for segment in normalized_segments
         ).strip()
         transcript.normalized_text = normalize_transcript(transcript.final_text)
-        transcript.normalization_fingerprint = canonical_fingerprint("normalization-output", "1", {
-            "segments": normalized_segments, "transcription_revision": transcript.transcription_revision,
-        })
+        transcript.normalization_fingerprint = canonical_fingerprint(
+            "normalization-output",
+            "1",
+            {
+                "segments": normalized_segments,
+                "transcription_revision": transcript.transcription_revision,
+            },
+        )
         total_segments = len(normalized_segments)
         applied = [segment for segment in normalized_segments if segment["correction_applied"]]
         uncertain = [
@@ -332,14 +378,20 @@ class ContextualReconstructionExecutor:
         self._reconstructor = reconstructor
 
     def input_fingerprint(self, source: SourceVideo) -> str:
-        transcript = self._session.scalar(select(Transcript).where(Transcript.source_video_id == source.id))
+        transcript = self._session.scalar(
+            select(Transcript).where(Transcript.source_video_id == source.id)
+        )
         if transcript is None:
             return ""
-        return canonical_fingerprint("reconstruction-input", "1", {
-            "normalization_fingerprint": transcript.normalization_fingerprint,
-            "transcription_revision": transcript.transcription_revision,
-            "provider": type(self._reconstructor).__name__,
-        })
+        return canonical_fingerprint(
+            "reconstruction-input",
+            "1",
+            {
+                "normalization_fingerprint": transcript.normalization_fingerprint,
+                "transcription_revision": transcript.transcription_revision,
+                "provider": type(self._reconstructor).__name__,
+            },
+        )
 
     def execute(self, source: SourceVideo, *, force: bool = False) -> StageExecutionResult:
         transcript = self._session.scalar(
@@ -438,8 +490,7 @@ class ContextualReconstructionExecutor:
                 1 for item in result.segments if getattr(item, "routing_score", None) is not None
             ),
             "unresolved_segments": sum(
-                1 for status in statuses
-                if status is ReconstructionStatus.LOW_CONFIDENCE_UNRESOLVED
+                1 for status in statuses if status is ReconstructionStatus.LOW_CONFIDENCE_UNRESOLVED
             ),
             "batch_count": 1 if total else 0,
             "status_counts": status_counts,
@@ -552,13 +603,22 @@ class AudioAnalysisExecutor:
         self._command_runner = command_runner
 
     def input_fingerprint(self, source: SourceVideo) -> str:
-        artifact = self._session.scalar(select(AudioArtifact).where(AudioArtifact.source_video_id == source.id))
-        transcript = self._session.scalar(select(Transcript).where(Transcript.source_video_id == source.id))
+        artifact = self._session.scalar(
+            select(AudioArtifact).where(AudioArtifact.source_video_id == source.id)
+        )
+        transcript = self._session.scalar(
+            select(Transcript).where(Transcript.source_video_id == source.id)
+        )
         if artifact is None or transcript is None:
             return ""
-        return canonical_fingerprint("audio-analysis-input", "1", {
-            "audio_hash": artifact.content_hash, "transcription_revision": transcript.transcription_revision,
-        })
+        return canonical_fingerprint(
+            "audio-analysis-input",
+            "1",
+            {
+                "audio_hash": artifact.content_hash,
+                "transcription_revision": transcript.transcription_revision,
+            },
+        )
 
     def execute(self, source: SourceVideo, *, force: bool = False) -> StageExecutionResult:
         artifact = self._session.scalar(
@@ -575,9 +635,8 @@ class AudioAnalysisExecutor:
         current_input = self.input_fingerprint(source)
         if existing is not None and existing.input_fingerprint == current_input and not force:
             quality = source.quality_assessment
-            if (
-                quality is not None
-                and quality.input_fingerprint == quality_input_fingerprint(transcript, existing)
+            if quality is not None and quality.input_fingerprint == quality_input_fingerprint(
+                transcript, existing
             ):
                 return StageExecutionResult(current_input, existing)
             duration = max(artifact.duration, transcript.duration)
@@ -630,7 +689,16 @@ class AudioAnalysisExecutor:
         self._session.commit()
         self._session.refresh(analysis)
         assess_source(self._session, source, transcript, analysis)
-        return StageExecutionResult(canonical_fingerprint("audio-analysis-output", "1", {
-            "audio_hash": analysis.audio_hash, "features": analysis.features,
-            "silence_intervals": analysis.silence_intervals, "transcription_revision": transcript.transcription_revision,
-        }), analysis)
+        return StageExecutionResult(
+            canonical_fingerprint(
+                "audio-analysis-output",
+                "1",
+                {
+                    "audio_hash": analysis.audio_hash,
+                    "features": analysis.features,
+                    "silence_intervals": analysis.silence_intervals,
+                    "transcription_revision": transcript.transcription_revision,
+                },
+            ),
+            analysis,
+        )

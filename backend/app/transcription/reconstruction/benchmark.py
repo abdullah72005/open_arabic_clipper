@@ -527,17 +527,13 @@ def _word_equivalent(candidate: str, reference: str) -> bool:
         return False
     if abs(len(candidate) - len(reference)) == 1:
         longer, shorter = (
-            (candidate, reference)
-            if len(candidate) > len(reference)
-            else (reference, candidate)
+            (candidate, reference) if len(candidate) > len(reference) else (reference, candidate)
         )
         if longer.startswith(shorter) or longer.endswith(shorter):
             return True
     if len(candidate) == len(reference):
         differences = [
-            (left, right)
-            for left, right in zip(candidate, reference, strict=True)
-            if left != right
+            (left, right) for left, right in zip(candidate, reference, strict=True) if left != right
         ]
         if len(differences) == 1 and differences[0] in _EGYPTIAN_DENTAL_SHIFTS:
             return True

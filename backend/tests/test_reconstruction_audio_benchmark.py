@@ -146,9 +146,9 @@ def test_classify_comparison_keeps_real_meaning_changes_as_errors() -> None:
 
 
 def test_comparison_status_treats_unresolved_reconstruction_and_missing_reference() -> None:
-    assert (
-        comparison_status(ReconstructionStatus.LOW_CONFIDENCE_UNRESOLVED, "a", "b", "c")
-        == ("unresolved", "unresolved")
+    assert comparison_status(ReconstructionStatus.LOW_CONFIDENCE_UNRESOLVED, "a", "b", "c") == (
+        "unresolved",
+        "unresolved",
     )
     assert comparison_status(ReconstructionStatus.APPLIED, "a", "b", "") == (
         "unresolved",
@@ -431,7 +431,13 @@ def test_runner_executes_pipeline_in_order_and_writes_deterministic_artifacts(
         result.exact_unchanged_wrong,
         result.exact_regressed,
         result.exact_hallucinated,
-    } == {result.improved, result.unchanged_correct, result.unchanged_wrong, result.regressed, result.hallucinated}
+    } == {
+        result.improved,
+        result.unchanged_correct,
+        result.unchanged_wrong,
+        result.regressed,
+        result.hallucinated,
+    }
     assert result.report_path is not None
     assert result.report_path.is_relative_to(storage.category_root(StorageCategory.BENCHMARKS))
 

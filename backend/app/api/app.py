@@ -573,7 +573,10 @@ def _quality_metrics_response(
 def _public_reconstruction_metadata(transcript: Transcript) -> dict[str, object]:
     metadata = _without_secrets(transcript.reconstruction_metadata)
     availability = metadata.get("provider_availability")
-    if availability is None and transcript.reconstruction_status is ReconstructionStatus.PROVIDER_UNAVAILABLE:
+    if (
+        availability is None
+        and transcript.reconstruction_status is ReconstructionStatus.PROVIDER_UNAVAILABLE
+    ):
         availability = "UNAVAILABLE"
     metadata["reconstruction_status"] = transcript.reconstruction_status.value
     metadata["provider_health"] = {

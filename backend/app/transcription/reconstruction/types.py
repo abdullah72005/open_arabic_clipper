@@ -30,6 +30,7 @@ class WindowSegment:
     following_context: str = ""
     word_evidence: tuple["WordEvidence", ...] = ()
 
+
 @dataclass(frozen=True)
 class WordEvidence:
     text: str
@@ -96,9 +97,13 @@ class ResolutionScores:
 
     @property
     def score(self) -> float:
-        return (0.35 * self.semantic_coherence + 0.25 * self.egyptian_naturalness
-                + 0.15 * self.discourse_continuity + 0.10 * self.entity_consistency
-                + 0.15 * self.selection_confidence)
+        return (
+            0.35 * self.semantic_coherence
+            + 0.25 * self.egyptian_naturalness
+            + 0.15 * self.discourse_continuity
+            + 0.10 * self.entity_consistency
+            + 0.15 * self.selection_confidence
+        )
 
 
 @dataclass(frozen=True)

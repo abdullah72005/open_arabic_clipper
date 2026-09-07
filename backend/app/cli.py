@@ -187,10 +187,7 @@ def benchmark_reconstruction(
 
     settings = get_settings()
     storage = _storage()
-    if (
-        allow_known_regression_set
-        and manifest_name != _KNOWN_REGRESSION_MANIFEST_NAME
-    ):
+    if allow_known_regression_set and manifest_name != _KNOWN_REGRESSION_MANIFEST_NAME:
         raise typer.BadParameter(
             "--allow-known-regression-set is reserved for the Chernobyl diagnostic manifest"
         )

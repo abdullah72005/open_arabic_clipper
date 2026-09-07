@@ -1,4 +1,5 @@
 """Stable content fingerprints for pipeline dependencies."""
+
 import hashlib
 import json
 from collections.abc import Mapping
