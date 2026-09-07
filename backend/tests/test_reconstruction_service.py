@@ -9,7 +9,6 @@ from app.transcription.reconstruction.types import (
     ProviderAvailability,
     ProviderHealth,
     ReconstructionCandidate,
-    ResolutionScores,
 )
 
 
@@ -20,7 +19,7 @@ class OnePassProvider:
         self._candidate = candidate or ReconstructionCandidate(
             "provider-0",
             "ضخمة",
-            scores=ResolutionScores(1.0, 1.0, 1.0, 1.0, 1.0),
+            provider_confidence=1.0,
         )
 
     def health(self) -> ProviderHealth:
@@ -177,6 +176,44 @@ def test_final_text_priority_keeps_manual_text_above_reconstruction() -> None:
         )
         == "manual"
     )
+
+
+def test_deterministic_validation_failure_is_never_applied() -> None:
+    """A protected-token change is rejected before the confidence policy runs."""
+
+    provider = OnePassProvider(
+        ReconstructionCandidate("provider-0", "الرئيس 70", provider_confidence=1.0)
+    )
+    result = ContextualReconstructor(provider).reconstruct(
+        [{"start": 0.0, "end": 1.0, "text": "الرئيس 71", "corrected_text": "الرئيس 71"}],
+        language="ar",
+        transcription_fingerprint="asr-v1",
+        correction_version="egyptian-ar-v1",
+    )
+
+    segment = result.segments[0]
+    assert segment.applied is False
+    assert segment.status is ReconstructionStatus.LOW_CONFIDENCE_UNRESOLVED
+    assert segment.contextual_reconstructed_text == "الرئيس 71"
+    assert segment.confidence == 0.0
+
+
+def test_unchanged_candidate_text_remains_unchanged() -> None:
+    """A provider proposal identical to Stage 2.5 never fabricates a reconstruction."""
+
+    provider = OnePassProvider(
+        ReconstructionCandidate("provider-0", "خلي بالك", provider_confidence=0.99)
+    )
+    result = ContextualReconstructor(provider).reconstruct(
+        [{"start": 0.0, "end": 1.0, "text": "خلي بالك", "corrected_text": "خلي بالك"}],
+        language="ar",
+        transcription_fingerprint="asr-v1",
+        correction_version="egyptian-ar-v1",
+    )
+
+    segment = result.segments[0]
+    assert segment.applied is False
+    assert segment.contextual_reconstructed_text == "خلي بالك"
 
 
 def test_reconstructor_sends_small_context_window() -> None:

@@ -83,27 +83,8 @@ class ReconstructionCandidate:
     text: str
     changes: tuple[dict[str, object], ...] = ()
     evidence_segment_ids: tuple[int, ...] = ()
-    scores: ResolutionScores | None = None
+    provider_confidence: float = 0.0
     explanation: str = ""
-
-
-@dataclass(frozen=True)
-class ResolutionScores:
-    semantic_coherence: float
-    egyptian_naturalness: float
-    discourse_continuity: float
-    entity_consistency: float
-    selection_confidence: float
-
-    @property
-    def score(self) -> float:
-        return (
-            0.35 * self.semantic_coherence
-            + 0.25 * self.egyptian_naturalness
-            + 0.15 * self.discourse_continuity
-            + 0.10 * self.entity_consistency
-            + 0.15 * self.selection_confidence
-        )
 
 
 @dataclass(frozen=True)

@@ -13,7 +13,6 @@ from app.transcription.reconstruction.types import (
     AcousticEvidence,
     ProviderAvailability,
     ProviderHealth,
-    ResolutionScores,
     WordEvidence,
 )
 
@@ -81,13 +80,8 @@ def test_provider_uses_structured_one_pass_contract() -> None:
     candidate = result[4]
     assert candidate.candidate_id == "provider-0"
     assert candidate.text == "كان بيقودها الرئيس"
-    assert candidate.scores == ResolutionScores(
-        semantic_coherence=0.92,
-        egyptian_naturalness=0.92,
-        discourse_continuity=0.92,
-        entity_consistency=0.92,
-        selection_confidence=0.92,
-    )
+    assert candidate.provider_confidence == 0.92
+    assert getattr(candidate, "scores", None) is None
     assert captured[0]["temperature"] == 0
     assert captured[0]["max_tokens"] == 256
     assert "response_format" not in captured[0]
@@ -224,7 +218,7 @@ def test_openai_compatible_release_is_a_no_op() -> None:
     assert calls == 0
 
 
-def test_parse_reconstructions_propagates_scores() -> None:
+def test_parse_reconstructions_preserves_single_provider_confidence() -> None:
     request = ReconstructionRequest(segment_index=4, raw_text="raw", corrected_text="raw")
     result = _parse_reconstructions(
         {
@@ -241,7 +235,8 @@ def test_parse_reconstructions_propagates_scores() -> None:
         [request],
     )
     assert result[4].text == "new"
-    assert result[4].scores.selection_confidence == 0.88
+    assert result[4].provider_confidence == 0.88
+    assert getattr(result[4], "scores", None) is None
 
 
 @pytest.mark.parametrize(

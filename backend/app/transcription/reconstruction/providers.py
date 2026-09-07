@@ -14,7 +14,6 @@ from app.transcription.reconstruction.types import (
     ProviderAvailability,
     ProviderHealth,
     ReconstructionCandidate,
-    ResolutionScores,
     WordEvidence,
 )
 
@@ -291,20 +290,13 @@ def _parse_reconstructions(
             raise ProviderResponseError("provider reconstruction has invalid text")
         unchanged = bool(entry.get("unchanged"))
         confidence = _validated_confidence(entry)
-        scores = ResolutionScores(
-            semantic_coherence=confidence,
-            egyptian_naturalness=confidence,
-            discourse_continuity=confidence,
-            entity_consistency=confidence,
-            selection_confidence=confidence,
-        )
         changes = tuple(entry.get("changes", [])) if isinstance(entry.get("changes"), list) else ()
         explanation = str(entry.get("explanation", ""))
         result[index] = ReconstructionCandidate(
             candidate_id="raw" if unchanged else "provider-0",
             text=text,
             changes=changes,
-            scores=scores,
+            provider_confidence=confidence,
             explanation=explanation,
         )
     if set(result) != requested:

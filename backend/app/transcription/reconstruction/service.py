@@ -21,7 +21,6 @@ from app.transcription.reconstruction.types import (
     QualityFlag,
     ReconstructionCandidate,
     ReconstructionResult,
-    ResolutionScores,
     SegmentReconstruction,
 )
 from app.transcription.reconstruction.validation import validate_candidate
@@ -232,14 +231,11 @@ class ContextualReconstructor:
                 reconstruction_method=provider_method,
                 validation_reason=validation.reason,
             )
-        scores = candidate.scores or _neutral_scores()
-        margin = scores.selection_confidence
         decision = decide_candidate(
+            provider_confidence=candidate.provider_confidence,
             phonetic_similarity=validation.phonetic_similarity,
-            resolution=scores,
             raw_acoustic_confidence=acoustic_evidence(segment).confidence,
             edit_ratio=validation.edit_ratio,
-            margin=margin,
             token_delta=validation.token_delta,
         )
         text = candidate.text if decision.applied else corrected
@@ -260,7 +256,7 @@ class ContextualReconstructor:
             text,
             candidate.text,
             decision.applied,
-            decision.score,
+            decision.provider_confidence,
             decision.level,
             flags,
             status,
@@ -270,7 +266,7 @@ class ContextualReconstructor:
             validated_changes=candidate.changes,
             reconstruction_method=provider_method,
             candidate_id=candidate.candidate_id,
-            confidence_margin=margin,
+            confidence_margin=0.0,
             explanation=candidate.explanation,
             decision_reason=decision.reason,
         )
@@ -370,7 +366,3 @@ def _batch_requests(
     if max_windows < 1:
         max_windows = 1
     return [requests[i : i + max_windows] for i in range(0, len(requests), max_windows)]
-
-
-def _neutral_scores() -> ResolutionScores:
-    return ResolutionScores(0.5, 0.5, 0.5, 0.5, 0.5)
