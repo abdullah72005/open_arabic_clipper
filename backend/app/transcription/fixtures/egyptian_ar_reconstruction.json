@@ -12,5 +12,10 @@
     ,{"id":"temporary-clearance","category":"multiword","previous":"اتأجلت الخطة","raw":"عملية إخلاق مؤقت","next":"لحد إشعار تاني","expected":"عملية إخلاء مؤقت","semantic_review":"Restore a multi-word Egyptian phrase.","must_change":true,"protected_tokens":[]}
     ,{"id":"three-days","category":"multiword","previous":"استنوا شوية","raw":"ثلاث يام بس لتطهير النطقة","next":"وبعدين نمشي","expected":"تلات أيام بس لتطهير المنطقة","semantic_review":"Repair several low-probability words without realignment.","must_change":true,"protected_tokens":[]}
     ,{"id":"no-excuse","category":"multiword","previous":"متقلقوش","raw":"يا جماعة مفيش دقل للزعو","next":"خلاص الموضوع بسيط","expected":"يا جماعة مفيش داعي للذعر","semantic_review":"Restore a contextual multi-word phrase.","must_change":true,"protected_tokens":[]}
+  ],
+  "word_pairs": [
+    {"a":"يام","b":"أيام","notes":"Prosthetic alef variant reviewed as dialect orthography."},
+    {"a":"تلات","b":"تلاتة","notes":"Word-final ة/ه suffix reviewed as dialect orthography."},
+    {"a":"تلات","b":"ثلاثة","notes":"Reviewed dental shift for the spoken numeral only."}
   ]
 }

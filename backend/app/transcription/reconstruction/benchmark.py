@@ -7,6 +7,7 @@ import re
 import resource
 import subprocess
 import time
+import unicodedata
 import uuid
 from collections import Counter
 from collections.abc import Callable, Sequence
@@ -56,6 +57,18 @@ class Reconstructor(Protocol):
 _MANIFEST_VERSION = "stage-2-7-private-v1"
 _REQUIRED_CATEGORIES = {"slang", "fast_speech", "code_switching", "entities", "narrative"}
 _SWAP_INFEASIBLE_BYTES = 1024**3
+_VALID_HUMAN_LABELS = frozenset(
+    {
+        "improved",
+        "unchanged_correct",
+        "unchanged_wrong",
+        "regressed",
+        "changed_wrong",
+        "hallucinated",
+        "unresolved",
+    }
+)
+_EXACT_WHITESPACE = re.compile(r"\s+")
 
 
 class BenchmarkSource(BaseModel):
@@ -87,6 +100,8 @@ class ReferenceSegment(BaseModel):
     def _validate(self) -> "ReferenceSegment":
         if not self.reviewed:
             raise ValueError("every benchmark reference must be reviewed")
+        if self.human_label is not None and self.human_label not in _VALID_HUMAN_LABELS:
+            raise ValueError(f"unknown human label: {self.human_label}")
         return self
 
 
@@ -187,13 +202,15 @@ class BenchmarkReport(BaseModel):
     regressed: int = Field(ge=0)
     preserved: int = Field(ge=0)
     hallucinated: int = Field(ge=0)
+    changed_wrong: int = Field(default=0, ge=0)
+    unreviewed: int = Field(default=0, ge=0)
     comprehensibility_stage25: dict[str, float] = Field(default_factory=dict)
     comprehensibility_stage27: dict[str, float] = Field(default_factory=dict)
     exact_improved: int = Field(default=0, ge=0)
     exact_unchanged_correct: int = Field(default=0, ge=0)
     exact_unchanged_wrong: int = Field(default=0, ge=0)
     exact_regressed: int = Field(default=0, ge=0)
-    exact_hallucinated: int = Field(default=0, ge=0)
+    exact_changed_wrong: int = Field(default=0, ge=0)
     source_audio_seconds: float = Field(gt=0)
     wall_clock_seconds: float = Field(gt=0)
     peak_ram_bytes: int = Field(ge=0)
@@ -207,6 +224,12 @@ class BenchmarkReport(BaseModel):
     @property
     def throughput_audio_minutes_per_wall_minute(self) -> float:
         return self.source_audio_seconds / self.wall_clock_seconds
+
+    @property
+    def reviewed_denominator(self) -> int:
+        """Referenced rows are never removed from the correctness denominator."""
+
+        return self.stage25_correct + self.stage25_wrong
 
 
 class BenchmarkRunner:
@@ -269,6 +292,8 @@ class BenchmarkRunner:
         counts: Counter[str] = Counter()
         exact_counts: Counter[str] = Counter()
         provider_died = False
+        unresolved = 0
+        unreviewed = 0
 
         for clip in manifest.clips:
             source_path = self._storage.resolve(
@@ -320,8 +345,16 @@ class BenchmarkRunner:
                 )
                 if item is not None and item.status is ReconstructionStatus.PROVIDER_UNAVAILABLE:
                     provider_died = True
-                counts[human_label or status] += 1
-                exact_counts[human_label or exact_status] += 1
+                is_unresolved_runtime = item is not None and item.status in {
+                    ReconstructionStatus.LOW_CONFIDENCE_UNRESOLVED,
+                    ReconstructionStatus.PROVIDER_UNAVAILABLE,
+                }
+                if reference_segment is not None:
+                    unresolved += int(is_unresolved_runtime)
+                    counts[human_label or status] += 1
+                    exact_counts[exact_status] += 1
+                else:
+                    unreviewed += 1
                 rows.append(
                     {
                         "clip_id": clip.id,
@@ -349,10 +382,10 @@ class BenchmarkRunner:
         unchanged_correct = counts["unchanged_correct"]
         unchanged_wrong = counts["unchanged_wrong"]
         regressed = counts["regressed"]
+        changed_wrong = counts["changed_wrong"]
         hallucinated = counts["hallucinated"]
-        unresolved = counts["unresolved"]
         stage25_correct = unchanged_correct + regressed
-        stage25_wrong = improved + unchanged_wrong + hallucinated
+        stage25_wrong = improved + unchanged_wrong + changed_wrong + hallucinated
         reviewed_total = stage25_correct + stage25_wrong
 
         report = BenchmarkReport(
@@ -376,11 +409,13 @@ class BenchmarkRunner:
             regressed=regressed,
             preserved=unchanged_correct,
             hallucinated=hallucinated,
+            changed_wrong=changed_wrong,
+            unreviewed=unreviewed,
             exact_improved=exact_counts["improved"],
             exact_unchanged_correct=exact_counts["unchanged_correct"],
             exact_unchanged_wrong=exact_counts["unchanged_wrong"],
             exact_regressed=exact_counts["regressed"],
-            exact_hallucinated=exact_counts["hallucinated"],
+            exact_changed_wrong=exact_counts["changed_wrong"],
             source_audio_seconds=sum(
                 clip.end_seconds - clip.start_seconds for clip in manifest.clips
             ),
@@ -447,26 +482,32 @@ class BenchmarkRunner:
         )
 
 
-_EGYPTIAN_DENTAL_SHIFTS = frozenset(
-    {
-        ("ث", "ت"),
-        ("ت", "ث"),
-        ("ذ", "د"),
-        ("د", "ذ"),
-        ("ظ", "ز"),
-        ("ز", "ظ"),
-    }
-)
+def _load_dialect_pairs() -> frozenset[tuple[str, str]]:
+    """Load the small reviewed Egyptian orthography lexicon stored as data."""
+
+    path = Path(__file__).parents[1] / "fixtures" / "egyptian_ar_reconstruction.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    pairs: set[tuple[str, str]] = set()
+    for entry in payload.get("word_pairs", []):
+        left = normalize_for_comparison(str(entry["a"])).strip()
+        right = normalize_for_comparison(str(entry["b"])).strip()
+        if left and right and left != right:
+            pairs.add((left, right))
+            pairs.add((right, left))
+    return frozenset(pairs)
+
+
+_DIALECT_PAIRS = _load_dialect_pairs()
 _PROTECTED_TOKEN = re.compile(r"[A-Za-z0-9٠-٩]")
 
 
 def classify_comparison(stage25: str, stage27: str, reference: str) -> str:
-    """Classify one segment by semantic/phonetic equivalence to its reference.
+    """Classify one segment by deterministic Egyptian word-pair equivalence.
 
-    Egyptian dialect spelling variants (prosthetic alef like ``يام``/``أيام``,
-    suffix ``ة`` like ``تلات``/``تلاتة``, dental shifts like ``تلات``/``ثلاثة``)
-    are equivalent. Names, numbers, Latin tokens, and meaning-changing
-    substitutions are not. Exact string equality is tracked separately via
+    Only the reviewed orthography lexicon stored in the reconstruction fixture
+    declares words equivalent. Possessives, names with dental shifts, verb
+    changes, numbers, and Latin tokens remain distinct unless an explicit pair
+    says otherwise. Exact string equality is tracked separately via
     ``exact_classify_comparison``.
     """
 
@@ -478,12 +519,12 @@ def classify_comparison(stage25: str, stage27: str, reference: str) -> str:
 
 
 def exact_classify_comparison(stage25: str, stage27: str, reference: str) -> str:
-    """Classify one segment by exact normalized string equality to its reference."""
+    """Classify one segment by exact NFC text equality after whitespace collapse."""
 
     return _six_way_classification(
-        stage25_correct=_canonical(stage25) == _canonical(reference),
-        stage27_correct=_canonical(stage27) == _canonical(reference),
-        unchanged=_canonical(stage27) == _canonical(stage25),
+        stage25_correct=_exact_canonical(stage25) == _exact_canonical(reference),
+        stage27_correct=_exact_canonical(stage27) == _exact_canonical(reference),
+        unchanged=_exact_canonical(stage27) == _exact_canonical(stage25),
     )
 
 
@@ -498,13 +539,19 @@ def _six_way_classification(
         return "improved"
     if unchanged:
         return "unchanged_wrong"
-    return "hallucinated"
+    return "changed_wrong"
 
 
 def _canonical(text: str) -> str:
-    """Normalize Arabic spelling/layout only for benchmark comparison."""
+    """Normalize Arabic spelling/layout only for the deterministic word lexicon."""
 
     return normalize_for_comparison(text)
+
+
+def _exact_canonical(text: str) -> str:
+    """Permit only NFC normalization and the documented whitespace collapse."""
+
+    return _EXACT_WHITESPACE.sub(" ", unicodedata.normalize("NFC", text)).strip()
 
 
 def _segment_equivalent(candidate: str, reference: str) -> bool:
@@ -525,37 +572,39 @@ def _word_equivalent(candidate: str, reference: str) -> bool:
         return True
     if _PROTECTED_TOKEN.search(candidate) or _PROTECTED_TOKEN.search(reference):
         return False
-    if abs(len(candidate) - len(reference)) == 1:
-        longer, shorter = (
-            (candidate, reference) if len(candidate) > len(reference) else (reference, candidate)
-        )
-        if longer.startswith(shorter) or longer.endswith(shorter):
-            return True
-    if len(candidate) == len(reference):
-        differences = [
-            (left, right) for left, right in zip(candidate, reference, strict=True) if left != right
-        ]
-        if len(differences) == 1 and differences[0] in _EGYPTIAN_DENTAL_SHIFTS:
-            return True
-    return False
+    return (candidate, reference) in _DIALECT_PAIRS
 
 
 def comparison_status(
     reconstruction_status: object | None, stage25: str, stage27: str, reference: str
 ) -> tuple[str, str]:
-    """Return (semantic status, exact status), honoring unresolved state."""
+    """Return (semantic status, exact status) for one referenced row.
+
+    Runtime reconstruction status never removes a referenced row from the text
+    comparison. Rows without a reference are ``unreviewed`` and never safe.
+    """
 
     if not reference.strip():
-        return ("unresolved", "unresolved")
-    if reconstruction_status in {
-        ReconstructionStatus.LOW_CONFIDENCE_UNRESOLVED,
-        ReconstructionStatus.PROVIDER_UNAVAILABLE,
-    }:
-        return ("unresolved", "unresolved")
+        return ("unreviewed", "unreviewed")
     return (
         classify_comparison(stage25, stage27, reference),
         exact_classify_comparison(stage25, stage27, reference),
     )
+
+
+def load_review_worksheet(path: Path) -> list[dict[str, object]]:
+    """Read a review worksheet and reject unknown human safety labels."""
+
+    rows: list[dict[str, object]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        row = cast(dict[str, object], json.loads(line))
+        label = row.get("human_label")
+        if label is not None and label not in _VALID_HUMAN_LABELS:
+            raise ValueError(f"unknown human label in review worksheet: {label}")
+        rows.append(row)
+    return rows
 
 
 def evaluate_completion_gate(

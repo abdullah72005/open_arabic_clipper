@@ -21,6 +21,7 @@ from app.transcription.reconstruction.benchmark import (
     evaluate_completion_gate,
     exact_classify_comparison,
     load_benchmark_manifest,
+    load_review_worksheet,
 )
 from app.transcription.reconstruction.types import (
     ConfidenceLevel,
@@ -37,7 +38,7 @@ STATUSES = [
     "unchanged_wrong",
     "regressed",
     "hallucinated",
-    "unresolved",
+    "changed_wrong",
 ]
 
 
@@ -51,10 +52,12 @@ def _source(source_id: str) -> dict[str, object]:
     return {"id": source_id, "path": f"{source_id}/video.webm", "authorized": True}
 
 
-def _reference(segment_index: int, label: str | None = None) -> dict[str, object]:
+def _reference(
+    segment_index: int, label: str | None = None, text: str | None = None
+) -> dict[str, object]:
     payload: dict[str, object] = {
         "segment_index": segment_index,
-        "text": f"reference-{segment_index}",
+        "text": text or f"reference-{segment_index}",
         "reviewed": True,
     }
     if label is not None:
@@ -108,6 +111,7 @@ def _report(**changes: object) -> BenchmarkReport:
         "regressed": 1,
         "preserved": 79,
         "hallucinated": 0,
+        "changed_wrong": 0,
         "unresolved": 0,
         "comprehensibility_stage25": {"slang": 3.0, "fast_speech": 3.0},
         "comprehensibility_stage27": {"slang": 3.5, "fast_speech": 3.0},
@@ -120,21 +124,28 @@ def _report(**changes: object) -> BenchmarkReport:
     return cast(BenchmarkReport, BenchmarkReport.model_validate(values))
 
 
-def test_classify_comparison_assigns_all_six_string_statuses() -> None:
+def test_classify_comparison_assigns_all_five_string_statuses() -> None:
     assert classify_comparison("wrong", "right", "right") == "improved"
     assert classify_comparison("right", "right", "right") == "unchanged_correct"
     assert classify_comparison("wrong", "wrong", "right") == "unchanged_wrong"
     assert classify_comparison("right", "worse", "right") == "regressed"
-    assert classify_comparison("wrong", "invented 999", "right") == "hallucinated"
+    assert classify_comparison("wrong", "invented 999", "right") == "changed_wrong"
 
 
-def test_classify_comparison_accepts_egyptian_dialect_spelling_variants() -> None:
+def test_changed_but_wrong_output_is_never_automatically_hallucinated() -> None:
+    """Hallucination is a human safety label; automated comparison emits changed_wrong."""
+
+    assert classify_comparison("wrong", "other", "right") == "changed_wrong"
+    assert exact_classify_comparison("wrong", "other", "right") == "changed_wrong"
+
+
+def test_classify_comparison_accepts_reviewed_dialect_orthography_pairs() -> None:
     stage25 = " ثلاثة يام بس لتطهير النطقة"
     candidate = "تلاتة يام بس لتطهير المنطقة"
     reference = "تلات أيام بس لتطهير المنطقة"
     assert classify_comparison(stage25, candidate, reference) == "improved"
     assert classify_comparison(stage25, stage25, reference) == "unchanged_wrong"
-    assert exact_classify_comparison(stage25, candidate, reference) == "hallucinated"
+    assert exact_classify_comparison(stage25, candidate, reference) == "changed_wrong"
 
 
 def test_classify_comparison_keeps_real_meaning_changes_as_errors() -> None:
@@ -142,17 +153,46 @@ def test_classify_comparison_keeps_real_meaning_changes_as_errors() -> None:
     reference = "وقت كارثة شرنوبل الحكومة هتمر السكان بعمل عملية إخلاء مؤقت"
     assert classify_comparison(stage25, stage25, reference) == "unchanged_wrong"
     changed = stage25.replace("بعد", "خلاف")
-    assert classify_comparison(stage25, changed, reference) == "hallucinated"
+    assert classify_comparison(stage25, changed, reference) == "changed_wrong"
 
 
-def test_comparison_status_treats_unresolved_reconstruction_and_missing_reference() -> None:
+def test_exact_comparison_rejects_spelling_layout_and_diacritic_variants() -> None:
+    """Exact comparison is literal NFC equality: no alef, ة/ه, ى/ي, or diacritic folding."""
+
+    assert exact_classify_comparison("آخر", "اخر", "آخر") == "regressed"
+    assert exact_classify_comparison("تلاته", "تلاتة", "تلاته") == "regressed"
+    assert exact_classify_comparison("حتى", "حتي", "حتى") == "regressed"
+    assert exact_classify_comparison("جيد،", "جيد", "جيد،") == "regressed"
+    assert exact_classify_comparison("مهم", "مُهم", "مهم") == "regressed"
+
+
+def test_exact_comparison_permits_nfc_and_documented_whitespace_collapse() -> None:
+    """Only NFC normalization and outer/duplicate-whitespace collapse are permitted."""
+
+    assert exact_classify_comparison("كلام   كتير", "كلام كتير", "كلام كتير") == "unchanged_correct"
+
+
+def test_deterministic_equivalence_rejects_unreviewed_word_variants() -> None:
+    """Possessives, dental-shift names, verb changes, numbers, and Latin tokens stay distinct."""
+
+    assert classify_comparison("كتاب", "كتاب", "كتابي") == "unchanged_wrong"
+    assert classify_comparison("حسن", "حسن", "حسني") == "unchanged_wrong"
+    assert classify_comparison("تامر", "تامر", "ثامر") == "unchanged_wrong"
+    assert classify_comparison("عمل", "يعمل", "عمل") == "regressed"
+    assert classify_comparison("سنة 1950", "سنة 1951", "سنة 1950") == "regressed"
+    assert classify_comparison("United Fruit", "United Fruits", "United Fruit") == "regressed"
+
+
+def test_comparison_status_separates_runtime_status_from_text_comparison() -> None:
+    """A referenced row is compared even when reconstruction runtime status is unresolved."""
+
     assert comparison_status(ReconstructionStatus.LOW_CONFIDENCE_UNRESOLVED, "a", "b", "c") == (
-        "unresolved",
-        "unresolved",
+        "changed_wrong",
+        "changed_wrong",
     )
     assert comparison_status(ReconstructionStatus.APPLIED, "a", "b", "") == (
-        "unresolved",
-        "unresolved",
+        "unreviewed",
+        "unreviewed",
     )
     assert comparison_status(ReconstructionStatus.APPLIED, "right", "right", "right") == (
         "unchanged_correct",
@@ -215,6 +255,24 @@ def test_manifest_refuses_unreviewed_unauthorized_and_out_of_storage_inputs() ->
             BenchmarkManifest.model_validate(payload)
 
 
+def test_manifest_rejects_unknown_human_label() -> None:
+    payload = _manifest().model_dump(mode="json")
+    payload["clips"][0]["reference_segments"][0]["human_label"] = "unknown-label"
+    with pytest.raises(ValueError, match="human label"):
+        BenchmarkManifest.model_validate(payload)
+
+
+def test_load_review_worksheet_rejects_unknown_human_label(tmp_path: Path) -> None:
+    worksheet = tmp_path / "review-worksheet.jsonl"
+    worksheet.write_text(
+        json.dumps({"clip_id": "clip-0", "segment_index": 0, "human_label": "wrong-label"}) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="human label"):
+        load_review_worksheet(worksheet)
+
+
 def test_manifest_loader_refuses_non_chernobyl_diagnostic_override(tmp_path: Path) -> None:
     payload = _manifest().model_dump(mode="json")
     payload["sources"] = payload["sources"][:1]
@@ -249,14 +307,15 @@ class _RecordingStorage(StorageService):
 
 
 class _Engine:
-    def __init__(self, events: list[str]) -> None:
+    def __init__(self, events: list[str], counts: dict[int, int] | None = None) -> None:
         self.events = events
+        self.counts = counts or {}
 
     def transcribe(self, path: Path, options: TranscriptionOptions) -> TranscriptionResult:
         clip_id = Path(path).stem
         self.events.append(f"asr:{clip_id}:{options.model}")
         index = int(clip_id.split("-")[1])
-        count = 6 if index == 0 else 1
+        count = self.counts.get(index, 1 if index else 6)
         segments = [
             {
                 "start": float(position),
@@ -312,13 +371,7 @@ class _Reconstructor:
         clip_index = int(str(segments[0]["raw_text"]).split("-")[1])
         rows = []
         for index, segment in enumerate(segments):
-            label = STATUSES[index] if clip_index == 0 else "unchanged_correct"
             final = f"final-{clip_index}-{index}"
-            status = (
-                ReconstructionStatus.LOW_CONFIDENCE_UNRESOLVED
-                if label == "unresolved"
-                else ReconstructionStatus.APPLIED
-            )
             rows.append(
                 SegmentReconstruction(
                     index,
@@ -330,7 +383,7 @@ class _Reconstructor:
                     0.91,
                     ConfidenceLevel.HIGH,
                     (),
-                    status,
+                    ReconstructionStatus.APPLIED,
                     reconstruction_method="ollama:qwen3:8b",
                 )
             )
@@ -348,14 +401,18 @@ def _write_clip(args: list[str]) -> None:
     Path(args[-1]).write_bytes(b"RIFF")
 
 
+def _seed_sources(storage: StorageService, manifest: BenchmarkManifest) -> None:
+    for source in manifest.sources:
+        path = storage.resolve(StorageCategory.SOURCES, source.path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"authorized media")
+
+
 def test_runner_executes_pipeline_in_order_and_writes_deterministic_artifacts(
     tmp_path: Path,
 ) -> None:
     storage = _RecordingStorage(tmp_path / "storage")
-    for source in _manifest().sources:
-        path = storage.resolve(StorageCategory.SOURCES, source.path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(b"authorized media")
+    _seed_sources(storage, _manifest())
     events: list[str] = []
 
     def ffmpeg(args: list[str]) -> None:
@@ -397,9 +454,15 @@ def test_runner_executes_pipeline_in_order_and_writes_deterministic_artifacts(
         result.unchanged_correct,
         result.unchanged_wrong,
         result.regressed,
+        result.changed_wrong,
         result.hallucinated,
         result.unresolved,
-    ] == [1, 5, 1, 1, 1, 1]
+        result.unreviewed,
+    ] == [1, 5, 1, 1, 1, 1, 0, 0]
+    assert result.semantic_correct_stage25 == pytest.approx(0.6)
+    assert result.semantic_correct_stage27 == pytest.approx(0.6)
+    assert result.exact_changed_wrong == 10
+    assert result.exact_improved == 0
     assert [path.name for path in storage.writes] == [
         "comparison.jsonl",
         "review-worksheet.jsonl",
@@ -425,29 +488,13 @@ def test_runner_executes_pipeline_in_order_and_writes_deterministic_artifacts(
         "human_label",
     }
     assert all(required <= row.keys() for row in comparison)
-    assert {
-        result.exact_improved,
-        result.exact_unchanged_correct,
-        result.exact_unchanged_wrong,
-        result.exact_regressed,
-        result.exact_hallucinated,
-    } == {
-        result.improved,
-        result.unchanged_correct,
-        result.unchanged_wrong,
-        result.regressed,
-        result.hallucinated,
-    }
     assert result.report_path is not None
     assert result.report_path.is_relative_to(storage.category_root(StorageCategory.BENCHMARKS))
 
 
 def test_runner_preserves_raw_segment_identity_through_derivation(tmp_path: Path) -> None:
     storage = _RecordingStorage(tmp_path / "storage")
-    for source in _manifest().sources:
-        path = storage.resolve(StorageCategory.SOURCES, source.path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(b"authorized media")
+    _seed_sources(storage, _manifest())
     events: list[str] = []
     reconstructor = _Reconstructor(events)
     runner = BenchmarkRunner(
@@ -469,6 +516,127 @@ def test_runner_preserves_raw_segment_identity_through_derivation(tmp_path: Path
             float(i + 1) for i in range(len(segments))
         ]
         assert all("raw_text" in segment and "corrected_text" in segment for segment in segments)
+
+
+def test_referenced_unresolved_row_stays_in_correctness_denominators(tmp_path: Path) -> None:
+    """Runtime-unresolved referenced rows stay in Stage 2.5/2.7 denominators."""
+
+    storage = _RecordingStorage(tmp_path / "storage")
+    manifest = _small_known_manifest([_reference(0)])
+    _seed_sources(storage, manifest)
+    events: list[str] = []
+
+    class UnresolvedReconstructor(_Reconstructor):
+        def reconstruct(self, segments, **kwargs) -> ReconstructionResult:
+            segment = segments[0]
+            corrected = str(segment["corrected_text"])
+            row = SegmentReconstruction(
+                0,
+                str(segment["raw_text"]),
+                corrected,
+                corrected,
+                None,
+                False,
+                0.0,
+                ConfidenceLevel.LOW,
+                (),
+                ReconstructionStatus.LOW_CONFIDENCE_UNRESOLVED,
+                reconstruction_method="ollama:qwen3:8b",
+            )
+            return ReconstructionResult((row,), corrected, "fingerprint")
+
+    runner = BenchmarkRunner(
+        storage=storage,
+        whisper_engine=_Engine(events, counts={0: 1}),
+        corrector=_Corrector(events),
+        reconstructor=UnresolvedReconstructor(events),
+        provider_health=_available_health(),
+        transcription_options=_options(),
+        command_runner=lambda args: _write_clip(args),
+        prompt_settings_fingerprint="production-fingerprint",
+    )
+
+    result = runner.run(manifest)
+
+    assert result.unresolved == 1
+    assert result.unchanged_wrong == 1
+    assert result.stage25_wrong == 1
+    assert result.stage25_correct == 0
+    assert result.semantic_correct_stage25 == 0.0
+    assert result.semantic_correct_stage27 == 0.0
+
+
+def test_unreferenced_row_is_reported_unreviewed_not_implicitly_safe(tmp_path: Path) -> None:
+    """Segments without a human reference are unreviewed and excluded from denominators."""
+
+    storage = _RecordingStorage(tmp_path / "storage")
+    manifest = _small_known_manifest([_reference(0, "unchanged_correct", text="corrected-0-0")])
+    _seed_sources(storage, manifest)
+    events: list[str] = []
+
+    class TwoSegmentReconstructor(_Reconstructor):
+        def reconstruct(self, segments, **kwargs) -> ReconstructionResult:
+            rows = []
+            for index, segment in enumerate(segments):
+                corrected = str(segment["corrected_text"])
+                rows.append(
+                    SegmentReconstruction(
+                        index,
+                        str(segment["raw_text"]),
+                        corrected,
+                        corrected,
+                        corrected,
+                        True,
+                        0.95,
+                        ConfidenceLevel.HIGH,
+                        (),
+                        ReconstructionStatus.APPLIED,
+                        reconstruction_method="ollama:qwen3:8b",
+                    )
+                )
+            return ReconstructionResult(tuple(rows), "joined", "fingerprint")
+
+    runner = BenchmarkRunner(
+        storage=storage,
+        whisper_engine=_Engine(events, counts={0: 2}),
+        corrector=_Corrector(events),
+        reconstructor=TwoSegmentReconstructor(events),
+        provider_health=_available_health(),
+        transcription_options=_options(),
+        command_runner=lambda args: _write_clip(args),
+        prompt_settings_fingerprint="production-fingerprint",
+    )
+
+    result = runner.run(manifest)
+
+    assert result.unreviewed == 1
+    assert result.unchanged_correct == 1
+    assert result.stage25_correct == 1
+    assert result.reviewed_denominator == 1
+    comparison = [json.loads(line) for line in result.comparison_path.read_text().splitlines()]  # type: ignore[union-attr]
+    assert comparison[1]["status"] == "unreviewed"
+    assert comparison[1]["exact_status"] == "unreviewed"
+
+
+def _small_known_manifest(reference_segments: list[dict[str, object]]) -> BenchmarkManifest:
+    payload: dict[str, object] = {
+        "version": "stage-2-7-private-v1",
+        "split": "test",
+        "sources": [_source("source-a")],
+        "clips": [
+            {
+                "id": "mini-0000-0030",
+                "source_id": "source-a",
+                "topic": "history",
+                "start_seconds": 0,
+                "end_seconds": 30,
+                "categories": ["narrative"],
+                "reference_segments": reference_segments,
+            }
+        ],
+        "known_regression_set": True,
+    }
+    return cast(BenchmarkManifest, BenchmarkManifest.model_validate(payload))
 
 
 def test_runner_rejects_missing_source_media(tmp_path: Path) -> None:
@@ -513,10 +681,7 @@ def test_known_regression_set_can_run_but_never_passes_readiness(tmp_path: Path)
 
 def test_runner_marks_provider_unavailable_and_model_infeasible(tmp_path: Path) -> None:
     storage = _RecordingStorage(tmp_path / "storage")
-    for source in _manifest().sources:
-        path = storage.resolve(StorageCategory.SOURCES, source.path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(b"authorized media")
+    _seed_sources(storage, _manifest())
     runner = BenchmarkRunner(
         storage=storage,
         whisper_engine=_Engine([]),
