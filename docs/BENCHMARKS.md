@@ -173,17 +173,19 @@ evidence for the current stack.
 
 | Source | Duration | Segments | Usable | Minor dialect variant | Meaning-changing | Nonsense/garbage | Number/name/fact |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Chernobyl narrative | 159 s | 76 | 45 | 12 | 1 | 18 | 0 |
-| Cuba/Granma narrative | 122 s | 61 | 38 | 8 | 0 | 13 | 2 |
-| **Total** | | **137** | **83** | **20** | **1** | **31** | **2** |
+| Chernobyl narrative | 159 s | 76 | 49 | 8 | 1 | 18 | 0 |
+| Cuba/Granma narrative | 122 s | 61 | 44 | 2 | 0 | 13 | 2 |
+| **Total** | | **137** | **93** | **10** | **1** | **31** | **2** |
 
 The transcript is semantically usable: a downstream Stage 3 model can recover
-the speaker's meaning without the audio for the large majority of segments, and
-meaning-changing errors are rare (1 of 137). The one meaning-changing error is
-the known `إخلاء` → `إخلاق` regression; the two fact errors are the known Cuba
-number regressions (`اتناشر` → `نصر`, `70` → `71`). Nonsense/garbage segments
-are localized unedited ASR fragments in heavy dialectal speech. This review is
-practical acceptance evidence, not the unseen-readiness gate: the strict
-human-reviewed unseen-audio benchmark remains open.
+the speaker's meaning without the audio for 93 of 137 reviewed segments and a
+further 10 carry only minor dialect/spelling variants. Meaning-changing errors
+are rare (1 of 137). The one meaning-changing error is the known
+`إخلاء` → `إخلاق` regression (Chernobyl `00:00.0`); the two fact errors are the
+known Cuba number regressions (`اتناشر` → `نصر`, `70` → `71`). Nonsense/garbage
+segments (31 of 137) are localized unedited ASR fragments in heavy dialectal
+speech and do not change the surrounding meaning. This review is practical
+acceptance evidence, not the unseen-readiness gate: the strict human-reviewed
+unseen-audio benchmark remains open.
 
 READY FOR STAGE 2.7.1

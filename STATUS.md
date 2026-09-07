@@ -127,8 +127,9 @@ reviewed segment by segment for meaning-changing transcript errors:
 
 | Source | Segments | Usable | Minor variants | Meaning-changing | Nonsense/garbage | Number/name/fact |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Chernobyl narrative (159 s) | 76 | 45 | 12 | 1 | 18 | 0 |
-| Cuba/Granma narrative (122 s) | 61 | 38 | 8 | 0 | 13 | 2 |
+| Chernobyl narrative (159 s) | 76 | 49 | 8 | 1 | 18 | 0 |
+| Cuba/Granma narrative (122 s) | 61 | 44 | 2 | 0 | 13 | 2 |
+| **Total** | **137** | **93** | **10** | **1** | **31** | **2** |
 
 The vast majority of segments are semantically usable; a downstream Stage 3
 model can recover the speaker's meaning from the final transcript. The
