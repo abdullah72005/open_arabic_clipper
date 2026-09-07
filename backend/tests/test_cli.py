@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from typer.testing import CliRunner
 
 from app.cli import app
+from app.runtime.memory import MemoryReadError, MemorySnapshot
 from app.transcription.reconstruction.types import ProviderAvailability, ProviderHealth
 
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
@@ -94,6 +95,30 @@ def test_reconstruction_health_exits_nonzero_when_provider_is_unavailable(monkey
 
     assert result.exit_code == 1
     assert json.loads(result.stdout)["detail"] == "configured model qwen3:8b is not installed"
+
+
+def test_diagnose_memory_json_prints_effective_capacity(monkeypatch) -> None:
+    snapshot = MemorySnapshot(0.0, 7803048 * 1024, 1, 1, 1, None, None, None, 1)
+    monkeypatch.setattr("app.cli.capture_memory", lambda **kwargs: snapshot)
+
+    result = CliRunner().invoke(app, ["diagnose-memory", "--json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["linux_total"] == 7803048 * 1024
+    assert payload["effective_capacity"] == 7803048 * 1024
+
+
+def test_diagnose_memory_exits_nonzero_when_required_inputs_unreadable(monkeypatch) -> None:
+    def raise_error(**kwargs: object) -> MemorySnapshot:
+        raise MemoryReadError("meminfo unreadable")
+
+    monkeypatch.setattr("app.cli.capture_memory", raise_error)
+
+    result = CliRunner().invoke(app, ["diagnose-memory", "--json"])
+
+    assert result.exit_code != 0
+    assert "meminfo unreadable" in result.stdout
 
 
 class _Provider:

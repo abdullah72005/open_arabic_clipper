@@ -13,6 +13,7 @@ from app.core.enums import JobKind, PipelineStage
 from app.core.settings import get_settings
 from app.db.session import create_session_factory
 from app.models import ProcessingJob, SourceVideo, Transcript
+from app.runtime.memory import MemoryReadError, capture_memory
 from app.services.health import HealthService
 from app.services.storage import StorageCategory, StorageService
 from app.transcription.benchmark import benchmark_transcription
@@ -33,6 +34,42 @@ _KNOWN_REGRESSION_MANIFEST_NAME = "stage-2-7/chernobyl-reference-v1.json"
 
 def _storage() -> StorageService:
     return StorageService(get_settings().storage_root)
+
+
+@app.command("diagnose-memory")
+def diagnose_memory(
+    json_output: bool = typer.Option(False, "--json/--text", help="Emit machine-readable JSON."),
+) -> None:
+    """Print labeled host/container memory facts. Read-only."""
+
+    try:
+        snapshot = capture_memory()
+    except MemoryReadError as error:
+        typer.echo(json.dumps({"error": str(error)}, ensure_ascii=False))
+        raise typer.Exit(code=1) from error
+    if json_output:
+        payload = asdict(snapshot)
+        payload["effective_capacity"] = snapshot.effective_capacity
+        typer.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        return
+    typer.echo(
+        f"linux_total={snapshot.linux_total / 1024**3:.2f} GiB "
+        f"linux_available={snapshot.linux_available / 1024**3:.2f} GiB"
+    )
+    typer.echo(
+        f"swap_total={snapshot.swap_total / 1024**3:.2f} GiB "
+        f"swap_free={snapshot.swap_free / 1024**3:.2f} GiB"
+    )
+    limit = (
+        f"{snapshot.cgroup_limit / 1024**3:.2f} GiB"
+        if snapshot.cgroup_limit is not None
+        else "unlimited"
+    )
+    typer.echo(f"cgroup_limit={limit} cgroup_peak={snapshot.cgroup_peak}")
+    typer.echo(
+        f"process_rss={snapshot.process_rss / 1024**3:.3f} GiB "
+        f"effective_capacity={snapshot.effective_capacity / 1024**3:.2f} GiB"
+    )
 
 
 @app.command()
