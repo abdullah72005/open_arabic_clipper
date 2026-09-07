@@ -2,7 +2,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.transcription.correction import ContextualCorrector, CorrectionConfig
@@ -69,8 +69,20 @@ class Settings(BaseSettings):
     reconstruction_safety_reserve: int = Field(default=128, gt=0, le=4_096)
     reconstruction_provider_batch_windows: int = Field(default=8, gt=0, le=16)
     reconstruction_provider_batch_characters: int = Field(default=24_000, gt=0, le=48_000)
+    heavy_model_lease_ttl_seconds: float = Field(default=300.0, gt=0)
+    heavy_model_lease_renewal_interval_seconds: float = Field(default=60.0, gt=0)
+    heavy_model_lease_acquisition_timeout_seconds: float = Field(default=15.0, gt=0)
     transcription_queue_concurrency: int = Field(default=1, gt=0)
     cors_origins: list[str] = ["http://localhost:3301"]
+
+    @model_validator(mode="after")  # type: ignore[untyped-decorator]
+    def _validate_heavy_model_lease(self) -> "Settings":
+        if (
+            self.heavy_model_lease_ttl_seconds
+            <= 2 * self.heavy_model_lease_renewal_interval_seconds
+        ):
+            raise ValueError("heavy model lease TTL must exceed two renewal intervals")
+        return self
 
     def transcription_options(self) -> TranscriptionOptions:
         """Build the output-affecting options passed to the worker-side engine."""
