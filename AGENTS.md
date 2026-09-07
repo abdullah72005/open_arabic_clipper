@@ -24,8 +24,15 @@
   preserves raw ASR text/timestamps and derives correction/final fields without
   realignment. Stage 2.7 preserves raw ASR text, segment timestamps, and word
   timestamps and derives reconstruction fields through a managed local provider.
-  Rights/provenance are tracked throughout the pipeline but do not block local
-  analysis; publishing eligibility is evaluated separately.
+  Reconstruction output carries one `provider_confidence` scalar and is validated
+  at a strict provider boundary; failures are isolated per segment. Stage 2.7
+  input/output fingerprints include the full runtime identity (provider, model,
+  digest, prompt hash/schema, budgets, confidence-policy and validation
+  versions), so any of those changes invalidates prior Stage 2.7 runs.
+  `contextual_reconstructed_text` joins each segment's actual Stage 2.7 output;
+  manual overrides change only `final_text`. Rights/provenance are tracked
+  throughout the pipeline but do not block local analysis; publishing eligibility
+  is evaluated separately.
 
 ## Local development facts (not product requirements)
 

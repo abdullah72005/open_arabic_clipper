@@ -27,33 +27,35 @@ A missing or indirect proof is a failed gate.
 | # | Gate | Evidence | Result |
 | --- | --- | --- | --- |
 | 1 | Local provider health `AVAILABLE`; live worker invokes it | `python -m app.cli reconstruction-health` | PASS (digest `2a654d98e6fb…eefd`) |
-| 2 | Provider regression tests and real audio prove multi-word repair | provider tests; benchmark comparison rows | FAIL (provisional: one repair applied under 0.82 gate; strict unseen set still missing) |
+| 2 | Provider regression tests and real audio prove multi-word repair | provider tests; benchmark comparison rows | FAIL (provisional: one repair applied under 0.82 gate; strict unseen set still missing; pre-fix reports non-comparable) |
 | 3 | Raw ASR text and all timestamps unchanged through downstream stages | `test_reconstruction_persistence.py` deep-equality | PASS |
 | 4 | Forced retranscription reruns every stale transcript-derived stage | `test_pipeline_fingerprints.py` | PASS |
 | 5 | Media/audio and transcript quality separate; bad sample no longer reports high transcript quality | `test_transcript_quality.py` | PASS |
 | 6 | Unavailable provider/model visible in persistence, health, API, CLI, UI | `test_reconstruction_status.py`, API/UI tests | PASS |
 | 7 | Real unseen Egyptian benchmark improves materially | private unseen-audio benchmark | FAIL (no unseen-audio set) |
-| 8 | Regression ≤2%, preserved-correct ≥98%, hallucinated = 0 | benchmark aggregate | FAIL (no aggregate) |
-| 9 | Chernobyl first 30 seconds manually re-tested | diagnostic comparison rows | FAIL (one accepted Egyptian repair: `تلاتة يام بس لتطهير المنطقة`; three known phrases not all fixed) |
+| 8 | Regression ≤2%, preserved-correct ≥98%, hallucinated = 0 | benchmark aggregate | FAIL (no valid aggregate; pre-fix aggregates invalid evidence) |
+| 9 | Chernobyl first 30 seconds manually re-tested | diagnostic comparison rows | FAIL (pre-fix reports non-comparable; must re-run on the committed evaluator and fingerprint) |
 | 10 | All Stage 2/2.5/2.6/2.7 backend and frontend tests pass | pytest + vitest | PASS (204 backend, 11 frontend) |
 | 11 | README, STATUS, AGENTS, ENVIRONMENT, architecture, pipeline, benchmark, local setup, troubleshooting match installation | documentation | PASS |
 | 12 | Final report ends with exactly one terminal status line | below | — |
 
-Benchmark findings recorded in `docs/BENCHMARKS.md`: `qwen3:8b` is infeasible on
-the 7.4 GiB machine (out-of-memory kill during load). The one-pass small-context
-protocol with `qwen3.5:4b` is feasible end-to-end. The benchmark evaluator now
-classifies by Egyptian normalization plus phonetic/semantic equivalence, keeping
-exact string match as a separate metric (`exact_*`). On that evaluator the
-Chernobyl diagnostic with the provisional `score >= 0.82` apply gate reached
-`provider_available=true`, `model_feasible=true`, one improved segment
-(`ثلاثة يام` → `تلاتة يام بس لتطهير المنطقة`), zero hallucinations, zero
-regressions, one unchanged-wrong, and nine unresolved (run
-`20260907-022146-65a6c42f`). The dialect variant `تلاتة/تلات` and `يام/أيام`
-still show as hallucinated under the separate exact-match metric, which is why
-the gate stays provisional pending a reviewed unseen set. `qwen3:4b` cannot be
-used: its thinking mode emits chain-of-thought that consumes the 256-token
-budget before any JSON payload. `qwen2.5:7b` could not be pulled reliably over
-the network. None of this is unseen readiness evidence.
+The Stage 2.7 correctness foundation was fixed and committed on 2026-09-07:
+provider output is validated at a strict boundary, confidence is the one scalar
+the model returns, failures are isolated per segment, prompts are budgeted over
+the complete chat envelope, evaluation separates runtime status, deterministic
+text comparison, literal exact comparison, and human labels, and reconstruction
+fingerprints include the full runtime identity. Because the evaluator and
+confidence pipeline changed, **every benchmark report produced before the
+correctness-foundation commit is non-comparable**; their semantic and exact
+aggregates are invalid evidence and their run IDs are historical artifacts only.
+
+Earlier benchmark findings in `docs/BENCHMARKS.md` remain as history:
+`qwen3:8b` was infeasible on the 7.4 GiB machine (out-of-memory kill during
+load), the one-pass small-context protocol with `qwen3.5:4b` was feasible
+end-to-end, `qwen3:4b` cannot be parsed (thinking mode exhausts the 256-token
+budget), and `qwen2.5:7b` could not be pulled reliably. None of this is unseen
+readiness evidence. A fresh, correctly-fingerprinted run is required before any
+new model or threshold decision.
 
 See the task report for the latest local verification evidence. Copy
 `.env.example` to `.env` before starting Compose.

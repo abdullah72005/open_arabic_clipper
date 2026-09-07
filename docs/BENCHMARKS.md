@@ -75,24 +75,48 @@ The machine (Core Ultra 9 185H, 7.4 GiB RAM, 2 GiB swap, CPU-only) cannot hold
 out-of-memory killed. `qwen3.5:4b` loads and runs the one-pass small-context
 protocol end-to-end.
 
-The evaluator classifies segments by Egyptian normalization plus
-phonetic/semantic equivalence: orthographic variants (diacritics, alef forms,
-`ة`/`ه`, `ى`/`ي`), prosthetic alef (`يام`/`أيام`), suffix `ة` (`تلات`/`تلاتة`),
-and Egyptian dental shifts (`ث`/`ت`, `ذ`/`د`, `ظ`/`ز`) are equivalent; names,
-numbers, Latin tokens, and meaning-changing substitutions are not. Exact string
-match is retained as a separate metric (`exact_*` in the report and
-`exact_status` per row).
+The evaluator separates four axes: reconstruction runtime status (`APPLIED`,
+`LOW_CONFIDENCE_UNRESOLVED`, and so on), deterministic text comparison against a
+human reference, literal exact-string comparison, and a human semantic/safety
+label. Deterministic equivalence uses Unicode normalization plus a small
+reviewed word-pair lexicon stored as data (`يام`/`أيام`, `تلات`/`تلاتة`,
+`تلات`/`ثلاثة`); names, possessives, verb changes, numbers, and Latin tokens
+remain distinct unless an explicit pair says otherwise. Exact comparison is
+literal NFC equality after whitespace collapse only: alef forms, `ة`/`ه`, `ى`/`ي`,
+punctuation, and diacritics are never folded. Automated changed-but-wrong output
+is `changed_wrong`; `hallucinated` is reserved for a validated human safety
+label. Referenced unresolved rows stay in the correctness denominators, and
+unreferenced rows are reported `unreviewed`, never implicitly safe.
 
 On the provisional `score >= 0.82` apply gate, the model applied segment 1 as
 `تلاتة يام بس لتطهير المنطقة` (reference `تلات أيام بس لتطهير المنطقة`): the
-semantic evaluator reports `improved`, and the exact-match metric reports
-`hallucinated` solely because of the dialect spelling variants `تلاتة`/`تلات`
+deterministic evaluator reports `improved`, and the exact-match metric reports
+`changed_wrong` solely because of the dialect spelling variants `تلاتة`/`تلات`
 and `يام`/`أيام`. There is no meaning change, regression, or invented fact, so
 0.82 is kept provisionally. Raw ASR and Stage 2.5 completed for all runs; the
 three known multi-word errors are not all fixed. `qwen2.5:7b` could not be
 pulled reliably over the network from this machine. `qwen3:4b` was pulled but
 cannot be parsed because its reasoning is emitted as free text before the JSON
 object.
+
+## Correctness-foundation change invalidates prior reports
+
+On 2026-09-07 the Stage 2.7 correctness foundation was fixed: provider output is
+rejected at a strict boundary, confidence represents the single scalar the model
+returns, failures are isolated per segment, prompts are budgeted over the
+complete chat envelope, and evaluation separates the four axes above. The
+reconstruction input and output fingerprints now include the full runtime
+identity (provider, model, live digest, prompt hash and schema version, context
+and output budgets, confidence-policy version, validation version), so any
+model, digest, prompt, policy, validation, or context change invalidates prior
+Stage 2.7 runs.
+
+**Every report produced before the correctness-foundation commit is
+non-comparable.** Their semantic and exact aggregates are invalid evidence for
+any model, threshold, or gate decision. Their run IDs (including
+`20260907-022146-65a6c42f` and the rows in the tables above) are retained only
+as historical artifacts. Any new model comparison must run on a fresh manifest
+whose production prompt/settings fingerprint matches the committed pipeline.
 
 These are regression diagnostics only. The model comparison and the strict
 unseen-audio acceptance set (at least five non-overlapping clips, two to five
