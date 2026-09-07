@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 from collections.abc import Callable
@@ -9,6 +10,7 @@ from dataclasses import dataclass, replace
 from typing import Protocol, cast
 from urllib.request import Request, urlopen
 
+from app.transcription.reconstruction.confidence import CONFIDENCE_POLICY_VERSION
 from app.transcription.reconstruction.types import (
     AcousticEvidence,
     ProviderAvailability,
@@ -18,6 +20,7 @@ from app.transcription.reconstruction.types import (
     WordEvidence,
     estimate_tokens,
 )
+from app.transcription.reconstruction.validation import VALIDATION_VERSION
 
 
 class ProviderResponseError(ValueError):
@@ -105,6 +108,8 @@ class ReconstructionProvider(Protocol):
 
     def release(self) -> None: ...
 
+    def runtime_identity(self) -> dict[str, object]: ...
+
 
 HttpRequest = Callable[[str, str, bytes | None, dict[str, str], float], bytes]
 
@@ -134,11 +139,29 @@ class OpenAICompatibleReconstructionProvider:
         self._request = request or _request_bytes
         self.provider_name = "openai_compatible"
         self._last_request_sizes: tuple[RequestSizeDiagnostics, ...] = ()
+        self._model_digest: str | None = None
 
     def last_request_sizes(self) -> tuple[RequestSizeDiagnostics, ...]:
         """Return measured serialized prompt sizes for the most recent call."""
 
         return self._last_request_sizes
+
+    def runtime_identity(self) -> dict[str, object]:
+        """Return every output-affecting reconstruction dependency as stable data."""
+
+        return {
+            "provider": self.provider_name,
+            "model": self.model,
+            "digest": self._model_digest or "digest_unavailable",
+            "prompt_hash": _PROMPT_HASH,
+            "schema_version": _PROMPT_SCHEMA_VERSION,
+            "max_context_tokens": self._max_context_tokens,
+            "output_tokens": self._output_tokens,
+            "chat_framing_reserve": self._chat_framing_reserve,
+            "safety_reserve": self._safety_reserve,
+            "confidence_policy_version": CONFIDENCE_POLICY_VERSION,
+            "validation_version": VALIDATION_VERSION,
+        }
 
     def health(self) -> ProviderHealth:
         try:
@@ -166,11 +189,12 @@ class OpenAICompatibleReconstructionProvider:
                 None,
                 f"configured model {self.model} is not available",
             )
+        self._model_digest = str(match.get("digest") or "") or None
         return ProviderHealth(
             ProviderAvailability.AVAILABLE,
             "openai_compatible",
             self.model,
-            None,
+            self._model_digest,
             "model available",
         )
 
@@ -307,6 +331,9 @@ _SYSTEM_INSTRUCTION = (
     '{"reconstructions": [{"segment_id": int, "corrected_text": string, '
     '"unchanged": bool, "confidence": number, "explanation": string, "changes": []}]}.'
 )
+
+_PROMPT_SCHEMA_VERSION = "stage-2-7-one-pass-v1"
+_PROMPT_HASH = hashlib.sha256(_SYSTEM_INSTRUCTION.encode("utf-8")).hexdigest()
 
 
 def _shrink_request_to_budget(

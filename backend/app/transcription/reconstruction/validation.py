@@ -11,6 +11,8 @@ from app.transcription.reconstruction.types import ReconstructionCandidate
 
 _PROTECTED = re.compile(r"[A-Za-z]+|[0-9٠-٩]+")
 
+VALIDATION_VERSION = "stage-2-7-validation-v1"
+
 
 @dataclass(frozen=True)
 class CandidateValidation:

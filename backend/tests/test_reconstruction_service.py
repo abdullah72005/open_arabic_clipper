@@ -27,6 +27,21 @@ class OnePassProvider:
             ProviderAvailability.AVAILABLE, "ollama", "qwen3.5:4b", "sha256:x", "ok"
         )
 
+    def runtime_identity(self) -> dict[str, object]:
+        return {
+            "provider": "ollama",
+            "model": "qwen3.5:4b",
+            "digest": "sha256:x",
+            "prompt_hash": "p",
+            "schema_version": "s",
+            "max_context_tokens": 4096,
+            "output_tokens": 256,
+            "chat_framing_reserve": 64,
+            "safety_reserve": 128,
+            "confidence_policy_version": "one-pass-provider-confidence-v1",
+            "validation_version": "stage-2-7-validation-v1",
+        }
+
     def release(self) -> None:
         self.release_calls += 1
 
@@ -77,7 +92,7 @@ def test_operator_text_precedes_provider_candidate_and_is_manual_override() -> N
         transcription_fingerprint="asr-v1",
         correction_version="egyptian-ar-v1",
     )
-    assert result.segments[0].contextual_reconstructed_text == "يدوي"
+    assert result.segments[0].contextual_reconstructed_text == "دخم"
     assert result.segments[0].status.value == "MANUAL_OVERRIDE"
 
 
@@ -115,6 +130,9 @@ def test_reconstructor_falls_back_only_for_expected_provider_failures() -> None:
         def health(self) -> ProviderHealth:
             return ProviderHealth(ProviderAvailability.AVAILABLE, "test", "test", "sha256:x", "ok")
 
+        def runtime_identity(self) -> dict[str, object]:
+            return {"provider": "test", "model": "test", "digest": "sha256:x"}
+
         def reconstruct_segments(
             self, requests: list[ReconstructionRequest]
         ) -> dict[int, ReconstructionCandidate]:
@@ -142,6 +160,9 @@ def test_reconstructor_surfaces_provider_unavailable_when_model_cannot_run() -> 
             return ProviderHealth(
                 ProviderAvailability.UNAVAILABLE, "ollama", "qwen3:8b", None, "OOM"
             )
+
+        def runtime_identity(self) -> dict[str, object]:
+            return {"provider": "ollama", "model": "qwen3:8b", "digest": "digest_unavailable"}
 
         def reconstruct_segments(
             self, requests: list[ReconstructionRequest]
@@ -234,6 +255,21 @@ class ScriptedTargetProvider:
         return ProviderHealth(
             ProviderAvailability.AVAILABLE, "ollama", "qwen3.5:4b", "sha256:x", "ok"
         )
+
+    def runtime_identity(self) -> dict[str, object]:
+        return {
+            "provider": "ollama",
+            "model": "qwen3.5:4b",
+            "digest": "sha256:x",
+            "prompt_hash": "p",
+            "schema_version": "s",
+            "max_context_tokens": 4096,
+            "output_tokens": 256,
+            "chat_framing_reserve": 64,
+            "safety_reserve": 128,
+            "confidence_policy_version": "one-pass-provider-confidence-v1",
+            "validation_version": "stage-2-7-validation-v1",
+        }
 
     def reconstruct_segments(
         self, requests: list[ReconstructionRequest]

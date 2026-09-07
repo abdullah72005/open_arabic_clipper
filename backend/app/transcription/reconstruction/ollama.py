@@ -61,11 +61,12 @@ class OllamaReconstructionProvider(OpenAICompatibleReconstructionProvider):
                 None,
                 f"configured model {self.model} is not installed",
             )
+        self._model_digest = str(match.get("digest") or "") or None
         return ProviderHealth(
             ProviderAvailability.AVAILABLE,
             "ollama",
             self.model,
-            str(match.get("digest") or "") or None,
+            self._model_digest,
             "model available",
         )
 

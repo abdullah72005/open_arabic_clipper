@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 
 from app.core.enums import ReconstructionStatus
+from app.pipeline.fingerprints import reconstruction_output_fingerprint
 from app.transcription.reconstruction.confidence import decide_candidate
 from app.transcription.reconstruction.entities import SourceEntityMemory, build_entity_memory
 from app.transcription.reconstruction.providers import (
@@ -33,6 +32,13 @@ class ContextualReconstructor:
     def __init__(self, provider: ReconstructionProvider | None) -> None:
         self._provider = provider
 
+    def runtime_identity(self) -> dict[str, object]:
+        """Return the stable runtime identity for Stage 2.7 output dependencies."""
+
+        if self._provider is None:
+            return {"provider": "disabled"}
+        return dict(self._provider.runtime_identity())
+
     def reconstruct(
         self,
         segments: Sequence[Mapping[str, object]],
@@ -41,15 +47,21 @@ class ContextualReconstructor:
         transcription_fingerprint: str,
         correction_version: str,
     ) -> ReconstructionResult:
-        fingerprint = reconstruction_fingerprint(
-            segments, language, transcription_fingerprint, correction_version
-        )
+        identity = self.runtime_identity()
         if self._provider is None:
+            fingerprint = reconstruction_output_fingerprint(
+                provider_identity=identity,
+                provider_available=False,
+                segments=segments,
+                language=language,
+                transcription_fingerprint=transcription_fingerprint,
+                correction_version=correction_version,
+            )
             results = tuple(
                 self._fallback(index, segment) for index, segment in enumerate(segments)
             )
             return ReconstructionResult(results, _joined(results), fingerprint)
-        result: ReconstructionResult = ReconstructionResult((), "", fingerprint)
+        result: ReconstructionResult = ReconstructionResult((), "", "")
         try:
             try:
                 health = self._provider.health()
@@ -60,7 +72,17 @@ class ContextualReconstructor:
                 if health is not None
                 else "unknown"
             )
-            if health is None or health.availability.value != "AVAILABLE":
+            provider_available = health is not None and health.availability.value == "AVAILABLE"
+            fingerprint = reconstruction_output_fingerprint(
+                provider_identity=identity,
+                provider_available=provider_available,
+                segments=segments,
+                language=language,
+                transcription_fingerprint=transcription_fingerprint,
+                correction_version=correction_version,
+            )
+            result = ReconstructionResult((), "", fingerprint)
+            if not provider_available:
                 results = tuple(
                     self._fallback(
                         index,
@@ -71,7 +93,12 @@ class ContextualReconstructor:
                     )
                     for index, segment in enumerate(segments)
                 )
-                result = ReconstructionResult(results, _joined(results), fingerprint)
+                result = ReconstructionResult(
+                    results,
+                    _joined(results),
+                    fingerprint,
+                    metadata={"runtime_identity": identity, "provider_available": False},
+                )
                 return result
             memory = build_entity_memory(segments)
             routing_decisions = [
@@ -120,13 +147,21 @@ class ContextualReconstructor:
                 )
                 for index, segment in enumerate(segments)
             )
-            result = ReconstructionResult(results, _joined(results), fingerprint)
+            result = ReconstructionResult(
+                results,
+                _joined(results),
+                fingerprint,
+                metadata={"runtime_identity": identity, "provider_available": True},
+            )
         finally:
             try:
                 self._provider.release()
             except Exception:
                 # Cleanup is best effort; never replace valid or fallback output.
-                result = replace(result, metadata={"release_warning": "provider_release_failed"})
+                result = replace(
+                    result,
+                    metadata={**result.metadata, "release_warning": "provider_release_failed"},
+                )
         return result
 
     def _fallback(
@@ -145,7 +180,7 @@ class ContextualReconstructor:
                 index,
                 raw,
                 corrected,
-                str(operator_text),
+                corrected,
                 None,
                 False,
                 1.0,
@@ -191,7 +226,7 @@ class ContextualReconstructor:
                 index,
                 raw,
                 corrected,
-                str(operator_text),
+                corrected,
                 None,
                 False,
                 1.0,
@@ -297,31 +332,6 @@ def select_final_text(
     if reconstruction_applied and level is ConfidenceLevel.HIGH:
         return reconstructed
     return corrected or raw
-
-
-def reconstruction_fingerprint(
-    segments: Sequence[Mapping[str, object]],
-    language: str | None,
-    transcription_fingerprint: str,
-    correction_version: str,
-) -> str:
-    payload = {
-        "language": language,
-        "transcription_fingerprint": transcription_fingerprint,
-        "correction_version": correction_version,
-        "segments": [
-            {
-                "raw": segment.get("raw_text", segment.get("text", "")),
-                "corrected": segment.get("corrected_text"),
-                "start": segment.get("start"),
-                "end": segment.get("end"),
-            }
-            for segment in segments
-        ],
-    }
-    return hashlib.sha256(
-        json.dumps(payload, ensure_ascii=False, sort_keys=True).encode()
-    ).hexdigest()
 
 
 def _reconstruction_request(

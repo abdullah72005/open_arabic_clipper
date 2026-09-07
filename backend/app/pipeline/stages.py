@@ -389,7 +389,8 @@ class ContextualReconstructionExecutor:
             {
                 "normalization_fingerprint": transcript.normalization_fingerprint,
                 "transcription_revision": transcript.transcription_revision,
-                "provider": type(self._reconstructor).__name__,
+                "correction_version": transcript.correction_version,
+                "runtime_identity": self._reconstructor.runtime_identity(),
             },
         )
 
@@ -456,11 +457,8 @@ class ContextualReconstructionExecutor:
             )
 
         transcript.segments = persisted_segments
-        # Keep the reconstruction field derived from corrected ASR text; operator
-        # overrides remain represented only in each segment/final display text.
         transcript.contextual_reconstructed_text = " ".join(
-            str(segment.get("corrected_text", segment.get("raw_text", "")))
-            for segment in persisted_segments
+            str(segment["contextual_reconstructed_text"]) for segment in persisted_segments
         ).strip()
         transcript.final_text = " ".join(
             str(segment["final_text"]) for segment in persisted_segments
@@ -483,6 +481,7 @@ class ContextualReconstructionExecutor:
         transcript.reconstruction_version = "stage2.7-v1"
         transcript.reconstruction_processing_duration = monotonic() - started_at
         status_counts = {status.value: statuses.count(status) for status in set(statuses)}
+        runtime_identity = result.metadata.get("runtime_identity")
         metadata = {
             "segments": total,
             "applied_segments": len(applied),
@@ -500,8 +499,14 @@ class ContextualReconstructionExecutor:
                 if any(status is ReconstructionStatus.PROVIDER_UNAVAILABLE for status in statuses)
                 else "AVAILABLE"
             ),
-            "model": result.metadata.get("model", transcript.reconstruction_method),
-            "model_digest": result.metadata.get("model_digest"),
+            "model": (
+                runtime_identity.get("model", transcript.reconstruction_method)
+                if isinstance(runtime_identity, dict)
+                else transcript.reconstruction_method
+            ),
+            "model_digest": (
+                runtime_identity.get("digest") if isinstance(runtime_identity, dict) else None
+            ),
             "algorithm_versions": {"reconstruction": "stage2.7-v1"},
         }
         metadata.update(result.metadata)
