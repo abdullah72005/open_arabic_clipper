@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from typing import Final
 from uuid import UUID
 
-from celery import Task  # type: ignore[import-not-found]
+from celery import Task  # type: ignore[import-untyped]
 from sqlalchemy.orm import Session
 
 from app.core.enums import JobKind, PipelineStage
@@ -18,6 +18,7 @@ from app.pipeline.runner import PipelineRunner
 from app.pipeline.stages import (
     AudioAnalysisExecutor,
     AudioExtractionExecutor,
+    ContextualReconstructionExecutor,
     IngestExecutor,
     ProbeExecutor,
     TranscriptionExecutor,
@@ -35,7 +36,8 @@ _NEXT_STAGE: Final = {
     PipelineStage.PROBE: PipelineStage.AUDIO_EXTRACTION,
     PipelineStage.AUDIO_EXTRACTION: PipelineStage.TRANSCRIPTION,
     PipelineStage.TRANSCRIPTION: PipelineStage.TRANSCRIPT_NORMALIZATION,
-    PipelineStage.TRANSCRIPT_NORMALIZATION: PipelineStage.AUDIO_ANALYSIS,
+    PipelineStage.TRANSCRIPT_NORMALIZATION: PipelineStage.CONTEXTUAL_RECONSTRUCTION,
+    PipelineStage.CONTEXTUAL_RECONSTRUCTION: PipelineStage.AUDIO_ANALYSIS,
 }
 
 
@@ -48,6 +50,7 @@ def _stage_executors(session: Session) -> dict[PipelineStage, StageExecutor]:
     """Build worker-local Stage 2 executors while retaining test/Stage 1 registrations."""
     settings = get_settings()
     storage = StorageService(settings.storage_root)
+    lease_factory = settings.heavy_model_lease_factory()
     defaults: dict[PipelineStage, StageExecutor] = {
         PipelineStage.INGEST: IngestExecutor(),
         PipelineStage.PROBE: ProbeExecutor(FFprobe(binary=settings.ffprobe_binary)),
@@ -59,8 +62,16 @@ def _stage_executors(session: Session) -> dict[PipelineStage, StageExecutor]:
             engine=WhisperEngine(),
             options=settings.transcription_options(),
             storage=storage,
+            lease_factory=lease_factory,
         ),
-        PipelineStage.TRANSCRIPT_NORMALIZATION: TranscriptNormalizationExecutor(session=session),
+        PipelineStage.TRANSCRIPT_NORMALIZATION: TranscriptNormalizationExecutor(
+            session=session, corrector=settings.contextual_corrector()
+        ),
+        PipelineStage.CONTEXTUAL_RECONSTRUCTION: ContextualReconstructionExecutor(
+            session=session,
+            reconstructor=settings.contextual_reconstructor(),
+            lease_factory=lease_factory,
+        ),
         PipelineStage.AUDIO_ANALYSIS: AudioAnalysisExecutor(
             session=session, storage=storage, ffmpeg_binary=settings.ffmpeg_binary
         ),
@@ -72,7 +83,7 @@ def _stage_executors(session: Session) -> dict[PipelineStage, StageExecutor]:
     bind=True, autoretry_for=(), name="clipfactory.run_pipeline_stage"
 )
 def run_pipeline_stage(
-    self: Task, source_id: str, stage: str, job_id: str | None = None
+    self: Task, source_id: str, stage: str, job_id: str | None = None, force: bool = False
 ) -> dict[str, str | bool | None]:
     """Run one durable stage; retry only exceptions explicitly marked retryable."""
     parsed_stage = PipelineStage(stage)
@@ -86,7 +97,7 @@ def run_pipeline_stage(
             parsed_job_id = job.id
         runner = PipelineRunner(session, _stage_executors(session))
         try:
-            result = runner.run(UUID(source_id), parsed_stage, job_id=parsed_job_id)
+            result = runner.run(UUID(source_id), parsed_stage, job_id=parsed_job_id, force=force)
         except Exception as error:
             if getattr(error, "retryable", False):
                 if parsed_job_id is not None:
@@ -95,7 +106,7 @@ def run_pipeline_stage(
                         retry_job.retry_count += 1
                         session.commit()
                 raise self.retry(
-                    args=[source_id, stage, str(parsed_job_id) if parsed_job_id else None],
+                    args=[source_id, stage, str(parsed_job_id) if parsed_job_id else None, force],
                     exc=error,
                     max_retries=MAX_RETRIES,
                 ) from error

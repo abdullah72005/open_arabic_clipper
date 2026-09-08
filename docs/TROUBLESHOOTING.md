@@ -21,6 +21,17 @@ The container image installs both. Native operators must install FFmpeg and put
 `ffmpeg`/`ffprobe` on `PATH`, or set the corresponding `CLIPFACTORY_*_BINARY`
 variables.
 
+## Reconstruction reports the provider unavailable
+
+Start the optional Ollama profile and pull the configured model, then run
+`python -m app.cli reconstruction-health` to confirm `AVAILABLE` with a model
+digest. A `DEGRADED` health result or a persisted
+`PROVIDER_UNAVAILABLE`/`LOW_CONFIDENCE_UNRESOLVED` transcript status means the
+configured model is absent or unreachable; Stage 2.5 output stays final. Pull
+the model explicitly — Compose never downloads model weights implicitly — and
+retry with `python -m app.cli reconstruct SOURCE_ID --force`, which re-queues
+the stage without clearing persisted cache fields.
+
 ## A URL is rejected
 
 Only ordinary permitted public HTTP(S) URLs are accepted. Do not attempt to

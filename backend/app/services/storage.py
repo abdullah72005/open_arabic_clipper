@@ -34,6 +34,7 @@ class StorageCategory(str, Enum):
 
     SOURCES = "sources"
     JOBS = "jobs"
+    BENCHMARKS = "benchmarks"
     TEMPORARY = "temporary"
 
 

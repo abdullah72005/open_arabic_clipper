@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 
 from app.core.enums import JobKind, JobStatus, PipelineRunStatus, PipelineStage, RightsStatus
 from app.db.base import Base
-from app.models import PipelineRun, ProcessingJob, SourceVideo
+from app.models import PipelineRun, ProcessingJob, SourceVideo, Transcript
 from app.pipeline.authorization import AutopilotAuthorizationError, require_autopilot_authorization
 from app.pipeline.runner import PipelineRunner
 
@@ -22,6 +22,9 @@ class RecordingExecutor:
         self.calls += 1
         if self.error is not None:
             raise self.error
+
+    def input_fingerprint(self, source: SourceVideo) -> str:
+        return "recording-input-v1"
 
 
 def _source(session: Session, rights_status: RightsStatus = RightsStatus.OWNED) -> SourceVideo:
@@ -40,6 +43,7 @@ def test_completed_stage_is_skipped(sqlite_engine: object) -> None:
                 source_video_id=source.id,
                 stage=PipelineStage.INGEST,
                 status=PipelineRunStatus.SUCCEEDED,
+                input_fingerprint="recording-input-v1",
             )
         )
         session.commit()
@@ -51,6 +55,30 @@ def test_completed_stage_is_skipped(sqlite_engine: object) -> None:
 
         assert result.skipped is True
         assert executor.calls == 0
+
+
+def test_force_reexecutes_a_completed_stage(sqlite_engine: object) -> None:
+    """An operator-requested rerun must not be hidden by a historical success record."""
+
+    Base.metadata.create_all(sqlite_engine)
+    with Session(sqlite_engine) as session:
+        source = _source(session)
+        session.add(
+            PipelineRun(
+                source_video_id=source.id,
+                stage=PipelineStage.CONTEXTUAL_RECONSTRUCTION,
+                status=PipelineRunStatus.SUCCEEDED,
+            )
+        )
+        session.commit()
+        executor = RecordingExecutor()
+
+        result = PipelineRunner(session, {PipelineStage.CONTEXTUAL_RECONSTRUCTION: executor}).run(
+            source.id, PipelineStage.CONTEXTUAL_RECONSTRUCTION, force=True
+        )
+
+        assert result.skipped is False
+        assert executor.calls == 1
 
 
 def test_failure_persists_stage_and_job_error(sqlite_engine: object) -> None:
@@ -148,3 +176,425 @@ def test_probe_stage_uses_probe_job_kind_and_retries_to_probe(
 
         assert result.run_id is not None
         assert source.lifecycle_state is PipelineStage.AUDIO_EXTRACTION
+
+
+def test_reconstruction_stage_uses_its_own_job_and_advances_to_audio_analysis(
+    sqlite_engine: object,
+) -> None:
+    """Stage 2.7 is independently retryable and sits before audio analysis."""
+
+    from app.pipeline.runner import _job_kind_for_stage, _stage_for_job_kind
+
+    assert _job_kind_for_stage(PipelineStage.CONTEXTUAL_RECONSTRUCTION) is JobKind.RECONSTRUCTION
+    assert _stage_for_job_kind(JobKind.RECONSTRUCTION) is PipelineStage.CONTEXTUAL_RECONSTRUCTION
+
+    Base.metadata.create_all(sqlite_engine)
+    with Session(sqlite_engine) as session:
+        source = _source(session)
+        source.lifecycle_state = PipelineStage.CONTEXTUAL_RECONSTRUCTION
+        session.commit()
+
+        result = PipelineRunner(
+            session, {PipelineStage.CONTEXTUAL_RECONSTRUCTION: RecordingExecutor()}
+        ).run(source.id, PipelineStage.CONTEXTUAL_RECONSTRUCTION)
+
+        job = session.get(ProcessingJob, result.job_id)
+        session.refresh(source)
+        assert job is not None
+        assert job.kind is JobKind.RECONSTRUCTION
+        assert source.lifecycle_state is PipelineStage.AUDIO_ANALYSIS
+
+
+class _RecordingEngine:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def transcribe(self, _path: object, _options: object, cancel_event: object = None) -> object:
+        self.calls.append("transcribe")
+        from app.transcription.engine import TranscriptionResult
+
+        return TranscriptionResult(
+            language="ar",
+            language_probability=0.9,
+            raw_text="raw",
+            segments=[],
+            word_segments=[],
+            duration=1.0,
+        )
+
+    def last_child_peak_rss(self) -> int | None:
+        return 1_000_000
+
+
+def test_transcription_stage_holds_heavy_lease_around_whisper(
+    sqlite_engine: object,
+) -> None:
+    """The transcription stage holds the heavy-model lease around Whisper work."""
+
+    from app.models import AudioArtifact
+    from app.pipeline.stages import TranscriptionExecutor
+    from app.runtime.heavy_model_lease import NoopHeavyModelLeaseFactory
+    from app.transcription.service import TranscriptionOptions
+
+    Base.metadata.create_all(sqlite_engine)
+    with Session(sqlite_engine) as session:
+        source = SourceVideo(
+            source_uri=f"file:///tmp/{uuid.uuid4()}.mp4",
+            content_hash="h",
+            rights_status=RightsStatus.OWNED,
+        )
+        session.add(source)
+        session.commit()
+        session.add(
+            AudioArtifact(
+                source_video_id=source.id,
+                output_path="/tmp/audio.wav",
+                content_hash="h",
+                sample_rate=16000,
+                duration=1.0,
+            )
+        )
+        session.commit()
+
+        engine = _RecordingEngine()
+        lease_factory = NoopHeavyModelLeaseFactory()
+        executor = TranscriptionExecutor(
+            session=session,
+            engine=engine,  # type: ignore[arg-type]
+            options=TranscriptionOptions("small", "cpu", "int8", 5),
+            lease_factory=lease_factory,
+        )
+
+        executor.execute(source)
+
+        events = lease_factory.events
+        assert [event["event"] for event in events] == [
+            "heavy_model_acquired",
+            "heavy_model_released",
+        ]
+        assert events[0]["purpose"] == "whisper"
+        assert engine.calls == ["transcribe"]
+
+
+def test_transcription_stage_emits_labeled_memory_snapshots(
+    sqlite_engine: object, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The stage records before-load, after-transcribe, and after-cleanup snapshots."""
+
+    import logging
+
+    from app.models import AudioArtifact
+    from app.pipeline.stages import TranscriptionExecutor
+    from app.runtime.memory import MemorySnapshot
+    from app.transcription.service import TranscriptionOptions
+
+    Base.metadata.create_all(sqlite_engine)
+    with Session(sqlite_engine) as session:
+        source = SourceVideo(
+            source_uri=f"file:///tmp/{uuid.uuid4()}.mp4",
+            content_hash="h",
+            rights_status=RightsStatus.OWNED,
+        )
+        session.add(source)
+        session.commit()
+        session.add(
+            AudioArtifact(
+                source_video_id=source.id,
+                output_path="/tmp/audio.wav",
+                content_hash="h",
+                sample_rate=16000,
+                duration=1.0,
+            )
+        )
+        session.commit()
+        snapshot = MemorySnapshot(0.0, 8 * 1024**3, 1, 1, 1, None, None, None, 1)
+        executor = TranscriptionExecutor(
+            session=session,
+            engine=_RecordingEngine(),  # type: ignore[arg-type]
+            options=TranscriptionOptions("small", "cpu", "int8", 5),
+            snapshotter=lambda: snapshot,
+        )
+
+        with caplog.at_level(logging.INFO, logger="clipfactory.stages"):
+            executor.execute(source)
+
+        labels = [
+            record.__dict__.get("snapshot")
+            for record in caplog.records
+            if record.msg == "transcription_memory_snapshot"
+        ]
+        assert labels == ["before_load", "after_transcribe", "after_cleanup"]
+        after = next(
+            record
+            for record in caplog.records
+            if record.msg == "transcription_memory_snapshot"
+            and record.__dict__.get("snapshot") == "after_transcribe"
+        )
+        assert after.__dict__["child_peak_rss"] == 1_000_000
+        assert "cgroup_current" in after.__dict__
+        assert "cgroup_peak" in after.__dict__
+
+
+def test_heavy_lease_ownership_loss_fails_closed(sqlite_engine: object) -> None:
+    """A lost lease aborts the stage with a retryable error instead of proceeding."""
+
+    from app.models import AudioArtifact
+    from app.pipeline.stages import TranscriptionExecutor
+    from app.runtime.heavy_model_lease import HeavyModelLeaseBusy
+    from app.transcription.service import TranscriptionOptions
+
+    class LostLease:
+        token = "t"
+        owner_pid = 1
+        ownership_lost = True
+
+        def __enter__(self) -> "LostLease":
+            return self
+
+        def __exit__(self, exc_type: object, exc: object, traceback: object) -> bool:
+            return False
+
+        def acquire(self) -> "LostLease":
+            return self
+
+        def renew(self) -> bool:
+            return False
+
+        def retain(self) -> None:
+            pass
+
+        def release(self) -> None:
+            pass
+
+    class LostLeaseFactory:
+        def acquire(self, *, purpose: str, on_ownership_lost: object = None) -> LostLease:
+            return LostLease()
+
+    Base.metadata.create_all(sqlite_engine)
+    with Session(sqlite_engine) as session:
+        source = SourceVideo(
+            source_uri=f"file:///tmp/{uuid.uuid4()}.mp4",
+            content_hash="h",
+            rights_status=RightsStatus.OWNED,
+        )
+        session.add(source)
+        session.commit()
+        session.add(
+            AudioArtifact(
+                source_video_id=source.id,
+                output_path="/tmp/audio.wav",
+                content_hash="h",
+                sample_rate=16000,
+                duration=1.0,
+            )
+        )
+        session.commit()
+        executor = TranscriptionExecutor(
+            session=session,
+            engine=_RecordingEngine(),  # type: ignore[arg-type]
+            options=TranscriptionOptions("small", "cpu", "int8", 5),
+            lease_factory=LostLeaseFactory(),  # type: ignore[arg-type]
+        )
+
+        with pytest.raises(HeavyModelLeaseBusy, match="lease was lost"):
+            executor.execute(source)
+
+
+def test_reconstruction_stage_holds_heavy_lease_around_ollama(
+    sqlite_engine: object,
+) -> None:
+    """The reconstruction stage holds the heavy-model lease around the model call."""
+
+    from app.pipeline.stages import ContextualReconstructionExecutor
+    from app.runtime.heavy_model_lease import NoopHeavyModelLeaseFactory
+    from app.transcription.reconstruction.service import ContextualReconstructor
+
+    Base.metadata.create_all(sqlite_engine)
+    with Session(sqlite_engine) as session:
+        source = SourceVideo(
+            source_uri=f"file:///tmp/{uuid.uuid4()}.mp4",
+            content_hash="h",
+            rights_status=RightsStatus.OWNED,
+        )
+        session.add(source)
+        session.commit()
+        session.add(
+            Transcript(
+                source_video_id=source.id,
+                whisper_model="large-v3-turbo",
+                input_fingerprint="fp",
+                normalization_fingerprint="nf",
+                transcription_revision=1,
+                correction_version="v1",
+                segments=[],
+            )
+        )
+        session.commit()
+
+        lease_factory = NoopHeavyModelLeaseFactory()
+        executor = ContextualReconstructionExecutor(
+            session=session,
+            reconstructor=ContextualReconstructor(None),
+            lease_factory=lease_factory,
+        )
+
+        executor.execute(source, force=True)
+
+        events = lease_factory.events
+        assert [event["event"] for event in events] == [
+            "heavy_model_acquired",
+            "heavy_model_released",
+        ]
+        assert events[0]["purpose"] == "ollama"
+
+
+def test_heavy_lease_contention_raises_retryable_busy(sqlite_engine: object) -> None:
+    """A contended lease surfaces as a retryable error before any model starts."""
+
+    from app.pipeline.stages import ContextualReconstructionExecutor
+    from app.runtime.heavy_model_lease import HeavyModelLeaseBusy
+    from app.transcription.reconstruction.service import ContextualReconstructor
+
+    class BusyLeaseFactory:
+        def acquire(self, *, purpose: str) -> object:
+            raise HeavyModelLeaseBusy("heavy-model lease busy")
+
+    Base.metadata.create_all(sqlite_engine)
+    with Session(sqlite_engine) as session:
+        source = SourceVideo(
+            source_uri=f"file:///tmp/{uuid.uuid4()}.mp4",
+            content_hash="h",
+            rights_status=RightsStatus.OWNED,
+        )
+        session.add(source)
+        session.commit()
+        session.add(
+            Transcript(
+                source_video_id=source.id,
+                whisper_model="large-v3-turbo",
+                input_fingerprint="fp",
+                normalization_fingerprint="nf",
+                transcription_revision=1,
+                correction_version="v1",
+                segments=[],
+            )
+        )
+        session.commit()
+        executor = ContextualReconstructionExecutor(
+            session=session,
+            reconstructor=ContextualReconstructor(None),
+            lease_factory=BusyLeaseFactory(),  # type: ignore[arg-type]
+        )
+
+        with pytest.raises(HeavyModelLeaseBusy, match="busy") as excinfo:
+            executor.execute(source, force=True)
+
+        assert getattr(excinfo.value, "retryable", False) is True
+
+
+def test_reconstruction_retains_lease_when_unload_times_out(sqlite_engine: object) -> None:
+    """An unsafe unload timeout blocks another heavy-model start via the lease."""
+
+    from app.pipeline.stages import ContextualReconstructionExecutor
+    from app.transcription.reconstruction.providers import (
+        ReconstructionCandidate,
+        ReconstructionRequest,
+    )
+    from app.transcription.reconstruction.service import ContextualReconstructor
+    from app.transcription.reconstruction.types import (
+        ProviderAvailability,
+        ProviderHealth,
+        UnloadOutcome,
+    )
+
+    class WarningProvider:
+        def health(self) -> ProviderHealth:
+            return ProviderHealth(
+                ProviderAvailability.AVAILABLE, "ollama", "qwen3.5:4b", "sha256:x", "ok"
+            )
+
+        def runtime_identity(self) -> dict[str, object]:
+            return {"provider": "ollama", "model": "qwen3.5:4b", "digest": "sha256:x"}
+
+        def refresh_runtime_identity(self) -> dict[str, object]:
+            return self.runtime_identity()
+
+        def reconstruct_segments(
+            self, requests: list[ReconstructionRequest]
+        ) -> dict[int, ReconstructionCandidate]:
+            return {}
+
+        def release(self) -> UnloadOutcome:
+            return UnloadOutcome(True, False, 1.0, "model still resident after unload timeout")
+
+    class RecordingLease:
+        def __init__(self) -> None:
+            self.token = "t"
+            self.owner_pid = 1
+            self.retained = False
+            self.released = False
+            self.ownership_lost = False
+
+        def __enter__(self) -> "RecordingLease":
+            return self
+
+        def __exit__(self, exc_type: object, exc: object, traceback: object) -> bool:
+            self.release()
+            return False
+
+        def acquire(self) -> "RecordingLease":
+            return self
+
+        def renew(self) -> None:
+            return None
+
+        def retain(self) -> None:
+            self.retained = True
+
+        def release(self) -> None:
+            if self.retained:
+                return
+            self.released = True
+
+    class RecordingLeaseFactory:
+        def __init__(self) -> None:
+            self.leases: list[RecordingLease] = []
+
+        def acquire(self, *, purpose: str) -> RecordingLease:
+            lease = RecordingLease()
+            self.leases.append(lease)
+            return lease
+
+    Base.metadata.create_all(sqlite_engine)
+    with Session(sqlite_engine) as session:
+        source = SourceVideo(
+            source_uri=f"file:///tmp/{uuid.uuid4()}.mp4",
+            content_hash="h",
+            rights_status=RightsStatus.OWNED,
+        )
+        session.add(source)
+        session.commit()
+        session.add(
+            Transcript(
+                source_video_id=source.id,
+                whisper_model="large-v3-turbo",
+                input_fingerprint="fp",
+                normalization_fingerprint="nf",
+                transcription_revision=1,
+                correction_version="v1",
+                segments=[],
+            )
+        )
+        session.commit()
+        factory = RecordingLeaseFactory()
+        executor = ContextualReconstructionExecutor(
+            session=session,
+            reconstructor=ContextualReconstructor(WarningProvider()),
+            lease_factory=factory,  # type: ignore[arg-type]
+        )
+
+        executor.execute(source, force=True)
+
+        lease = factory.leases[0]
+        assert lease.retained is True
+        assert lease.released is False

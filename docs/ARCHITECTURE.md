@@ -10,6 +10,8 @@ late acknowledgements so local media work is conservative and retryable.
 per-source folders, validates paths, checks capacity, and writes atomically.
 The backend image uses Python 3.12 and installs FFmpeg/ffprobe from Debian.
 
-Compose services are `postgres`, `redis`, `backend`, `worker`, and `frontend`.
-Postgres and Redis use named volumes; source media uses the visible local
-`storage/` mount so an operator can inspect or back it up.
+Compose services are `postgres`, `redis`, `backend`, `worker`, `frontend`, and
+the optional `ollama` service under the `reconstruction` profile. Postgres and
+Redis use named volumes; source media uses the visible local `storage/` mount so
+an operator can inspect or back it up. Ollama stores models in the
+`ollama_models` volume and exposes no public port.

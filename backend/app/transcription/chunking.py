@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Mapping
+from typing import Mapping, Sequence
 
 
 @dataclass(frozen=True)
@@ -27,7 +27,7 @@ class TranscriptChunk:
 
 
 def build_chunks(
-    segments: list[Mapping[str, object]], config: ChunkConfig = ChunkConfig()
+    segments: Sequence[Mapping[str, object]], config: ChunkConfig = ChunkConfig()
 ) -> list[TranscriptChunk]:
     """Group complete segments near target duration, preserving neighbor text."""
 
@@ -51,7 +51,7 @@ def build_chunks(
 
 
 def _make_chunk(
-    segments: list[Mapping[str, object]], indexes: list[int], context_count: int
+    segments: Sequence[Mapping[str, object]], indexes: list[int], context_count: int
 ) -> TranscriptChunk:
     first, last = indexes[0], indexes[-1]
     before = range(max(0, first - context_count), first)
@@ -71,4 +71,6 @@ def _time(segment: Mapping[str, object], field: str) -> float:
 
 
 def _text(segment: Mapping[str, object]) -> str:
-    return str(segment.get("text", ""))
+    return str(
+        segment.get("final_text") or segment.get("normalized_text") or segment.get("text", "")
+    )

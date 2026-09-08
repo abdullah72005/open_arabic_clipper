@@ -1,8 +1,12 @@
+from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
+import pytest
 from sqlalchemy.orm import Session
 
+from app.runtime.model_process import DirectRunner
 from app.transcription.service import TranscriptionOptions
 from app.workers.celery_app import celery_app
 
@@ -16,10 +20,13 @@ class FakeWord:
 
 class FakeSegment:
     start = 0.0
-    end = 0.8
+    end = 1.25
     text = "أهلا"
+    tokens = [50364, 1234, 50414]
     avg_logprob = -0.1
+    compression_ratio = 1.17
     no_speech_prob = 0.01
+    temperature = 0.2
     words = [FakeWord()]
 
 
@@ -34,6 +41,19 @@ class FakeModel:
         assert path == "speech.wav"
         assert kwargs["word_timestamps"] is True
         return [FakeSegment()], FakeInfo()
+
+
+class LazyWhisperModel:
+    exhausted = False
+
+    def transcribe(self, path: str, **kwargs: object) -> tuple[Iterator[object], object]:
+        del path, kwargs
+
+        def rows() -> Iterator[object]:
+            yield SimpleNamespace(start=0.0, end=1.0, text=" كلام", words=[])
+            self.exhausted = True
+
+        return rows(), SimpleNamespace(language="ar", language_probability=0.99, duration=1.0)
 
 
 def test_transcription_fingerprint_changes_for_material_settings_only() -> None:
@@ -78,14 +98,177 @@ def test_engine_falls_back_to_cpu_int8_and_preserves_word_timestamps() -> None:
         created.append((model, device, compute_type))
         return FakeModel()
 
-    result = WhisperEngine(model_factory=model_factory, cuda_available=lambda: False).transcribe(
-        Path("speech.wav"), TranscriptionOptions("small", "auto", "auto", 5)
-    )
+    result = WhisperEngine(
+        model_factory=model_factory, cuda_available=lambda: False, runner=DirectRunner()
+    ).transcribe(Path("speech.wav"), TranscriptionOptions("small", "auto", "auto", 5))
 
     assert created == [("small", "cpu", "int8")]
     assert result.language == "ar"
     assert result.language_probability == 0.97
+    assert result.segments[0]["tokens"] == [50364, 1234, 50414]
+    assert result.segments[0]["compression_ratio"] == 1.17
+    assert result.segments[0]["temperature"] == 0.2
+    assert result.segments[0]["start"] == 0.0
+    assert result.segments[0]["end"] == 1.25
     assert result.segments[0]["words"][0]["start"] == 0.0
+
+
+def test_whisper_materializes_segments_before_collecting_model() -> None:
+    """Model cleanup happens only after the lazy Whisper stream is exhausted."""
+
+    from app.transcription.engine import WhisperEngine
+
+    model = LazyWhisperModel()
+    collected: list[bool] = []
+    engine = WhisperEngine(
+        model_factory=lambda *_: model,
+        cuda_available=lambda: False,
+        collect_garbage=lambda: collected.append(model.exhausted) or 0,
+        runner=DirectRunner(),
+    )
+
+    result = engine.transcribe(
+        Path("speech.wav"),
+        TranscriptionOptions(model="small", device="cpu", compute_type="int8", beam_size=5),
+    )
+
+    assert result.segments
+    assert collected == [True]
+
+
+def test_engine_passes_explicit_safe_decoding_options() -> None:
+    """Optional Whisper controls are explicit, output-affecting, and still local."""
+
+    from app.transcription.engine import WhisperEngine
+
+    received: dict[str, object] = {}
+
+    class RecordingModel:
+        def transcribe(self, _path: str, **kwargs: object) -> tuple[list[FakeSegment], FakeInfo]:
+            received.update(kwargs)
+            return [FakeSegment()], FakeInfo()
+
+    WhisperEngine(
+        model_factory=lambda *_args: RecordingModel(),
+        cuda_available=lambda: False,
+        runner=DirectRunner(),
+    ).transcribe(
+        Path("speech.wav"),
+        TranscriptionOptions(
+            "small",
+            "cpu",
+            "int8",
+            5,
+            temperature=(0.0, 0.4),
+            condition_on_previous_text=False,
+            vad_filter=True,
+            initial_prompt="مصري",
+            hotwords="خلي بالك",
+        ),
+    )
+
+    assert received["temperature"] == (0.0, 0.4)
+    assert received["condition_on_previous_text"] is False
+    assert received["vad_filter"] is True
+    assert received["initial_prompt"] == "مصري"
+    assert received["hotwords"] == "خلي بالك"
+
+
+class _ChildSegment:
+    start = 0.0
+    end = 1.0
+    text = " كلام"
+    tokens = [1, 2]
+    avg_logprob = -0.1
+    compression_ratio = 1.1
+    no_speech_prob = 0.0
+    temperature = 0.0
+    words = [SimpleNamespace(start=0.0, end=0.5, word="كلام", probability=0.9)]
+
+
+class _ChildInfo:
+    language = "ar"
+    language_probability = 0.98
+    duration = 1.0
+
+
+class _ChildModel:
+    def __init__(self) -> None:
+        self.exhausted = False
+
+    def transcribe(self, path: str, **kwargs: object) -> tuple[Iterator[object], object]:
+        del path, kwargs
+
+        def rows() -> Iterator[object]:
+            yield _ChildSegment()
+            self.exhausted = True
+
+        return rows(), _ChildInfo()
+
+
+def _child_fake_model_factory(model: str, device: str, compute_type: str) -> _ChildModel:
+    return _ChildModel()
+
+
+def test_engine_spawned_child_materializes_full_result_before_reply() -> None:
+    """The child consumes the generator so the parent receives a materialized result."""
+
+    from app.runtime.model_process import ModelProcessRunner
+    from app.transcription.engine import WhisperEngine
+
+    engine = WhisperEngine(
+        model_factory=_child_fake_model_factory,
+        cuda_available=lambda: False,
+        runner=ModelProcessRunner(timeout_seconds=30),
+    )
+
+    result = engine.transcribe(Path("speech.wav"), TranscriptionOptions("small", "cpu", "int8", 5))
+
+    assert result.segments == [
+        {
+            "start": 0.0,
+            "end": 1.0,
+            "text": " كلام",
+            "tokens": [1, 2],
+            "avg_logprob": -0.1,
+            "compression_ratio": 1.1,
+            "no_speech_prob": 0.0,
+            "temperature": 0.0,
+            "words": [{"start": 0.0, "end": 0.5, "word": "كلام", "probability": 0.9}],
+        }
+    ]
+    assert result.raw_text == "كلام"
+
+
+def test_engine_collects_garbage_on_exception() -> None:
+    """Cleanup still runs when transcription raises inside the child call."""
+
+    from app.transcription.engine import SpawnedProcessError, WhisperEngine
+
+    class ExplodingModel:
+        def transcribe(self, _path: str, **_kwargs: object) -> tuple[list[object], object]:
+            raise RuntimeError("boom")
+
+    collected: list[int] = []
+    engine = WhisperEngine(
+        model_factory=lambda *_args: ExplodingModel(),
+        cuda_available=lambda: False,
+        collect_garbage=lambda: collected.append(1) or 0,
+        runner=DirectRunner(),
+    )
+
+    with pytest.raises(SpawnedProcessError, match="RuntimeError"):
+        engine.transcribe(Path("speech.wav"), TranscriptionOptions("small", "cpu", "int8", 5))
+
+    assert collected == [1]
+
+
+def test_celery_worker_uses_single_concurrency_prefetch_and_child_recycling() -> None:
+    """Effective Celery values enforce sequential heavy-model execution."""
+
+    assert celery_app.conf.worker_concurrency == 1
+    assert celery_app.conf.worker_prefetch_multiplier == 1
+    assert celery_app.conf.worker_max_tasks_per_child == 1
 
 
 def test_transcription_executor_persists_raw_timestamped_result(
@@ -99,7 +282,9 @@ def test_transcription_executor_persists_raw_timestamped_result(
     from app.transcription.engine import TranscriptionResult
 
     class FakeEngine:
-        def transcribe(self, path: Path, options: TranscriptionOptions) -> TranscriptionResult:
+        def transcribe(
+            self, path: Path, options: TranscriptionOptions, cancel_event: object = None
+        ) -> TranscriptionResult:
             return TranscriptionResult(
                 language="ar",
                 language_probability=0.9,
@@ -108,6 +293,9 @@ def test_transcription_executor_persists_raw_timestamped_result(
                 segments=[{"start": 0.0, "end": 1.0, "text": "أهلا hello", "words": []}],
                 word_segments=[],
             )
+
+        def last_child_peak_rss(self) -> int | None:
+            return None
 
     Base.metadata.create_all(sqlite_engine)
     with Session(sqlite_engine) as session:
@@ -196,6 +384,110 @@ def test_normalization_and_audio_analysis_persist_reusable_signals(
         assert analysis.speech_density == 0.8
 
 
+def test_normalization_persists_raw_corrected_final_text_and_timestamp(
+    sqlite_engine: object, tmp_path: Path
+) -> None:
+    """Stage 2.5 persists derived correction state without altering ASR timestamps."""
+
+    from app.db.base import Base
+    from app.models import SourceVideo, Transcript
+    from app.pipeline.stages import TranscriptNormalizationExecutor
+
+    Base.metadata.create_all(sqlite_engine)
+    with Session(sqlite_engine) as session:
+        source = SourceVideo(source_uri=str(tmp_path / "source.mp4"), content_hash="source")
+        session.add(source)
+        session.flush()
+        session.add(
+            Transcript(
+                source_video_id=source.id,
+                whisper_model="small",
+                input_fingerprint="fingerprint",
+                raw_text="خطي بالك",
+                normalized_text="خطي بالك",
+                segments=[{"start": 0.0, "end": 1.0, "text": "خطي بالك", "words": []}],
+                word_segments=[],
+                duration=1.0,
+            )
+        )
+        session.commit()
+
+        transcript = TranscriptNormalizationExecutor(session=session).execute(source)
+
+        assert transcript.raw_text == "خطي بالك"
+        assert transcript.corrected_text == "خلي بالك"
+        assert transcript.final_text == "خلي بالك"
+        assert transcript.segments[0]["raw_text"] == "خطي بالك"
+        assert transcript.segments[0]["corrected_text"] == "خلي بالك"
+        assert transcript.segments[0]["final_text"] == "خلي بالك"
+        assert transcript.segments[0]["correction_applied"] is True
+        assert transcript.segments[0]["start"] == 0.0
+        assert transcript.segments[0]["end"] == 1.0
+        assert transcript.corrected_segment_ratio == 1.0
+        assert transcript.uncertain_segment_ratio == 0.0
+
+
+def test_reconstruction_persists_derived_text_without_replacing_prior_evidence(
+    sqlite_engine: object, tmp_path: Path
+) -> None:
+    """Stage 2.7 keeps ASR, correction, and manual values separate from final display text."""
+
+    from app.db.base import Base
+    from app.models import SourceVideo, Transcript
+    from app.pipeline.stages import ContextualReconstructionExecutor
+    from app.transcription.reconstruction import ContextualReconstructor
+
+    Base.metadata.create_all(sqlite_engine)
+    with Session(sqlite_engine) as session:
+        source = SourceVideo(source_uri=str(tmp_path / "source.mp4"), content_hash="source")
+        session.add(source)
+        session.flush()
+        session.add(
+            Transcript(
+                source_video_id=source.id,
+                whisper_model="small",
+                input_fingerprint="fingerprint",
+                raw_text="خطي بالك يا صحبي",
+                corrected_text="خلي بالك يا صاحبي",
+                segments=[
+                    {
+                        "start": 0.0,
+                        "end": 1.0,
+                        "text": "خطي بالك",
+                        "raw_text": "خطي بالك",
+                        "corrected_text": "خلي بالك",
+                    },
+                    {
+                        "start": 1.0,
+                        "end": 2.0,
+                        "text": "يا صحبي",
+                        "raw_text": "يا صحبي",
+                        "corrected_text": "يا صاحبي",
+                        "operator_text": "يا صديقي",
+                    },
+                ],
+                word_segments=[],
+                duration=2.0,
+            )
+        )
+        session.commit()
+
+        transcript = ContextualReconstructionExecutor(
+            session=session, reconstructor=ContextualReconstructor(provider=None)
+        ).execute(source)
+
+        assert transcript.raw_text == "خطي بالك يا صحبي"
+        assert transcript.corrected_text == "خلي بالك يا صاحبي"
+        assert transcript.contextual_reconstructed_text == "خلي بالك يا صاحبي"
+        assert transcript.final_text == "خلي بالك يا صديقي"
+        assert transcript.segments[0]["raw_text"] == "خطي بالك"
+        assert transcript.segments[0]["corrected_text"] == "خلي بالك"
+        assert transcript.segments[0]["contextual_reconstructed_text"] == "خلي بالك"
+        assert transcript.segments[1]["final_text"] == "يا صديقي"
+        assert transcript.reconstruction_method == "stage2_5_fallback"
+        assert transcript.chunks[0].text == "خلي بالك يا صديقي"
+
+
 def test_benchmark_reports_actual_transcription_throughput(tmp_path: Path) -> None:
     from app.transcription.benchmark import benchmark_transcription
     from app.transcription.engine import TranscriptionResult
@@ -204,7 +496,9 @@ def test_benchmark_reports_actual_transcription_throughput(tmp_path: Path) -> No
         def resolved_hardware(self, _options: TranscriptionOptions) -> tuple[str, str]:
             return "cpu", "int8"
 
-        def transcribe(self, _path: Path, _options: TranscriptionOptions) -> TranscriptionResult:
+        def transcribe(
+            self, _path: Path, _options: TranscriptionOptions, cancel_event: object = None
+        ) -> TranscriptionResult:
             return TranscriptionResult(
                 language="ar",
                 language_probability=0.9,
@@ -226,6 +520,7 @@ def test_benchmark_reports_actual_transcription_throughput(tmp_path: Path) -> No
 
 
 def test_ingest_and_probe_executors_validate_local_source(tmp_path: Path) -> None:
+    from app.media.ffprobe import MediaMetadata
     from app.models import SourceVideo
     from app.pipeline.stages import IngestExecutor, ProbeExecutor
 
@@ -237,13 +532,21 @@ def test_ingest_and_probe_executors_validate_local_source(tmp_path: Path) -> Non
         def __init__(self) -> None:
             self.paths: list[Path] = []
 
-        def probe(self, path: Path) -> object:
+        def probe(self, path: Path) -> MediaMetadata:
             self.paths.append(path)
-            return object()
+            return MediaMetadata(
+                duration_seconds=1.0,
+                video_codec="h264",
+                width=16,
+                height=16,
+                frames_per_second=30.0,
+                audio_codec="aac",
+                audio_sample_rate=44100,
+            )
 
     probe = RecordingProbe()
-    assert IngestExecutor().execute(source) is source
-    assert ProbeExecutor(probe).execute(source) is not None
+    assert IngestExecutor().execute(source).value is source
+    assert ProbeExecutor(probe).execute(source).value is not None  # type: ignore[arg-type]
     assert probe.paths == [source_path]
 
 

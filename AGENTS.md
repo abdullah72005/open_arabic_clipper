@@ -3,9 +3,11 @@
 ## Product and stage
 
 - Product name: `open_arabic_clipper` (working product label: ClipFactory).
-- Current scope: Stage 1 only — local-first foundation, ingest/probe pipeline,
-  storage, jobs, dashboard shell, and operational tooling.
-- Explicitly out of scope until later stages: transcription, AI clip selection,
+- Current scope: Stage 2.7 — local-first ingest/probe, cached audio,
+  faster-whisper transcription, conservative contextual Egyptian correction,
+  bounded contextual reconstruction through a managed local provider, storage,
+  jobs, dashboard, and operational tooling through `READY_FOR_ANALYSIS`.
+- Explicitly out of scope until later stages: Stage 3 AI clip selection,
   advanced rendering/reframing, social publishing, and automatic authorization.
 - Process only media the operator owns or is authorized to process. Never add
   DRM, login, paywall, CAPTCHA, or platform-protection circumvention.
@@ -18,9 +20,27 @@
 - Media interfaces use FFmpeg/ffprobe through safe argument arrays; GPU use is
   optional and must never be required.
 - The storage service is the sole owner of application filesystem paths.
-- Pipeline stages are persisted, idempotent, retryable, and resumable. Stage 1
-  ends at `READY_FOR_TRANSCRIPTION`; future stage authorization must gate
-  UNKNOWN-rights sources before candidate generation, rendering, or publishing.
+- Pipeline stages are persisted, idempotent, retryable, and resumable. Stage 2.5
+  preserves raw ASR text/timestamps and derives correction/final fields without
+  realignment. Stage 2.7 preserves raw ASR text, segment timestamps, and word
+  timestamps and derives reconstruction fields through a managed local provider.
+  Reconstruction output carries one `provider_confidence` scalar and is validated
+  at a strict provider boundary; failures are isolated per segment. Stage 2.7
+  input/output fingerprints include the full runtime identity (provider, model,
+  digest, prompt hash/schema, budgets, confidence-policy and validation
+  versions), so any of those changes invalidates prior Stage 2.7 runs.
+  `contextual_reconstructed_text` joins each segment's actual Stage 2.7 output;
+  manual overrides change only `final_text`. Rights/provenance are tracked
+  throughout the pipeline but do not block local analysis; publishing eligibility
+  is evaluated separately. Unsafe heavy-model residency is a persistent
+  Redis marker with no TTL that survives restart, CLI exit, and lease TTL
+  expiry; `python -m app.cli recover-heavy-model` clears it only after
+  confirming the model is no longer resident. A lost heavy-model lease cancels
+  the active Whisper child and records unsafe state so overlapping jobs cannot
+  start. Immutable ASR capture replay verifies clip id, source id,
+  original-media SHA-256, exact clip audio SHA-256, exact bounds, schema, and
+  decoder identity. Whisper child peak memory is measured in the child after
+  model work; abnormal exits report UNKNOWN.
 
 ## Local development facts (not product requirements)
 

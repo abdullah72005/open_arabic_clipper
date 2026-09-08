@@ -5,9 +5,21 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 from uuid import UUID
 
-from sqlalchemy import JSON, DateTime, Float, ForeignKey, String, Text, func
+from sqlalchemy import (
+    JSON,
+    CheckConstraint,
+    DateTime,
+    Enum,
+    Float,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    func,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
+from app.core.enums import ReconstructionStatus
 from app.db.base import Base
 
 if TYPE_CHECKING:
@@ -19,6 +31,12 @@ class Transcript(Base):
     """Current reusable timestamped transcript for a source."""
 
     __tablename__ = "transcripts"
+    __table_args__ = (
+        CheckConstraint(
+            "transcription_revision >= 0",
+            name="ck_transcripts_transcription_revision_nonnegative",
+        ),
+    )
 
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
     source_video_id: Mapped[UUID] = mapped_column(
@@ -29,8 +47,41 @@ class Transcript(Base):
     whisper_model: Mapped[str] = mapped_column(String(64))
     transcription_options: Mapped[dict[str, object]] = mapped_column(JSON, default=dict)
     input_fingerprint: Mapped[str] = mapped_column(String(64), index=True)
+    transcription_revision: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    normalization_fingerprint: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="", server_default=""
+    )
+    reconstruction_status: Mapped[ReconstructionStatus] = mapped_column(
+        Enum(
+            ReconstructionStatus,
+            name="reconstruction_status",
+            native_enum=False,
+            create_constraint=True,
+        ),
+        nullable=False,
+        default=ReconstructionStatus.NOT_REQUIRED,
+        server_default=ReconstructionStatus.NOT_REQUIRED.value,
+    )
     raw_text: Mapped[str] = mapped_column(Text, default="")
     normalized_text: Mapped[str] = mapped_column(Text, default="")
+    corrected_text: Mapped[str] = mapped_column(Text, default="")
+    contextual_reconstructed_text: Mapped[str] = mapped_column(Text, default="")
+    final_text: Mapped[str] = mapped_column(Text, default="")
+    raw_transcript_confidence: Mapped[float] = mapped_column(Float, default=0)
+    correction_confidence: Mapped[float] = mapped_column(Float, default=0)
+    corrected_segment_ratio: Mapped[float] = mapped_column(Float, default=0)
+    uncertain_segment_ratio: Mapped[float] = mapped_column(Float, default=0)
+    correction_method: Mapped[str] = mapped_column(String(64), default="pending")
+    correction_version: Mapped[str] = mapped_column(String(64), default="pending")
+    reconstruction_fingerprint: Mapped[str] = mapped_column(String(64), default="")
+    reconstruction_confidence: Mapped[float] = mapped_column(Float, default=0)
+    reconstructed_segment_ratio: Mapped[float] = mapped_column(Float, default=0)
+    reconstruction_method: Mapped[str] = mapped_column(String(64), default="pending")
+    reconstruction_version: Mapped[str] = mapped_column(String(64), default="pending")
+    reconstruction_processing_duration: Mapped[float | None] = mapped_column(Float)
+    reconstruction_metadata: Mapped[dict[str, object]] = mapped_column(JSON, default=dict)
     segments: Mapped[list[dict[str, object]]] = mapped_column(JSON, default=list)
     word_segments: Mapped[list[dict[str, object]]] = mapped_column(JSON, default=list)
     duration: Mapped[float] = mapped_column(Float, default=0)

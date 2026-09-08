@@ -1,9 +1,55 @@
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.core.enums import JobKind, JobStatus, PipelineRunStatus, PipelineStage, RightsStatus
+from app.core.enums import (
+    JobKind,
+    JobStatus,
+    PipelineRunStatus,
+    PipelineStage,
+    ReconstructionStatus,
+    RightsStatus,
+)
 from app.db.base import Base
-from app.models import PipelineRun, ProcessingJob, SourceVideo, Transcript
+from app.models import (
+    AudioAnalysis,
+    PipelineRun,
+    ProcessingJob,
+    SourceQualityAssessment,
+    SourceVideo,
+    Transcript,
+)
+
+
+def test_stage_2_7_truth_columns_exist() -> None:
+    assert {"input_fingerprint", "output_fingerprint"} <= set(PipelineRun.__table__.columns.keys())
+    assert {
+        "transcription_revision",
+        "normalization_fingerprint",
+        "reconstruction_status",
+    } <= set(Transcript.__table__.columns.keys())
+    assert "input_fingerprint" in AudioAnalysis.__table__.columns
+    assert {
+        "transcript_quality_score",
+        "low_confidence_word_ratio",
+        "unresolved_segment_ratio",
+        "manual_review_required",
+        "input_fingerprint",
+    } <= set(SourceQualityAssessment.__table__.columns.keys())
+
+    reconstruction_status = Transcript.__table__.columns["reconstruction_status"]
+    assert reconstruction_status.type.native_enum is False
+    assert reconstruction_status.default.arg is ReconstructionStatus.NOT_REQUIRED
+
+    constraint_sql = {
+        str(constraint.sqltext)
+        for table in (Transcript.__table__, SourceQualityAssessment.__table__)
+        for constraint in table.constraints
+        if hasattr(constraint, "sqltext")
+    }
+    assert "transcription_revision >= 0" in constraint_sql
+    assert "transcript_quality_score >= 0 AND transcript_quality_score <= 1" in constraint_sql
+    assert "low_confidence_word_ratio >= 0 AND low_confidence_word_ratio <= 1" in constraint_sql
+    assert "unresolved_segment_ratio >= 0 AND unresolved_segment_ratio <= 1" in constraint_sql
 
 
 def test_source_video_defaults_and_content_hash_is_unique(sqlite_engine: object) -> None:

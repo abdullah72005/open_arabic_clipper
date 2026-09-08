@@ -17,6 +17,7 @@ the application remains portable and config-driven.
 | Git | 2.34.1 |
 | Free disk | 259 GiB free on the mounted Windows volume (952 GiB total) |
 | Network | HTTPS checks to PyPI and npm registry succeeded |
+| Ollama | `ollama/ollama` runs under the `reconstruction` profile; `qwen3:8b` pulled with digest `500a1f067a9f…b41` |
 
 ## Development implications
 
@@ -24,3 +25,95 @@ The Docker services use Python 3.12 and install FFmpeg, so they are the
 supported path on this machine. Native execution is still supported after the
 operator installs Python 3.12+ and FFmpeg/ffprobe. CPU-only operation is the
 default; later GPU acceleration is an optional enhancement.
+
+The 7.4 GiB RAM limit makes the provisional `qwen3:8b` reconstruction model
+infeasible for the live pipeline benchmark: loading it (~5.5 GiB) alongside
+faster-whisper and the running services triggers an out-of-memory kill.
+`qwen3.5:4b` (~3.4 GiB) loads but did not apply a reconstruction during the
+diagnostic because its unbatched request exceeded the model context; see
+`docs/BENCHMARKS.md` for measured results.
+
+## Stage 2.7 memory ceiling (measured 2026-09-07)
+
+`scripts/diagnose-memory.sh` is a read-only diagnostic that prints these facts.
+The measured values below distinguish host RAM, the WSL VM limit, the container
+cgroup limit, process/container usage, and swap.
+
+| Layer | Measurement | Value |
+| --- | --- | --- |
+| Host physical RAM | `Win32_ComputerSystem.TotalPhysicalMemory` | 16,506,011,648 bytes ≈ 15.37 GiB |
+| WSL config | `%UserProfile%\.wslconfig` | absent (no explicit limit) |
+| WSL default | `wsl --status` | WSL2, Ubuntu-22.04 |
+| Linux total | `/proc/meminfo MemTotal` | 7,803,048 kB ≈ 7.44 GiB |
+| Linux available | `/proc/meminfo MemAvailable` | ≈ 4.34 GiB at measurement |
+| Swap total / used | `swapon --show --bytes` | 2 GiB total, ≈ 1.3 GiB used |
+| cgroup limit | `/sys/fs/cgroup/memory.max` | `max` (no container cgroup limit) |
+| cgroup current / peak | `memory.current` / `memory.peak` | ≈ 383 MB / 504 MB |
+| Docker host view | `docker info MemTotal` | 7,990,321,152 bytes ≈ 7.44 GiB |
+| Worker container limit | `docker inspect .HostConfig.Memory` | 0 (unlimited) |
+| Ollama residency | `ollama ps` | no model loaded at measurement |
+
+**Conclusion:** the narrowest active ceiling is the WSL2 virtual-machine
+allocation. With no `.wslconfig`, WSL2 defaults to 50% of host RAM (about 8 GB),
+which the guest reports as 7.44 GiB of `MemTotal`. Container cgroup limits are
+unlimited and are not the cause. This is a WSL/Docker VM capacity limit, not an
+application limit.
+
+To raise the ceiling, the operator writes `%UserProfile%\.wslconfig`:
+
+```ini
+[wsl2]
+memory=11GB
+swap=4GB
+```
+
+then runs `wsl --shutdown` from Windows, restarts Docker Desktop, and reruns
+`scripts/diagnose-memory.sh`. Eleven GiB leaves roughly five GiB of host
+headroom while allowing a practical quantized 8B trial. Twelve GiB is acceptable
+only as an operator-selected alternative after measuring that Windows pressure
+stays safe. The repository never edits `.wslconfig` or restarts WSL itself.
+
+### After applying the WSL configuration (measured 2026-09-07)
+
+The operator applied the `memory=11GB swap=4GB` configuration. `diagnose-memory`
+now reports:
+
+| Layer | Value |
+| --- | --- |
+| Linux `MemTotal` | 11,212,972 kB ≈ 10.69 GiB |
+| Docker `MemTotal` | 11,482,083,328 bytes ≈ 10.69 GiB |
+| Linux `MemAvailable` | ≈ 8.2 GiB at rest |
+| Swap | 4 GiB total, ≈ 0 used at rest |
+| cgroup limit | `max` (unlimited) |
+
+The heavy-model lifecycle was then measured over three sequential
+transcription-plus-reconstruction trials. In every trial the Whisper model ran
+in a spawned child process that exited and was reaped before the Ollama
+reconstruction began (the Redis `clipfactory:heavy-model` lease serializes
+them). `ollama ps` was empty before and after each reconstruction, and the
+`unload_outcome` metadata confirmed the unload within a second. See
+`docs/STAGE_2_7_OPERATIONS.md` for the per-trial memory table.
+
+## Unsafe heavy-model state and operator recovery (2026-09-08)
+
+Unsafe model residency is recorded in a separate persistent Redis marker
+(`clipfactory:heavy-model:unsafe`) that carries no TTL. It is written when an
+Ollama unload fails or when a heavy-model lease is lost while work is active.
+Because it has no expiry, the marker survives worker restart, CLI exit, and the
+lease TTL, so no new heavy-model work may start until an operator clears it.
+
+Recovery is explicit and conservative. `recover-heavy-model` only clears the
+marker after confirming the configured model is no longer resident (it polls
+Ollama `/api/ps` and treats an unreadable listing as resident):
+
+```bash
+docker compose exec backend python -m app.cli recover-heavy-model
+```
+
+A worker or CLI that finds the marker refuses to acquire the heavy-model lease
+(`HeavyModelUnsafe`) until recovery succeeds. Acquisition checks the unsafe
+marker and takes the lease inside one atomic Redis script, and recovery clears
+the stale lease and the marker inside one atomic script, so no acquisition can
+slip into the gap between the two operations and recovery never deletes a
+valid newly acquired lease. This behavior is covered by the heavy-model lease
+lifecycle tests.
