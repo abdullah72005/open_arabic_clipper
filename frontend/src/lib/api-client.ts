@@ -46,6 +46,9 @@ export interface Job {
   retry_count: number;
   error_code: string | null;
   error_message: string | null;
+  created_at: string;
+  started_at: string | null;
+  completed_at: string | null;
 }
 
 export interface Health {

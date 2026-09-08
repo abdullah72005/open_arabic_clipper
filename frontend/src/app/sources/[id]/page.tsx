@@ -3,6 +3,8 @@
 import { useParams, useRouter } from "next/navigation";
 import { useCallback, useRef, useState } from "react";
 import { ApiState } from "@/components/api-state";
+import { JobPoller } from "@/components/job-poller";
+import { JobProgress } from "@/components/job-progress";
 import { TranscriptStatus } from "@/components/transcript-status";
 import { api, ApiError, type QualityResponse, type Transcript } from "@/lib/api-client";
 
@@ -136,6 +138,10 @@ export default function SourceDetail() {
   const [error, setError] = useState("");
   const [transcriptRevision, setTranscriptRevision] = useState(0);
   const [jobRevision, setJobRevision] = useState(0);
+  const refreshAfterJob = useCallback(() => {
+    setTranscriptRevision((value) => value + 1);
+    setJobRevision((value) => value + 1);
+  }, []);
   const load = useCallback(() => api.getSource(params.id), [params.id]);
   const loadTranscript = useCallback(
     () => api.getTranscript(params.id).catch((cause) => {
@@ -195,41 +201,48 @@ export default function SourceDetail() {
   return (
     <ApiState load={load}>
       {(source) => (
-        <>
-          <section className="card">
-            <h2>{source.original_filename ?? "URL source"}</h2>
-            {!source.source_uri.startsWith("http") && (
-              <video
-                controls
-                id="source-preview"
-                preload="metadata"
-                ref={videoRef}
-                src={api.sourceMediaUrl(source.id)}
-              />
-            )}
-            <dl>
-              <dt>Origin</dt><dd>{source.source_uri}</dd>
-              <dt>Rights</dt><dd>{source.rights_status}</dd>
-              <dt>Pipeline state</dt><dd>{source.lifecycle_state}</dd>
-            </dl>
-            <ApiState key={jobRevision} load={api.listJobs}>
-              {(jobs) => {
-                const job = jobs.find((item) => item.source_video_id === source.id);
-                if (!job) return null;
-                const canRetry = ["FAILED", "CANCELLED"].includes(job.status);
-                return <div><strong>{job.kind} — {job.status}</strong>{job.error_message && <p className="error">Reason: {job.error_message}</p>}{canRetry && <button className="button" onClick={() => void retry()}>Retry</button>}</div>;
-              }}
-            </ApiState>
-            <p className="muted">Transcription auto-detects Arabic, English, and mixed speech locally.</p>
-            <button className="button" onClick={() => void reconstruct()}>Reconstruct transcript</button>
-            <button className="button" onClick={() => void retranscribe()}>Force retranscription</button>
-            <button className="button danger" onClick={remove}>Delete source</button>
-            {error && <p className="error">{error}</p>}
-          </section>
-          <ApiState key={transcriptRevision} load={loadTranscriptData}>
-            {({ transcript, quality }) => <TranscriptViewer onSeek={seekTo} onUpdated={() => setTranscriptRevision((value) => value + 1)} quality={quality} sourceId={source.id} transcript={transcript} />}
-          </ApiState>
-        </>
+        <ApiState key={jobRevision} load={api.listJobs}>
+          {(jobs) => {
+            const job = jobs.find((item) => item.source_video_id === source.id);
+            const active = !!job && ["QUEUED", "RUNNING"].includes(job.status);
+            return (
+              <>
+                <section className="card">
+                  <h2>{source.original_filename ?? "URL source"}</h2>
+                  {!source.source_uri.startsWith("http") && (
+                    <video
+                      controls
+                      id="source-preview"
+                      preload="metadata"
+                      ref={videoRef}
+                      src={api.sourceMediaUrl(source.id)}
+                    />
+                  )}
+                  <dl>
+                    <dt>Origin</dt><dd>{source.source_uri}</dd>
+                    <dt>Rights</dt><dd>{source.rights_status}</dd>
+                    <dt>Pipeline state</dt><dd>{source.lifecycle_state}</dd>
+                  </dl>
+                  {job && <JobPoller onComplete={refreshAfterJob} sourceId={source.id} jobStatus={job.status} />}
+                  {job && job.error_message && <p className="error">Reason: {job.error_message}</p>}
+                  {job && ["FAILED", "CANCELLED"].includes(job.status) && <button className="button" onClick={() => void retry()}>Retry</button>}
+                  <p className="muted">Transcription auto-detects Arabic, English, and mixed speech locally.</p>
+                  <button className="button" onClick={() => void reconstruct()}>Reconstruct transcript</button>
+                  <button className="button" onClick={() => void retranscribe()}>Force retranscription</button>
+                  <button className="button danger" onClick={remove}>Delete source</button>
+                  {error && <p className="error">{error}</p>}
+                </section>
+                {active && job ? (
+                  <JobProgress job={job} />
+                ) : (
+                  <ApiState key={transcriptRevision} load={loadTranscriptData}>
+                    {({ transcript, quality }) => <TranscriptViewer onSeek={seekTo} onUpdated={() => setTranscriptRevision((value) => value + 1)} quality={quality} sourceId={source.id} transcript={transcript} />}
+                  </ApiState>
+                )}
+              </>
+            );
+          }}
+        </ApiState>
       )}
     </ApiState>
   );

@@ -74,6 +74,9 @@ class JobResponse(BaseModel):
     retry_count: int
     error_code: str | None
     error_message: str | None
+    created_at: datetime
+    started_at: datetime | None
+    completed_at: datetime | None
 
     model_config = {"from_attributes": True}
 
