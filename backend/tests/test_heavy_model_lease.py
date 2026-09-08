@@ -56,16 +56,39 @@ class FakeRedis:
             return 1
         return 0
 
-    def eval(self, script: str, numkeys: int, *args: object) -> int:
+    def eval(self, script: str, numkeys: int, *args: object) -> object:
         self.eval_scripts.append(script)
+        if "pexpire" in script:
+            key = str(args[0])
+            token = str(args[1])
+            if self.get(key) != token:
+                return 0
+            ttl_ms = int(str(args[2]))
+            self.expires_at[key] = self._now() + ttl_ms / 1000
+            return 1
+        if "UNSAFE" in script:
+            unsafe_key = str(args[0])
+            lease_key = str(args[1])
+            token = str(args[2])
+            ttl_ms = int(str(args[3]))
+            if self.get(unsafe_key) is not None:
+                return "UNSAFE"
+            if self.get(lease_key) is not None:
+                return "BUSY"
+            self.set(lease_key, token, px=ttl_ms)
+            return "ACQUIRED"
+        if "exists" in script:
+            unsafe_key = str(args[0])
+            lease_key = str(args[1])
+            if self.get(unsafe_key) is None:
+                return 0
+            self.delete(lease_key)
+            self.delete(unsafe_key)
+            return 1
         key = str(args[0])
         token = str(args[1])
         if self.get(key) != token:
             return 0
-        if "pexpire" in script:
-            ttl_ms = int(str(args[2]))
-            self.expires_at[key] = self._now() + ttl_ms / 1000
-            return 1
         del self.data[key]
         del self.expires_at[key]
         return 1
@@ -224,8 +247,10 @@ def test_renewal_ownership_loss_is_detected() -> None:
 
 def test_renewal_redis_exception_marks_ownership_lost() -> None:
     class ExplodingRedis(FakeRedis):
-        def eval(self, script: str, numkeys: int, *args: object) -> int:
-            raise ConnectionError("redis unavailable")
+        def eval(self, script: str, numkeys: int, *args: object) -> object:
+            if "pexpire" in script:
+                raise ConnectionError("redis unavailable")
+            return super().eval(script, numkeys, *args)
 
     now = FakeClock()
     redis = ExplodingRedis(now)
@@ -371,3 +396,147 @@ def test_ownership_loss_callback_fires_and_persists_unsafe() -> None:
     assert lease.ownership_lost is True
     assert events == ["lost"]
     assert factory.unsafe_recorded() is True
+
+
+def test_unsafe_marker_blocks_acquisition_and_never_writes_lease() -> None:
+    """A pre-existing unsafe marker blocks acquisition without touching the lease key."""
+
+    now = FakeClock()
+    redis = FakeRedis(now)
+    factory = HeavyModelLeaseFactory(
+        redis=redis,
+        ttl_seconds=300,
+        renewal_interval_seconds=60,
+        acquisition_timeout_seconds=5,
+        snapshotter=lambda: SimpleNamespace(effective_capacity=1),
+    )
+    factory.mark_unsafe(reason="unload failed")
+
+    with pytest.raises(HeavyModelUnsafe):
+        factory.acquire(purpose="whisper").acquire()
+
+    assert redis.get(_LEASE_KEY) is None
+
+
+def test_unsafe_marker_appearing_during_acquisition_retry_blocks_waiter() -> None:
+    """An unsafe marker recorded while another waiter retries must stop that waiter."""
+
+    now = FakeClock()
+    redis = FakeRedis(now)
+    factory = HeavyModelLeaseFactory(
+        redis=redis,
+        ttl_seconds=300,
+        renewal_interval_seconds=60,
+        acquisition_timeout_seconds=5,
+        snapshotter=lambda: SimpleNamespace(effective_capacity=1),
+    )
+    redis.set(_LEASE_KEY, "other-token", nx=True, px=300000)
+    real_eval = redis.eval
+
+    def mark_unsafe_before_next_attempt(script: str, numkeys: int, *args: object) -> object:
+        redis.set(_UNSAFE_KEY, '{"reason": "unload failed"}')
+        return real_eval(script, numkeys, *args)
+
+    redis.eval = mark_unsafe_before_next_attempt  # type: ignore[method-assign]
+    lease = factory.acquire(purpose="whisper")
+
+    with pytest.raises(HeavyModelUnsafe):
+        lease.acquire()
+
+    assert redis.get(_LEASE_KEY) == "other-token"
+    assert factory.unsafe_recorded() is True
+
+
+def test_recovery_clears_stale_lease_and_unsafe_marker_in_one_atomic_operation() -> None:
+    """Recovery removes stale lease state and the unsafe marker as a single Redis script."""
+
+    now = FakeClock()
+    redis = FakeRedis(now)
+    factory = HeavyModelLeaseFactory(
+        redis=redis,
+        ttl_seconds=300,
+        renewal_interval_seconds=60,
+        acquisition_timeout_seconds=5,
+        snapshotter=lambda: SimpleNamespace(effective_capacity=1),
+    )
+    factory.mark_unsafe(reason="lease retained for ollama")
+    redis.set(_LEASE_KEY, "stale-token", nx=True, px=300000)
+
+    factory.recover()
+
+    assert factory.unsafe_recorded() is False
+    assert redis.get(_LEASE_KEY) is None
+    assert len(redis.eval_scripts) == 1
+
+
+def test_acquisition_and_recovery_are_single_atomic_redis_operations() -> None:
+    """Acquire observes unsafe inside its own script; recovery clears both keys in one script.
+
+    This makes it impossible for an acquisition to slip between the unsafe-marker
+    clear and the lease delete that the old recovery performed as two operations.
+    """
+
+    now = FakeClock()
+    redis = FakeRedis(now)
+    factory = HeavyModelLeaseFactory(
+        redis=redis,
+        ttl_seconds=300,
+        renewal_interval_seconds=60,
+        acquisition_timeout_seconds=5,
+        snapshotter=lambda: SimpleNamespace(effective_capacity=1),
+    )
+    factory.mark_unsafe(reason="lease retained for ollama")
+    redis.set(_LEASE_KEY, "stale-token", nx=True, px=300000)
+
+    waiter = factory.acquire(purpose="whisper")
+    with pytest.raises(HeavyModelUnsafe):
+        waiter.acquire()
+
+    factory.recover()
+
+    assert len(redis.eval_scripts) == 2
+    assert "UNSAFE" in redis.eval_scripts[0]
+    assert "exists" in redis.eval_scripts[1]
+
+
+def test_recovery_without_unsafe_marker_never_deletes_a_valid_new_lease() -> None:
+    """A recovery racing with a fresh acquisition must not delete the new lease."""
+
+    now = FakeClock()
+    redis = FakeRedis(now)
+    factory = HeavyModelLeaseFactory(
+        redis=redis,
+        ttl_seconds=300,
+        renewal_interval_seconds=60,
+        acquisition_timeout_seconds=5,
+        snapshotter=lambda: SimpleNamespace(effective_capacity=1),
+    )
+    holder = factory.acquire(purpose="whisper")
+    holder.acquire()
+
+    factory.recover()
+
+    assert redis.get(_LEASE_KEY) == holder.token
+
+
+def test_acquisition_works_normally_after_successful_recovery() -> None:
+    """Once recovery completes, a fresh acquisition proceeds normally."""
+
+    now = FakeClock()
+    redis = FakeRedis(now)
+    factory = HeavyModelLeaseFactory(
+        redis=redis,
+        ttl_seconds=300,
+        renewal_interval_seconds=60,
+        acquisition_timeout_seconds=5,
+        snapshotter=lambda: SimpleNamespace(effective_capacity=1),
+    )
+    factory.mark_unsafe(reason="lease retained for ollama")
+    redis.set(_LEASE_KEY, "stale-token", nx=True, px=300000)
+
+    factory.recover()
+
+    lease = factory.acquire(purpose="whisper")
+    lease.acquire()
+
+    assert redis.get(_LEASE_KEY) == lease.token

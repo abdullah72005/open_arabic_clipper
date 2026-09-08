@@ -2,6 +2,7 @@ import json
 import re
 from types import SimpleNamespace
 
+import pytest
 from typer.testing import CliRunner
 
 from app.cli import app
@@ -103,6 +104,49 @@ def test_recover_heavy_model_clears_only_after_confirmed_not_resident(monkeypatc
     assert result.exit_code == 0
     assert json.loads(result.stdout)["status"] == "RECOVERED"
     assert cleared == ["recovered"]
+
+
+def test_recover_heavy_model_resident_changes_no_redis_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Recovery while the model is still resident must fail and leave Redis untouched."""
+
+    from test_heavy_model_lease import FakeClock, FakeRedis
+
+    from app.runtime.heavy_model_lease import HeavyModelLeaseFactory
+
+    _LEASE_KEY = "clipfactory:heavy-model"
+    now = FakeClock()
+    redis = FakeRedis(now)
+    factory = HeavyModelLeaseFactory(
+        redis=redis,
+        ttl_seconds=300,
+        renewal_interval_seconds=60,
+        acquisition_timeout_seconds=5,
+        snapshotter=lambda: SimpleNamespace(effective_capacity=1),
+    )
+    factory.mark_unsafe(reason="model still resident after unload timeout")
+    redis.set(_LEASE_KEY, "stale-token", nx=True, px=300000)
+
+    class Provider:
+        def is_model_resident(self) -> bool:
+            return True
+
+    class Settings:
+        reconstruction_provider_model = "qwen3.5:4b"
+
+        def heavy_model_lease_factory(self) -> HeavyModelLeaseFactory:
+            return factory
+
+        def reconstruction_provider_instance(self) -> Provider:
+            return Provider()
+
+    monkeypatch.setattr("app.cli.get_settings", lambda: Settings())
+    result = CliRunner().invoke(app, ["recover-heavy-model"])
+    assert result.exit_code == 1
+    assert json.loads(result.stdout)["status"] == "UNSAFE"
+    assert factory.unsafe_recorded() is True
+    assert redis.get(_LEASE_KEY) == "stale-token"
 
 
 def test_benchmark_reconstruction_exposes_model_and_regression_flags() -> None:

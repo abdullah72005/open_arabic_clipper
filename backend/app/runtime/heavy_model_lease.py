@@ -1,8 +1,11 @@
 """Redis-backed cross-process lease that serializes heavy-model usage.
 
 Worker and CLI processes coordinate through a single key so Whisper and Ollama
-can never be resident concurrently. Release is an atomic compare-and-delete so a
-lease is never deleted by a token that does not own it.
+can never be resident concurrently. Acquisition and operator recovery are each
+one Redis-side Lua script, so no gap can occur between the unsafe-marker check
+and lease acquisition or between clearing the marker and deleting a stale lease.
+Release is an atomic compare-and-delete so a lease is never deleted by a token
+that does not own it.
 
 Unsafe model residency is a separate, persistent Redis marker. It is written
 when unload fails or lease ownership is lost while a heavy model may still be
@@ -40,6 +43,26 @@ end
 return 0
 """
 
+_ACQUIRE_LUA = """
+if redis.call('exists', KEYS[1]) == 1 then
+    return 'UNSAFE'
+end
+if redis.call('exists', KEYS[2]) == 1 then
+    return 'BUSY'
+end
+redis.call('set', KEYS[2], ARGV[1], 'PX', ARGV[2])
+return 'ACQUIRED'
+"""
+
+_RECOVER_LUA = """
+if redis.call('exists', KEYS[1]) == 0 then
+    return 0
+end
+redis.call('del', KEYS[2])
+redis.call('del', KEYS[1])
+return 1
+"""
+
 
 class HeavyModelLeaseBusy(RuntimeError):
     """Another process owns the heavy-model lease; retryable by the caller."""
@@ -74,7 +97,6 @@ class HeavyModelLease:
         on_ownership_lost: Callable[[], None] | None = None,
         on_unsafe: Callable[[str], None] | None = None,
         on_unsafe_clear: Callable[[], None] | None = None,
-        unsafe_guard: Callable[[], bool] | None = None,
     ) -> None:
         self._redis = redis
         self._ttl_seconds = ttl_seconds
@@ -91,7 +113,6 @@ class HeavyModelLease:
         self._on_ownership_lost = on_ownership_lost
         self._on_unsafe = on_unsafe
         self._on_unsafe_clear = on_unsafe_clear
-        self._unsafe_guard = unsafe_guard
         self._acquired = False
         self._renewer: threading.Thread | None = None
         self._retained = False
@@ -136,23 +157,33 @@ class HeavyModelLease:
     def acquire(self) -> "HeavyModelLease":
         """Acquire the lease within a bounded deadline or raise HeavyModelLeaseBusy.
 
-        An active unsafe marker blocks every acquisition, including this token:
-        unsafe residency must be operator-cleared before any heavy-model work.
+        Acquisition is one Redis-side atomic operation that first checks the
+        persistent unsafe marker: an active marker returns UNSAFE and never
+        acquires. The retry loop re-runs the same atomic operation, so an unsafe
+        marker written while this process waits still blocks it.
         """
 
-        if self._unsafe_guard is not None and self._unsafe_guard():
-            raise HeavyModelUnsafe("unsafe model residency is recorded; run the recovery command")
         started = self._monotonic()
         deadline = started + self._acquisition_timeout_seconds
         while True:
-            if self._redis.set(  # type: ignore[attr-defined]
-                _LEASE_KEY, self._token, nx=True, px=int(self._ttl_seconds * 1000)
-            ):
+            result = self._redis.eval(  # type: ignore[attr-defined]
+                _ACQUIRE_LUA,
+                2,
+                _UNSAFE_KEY,
+                _LEASE_KEY,
+                self._token,
+                int(self._ttl_seconds * 1000),
+            )
+            if result == "ACQUIRED":
                 self._acquired = True
                 if self._on_acquire is not None:
                     self._on_acquire(self._monotonic() - started, self._token)
                 self._start_renewer()
                 return self
+            if result == "UNSAFE":
+                raise HeavyModelUnsafe(
+                    "unsafe model residency is recorded; run the recovery command"
+                )
             if self._monotonic() >= deadline:
                 raise HeavyModelLeaseBusy(
                     "heavy-model lease is held by another process; retry later"
@@ -326,16 +357,17 @@ class HeavyModelLeaseFactory:
         self._redis.delete(_UNSAFE_KEY)  # type: ignore[attr-defined]
 
     def recover(self) -> None:
-        """Operator recovery: clear unsafe state and any stale lease key.
+        """Operator recovery: clear unsafe state and any stale lease key atomically.
 
-        This must only be called after the model is confirmed no longer
-        resident. The lease key is deleted unconditionally because the unsafe
-        guard blocks every new acquisition and confirmed-not-resident means no
-        legitimate heavy holder can remain.
+        One Redis-side script clears the stale lease and the unsafe marker with
+        no gap in which a new acquisition can occur. The script refuses to run
+        when no unsafe marker exists, so it never deletes a valid newly acquired
+        lease. Callers must confirm the model is no longer resident first.
         """
 
-        self.clear_unsafe()
-        self._redis.delete(_LEASE_KEY)  # type: ignore[attr-defined]
+        self._redis.eval(  # type: ignore[attr-defined]
+            _RECOVER_LUA, 2, _UNSAFE_KEY, _LEASE_KEY
+        )
 
     def acquire(
         self, *, purpose: str, on_ownership_lost: Callable[[], None] | None = None
@@ -378,7 +410,6 @@ class HeavyModelLeaseFactory:
             on_ownership_lost=on_ownership_lost,
             on_unsafe=self._record_unsafe,
             on_unsafe_clear=self.clear_unsafe,
-            unsafe_guard=self.unsafe_recorded,
         )
 
     def _record_unsafe(self, purpose: str) -> None:
