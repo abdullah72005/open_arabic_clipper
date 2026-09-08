@@ -111,5 +111,9 @@ docker compose exec backend python -m app.cli recover-heavy-model
 ```
 
 A worker or CLI that finds the marker refuses to acquire the heavy-model lease
-(`HeavyModelUnsafe`) until recovery succeeds. This behavior is covered by the
-heavy-model lease lifecycle tests.
+(`HeavyModelUnsafe`) until recovery succeeds. Acquisition checks the unsafe
+marker and takes the lease inside one atomic Redis script, and recovery clears
+the stale lease and the marker inside one atomic script, so no acquisition can
+slip into the gap between the two operations and recovery never deletes a
+valid newly acquired lease. This behavior is covered by the heavy-model lease
+lifecycle tests.

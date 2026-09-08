@@ -88,6 +88,19 @@ worker restart, CLI exit, and the lease TTL, so no new heavy-model work can
 start until an operator explicitly clears it. A worker or CLI that finds the
 marker raises `HeavyModelUnsafe` instead of acquiring the lease.
 
+Acquisition and recovery are each a single Redis-side Lua script, so the unsafe
+marker check, the lease acquisition, the marker clear, and the stale-lease
+delete never interleave with each other:
+
+- Acquisition first checks the unsafe marker and only then takes the lease
+  with `NX` + TTL inside one atomic script; a marker written while a waiter
+  retries still blocks that waiter, and a marker present before the script runs
+  returns `HeavyModelUnsafe` without acquiring.
+- Recovery deletes the stale lease and clears the unsafe marker in one atomic
+  script, so no acquisition can slip into the gap between the two operations.
+  The script refuses to run when no unsafe marker exists, so it never deletes a
+  valid newly acquired lease.
+
 Recovery clears the marker only after confirming the model is no longer
 resident:
 
@@ -96,8 +109,9 @@ docker compose exec backend python -m app.cli recover-heavy-model
 ```
 
 The command polls Ollama `/api/ps`; a resident model or an unreadable listing
-keeps the marker in place. When the model is confirmed gone, it clears the
-marker and any stale lease key. See `docs/ENVIRONMENT.md`.
+keeps the marker in place and changes no Redis state. When the model is
+confirmed gone, the atomic recovery script clears the marker and any stale
+lease key. See `docs/ENVIRONMENT.md`.
 
 ## Lease-loss handling
 

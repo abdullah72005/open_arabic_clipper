@@ -98,8 +98,6 @@ implemented and tested. A known-regression corpus was captured on
   be authorized. A stricter 8B/ASR reliability and quality evaluation remains
   open.
 
-STAGE 2.7 MUST CONTINUE
-
 ## Infrastructure and telemetry fixes (2026-09-08)
 
 Persistent unsafe-model state, lease-loss handling, capture provenance
@@ -110,6 +108,11 @@ verification, and child memory telemetry were implemented and tested:
   lease TTL expiry, and blocks every new heavy-model acquisition until an
   operator runs `python -m app.cli recover-heavy-model`, which clears it only
   after confirming the model is no longer resident.
+- Acquisition and operator recovery are each a single Redis-side Lua script.
+  Acquisition checks the unsafe marker and takes the lease atomically, so a
+  marker written while a waiter retries still blocks it; recovery clears the
+  stale lease and the unsafe marker in one script with no gap in which a new
+  acquisition can occur, and never deletes a valid newly acquired lease.
 - A lost or unrenewable lease cancels and reaps the active Whisper child,
   records persistent unsafe state, and fails the stage closed; overlapping
   heavy jobs cannot start after lease expiry.
@@ -143,7 +146,10 @@ The production stack is unchanged: ASR `large-v3-turbo`, reconstruction
 `qwen3.5:4b`. The infrastructure gates pass and the small practical acceptance
 review shows the current transcript is semantically usable with rare
 meaning-changing errors, so the unrepaired known-regression phrases no longer
-block infrastructure readiness.
+block infrastructure readiness. Stage 2.7.1 is not authorized yet: until the
+strict unseen-audio benchmark and a stricter 8B/ASR reliability and quality
+evaluation are available, manual correction or Stage-3 exclusion of harmful
+transcript segments remains the short practical quality path.
 
-READY FOR STAGE 2.7.1
+STAGE 2.7 MUST CONTINUE
 
