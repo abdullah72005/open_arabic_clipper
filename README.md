@@ -97,6 +97,17 @@ Redis with no TTL and blocks new heavy work; run
 `python -m app.cli recover-heavy-model` to clear it after confirming the model
 is no longer resident.
 
+An optional hosted Gemini provider (`gemini-3.6-flash`) supports deterministic
+adaptive routing (`local_only` / `adaptive` / `gemini_only`;
+`CLIPFACTORY_RECONSTRUCTION_ROUTING_MODE`, default `adaptive`). Trusted Stage 2.5
+targets never consume an LLM, normal uncertainty uses Qwen first, clearly
+difficult targets use one Gemini request directly, and Qwen failures escalate to
+Gemini under a finite per-job budget
+(`CLIPFACTORY_GEMINI_MAX_TARGETS_PER_JOB`, default `5`). `adaptive` and
+`gemini_only` may send short transcript snippets and bounded context to Google
+Gemini; set `local_only` for a fully local pipeline. The key is presence-checked
+only and never logged or committed.
+
 Stage 2.7 cache reuse is dependency-aware: stage runs persist canonical input
 and output fingerprints, and changed upstream evidence reruns downstream work.
 Manual force requests queue the requested stage without clearing historical

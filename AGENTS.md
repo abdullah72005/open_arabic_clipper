@@ -32,7 +32,14 @@
   `contextual_reconstructed_text` joins each segment's actual Stage 2.7 output;
   manual overrides change only `final_text`. Rights/provenance are tracked
   throughout the pipeline but do not block local analysis; publishing eligibility
-  is evaluated separately. Unsafe heavy-model residency is a persistent
+  is evaluated separately. Stage 2.7 also supports an optional hosted Gemini
+  provider through `CLIPFACTORY_RECONSTRUCTION_ROUTING_MODE`
+  (`local_only`/`adaptive`/`gemini_only`, default `adaptive`). The shared request
+  carries a future optional dialect/language-profile hint; Gemini candidates pass
+  the same shared validation/confidence gates and a deterministic router enforces
+  a finite per-job Gemini target budget. `adaptive` and `gemini_only` may send
+  short transcript snippets to Google Gemini; the API key is presence-checked
+  only and never logged, exposed, or committed. Unsafe heavy-model residency is a persistent
   Redis marker with no TTL that survives restart, CLI exit, and lease TTL
   expiry; `python -m app.cli recover-heavy-model` clears it only after
   confirming the model is no longer resident. A lost heavy-model lease cancels

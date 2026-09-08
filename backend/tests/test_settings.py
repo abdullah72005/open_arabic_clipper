@@ -143,3 +143,53 @@ def test_reconstruction_prompt_budget_settings_reject_zero() -> None:
         Settings(_env_file=None, reconstruction_chat_framing_reserve=0)
     with pytest.raises(ValidationError, match="greater than 0"):
         Settings(_env_file=None, reconstruction_safety_reserve=0)
+
+
+def test_reconstruction_default_mode_is_adaptive() -> None:
+    settings = Settings(_env_file=None)
+
+    assert settings.reconstruction_routing_mode == "adaptive"
+
+
+def test_gemini_defaults_and_absent_key_do_not_block_startup() -> None:
+    settings = Settings(_env_file=None)
+
+    assert settings.gemini_model == "gemini-3.6-flash"
+    assert settings.gemini_timeout_seconds == 30.0
+    assert settings.gemini_max_targets_per_job == 5
+    assert settings.gemini_api_key_present is False
+    assert settings.gemini_provider_instance() is None
+
+
+def test_gemini_key_is_presence_detected_from_prefixed_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CLIPFACTORY_GEMINI_API_KEY", "test-key-not-committed")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.gemini_api_key_present is True
+    assert settings.gemini_provider_instance() is not None
+
+
+def test_gemini_key_is_presence_detected_from_unprefixed_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key-not-committed")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.gemini_api_key_present is True
+
+
+def test_gemini_key_value_is_never_returned_by_public_api(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GEMINI_API_KEY", "AIza-super-secret-value")
+
+    settings = Settings(_env_file=None)
+    identity = settings.contextual_reconstructor().runtime_identity()
+
+    serialized = repr(identity)
+    assert "AIza-super-secret-value" not in serialized
+    assert "gemini_api_key" not in serialized.casefold()

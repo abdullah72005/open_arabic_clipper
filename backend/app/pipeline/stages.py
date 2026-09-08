@@ -449,6 +449,15 @@ class ContextualReconstructionExecutor:
         if transcript is None:
             raise StageExecutionError("normalized transcript is missing")
         started_at = monotonic()
+        if transcript.reconstruction_fingerprint and not force:
+            current = self._reconstructor.output_fingerprint(
+                transcript.segments,
+                language=transcript.language,
+                transcription_fingerprint=transcript.input_fingerprint,
+                correction_version=transcript.correction_version,
+            )
+            if transcript.reconstruction_fingerprint == current:
+                return StageExecutionResult(current, transcript)
         with self._lease_factory.acquire(purpose="ollama") as heavy_lease:
             result = self._reconstructor.reconstruct(
                 transcript.segments,
@@ -508,6 +517,15 @@ class ContextualReconstructionExecutor:
                     "reconstruction_method": reconstruction.reconstruction_method,
                     "final_text": final_text,
                     "normalized_text": normalize_transcript(final_text),
+                    "reconstruction_route": reconstruction.route,
+                    "routing_evidence": list(reconstruction.routing_evidence),
+                    "local_attempted": reconstruction.local_attempted,
+                    "local_result_state": reconstruction.local_result_state,
+                    "gemini_attempted": reconstruction.gemini_attempted,
+                    "gemini_result_state": reconstruction.gemini_result_state,
+                    "final_provider": reconstruction.final_provider,
+                    "escalation_reason": reconstruction.escalation_reason,
+                    "near_acceptance": reconstruction.near_acceptance,
                 }
             )
 
@@ -531,12 +549,21 @@ class ContextualReconstructionExecutor:
         transcript.reconstruction_method = (
             "stage2_5_fallback"
             if getattr(self._reconstructor, "_provider", object()) is None
+            and getattr(self._reconstructor, "_gemini", object()) is None
             else _reconstruction_method(result.segments, result.metadata)
         )
         transcript.reconstruction_version = "stage2.7-v1"
         transcript.reconstruction_processing_duration = monotonic() - started_at
         status_counts = {status.value: statuses.count(status) for status in set(statuses)}
         runtime_identity = result.metadata.get("runtime_identity")
+        routing_counts = result.metadata.get("routing_counts")
+        gemini_usage = result.metadata.get("gemini_usage")
+        gemini_runtime = (
+            runtime_identity.get("gemini")
+            if isinstance(runtime_identity, dict)
+            and isinstance(runtime_identity.get("gemini"), dict)
+            else None
+        )
         metadata = {
             "segments": total,
             "applied_segments": len(applied),
@@ -564,6 +591,13 @@ class ContextualReconstructionExecutor:
             ),
             "algorithm_versions": {"reconstruction": "stage2.7-v1"},
         }
+        if isinstance(routing_counts, dict):
+            metadata["routing_counts"] = routing_counts
+        if isinstance(gemini_usage, dict):
+            metadata["gemini_usage"] = gemini_usage
+        if isinstance(gemini_runtime, dict):
+            metadata["gemini_model"] = gemini_runtime.get("model")
+            metadata["gemini_model_digest"] = gemini_runtime.get("digest")
         metadata.update(result.metadata)
         transcript.reconstruction_metadata = metadata
         self._session.execute(

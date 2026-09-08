@@ -46,6 +46,7 @@ class ReconstructionRequest:
     routing_reasons: tuple[str, ...] = ()
     focus_spans: tuple[WordEvidence, ...] = ()
     language: str | None = None
+    dialect_profile: str | None = None
 
     def to_payload(self) -> dict[str, object]:
         return {
@@ -81,6 +82,7 @@ class ReconstructionRequest:
                 for span in self.focus_spans
             ],
             "language": self.language,
+            "dialect_profile": self.dialect_profile,
         }
 
     def estimated_tokens(
@@ -269,7 +271,7 @@ class OpenAICompatibleReconstructionProvider:
         return _parse_reconstructions(content, requests)
 
     def _system_instruction(self) -> str:
-        instruction = _SYSTEM_INSTRUCTION
+        instruction = SYSTEM_INSTRUCTION
         if self.provider_name == "ollama" and self.model.startswith("qwen3"):
             instruction = instruction + " /no_think"
         return instruction
@@ -346,7 +348,7 @@ class OpenAICompatibleReconstructionProvider:
         return parsed
 
 
-_SYSTEM_INSTRUCTION = (
+SYSTEM_INSTRUCTION = (
     "You are a conservative Arabic ASR post-processor for Egyptian Arabic speech. "
     "For the target segment, return the most plausible SPOKEN EGYPTIAN ARABIC text. "
     "Preserve Egyptian colloquial word choices, pronunciation-driven spelling, "
@@ -364,7 +366,10 @@ _SYSTEM_INSTRUCTION = (
 )
 
 _PROMPT_SCHEMA_VERSION = "stage-2-7-one-pass-v1"
-_PROMPT_HASH = hashlib.sha256(_SYSTEM_INSTRUCTION.encode("utf-8")).hexdigest()
+_PROMPT_HASH = hashlib.sha256(SYSTEM_INSTRUCTION.encode("utf-8")).hexdigest()
+
+# Backward-compatible alias for existing consumers of the shared instruction.
+_SYSTEM_INSTRUCTION = SYSTEM_INSTRUCTION
 
 
 def _shrink_request_to_budget(

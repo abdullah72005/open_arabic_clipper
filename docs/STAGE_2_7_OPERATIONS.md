@@ -17,6 +17,76 @@ docker compose exec ollama ollama pull qwen3.5:4b
 docker compose exec backend python -m app.cli reconstruction-health
 ```
 
+## Hosted Gemini provider and routing modes
+
+Stage 2.7 also supports an optional hosted Gemini provider
+(`gemini-3.6-flash` by default) through the official Google Gen AI SDK
+(`google-genai`). The Gemini API key is read through application settings from
+`GEMINI_API_KEY` or `CLIPFACTORY_GEMINI_API_KEY` in the local `.env`. The key is
+presence-checked only, never logged, never exposed through the API or
+fingerprints, and never committed. If the key is absent the application starts
+and runs normally with the local path only.
+
+Three routing modes are controlled by `CLIPFACTORY_RECONSTRUCTION_ROUTING_MODE`:
+
+| Mode | Behavior |
+| --- | --- |
+| `local_only` | Never calls Gemini; uses Qwen for targets needing reconstruction; safe unresolved fallback. |
+| `adaptive` (default) | Qwen for normal uncertainty; Gemini directly for clearly difficult targets; Qwen failures escalate to Gemini; safe local/unresolved degradation when Gemini is unavailable. |
+| `gemini_only` | Skips Qwen; sends only targets that need LLM reconstruction to Gemini; still permits `NO_LLM`; degrades safely. |
+
+**Cloud snippet disclosure.** `adaptive` and `gemini_only` may send short
+transcript snippets and bounded context to Google Gemini. Configure the key and
+mode explicitly; this is a cloud-processing configuration decision and is
+separate from rights/provenance eligibility, which is evaluated independently.
+
+### Quota-efficient routing and the Gemini per-job budget
+
+Routing is deterministic and quota-conscious:
+
+- Stage 2.5-trustworthy targets (`NO_LLM`) never consume Gemini or Qwen.
+- Normal uncertainty uses Qwen first; an accepted Qwen result never calls
+  Gemini.
+- Clearly difficult targets (contiguous very-low-probability words, large
+  low-confidence spans, severe routing scores, uncertainty overlapping a
+  protected number/name, or multiple severe indicators) bypass Qwen and use one
+  Gemini request directly.
+- Only bounded context windows are sent; full transcripts and audio are never
+  sent.
+- `CLIPFACTORY_GEMINI_MAX_TARGETS_PER_JOB` (default `5`) caps Gemini
+  reconstruction targets per job. When exhausted, eligible targets fall back to
+  local when useful or stay on safe Stage 2.5 text marked unresolved; the
+  strongest difficult segments are prioritized deterministically when more
+  targets are eligible than the budget allows.
+- At most one normal Gemini attempt plus one bounded retry for eligible
+  transient failures (`connection`, `timeout`, `provider_error`). A 429 or
+  quota exhaustion is not retried and stops further Gemini attempts for the
+  current job.
+- Completed identical work reuses its fingerprint without a duplicate Gemini
+  call after retries or restarts.
+
+The per-job cap reserves Gemini capacity for later project stages; it is not an
+account-wide billing or quota manager. Tune the cap through configuration for
+later needs.
+
+### Gemini configuration settings
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `CLIPFACTORY_RECONSTRUCTION_ROUTING_MODE` | `adaptive` | Provider selection policy. |
+| `GEMINI_API_KEY` / `CLIPFACTORY_GEMINI_API_KEY` | — | Presence-detected API key. |
+| `CLIPFACTORY_GEMINI_MODEL` | `gemini-3.6-flash` | Hosted model for reconstruction. |
+| `CLIPFACTORY_GEMINI_TIMEOUT_SECONDS` | `30` | Per-request timeout. |
+| `CLIPFACTORY_GEMINI_RETRY_ATTEMPTS` | `1` | Bounded retries for transient failures. |
+| `CLIPFACTORY_GEMINI_RETRY_BACKOFF_SECONDS` | `1.5` | Backoff between retries. |
+| `CLIPFACTORY_GEMINI_MAX_TARGETS_PER_JOB` | `5` | Per-job Gemini target budget. |
+| `CLIPFACTORY_GEMINI_MAX_OUTPUT_TOKENS` | `1024` | Tight structured-output budget. |
+
+When Gemini is unavailable, misconfigured, budget-blocked, or fails, a safe
+accepted local result is retained when one exists, otherwise safe Stage 2.5
+text is preserved and the segment is marked unresolved/manual review. Provider
+failures are never silently reported as success.
+
 ## Memory diagnostics
 
 `scripts/diagnose-memory.sh` is a read-only host/container diagnostic that

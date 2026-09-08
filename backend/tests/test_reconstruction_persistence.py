@@ -14,6 +14,10 @@ from app.transcription.reconstruction.providers import (
     ReconstructionCandidate,
     ReconstructionRequest,
 )
+from app.transcription.reconstruction.routing import (
+    AdaptiveRoutingConfig,
+    RoutingMode,
+)
 from app.transcription.reconstruction.service import ContextualReconstructor
 from app.transcription.reconstruction.types import (
     ProviderAvailability,
@@ -427,3 +431,103 @@ def test_forced_reconstruction_run_uses_refreshed_digest(sqlite_engine: object) 
         executor.execute(source, force=True)
         session.refresh(transcript)
         assert transcript.reconstruction_metadata["runtime_identity"]["digest"] == "sha256:new"
+
+
+class CountingGemini:
+    def __init__(self) -> None:
+        self.model = "gemini-3.6-flash"
+        self.calls = 0
+
+    def health(self) -> ProviderHealth:
+        return ProviderHealth(
+            ProviderAvailability.AVAILABLE, "gemini", "gemini-3.6-flash", "sha256:g", "ok"
+        )
+
+    def runtime_identity(self) -> dict[str, object]:
+        return {
+            "provider": "gemini",
+            "model": "gemini-3.6-flash",
+            "digest": "sha256:g",
+            "prompt_hash": "p",
+            "schema_version": "s",
+            "timeout_seconds": 30.0,
+            "retry_attempts": 0,
+            "retry_backoff_seconds": 0.0,
+            "max_output_tokens": 256,
+            "confidence_policy_version": CONFIDENCE_POLICY_VERSION,
+            "validation_version": VALIDATION_VERSION,
+        }
+
+    def refresh_runtime_identity(self) -> dict[str, object]:
+        return self.runtime_identity()
+
+    def release(self) -> None:
+        pass
+
+    def reconstruct_segments(
+        self, requests: list[ReconstructionRequest]
+    ) -> dict[int, ReconstructionCandidate]:
+        self.calls += 1
+        return {
+            request.segment_index: ReconstructionCandidate(
+                "provider-0", "ضخمة", provider_confidence=1.0
+            )
+            for request in requests
+        }
+
+    def usage_summary(self) -> dict[str, int]:
+        return {"prompt_token_count": 1, "candidates_token_count": 1, "total_token_count": 2}
+
+
+def test_executor_cache_hit_avoids_duplicate_gemini_call(sqlite_engine: object) -> None:
+    """Completed identical work reuses the fingerprint and never calls Gemini again."""
+
+    Base.metadata.create_all(sqlite_engine)
+    with Session(sqlite_engine) as session:
+        source = SourceVideo(
+            source_uri="file:///tmp/source.mp4", content_hash="h", rights_status=RightsStatus.OWNED
+        )
+        session.add(source)
+        session.commit()
+        hard_words = [
+            {"word": "م", "probability": 0.30},
+            {"word": "ش", "probability": 0.25},
+            {"word": "قادر", "probability": 0.20},
+            {"word": "يفهم", "probability": 0.90},
+        ]
+        transcript = Transcript(
+            source_video_id=source.id,
+            whisper_model="large-v3-turbo",
+            input_fingerprint="asr-fp",
+            normalization_fingerprint="norm-fp",
+            transcription_revision=1,
+            correction_version="egyptian-ar-v1",
+            language="ar",
+            segments=[
+                {
+                    "start": 0.0,
+                    "end": 1.0,
+                    "text": "مش قادر يفهم",
+                    "raw_text": "مش قادر يفهم",
+                    "corrected_text": "مش قادر يفهم",
+                    "words": hard_words,
+                }
+            ],
+        )
+        session.add(transcript)
+        session.commit()
+
+        gemini = CountingGemini()
+        reconstructor = ContextualReconstructor(
+            CandidateProvider(
+                ReconstructionCandidate("provider-0", "ضخمة", provider_confidence=1.0)
+            ),
+            gemini_provider=gemini,
+            routing=AdaptiveRoutingConfig(mode=RoutingMode.ADAPTIVE),
+            gemini_budget=5,
+        )
+        executor = ContextualReconstructionExecutor(session=session, reconstructor=reconstructor)
+        executor.execute(source, force=True)
+        assert gemini.calls == 1
+        executor.execute(source, force=False)
+        assert gemini.calls == 1

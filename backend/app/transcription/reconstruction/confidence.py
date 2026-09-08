@@ -8,6 +8,7 @@ from app.transcription.reconstruction.types import ConfidenceLevel
 
 CONFIDENCE_POLICY_VERSION = "one-pass-provider-confidence-v1"
 _HIGH_SCORE = 0.82
+_HIGH_PHONETIC_SIMILARITY = 0.72
 _MEDIUM_SCORE = 0.74
 
 
@@ -17,6 +18,7 @@ class ReconstructionDecision:
     applied: bool
     provider_confidence: float
     reason: str | None = None
+    score: float | None = None
 
 
 def decide_candidate(
@@ -33,11 +35,11 @@ def decide_candidate(
     score = provider_confidence - 0.20 * acoustic * edit_ratio
     high_checks = {
         "score": score >= _HIGH_SCORE,
-        "phonetic_similarity": phonetic_similarity >= 0.72,
+        "phonetic_similarity": phonetic_similarity >= _HIGH_PHONETIC_SIMILARITY,
     }
     if all(high_checks.values()):
         return ReconstructionDecision(
-            ConfidenceLevel.HIGH, True, provider_confidence, "one_pass_high"
+            ConfidenceLevel.HIGH, True, provider_confidence, "one_pass_high", score
         )
     medium_checks = {
         "score": score >= _MEDIUM_SCORE,
@@ -48,9 +50,33 @@ def decide_candidate(
     }
     if all(medium_checks.values()):
         return ReconstructionDecision(
-            ConfidenceLevel.MEDIUM, False, provider_confidence, "one_pass_medium"
+            ConfidenceLevel.MEDIUM, False, provider_confidence, "one_pass_medium", score
         )
     failed = [name for name, passed in high_checks.items() if not passed]
     return ReconstructionDecision(
-        ConfidenceLevel.LOW, False, provider_confidence, ",".join(failed) or "low_confidence"
+        ConfidenceLevel.LOW,
+        False,
+        provider_confidence,
+        ",".join(failed) or "low_confidence",
+        score,
+    )
+
+
+def is_near_acceptance(
+    decision: ReconstructionDecision,
+    *,
+    phonetic_similarity: float,
+    margin: float,
+) -> bool:
+    """True when an unaccepted candidate is narrowly below the HIGH acceptance gate.
+
+    This justifies a bounded local-to-Gemini escalation but never makes an
+    unsafe local candidate acceptable.
+    """
+
+    if decision.applied or decision.score is None:
+        return False
+    return (
+        decision.score >= _HIGH_SCORE - margin
+        and phonetic_similarity >= _HIGH_PHONETIC_SIMILARITY - margin
     )

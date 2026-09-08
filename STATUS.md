@@ -151,5 +151,41 @@ strict unseen-audio benchmark and a stricter 8B/ASR reliability and quality
 evaluation are available, manual correction or Stage-3 exclusion of harmful
 transcript segments remains the short practical quality path.
 
+## Hosted Gemini adaptive routing (2026-09-09)
+
+Stage 2.7 now supports an optional hosted Gemini reconstruction provider with
+deterministic routing. `qwen3.5:4b` remains the normal private quota-free path.
+Three routing modes exist: `local_only` (never calls Gemini), `adaptive`
+(default), and `gemini_only` (skips Qwen). The default is `ADAPTIVE` because a
+configured live Gemini key passed the tiny smoke test; a missing key falls back
+to local behavior exactly.
+
+Routing is a single deterministic policy (`route_adaptive`) with centralized
+constants. Targets that Stage 2.5 already trusts (`NO_LLM`) consume no provider
+calls. Mild localized uncertainty uses Qwen. Clearly difficult segments
+(contiguous very-low-probability words, large low-confidence spans, severe
+routing scores, or uncertainty overlapping a protected number/name) use one
+Gemini request directly. In ADAPTIVE mode, unresolved, malformed, failed, or
+near-accepted Qwen results escalate to one Gemini attempt. Every Gemini
+candidate passes the same shared validation and confidence/acceptance gates;
+Gemini is never automatically authoritative.
+
+Gemini is treated as scarce: `CLIPFACTORY_GEMINI_MAX_TARGETS_PER_JOB` (default
+5) caps Gemini reconstruction targets per job, accepted local results never
+call Gemini, full transcripts are never sent (only bounded windows), a 429/quota
+exhaustion stops further Gemini calls for that job, and identical completed work
+reuses its fingerprint without a duplicate Gemini call. `ADAPTIVE` and
+`GEMINI_ONLY` may send short transcript snippets and bounded context to Google
+Gemini; this is configuration, not rights/provenance policy. The cap reserves
+Gemini capacity but is not an account-wide billing/quota manager.
+
+The live smoke used the operator's configured `GEMINI_API_KEY` (never printed,
+logged, or committed) against `gemini-3.6-flash`, verified authentication, model
+availability, structured-output parsing, and readable usage metadata
+(`290` prompt / `87` candidate / `858` total tokens) in one tiny request that
+repaired `دي موقراطية` to `ديمقراطية`. The operator retains the local-first
+default in `local_only` by setting
+`CLIPFACTORY_RECONSTRUCTION_ROUTING_MODE=local_only`.
+
 STAGE 2.7 MUST CONTINUE
 

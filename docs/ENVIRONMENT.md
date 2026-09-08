@@ -19,6 +19,39 @@ the application remains portable and config-driven.
 | Network | HTTPS checks to PyPI and npm registry succeeded |
 | Ollama | `ollama/ollama` runs under the `reconstruction` profile; `qwen3:8b` pulled with digest `500a1f067a9f…b41` |
 
+## Hosted Gemini cloud configuration (2026-09-09)
+
+Stage 2.7 supports an optional hosted Gemini reconstruction provider through the
+official Google Gen AI SDK. It is configured by environment variables only; no
+frontend settings system exists. The Gemini API key is read by application
+settings from `GEMINI_API_KEY` or `CLIPFACTORY_GEMINI_API_KEY` in the local
+`.env` and is presence-checked only. It is never printed, logged, serialized,
+fingerprinted, returned by any API, or committed.
+
+**Cloud snippet disclosure.** The `adaptive` and `gemini_only` routing modes may
+send short transcript snippets and bounded context to Google Gemini. The
+default mode is `adaptive`; set `CLIPFACTORY_RECONSTRUCTION_ROUTING_MODE` to
+`local_only` for a fully local pipeline. Cloud-processing configuration is
+separate from rights/provenance eligibility.
+
+Model, timeout, retry, and budget settings mirror the local provider pattern:
+
+```bash
+CLIPFACTORY_RECONSTRUCTION_ROUTING_MODE=adaptive
+CLIPFACTORY_GEMINI_MODEL=gemini-3.6-flash
+CLIPFACTORY_GEMINI_TIMEOUT_SECONDS=30
+CLIPFACTORY_GEMINI_RETRY_ATTEMPTS=1
+CLIPFACTORY_GEMINI_RETRY_BACKOFF_SECONDS=1.5
+CLIPFACTORY_GEMINI_MAX_TARGETS_PER_JOB=5
+CLIPFACTORY_GEMINI_MAX_OUTPUT_TOKENS=1024
+```
+
+A missing key never blocks startup or local operation. Gemini is treated as a
+scarce resource: the per-job target budget, one-bounded-retry policy, and
+429/quota exhaustion stop together keep free-plan consumption small and bounded.
+The per-job cap is not an account-wide billing/quota manager. See
+`docs/STAGE_2_7_OPERATIONS.md` for the full routing policy.
+
 ## Development implications
 
 The Docker services use Python 3.12 and install FFmpeg, so they are the
