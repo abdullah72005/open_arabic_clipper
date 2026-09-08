@@ -36,6 +36,7 @@ def _segment(
     corrected: str | None = None,
     words: list[dict[str, object]] | None = None,
     operator: str | None = None,
+    stage25: bool = False,
 ) -> dict[str, object]:
     corrected = corrected or raw
     segment: dict[str, object] = {
@@ -49,6 +50,11 @@ def _segment(
         segment["words"] = words
     if operator is not None:
         segment["operator_text"] = operator
+    if stage25:
+        segment["correction_applied"] = True
+        segment["correction_confidence"] = 0.95
+        segment["correction_method"] = "lexicon"
+        segment["correction_version"] = "egyptian-ar-v1"
     return segment
 
 
@@ -191,9 +197,47 @@ def _run(reconstructor: ContextualReconstructor, segments: list[dict[str, object
 
 
 def test_route_adaptive_easy_high_confidence_is_no_llm() -> None:
-    segment = _segment(words=_words([0.98, 0.99], ["ده", "كلام"]))
+    segment = _segment(words=_words([0.98, 0.99], ["ده", "كلام"]), stage25=True)
     decision = route_adaptive(segment, AdaptiveRoutingConfig())
     assert decision.route is ReconstructionRoute.NO_LLM
+
+
+def test_route_adaptive_high_probabilities_but_untrusted_stage25_is_not_no_llm() -> None:
+    segment = _segment(words=_words([0.98, 0.99], ["ده", "كلام"]), stage25=False)
+    decision = route_adaptive(segment, AdaptiveRoutingConfig())
+    assert decision.route is ReconstructionRoute.LOCAL
+    assert decision.evidence == ("stage25_untrusted",) or "stage25_untrusted" in decision.evidence
+
+
+def test_route_adaptive_unchanged_stage25_with_clean_acoustic_is_local() -> None:
+    segment = _segment(
+        words=_words([0.98, 0.99], ["ده", "كلام"]),
+    )
+    segment["correction_applied"] = False
+    segment["correction_confidence"] = 0.0
+    segment["correction_method"] = "unchanged"
+    decision = route_adaptive(segment, AdaptiveRoutingConfig())
+    assert decision.route is ReconstructionRoute.LOCAL
+
+
+def test_route_adaptive_isolated_low_word_reports_accurate_evidence() -> None:
+    segment = _segment(words=_words([0.98, 0.60, 0.98], ["ده", "كلام", "مصري"]))
+    decision = route_adaptive(segment, AdaptiveRoutingConfig())
+    assert decision.route is ReconstructionRoute.LOCAL
+    assert decision.evidence == ("isolated_low_probability_words",)
+
+
+def test_route_adaptive_isolated_very_low_word_is_never_no_llm() -> None:
+    segment = _segment(words=_words([0.98, 0.30, 0.98], ["ده", "كلام", "مصري"]))
+    decision = route_adaptive(segment, AdaptiveRoutingConfig())
+    assert decision.route is ReconstructionRoute.LOCAL
+    assert "no_low_probability_evidence" not in decision.evidence
+
+
+def test_route_adaptive_normal_uncertain_arabic_retains_local_path() -> None:
+    segment = _segment(words=_words([0.98, 0.60, 0.55, 0.98], ["ده", "كلام", "جديد", "مصري"]))
+    decision = route_adaptive(segment, AdaptiveRoutingConfig())
+    assert decision.route is ReconstructionRoute.LOCAL
 
 
 def test_route_adaptive_mild_uncertainty_is_local() -> None:
@@ -225,13 +269,27 @@ def test_good_stage25_never_invokes_any_llm() -> None:
     reconstructor, local, gemini = _reconstructor(
         FakeLocal(), FakeGemini(), mode=RoutingMode.ADAPTIVE
     )
-    result = _run(reconstructor, [_segment(words=_words([0.98, 0.99], ["ده", "كلام"]))])
+    result = _run(
+        reconstructor, [_segment(words=_words([0.98, 0.99], ["ده", "كلام"]), stage25=True)]
+    )
     segment = result.segments[0]
     assert local is not None and local.calls == 0
     assert gemini is not None and gemini.calls == 0
     assert segment.route == "NO_LLM"
     assert segment.status is ReconstructionStatus.UNCHANGED_HIGH_CONFIDENCE
     assert segment.final_provider == "stage25"
+
+
+def test_high_whisper_confidence_with_untrusted_stage25_uses_local() -> None:
+    reconstructor, local, gemini = _reconstructor(
+        FakeLocal(), FakeGemini(), mode=RoutingMode.ADAPTIVE
+    )
+    result = _run(reconstructor, [_segment(words=_words([0.98, 0.99], ["ده", "كلام"]))])
+    segment = result.segments[0]
+    assert local is not None and local.calls == 1
+    assert gemini is not None and gemini.calls == 0
+    assert segment.route == "LOCAL"
+    assert segment.applied is True
 
 
 def test_mild_uncertainty_uses_local_and_never_gemini_when_local_accepted() -> None:
@@ -300,38 +358,85 @@ def test_gemini_absent_hard_segment_falls_back_to_local() -> None:
     segment = result.segments[0]
     assert local is not None and local.calls == 1
     assert segment.local_attempted is True
-    assert segment.escalation_reason == "gemini_unavailable"
+    assert segment.escalation_reason == "gemini_not_configured"
 
 
-def test_gemini_budget_exhausted_falls_back_to_local() -> None:
-    hard_a = _segment(raw="دخم", words=_words([0.30, 0.25, 0.20, 0.90], ["م", "ش", "قادر", "يفهم"]))
-    hard_b = _segment(
-        raw="ماشي", words=_words([0.20, 0.18, 0.25, 0.15], ["م", "ش", "ماشي", "خالص"])
+def test_gemini_budget_goes_to_strongest_direct_targets_first() -> None:
+    hard_weak = _segment(
+        raw="دخم", words=_words([0.30, 0.25, 0.20, 0.90], ["م", "ش", "قادر", "يفهم"])
+    )
+    hard_strong = _segment(
+        raw="دخم", words=_words([0.20, 0.18, 0.25, 0.15], ["م", "ش", "ماشي", "خالص"])
     )
     reconstructor, local, gemini = _reconstructor(
         FakeLocal(), FakeGemini(), mode=RoutingMode.ADAPTIVE, budget=1
     )
-    result = _run(reconstructor, [hard_a, hard_b])
+    result = _run(reconstructor, [hard_weak, hard_strong])
     assert gemini is not None and gemini.calls == 1
-    assert result.segments[0].applied is True
-    assert result.segments[1].escalation_reason == "gemini_budget_exhausted"
+    assert result.segments[1].applied is True  # stronger hard segment won the budget
+    assert result.segments[1].gemini_attempted is True
+    assert result.segments[0].escalation_reason == "gemini_budget_exhausted"
+    assert result.segments[0].local_attempted is True
     assert local is not None and local.calls >= 1
 
 
 def test_gemini_429_is_not_retried_and_blocks_remaining_targets() -> None:
     gemini = FakeGemini(error=GeminiProviderError(GeminiErrorCategory.RATE_LIMITED))
-    hard_a = _segment(raw="دخم", words=_words([0.30, 0.25, 0.20, 0.90], ["م", "ش", "قادر", "يفهم"]))
-    hard_b = _segment(
+    hard_weak = _segment(
+        raw="دخم", words=_words([0.30, 0.25, 0.20, 0.90], ["م", "ش", "قادر", "يفهم"])
+    )
+    hard_strong = _segment(
         raw="ماشي", words=_words([0.20, 0.18, 0.25, 0.15], ["م", "ش", "ماشي", "خالص"])
     )
     reconstructor, local, gemini = _reconstructor(
         FakeLocal(), gemini, mode=RoutingMode.ADAPTIVE, budget=10
     )
-    result = _run(reconstructor, [hard_a, hard_b])
+    result = _run(reconstructor, [hard_weak, hard_strong])
     assert gemini.calls == 1
-    assert result.segments[0].gemini_result_state == "failure:RATE_LIMITED"
-    assert result.segments[1].gemini_attempted is False
-    assert result.segments[1].escalation_reason == "gemini_rate_limit_exhausted"
+    assert result.segments[1].gemini_result_state == "failure:RATE_LIMITED"
+    assert result.segments[0].gemini_attempted is False
+    assert result.segments[0].escalation_reason == "gemini_rate_limit_exhausted"
+
+
+def test_gemini_authentication_is_not_counted_as_rate_limit() -> None:
+    gemini = FakeGemini(error=GeminiProviderError(GeminiErrorCategory.AUTHENTICATION))
+    reconstructor, local, gemini = _reconstructor(
+        FakeLocal(), gemini, mode=RoutingMode.ADAPTIVE, budget=10
+    )
+    result = _run(
+        reconstructor,
+        [_segment(words=_words([0.30, 0.25, 0.20, 0.90], ["م", "ش", "قادر", "يفهم"]))],
+    )
+    counts = result.metadata["routing_counts"]
+    assert counts["gemini_authentication_failed"] == 1
+    assert counts.get("gemini_rate_limited", 0) == 0
+    assert result.segments[0].gemini_result_state == "failure:AUTHENTICATION"
+
+
+def test_long_list_strongest_eligible_targets_win_budget_over_earlier_mild() -> None:
+    def hard(words: list[float], texts: list[str]) -> dict[str, object]:
+        return _segment(raw=" ".join(texts), words=_words(words, texts))
+
+    targets = [
+        # five hard targets with increasing severity; the earliest is the weakest
+        hard([0.45, 0.45, 0.45, 0.99], ["w0", "w1", "w2", "w3"]),
+        hard([0.42, 0.42, 0.42, 0.98], ["w4", "w5", "w6", "w7"]),
+        hard([0.40, 0.40, 0.40, 0.98], ["w8", "w9", "w10", "w11"]),
+        hard([0.38, 0.38, 0.38, 0.97], ["w12", "w13", "w14", "w15"]),
+        hard([0.35, 0.35, 0.35, 0.96], ["w16", "w17", "w18", "w19"]),
+        # the last target is clearly the hardest (all very low, contiguous 4)
+        hard([0.22, 0.20, 0.18, 0.16], ["w20", "w21", "w22", "w23"]),
+    ]
+    reconstructor, local, gemini = _reconstructor(
+        FakeLocal(), FakeGemini(), mode=RoutingMode.ADAPTIVE, budget=5
+    )
+    result = _run(reconstructor, targets)
+    assert gemini is not None and gemini.calls == 5
+    assert result.segments[5].gemini_attempted is True  # hardest, latest, wins budget
+    assert result.segments[0].gemini_attempted is False  # earliest weakest loses budget
+    assert result.segments[0].local_attempted is True
+    assert result.segments[0].escalation_reason == "gemini_budget_exhausted"
+    assert local is not None and local.calls >= 1
 
 
 def test_gemini_timeout_falls_back_safely() -> None:
@@ -400,14 +505,28 @@ def test_gemini_only_skips_qwen_and_still_permits_no_llm() -> None:
     result = _run(
         reconstructor,
         [
-            _segment(words=_words([0.98, 0.99], ["ده", "كلام"])),
+            _segment(words=_words([0.98, 0.99], ["ده", "كلام"]), stage25=True),
             _segment(words=_words([0.30, 0.25, 0.20, 0.90], ["م", "ش", "قادر", "يفهم"])),
         ],
     )
     assert local is not None and local.calls == 0
     assert gemini is not None and gemini.calls == 1
     assert result.segments[0].route == "NO_LLM"
+    assert result.segments[1].route == "GEMINI_DIRECT"
     assert result.segments[1].applied is True
+
+
+def test_gemini_only_local_route_target_is_persisted_as_gemini_direct() -> None:
+    reconstructor, _, gemini = _reconstructor(
+        FakeLocal(), FakeGemini(), mode=RoutingMode.GEMINI_ONLY
+    )
+    result = _run(
+        reconstructor,
+        [_segment(words=_words([0.98, 0.60, 0.55, 0.98], ["ده", "كلام", "جديد", "مصري"]))],
+    )
+    assert gemini is not None and gemini.calls == 1
+    assert result.segments[0].route == "GEMINI_DIRECT"
+    assert result.segments[0].final_provider.startswith("gemini:")
 
 
 def test_manual_override_wins_inside_gemini_only() -> None:
@@ -425,7 +544,7 @@ def test_routing_counts_are_retained_in_metadata() -> None:
     result = _run(
         reconstructor,
         [
-            _segment(words=_words([0.98, 0.99], ["ده", "كلام"])),
+            _segment(words=_words([0.98, 0.99], ["ده", "كلام"]), stage25=True),
             _segment(words=_words([0.30, 0.25, 0.20, 0.90], ["م", "ش", "قادر", "يفهم"])),
         ],
     )
@@ -435,6 +554,7 @@ def test_routing_counts_are_retained_in_metadata() -> None:
     assert counts["gemini_direct"] == 1
     assert counts["gemini_accepted"] == 1
     assert result.metadata["gemini_usage"]["total_token_count"] == 15
+    assert result.metadata["cache_eligible"] is True
 
 
 def test_completed_identical_work_has_identical_fingerprint_without_duplicate_call() -> None:
@@ -481,3 +601,29 @@ def test_secret_strings_never_appear_in_results() -> None:
     assert "api_key" not in serialized.casefold()
     assert "AIza" not in serialized
     assert gemini is not None
+
+
+def test_final_provider_reflects_accepted_local_after_gemini_failure() -> None:
+    gemini = FakeGemini(error=GeminiProviderError(GeminiErrorCategory.TIMEOUT))
+    reconstructor, _, gemini = _reconstructor(FakeLocal(), gemini, mode=RoutingMode.ADAPTIVE)
+    result = _run(
+        reconstructor,
+        [_segment(words=_words([0.30, 0.25, 0.20, 0.90], ["م", "ش", "قادر", "يفهم"]))],
+    )
+    segment = result.segments[0]
+    assert segment.gemini_result_state == "failure:TIMEOUT"
+    assert segment.applied is True
+    assert segment.final_provider == "ollama:qwen3.5:4b"
+
+
+def test_final_provider_is_stage25_when_no_provider_accepts() -> None:
+    gemini = FakeGemini(error=GeminiProviderError(GeminiErrorCategory.TIMEOUT))
+    local = FakeLocal(
+        candidate=ReconstructionCandidate("provider-0", "الرئيس 70", provider_confidence=1.0)
+    )
+    reconstructor, _, gemini = _reconstructor(local, gemini, mode=RoutingMode.ADAPTIVE)
+    result = _run(reconstructor, [_segment(raw="دخم", corrected="دخم")])
+    segment = result.segments[0]
+    assert segment.applied is False
+    assert segment.final_provider == "stage25"
+    assert segment.contextual_reconstructed_text == "دخم"

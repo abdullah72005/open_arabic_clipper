@@ -97,16 +97,19 @@ Redis with no TTL and blocks new heavy work; run
 `python -m app.cli recover-heavy-model` to clear it after confirming the model
 is no longer resident.
 
-An optional hosted Gemini provider (`gemini-3.6-flash`) supports deterministic
-adaptive routing (`local_only` / `adaptive` / `gemini_only`;
-`CLIPFACTORY_RECONSTRUCTION_ROUTING_MODE`, default `adaptive`). Trusted Stage 2.5
-targets never consume an LLM, normal uncertainty uses Qwen first, clearly
-difficult targets use one Gemini request directly, and Qwen failures escalate to
-Gemini under a finite per-job budget
-(`CLIPFACTORY_GEMINI_MAX_TARGETS_PER_JOB`, default `5`). `adaptive` and
+An optional hosted Gemini provider (`gemini-3.8-flash`, low thinking by default)
+supports deterministic adaptive routing (`local_only` / `adaptive` / `gemini_only`;
+`CLIPFACTORY_RECONSTRUCTION_ROUTING_MODE`, default `adaptive`). `NO_LLM` requires
+affirmative Stage 2.5 trust; trusted targets never consume an LLM. Normal
+uncertainty uses Qwen first, clearly difficult targets use one Gemini request
+directly, and Qwen failures escalate to Gemini under a finite per-job budget
+(`CLIPFACTORY_GEMINI_MAX_TARGETS_PER_JOB`, default `5`) that is spent on the
+strongest eligible targets first, not the first five. `adaptive` and
 `gemini_only` may send short transcript snippets and bounded context to Google
-Gemini; set `local_only` for a fully local pipeline. The key is presence-checked
-only and never logged or committed.
+Gemini; set `local_only` for a fully local pipeline. The key is a secret, held
+as `SecretStr`, and never logged or committed. A temporary Gemini outage never
+overwrites accepted output: fingerprints are stable identity only and cache
+eligibility is tracked separately.
 
 Stage 2.7 cache reuse is dependency-aware: stage runs persist canonical input
 and output fingerprints, and changed upstream evidence reruns downstream work.

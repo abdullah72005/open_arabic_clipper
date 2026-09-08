@@ -191,7 +191,9 @@ def test_reconstruction_output_fingerprint_changes_with_each_identity_component(
     assert baseline.fingerprint != changed.fingerprint
 
 
-def test_unavailable_run_fingerprint_cannot_collide_with_available_run() -> None:
+def test_unavailable_run_shares_stable_fingerprint_but_is_not_cache_eligible() -> None:
+    """Availability is execution state, not identity; a degraded run stays retryable."""
+
     segments = [{"start": 0.0, "end": 1.0, "text": "دخم", "corrected_text": "دخم"}]
 
     available = ContextualReconstructor(
@@ -211,7 +213,9 @@ def test_unavailable_run_fingerprint_cannot_collide_with_available_run() -> None
         correction_version="egyptian-ar-v1",
     )
 
-    assert available.fingerprint != unavailable.fingerprint
+    assert available.fingerprint == unavailable.fingerprint
+    assert available.metadata["cache_eligible"] is True
+    assert unavailable.metadata["cache_eligible"] is False
 
 
 class CandidateProvider(IdentityProvider):
@@ -529,5 +533,133 @@ def test_executor_cache_hit_avoids_duplicate_gemini_call(sqlite_engine: object) 
         executor = ContextualReconstructionExecutor(session=session, reconstructor=reconstructor)
         executor.execute(source, force=True)
         assert gemini.calls == 1
+        executor.execute(source, force=False)
+        assert gemini.calls == 1
+
+
+class FlappyGemini(CountingGemini):
+    def __init__(self) -> None:
+        super().__init__()
+        self.available = True
+
+    def health(self) -> ProviderHealth:
+        if not self.available:
+            return ProviderHealth(
+                ProviderAvailability.UNAVAILABLE, "gemini", "gemini-3.8-flash", None, "offline"
+            )
+        return ProviderHealth(
+            ProviderAvailability.AVAILABLE, "gemini", "gemini-3.8-flash", "sha256:g", "ok"
+        )
+
+
+def _hard_segment() -> dict[str, object]:
+    return {
+        "start": 0.0,
+        "end": 1.0,
+        "text": "دخم",
+        "raw_text": "دخم",
+        "corrected_text": "دخم",
+        "words": [
+            {"word": "م", "probability": 0.30},
+            {"word": "ش", "probability": 0.25},
+            {"word": "قادر", "probability": 0.20},
+            {"word": "يفهم", "probability": 0.90},
+        ],
+    }
+
+
+def test_successful_gemini_result_reused_during_mocked_outage(sqlite_engine: object) -> None:
+    """A temporary outage never overwrites accepted Gemini output nor re-generates."""
+
+    Base.metadata.create_all(sqlite_engine)
+    with Session(sqlite_engine) as session:
+        source = SourceVideo(
+            source_uri="file:///tmp/source.mp4", content_hash="h", rights_status=RightsStatus.OWNED
+        )
+        session.add(source)
+        session.commit()
+        session.add(
+            Transcript(
+                source_video_id=source.id,
+                whisper_model="large-v3-turbo",
+                input_fingerprint="asr-fp",
+                normalization_fingerprint="norm-fp",
+                transcription_revision=1,
+                correction_version="egyptian-ar-v1",
+                language="ar",
+                segments=[_hard_segment()],
+            )
+        )
+        session.commit()
+
+        gemini = FlappyGemini()
+        reconstructor = ContextualReconstructor(
+            CandidateProvider(
+                ReconstructionCandidate("provider-0", "ضخمة", provider_confidence=1.0)
+            ),
+            gemini_provider=gemini,
+            routing=AdaptiveRoutingConfig(mode=RoutingMode.ADAPTIVE),
+            gemini_budget=5,
+        )
+        executor = ContextualReconstructionExecutor(session=session, reconstructor=reconstructor)
+        executor.execute(source, force=True)
+        session.refresh(source)
+        assert gemini.calls == 1
+        accepted_text = source.transcript.contextual_reconstructed_text
+        assert accepted_text == "ضخمة"
+
+        gemini.available = False
+        executor.execute(source, force=False)
+        session.refresh(source)
+        assert gemini.calls == 1  # no duplicate generation during outage
+        assert source.transcript.contextual_reconstructed_text == accepted_text
+
+
+def test_transient_first_run_fallback_is_retried_after_recovery(sqlite_engine: object) -> None:
+    """A first-run degraded fallback is not cached forever once the provider recovers."""
+
+    Base.metadata.create_all(sqlite_engine)
+    with Session(sqlite_engine) as session:
+        source = SourceVideo(
+            source_uri="file:///tmp/source.mp4", content_hash="h", rights_status=RightsStatus.OWNED
+        )
+        session.add(source)
+        session.commit()
+        session.add(
+            Transcript(
+                source_video_id=source.id,
+                whisper_model="large-v3-turbo",
+                input_fingerprint="asr-fp",
+                normalization_fingerprint="norm-fp",
+                transcription_revision=1,
+                correction_version="egyptian-ar-v1",
+                language="ar",
+                segments=[_hard_segment()],
+            )
+        )
+        session.commit()
+
+        gemini = FlappyGemini()
+        gemini.available = False
+        reconstructor = ContextualReconstructor(
+            CandidateProvider(
+                ReconstructionCandidate("provider-0", "ضخمة", provider_confidence=1.0)
+            ),
+            gemini_provider=gemini,
+            routing=AdaptiveRoutingConfig(mode=RoutingMode.ADAPTIVE),
+            gemini_budget=5,
+        )
+        executor = ContextualReconstructionExecutor(session=session, reconstructor=reconstructor)
+        executor.execute(source, force=True)
+        session.refresh(source)
+        assert gemini.calls == 0
+        assert source.transcript.reconstruction_metadata["cache_eligible"] is False
+
+        gemini.available = True
+        executor.execute(source, force=False)
+        session.refresh(source)
+        assert gemini.calls == 1  # degraded first run retried after recovery
+        assert source.transcript.reconstruction_metadata["cache_eligible"] is True
+        assert source.transcript.contextual_reconstructed_text == "ضخمة"
         executor.execute(source, force=False)
         assert gemini.calls == 1

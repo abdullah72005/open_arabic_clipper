@@ -2,7 +2,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import AliasChoices, Field, model_validator
+from pydantic import AliasChoices, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.runtime.heavy_model_lease import HeavyModelLeaseFactory
@@ -73,12 +73,12 @@ class Settings(BaseSettings):
     reconstruction_provider_batch_windows: int = Field(default=8, gt=0, le=16)
     reconstruction_provider_batch_characters: int = Field(default=24_000, gt=0, le=48_000)
     reconstruction_routing_mode: Literal["local_only", "adaptive", "gemini_only"] = "adaptive"
-    gemini_api_key: str | None = Field(
+    gemini_api_key: SecretStr | None = Field(
         default=None,
-        max_length=4_096,
         validation_alias=AliasChoices("CLIPFACTORY_GEMINI_API_KEY", "GEMINI_API_KEY"),
     )
-    gemini_model: str = Field(default="gemini-3.6-flash", max_length=256)
+    gemini_model: str = Field(default="gemini-3.8-flash", max_length=256)
+    gemini_thinking_level: Literal["low", "medium", "high"] = "low"
     gemini_timeout_seconds: float = Field(default=30.0, gt=0, le=300)
     gemini_retry_attempts: int = Field(default=1, ge=0, le=3)
     gemini_retry_backoff_seconds: float = Field(default=1.5, gt=0, le=30)
@@ -200,22 +200,26 @@ class Settings(BaseSettings):
     def gemini_provider_instance(self) -> GeminiReconstructionProvider | None:
         """Return the hosted Gemini provider only when a key is configured."""
 
-        if not self.gemini_api_key_present:
+        key = self.gemini_api_key
+        if key is None or not key.get_secret_value():
             return None
         return GeminiReconstructionProvider(
-            api_key=self.gemini_api_key,
+            api_key=key.get_secret_value(),
             model=self.gemini_model,
             timeout_seconds=self.gemini_timeout_seconds,
             retry_attempts=self.gemini_retry_attempts,
             retry_backoff_seconds=self.gemini_retry_backoff_seconds,
             max_output_tokens=self.gemini_max_output_tokens,
+            thinking_level=self.gemini_thinking_level,
         )
 
     @property
     def gemini_api_key_present(self) -> bool:
         """Presence-only check that never exposes the key value."""
 
-        return bool(self.gemini_api_key)
+        if self.gemini_api_key is None:
+            return False
+        return bool(self.gemini_api_key.get_secret_value())
 
     def heavy_model_lease_factory(self) -> HeavyModelLeaseFactory:
         """Build the Redis-backed lease factory that serializes heavy models."""

@@ -235,7 +235,10 @@ class OpenAICompatibleReconstructionProvider:
     def reconstruct_segments(
         self, requests: list[ReconstructionRequest]
     ) -> dict[int, ReconstructionCandidate]:
-        system_instruction = self._system_instruction()
+        profile = next(
+            (request.dialect_profile for request in requests if request.dialect_profile), None
+        )
+        system_instruction = self._system_instruction(profile)
         if self._max_context_tokens is not None:
             requests = [
                 _shrink_request_to_budget(
@@ -270,11 +273,11 @@ class OpenAICompatibleReconstructionProvider:
         )
         return _parse_reconstructions(content, requests)
 
-    def _system_instruction(self) -> str:
+    def _system_instruction(self, profile: str | None = None) -> str:
         instruction = SYSTEM_INSTRUCTION
         if self.provider_name == "ollama" and self.model.startswith("qwen3"):
             instruction = instruction + " /no_think"
-        return instruction
+        return instruction_for_profile(instruction, profile)
 
     def _envelope_estimate(self, system_instruction: str) -> Callable[[ReconstructionRequest], int]:
         def estimate(request: ReconstructionRequest) -> int:
@@ -370,6 +373,20 @@ _PROMPT_HASH = hashlib.sha256(SYSTEM_INSTRUCTION.encode("utf-8")).hexdigest()
 
 # Backward-compatible alias for existing consumers of the shared instruction.
 _SYSTEM_INSTRUCTION = SYSTEM_INSTRUCTION
+
+DIALECT_PROFILE_ADDENDUM = (
+    'The source uses the "{profile}" dialect profile. Preserve that profile\'s '
+    "word choices and pronunciation-driven spelling exactly; do not shift "
+    "register, translate, or standardize."
+)
+
+
+def instruction_for_profile(base: str, profile: str | None) -> str:
+    """Append a narrow dialect-profile preservation addendum when supplied."""
+
+    if not profile:
+        return base
+    return base + "\n" + DIALECT_PROFILE_ADDENDUM.format(profile=profile)
 
 
 def _shrink_request_to_budget(

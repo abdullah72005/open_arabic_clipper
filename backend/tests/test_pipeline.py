@@ -407,7 +407,40 @@ def test_reconstruction_stage_holds_heavy_lease_around_ollama(
 
     from app.pipeline.stages import ContextualReconstructionExecutor
     from app.runtime.heavy_model_lease import NoopHeavyModelLeaseFactory
+    from app.transcription.reconstruction.providers import (
+        ReconstructionCandidate,
+        ReconstructionRequest,
+    )
     from app.transcription.reconstruction.service import ContextualReconstructor
+    from app.transcription.reconstruction.types import (
+        ProviderAvailability,
+        ProviderHealth,
+    )
+
+    class LocalProvider:
+        def health(self) -> ProviderHealth:
+            return ProviderHealth(
+                ProviderAvailability.AVAILABLE, "ollama", "qwen3.5:4b", "sha256:x", "ok"
+            )
+
+        def runtime_identity(self) -> dict[str, object]:
+            return {"provider": "ollama", "model": "qwen3.5:4b", "digest": "sha256:x"}
+
+        def refresh_runtime_identity(self) -> dict[str, object]:
+            return self.runtime_identity()
+
+        def reconstruct_segments(
+            self, requests: list[ReconstructionRequest]
+        ) -> dict[int, ReconstructionCandidate]:
+            return {
+                request.segment_index: ReconstructionCandidate(
+                    "provider-0", "ضخمة", provider_confidence=1.0
+                )
+                for request in requests
+            }
+
+        def release(self) -> None:
+            return None
 
     Base.metadata.create_all(sqlite_engine)
     with Session(sqlite_engine) as session:
@@ -426,7 +459,21 @@ def test_reconstruction_stage_holds_heavy_lease_around_ollama(
                 normalization_fingerprint="nf",
                 transcription_revision=1,
                 correction_version="v1",
-                segments=[],
+                segments=[
+                    {
+                        "start": 0.0,
+                        "end": 1.0,
+                        "text": "دخم",
+                        "raw_text": "دخم",
+                        "corrected_text": "دخم",
+                        "words": [
+                            {"word": "ده", "probability": 0.98},
+                            {"word": "كلام", "probability": 0.60},
+                            {"word": "جديد", "probability": 0.55},
+                            {"word": "مصري", "probability": 0.98},
+                        ],
+                    }
+                ],
             )
         )
         session.commit()
@@ -434,7 +481,7 @@ def test_reconstruction_stage_holds_heavy_lease_around_ollama(
         lease_factory = NoopHeavyModelLeaseFactory()
         executor = ContextualReconstructionExecutor(
             session=session,
-            reconstructor=ContextualReconstructor(None),
+            reconstructor=ContextualReconstructor(LocalProvider()),
             lease_factory=lease_factory,
         )
 
@@ -448,16 +495,186 @@ def test_reconstruction_stage_holds_heavy_lease_around_ollama(
         assert events[0]["purpose"] == "ollama"
 
 
-def test_heavy_lease_contention_raises_retryable_busy(sqlite_engine: object) -> None:
-    """A contended lease surfaces as a retryable error before any model starts."""
+def test_no_llm_and_gemini_only_jobs_run_without_ollama_lease(
+    sqlite_engine: object,
+) -> None:
+    """NO_LLM and GEMINI_ONLY work never requires the heavy-model lease."""
 
     from app.pipeline.stages import ContextualReconstructionExecutor
     from app.runtime.heavy_model_lease import HeavyModelLeaseBusy
+    from app.transcription.reconstruction.providers import (
+        ReconstructionCandidate,
+        ReconstructionRequest,
+    )
+    from app.transcription.reconstruction.routing import AdaptiveRoutingConfig, RoutingMode
     from app.transcription.reconstruction.service import ContextualReconstructor
+    from app.transcription.reconstruction.types import (
+        ProviderAvailability,
+        ProviderHealth,
+    )
+
+    class NoLeaseFactory:
+        def acquire(self, *, purpose: str) -> object:
+            raise HeavyModelLeaseBusy("heavy-model lease busy")
+
+    class LocalProvider:
+        def health(self) -> ProviderHealth:
+            return ProviderHealth(
+                ProviderAvailability.AVAILABLE, "ollama", "qwen3.5:4b", "sha256:x", "ok"
+            )
+
+        def runtime_identity(self) -> dict[str, object]:
+            return {"provider": "ollama", "model": "qwen3.5:4b", "digest": "sha256:x"}
+
+        def refresh_runtime_identity(self) -> dict[str, object]:
+            return self.runtime_identity()
+
+        def reconstruct_segments(
+            self, requests: list[ReconstructionRequest]
+        ) -> dict[int, ReconstructionCandidate]:
+            return {
+                request.segment_index: ReconstructionCandidate(
+                    "provider-0", "ضخمة", provider_confidence=1.0
+                )
+                for request in requests
+            }
+
+        def release(self) -> None:
+            return None
+
+    class GeminiOnlyProvider:
+        model = "gemini-3.8-flash"
+
+        def health(self) -> ProviderHealth:
+            return ProviderHealth(
+                ProviderAvailability.AVAILABLE, "gemini", "gemini-3.8-flash", "sha256:g", "ok"
+            )
+
+        def runtime_identity(self) -> dict[str, object]:
+            return {"provider": "gemini", "model": "gemini-3.8-flash", "digest": "sha256:g"}
+
+        def refresh_runtime_identity(self) -> dict[str, object]:
+            return self.runtime_identity()
+
+        def release(self) -> None:
+            return None
+
+        def reconstruct_segments(
+            self, requests: list[ReconstructionRequest]
+        ) -> dict[int, ReconstructionCandidate]:
+            return {
+                request.segment_index: ReconstructionCandidate(
+                    "provider-0", "ضخمة", provider_confidence=1.0
+                )
+                for request in requests
+            }
+
+        def usage_summary(self) -> dict[str, int]:
+            return {"prompt_token_count": 0, "candidates_token_count": 0, "total_token_count": 0}
+
+    Base.metadata.create_all(sqlite_engine)
+    with Session(sqlite_engine) as session:
+        source = SourceVideo(
+            source_uri=f"file:///tmp/{uuid.uuid4()}.mp4",
+            content_hash="h",
+            rights_status=RightsStatus.OWNED,
+        )
+        session.add(source)
+        session.commit()
+        trusted = {
+            "start": 0.0,
+            "end": 1.0,
+            "text": "ده كلام",
+            "raw_text": "ده كلام",
+            "corrected_text": "ده كلام",
+            "words": [{"word": "ده", "probability": 0.98}, {"word": "كلام", "probability": 0.99}],
+            "correction_applied": True,
+            "correction_confidence": 0.95,
+            "correction_method": "lexicon",
+        }
+        session.add(
+            Transcript(
+                source_video_id=source.id,
+                whisper_model="large-v3-turbo",
+                input_fingerprint="fp",
+                normalization_fingerprint="nf",
+                transcription_revision=1,
+                correction_version="v1",
+                segments=[trusted],
+            )
+        )
+        session.commit()
+
+        no_llm_executor = ContextualReconstructionExecutor(
+            session=session,
+            reconstructor=ContextualReconstructor(
+                LocalProvider(),
+                routing=AdaptiveRoutingConfig(mode=RoutingMode.ADAPTIVE),
+            ),
+            lease_factory=NoLeaseFactory(),  # type: ignore[arg-type]
+        )
+        no_llm_executor.execute(source, force=True)
+        session.refresh(source)
+        assert source.transcript.segments[0]["reconstruction_route"] == "NO_LLM"
+
+        gemini_only_executor = ContextualReconstructionExecutor(
+            session=session,
+            reconstructor=ContextualReconstructor(
+                LocalProvider(),
+                gemini_provider=GeminiOnlyProvider(),  # type: ignore[arg-type]
+                routing=AdaptiveRoutingConfig(mode=RoutingMode.GEMINI_ONLY),
+            ),
+            lease_factory=NoLeaseFactory(),  # type: ignore[arg-type]
+        )
+        gemini_only_executor.execute(source, force=True)
+        session.refresh(source)
+        assert source.transcript.segments[0]["reconstruction_route"] == "NO_LLM"
+
+
+def test_real_local_inference_still_requires_the_lease(sqlite_engine: object) -> None:
+    """Actual local inference still acquires the heavy-model lease."""
+
+    from app.pipeline.stages import ContextualReconstructionExecutor
+    from app.runtime.heavy_model_lease import HeavyModelLeaseBusy
+    from app.transcription.reconstruction.providers import (
+        ReconstructionCandidate,
+        ReconstructionRequest,
+    )
+    from app.transcription.reconstruction.routing import AdaptiveRoutingConfig, RoutingMode
+    from app.transcription.reconstruction.service import ContextualReconstructor
+    from app.transcription.reconstruction.types import (
+        ProviderAvailability,
+        ProviderHealth,
+    )
 
     class BusyLeaseFactory:
         def acquire(self, *, purpose: str) -> object:
             raise HeavyModelLeaseBusy("heavy-model lease busy")
+
+    class LocalProvider:
+        def health(self) -> ProviderHealth:
+            return ProviderHealth(
+                ProviderAvailability.AVAILABLE, "ollama", "qwen3.5:4b", "sha256:x", "ok"
+            )
+
+        def runtime_identity(self) -> dict[str, object]:
+            return {"provider": "ollama", "model": "qwen3.5:4b", "digest": "sha256:x"}
+
+        def refresh_runtime_identity(self) -> dict[str, object]:
+            return self.runtime_identity()
+
+        def reconstruct_segments(
+            self, requests: list[ReconstructionRequest]
+        ) -> dict[int, ReconstructionCandidate]:
+            return {
+                request.segment_index: ReconstructionCandidate(
+                    "provider-0", "ضخمة", provider_confidence=1.0
+                )
+                for request in requests
+            }
+
+        def release(self) -> None:
+            return None
 
     Base.metadata.create_all(sqlite_engine)
     with Session(sqlite_engine) as session:
@@ -476,13 +693,119 @@ def test_heavy_lease_contention_raises_retryable_busy(sqlite_engine: object) -> 
                 normalization_fingerprint="nf",
                 transcription_revision=1,
                 correction_version="v1",
-                segments=[],
+                segments=[
+                    {
+                        "start": 0.0,
+                        "end": 1.0,
+                        "text": "دخم",
+                        "raw_text": "دخم",
+                        "corrected_text": "دخم",
+                        "words": [
+                            {"word": "ده", "probability": 0.98},
+                            {"word": "كلام", "probability": 0.60},
+                            {"word": "جديد", "probability": 0.55},
+                            {"word": "مصري", "probability": 0.98},
+                        ],
+                    }
+                ],
             )
         )
         session.commit()
         executor = ContextualReconstructionExecutor(
             session=session,
-            reconstructor=ContextualReconstructor(None),
+            reconstructor=ContextualReconstructor(
+                LocalProvider(),
+                routing=AdaptiveRoutingConfig(mode=RoutingMode.ADAPTIVE),
+            ),
+            lease_factory=BusyLeaseFactory(),  # type: ignore[arg-type]
+        )
+
+        with pytest.raises(HeavyModelLeaseBusy, match="busy"):
+            executor.execute(source, force=True)
+
+
+def test_heavy_lease_contention_raises_retryable_busy(sqlite_engine: object) -> None:
+    """A contended lease surfaces as a retryable error before any local model starts."""
+
+    from app.pipeline.stages import ContextualReconstructionExecutor
+    from app.runtime.heavy_model_lease import HeavyModelLeaseBusy
+    from app.transcription.reconstruction.providers import (
+        ReconstructionCandidate,
+        ReconstructionRequest,
+    )
+    from app.transcription.reconstruction.service import ContextualReconstructor
+    from app.transcription.reconstruction.types import (
+        ProviderAvailability,
+        ProviderHealth,
+    )
+
+    class BusyLeaseFactory:
+        def acquire(self, *, purpose: str) -> object:
+            raise HeavyModelLeaseBusy("heavy-model lease busy")
+
+    class LocalProvider:
+        def health(self) -> ProviderHealth:
+            return ProviderHealth(
+                ProviderAvailability.AVAILABLE, "ollama", "qwen3.5:4b", "sha256:x", "ok"
+            )
+
+        def runtime_identity(self) -> dict[str, object]:
+            return {"provider": "ollama", "model": "qwen3.5:4b", "digest": "sha256:x"}
+
+        def refresh_runtime_identity(self) -> dict[str, object]:
+            return self.runtime_identity()
+
+        def reconstruct_segments(
+            self, requests: list[ReconstructionRequest]
+        ) -> dict[int, ReconstructionCandidate]:
+            return {
+                request.segment_index: ReconstructionCandidate(
+                    "provider-0", "ضخمة", provider_confidence=1.0
+                )
+                for request in requests
+            }
+
+        def release(self) -> None:
+            return None
+
+    Base.metadata.create_all(sqlite_engine)
+    with Session(sqlite_engine) as session:
+        source = SourceVideo(
+            source_uri=f"file:///tmp/{uuid.uuid4()}.mp4",
+            content_hash="h",
+            rights_status=RightsStatus.OWNED,
+        )
+        session.add(source)
+        session.commit()
+        session.add(
+            Transcript(
+                source_video_id=source.id,
+                whisper_model="large-v3-turbo",
+                input_fingerprint="fp",
+                normalization_fingerprint="nf",
+                transcription_revision=1,
+                correction_version="v1",
+                segments=[
+                    {
+                        "start": 0.0,
+                        "end": 1.0,
+                        "text": "دخم",
+                        "raw_text": "دخم",
+                        "corrected_text": "دخم",
+                        "words": [
+                            {"word": "ده", "probability": 0.98},
+                            {"word": "كلام", "probability": 0.60},
+                            {"word": "جديد", "probability": 0.55},
+                            {"word": "مصري", "probability": 0.98},
+                        ],
+                    }
+                ],
+            )
+        )
+        session.commit()
+        executor = ContextualReconstructionExecutor(
+            session=session,
+            reconstructor=ContextualReconstructor(LocalProvider()),
             lease_factory=BusyLeaseFactory(),  # type: ignore[arg-type]
         )
 
@@ -582,7 +905,21 @@ def test_reconstruction_retains_lease_when_unload_times_out(sqlite_engine: objec
                 normalization_fingerprint="nf",
                 transcription_revision=1,
                 correction_version="v1",
-                segments=[],
+                segments=[
+                    {
+                        "start": 0.0,
+                        "end": 1.0,
+                        "text": "دخم",
+                        "raw_text": "دخم",
+                        "corrected_text": "دخم",
+                        "words": [
+                            {"word": "ده", "probability": 0.98},
+                            {"word": "كلام", "probability": 0.60},
+                            {"word": "جديد", "probability": 0.55},
+                            {"word": "مصري", "probability": 0.98},
+                        ],
+                    }
+                ],
             )
         )
         session.commit()

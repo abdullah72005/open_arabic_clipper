@@ -25,20 +25,23 @@ Stage 2.7 supports an optional hosted Gemini reconstruction provider through the
 official Google Gen AI SDK. It is configured by environment variables only; no
 frontend settings system exists. The Gemini API key is read by application
 settings from `GEMINI_API_KEY` or `CLIPFACTORY_GEMINI_API_KEY` in the local
-`.env` and is presence-checked only. It is never printed, logged, serialized,
-fingerprinted, returned by any API, or committed.
+`.env`, held as a Pydantic `SecretStr`, and unwrapped only when constructing the
+SDK client. It is masked in settings repr/serialization/validation errors and is
+never printed, logged, fingerprinted, returned by any API, or committed.
 
 **Cloud snippet disclosure.** The `adaptive` and `gemini_only` routing modes may
 send short transcript snippets and bounded context to Google Gemini. The
 default mode is `adaptive`; set `CLIPFACTORY_RECONSTRUCTION_ROUTING_MODE` to
 `local_only` for a fully local pipeline. Cloud-processing configuration is
-separate from rights/provenance eligibility.
+separate from rights/provenance eligibility. Free-tier quotas are shared per
+Google project, so all Gemini consumers draw from the same project allowance.
 
 Model, timeout, retry, and budget settings mirror the local provider pattern:
 
 ```bash
 CLIPFACTORY_RECONSTRUCTION_ROUTING_MODE=adaptive
-CLIPFACTORY_GEMINI_MODEL=gemini-3.6-flash
+CLIPFACTORY_GEMINI_MODEL=gemini-3.8-flash
+CLIPFACTORY_GEMINI_THINKING_LEVEL=low
 CLIPFACTORY_GEMINI_TIMEOUT_SECONDS=30
 CLIPFACTORY_GEMINI_RETRY_ATTEMPTS=1
 CLIPFACTORY_GEMINI_RETRY_BACKOFF_SECONDS=1.5
@@ -47,10 +50,13 @@ CLIPFACTORY_GEMINI_MAX_OUTPUT_TOKENS=1024
 ```
 
 A missing key never blocks startup or local operation. Gemini is treated as a
-scarce resource: the per-job target budget, one-bounded-retry policy, and
-429/quota exhaustion stop together keep free-plan consumption small and bounded.
-The per-job cap is not an account-wide billing/quota manager. See
-`docs/STAGE_2_7_OPERATIONS.md` for the full routing policy.
+scarce resource: the per-job target budget spends on the strongest eligible
+targets first, only transient failures get one bounded retry, and a 429/quota
+exhaustion stops further calls for that job. The per-job cap is not an
+account-wide billing/quota manager. A temporary provider outage does not
+invalidate accepted output: fingerprints are stable identity only and cache
+eligibility is tracked separately. See `docs/STAGE_2_7_OPERATIONS.md` for the
+full routing policy.
 
 ## Development implications
 

@@ -15,29 +15,28 @@ def canonical_fingerprint(namespace: str, version: str, payload: Mapping[str, ob
 def reconstruction_output_fingerprint(
     *,
     provider_identity: Mapping[str, object],
-    provider_available: bool,
     segments: Sequence[Mapping[str, object]],
     language: str | None,
     transcription_fingerprint: str,
     correction_version: str,
-    gemini_available: bool = False,
 ) -> str:
-    """Fingerprint Stage 2.7 output including every output-affecting dependency.
+    """Fingerprint Stage 2.7 output from stable dependency identity only.
 
-    ``provider_identity`` carries the full runtime identity: local provider,
-    routing mode and policy thresholds, Gemini provider/model/schema, budgets,
-    and confidence/validation versions. Never include credentials in this data.
+    ``provider_identity`` carries the full stable runtime identity: local
+    provider, routing mode and policy thresholds, Gemini provider/model/schema,
+    budgets, thinking level, and confidence/validation versions. Transient
+    provider availability is execution state, not identity, and is deliberately
+    excluded so a temporary outage cannot invalidate accepted output. Cache
+    eligibility is tracked separately by the executor. Never include credentials.
     """
 
     return canonical_fingerprint(
         "reconstruction-output",
-        "2",
+        "3",
         {
             "language": language,
             "transcription_fingerprint": transcription_fingerprint,
             "correction_version": correction_version,
-            "provider_available": provider_available,
-            "gemini_available": gemini_available,
             "runtime_identity": dict(provider_identity),
             "segments": [
                 {

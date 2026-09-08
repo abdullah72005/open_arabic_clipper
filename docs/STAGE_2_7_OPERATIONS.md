@@ -20,12 +20,13 @@ docker compose exec backend python -m app.cli reconstruction-health
 ## Hosted Gemini provider and routing modes
 
 Stage 2.7 also supports an optional hosted Gemini provider
-(`gemini-3.6-flash` by default) through the official Google Gen AI SDK
+(`gemini-3.8-flash` by default) through the official Google Gen AI SDK
 (`google-genai`). The Gemini API key is read through application settings from
-`GEMINI_API_KEY` or `CLIPFACTORY_GEMINI_API_KEY` in the local `.env`. The key is
-presence-checked only, never logged, never exposed through the API or
-fingerprints, and never committed. If the key is absent the application starts
-and runs normally with the local path only.
+`GEMINI_API_KEY` or `CLIPFACTORY_GEMINI_API_KEY` in the local `.env`; it is held
+as a Pydantic `SecretStr`, unwrapped only when constructing the SDK client, and
+masked in settings repr/serialization/validation errors. The key is never
+logged, exposed through the API or fingerprints, or committed. If the key is
+absent the application starts and runs normally with the local path only.
 
 Three routing modes are controlled by `CLIPFACTORY_RECONSTRUCTION_ROUTING_MODE`:
 
@@ -39,53 +40,80 @@ Three routing modes are controlled by `CLIPFACTORY_RECONSTRUCTION_ROUTING_MODE`:
 transcript snippets and bounded context to Google Gemini. Configure the key and
 mode explicitly; this is a cloud-processing configuration decision and is
 separate from rights/provenance eligibility, which is evaluated independently.
+Free-tier limits are shared per Google project, so all Gemini consumers
+(including future project stages) draw from the same quota.
 
-### Quota-efficient routing and the Gemini per-job budget
+### Routing on real Stage 2.5 trust
 
-Routing is deterministic and quota-conscious:
+`NO_LLM` is chosen only with affirmative Stage 2.5 evidence: a non-unchanged
+correction method (`correction_method` not `unchanged`/`pending`) carrying
+confidence at or above `stage25_trust_confidence` (`0.90`), together with clean
+acoustic evidence and no localized protected-token ambiguity. High Whisper word
+probabilities alone never suppress contextual checking: a confidently wrong
+Whisper segment whose correction was `unchanged` with `correction_confidence=0.0`
+remains eligible for the Qwen path. A single isolated low-confidence word is
+reported accurately and never labeled `no_low_probability_evidence`. Missing
+word probabilities are never automatically hard.
 
-- Stage 2.5-trustworthy targets (`NO_LLM`) never consume Gemini or Qwen.
-- Normal uncertainty uses Qwen first; an accepted Qwen result never calls
-  Gemini.
-- Clearly difficult targets (contiguous very-low-probability words, large
-  low-confidence spans, severe routing scores, uncertainty overlapping a
-  protected number/name, or multiple severe indicators) bypass Qwen and use one
-  Gemini request directly.
-- Only bounded context windows are sent; full transcripts and audio are never
-  sent.
-- `CLIPFACTORY_GEMINI_MAX_TARGETS_PER_JOB` (default `5`) caps Gemini
-  reconstruction targets per job. When exhausted, eligible targets fall back to
-  local when useful or stay on safe Stage 2.5 text marked unresolved; the
-  strongest difficult segments are prioritized deterministically when more
-  targets are eligible than the budget allows.
-- At most one normal Gemini attempt plus one bounded retry for eligible
-  transient failures (`connection`, `timeout`, `provider_error`). A 429 or
-  quota exhaustion is not retried and stops further Gemini attempts for the
-  current job.
-- Completed identical work reuses its fingerprint without a duplicate Gemini
-  call after retries or restarts.
+### Strongest-first Gemini budget
 
-The per-job cap reserves Gemini capacity for later project stages; it is not an
-account-wide billing or quota manager. Tune the cap through configuration for
-later needs.
+`CLIPFACTORY_GEMINI_MAX_TARGETS_PER_JOB` (default `5`) caps Gemini reconstruction
+targets per job. The budget is spent on the **five strongest eligible targets**,
+not the first five in transcript order. Routing severity is deterministic
+(existing routing score, bounded per-contiguous-very-low-word bonus, protected
+overlap, multiple severe indicators), and ties break by segment index. Direct
+Gemini candidates are ranked and allocated first; Qwen runs afterward; then
+local failures/rejections are ranked by severity, protected ambiguity, local
+outcome, and near-acceptance evidence and the remaining budget is spent on the
+strongest escalations. Direct-Gemini targets never run Qwen before Gemini.
+
+Operators may raise the budget for long videos after checking active AI Studio
+quota. The cap reserves Gemini capacity for later project stages; it is not an
+account-wide billing or quota manager. Future Gemini consumers will need
+coordinated project-level budgeting because quotas are shared per Google project.
+
+### Stable fingerprints, outages, and cache eligibility
+
+Reconstruction fingerprints cover stable dependency identity only: provider
+configuration, model identity/digest, prompt/schema, routing policy and
+thresholds, budgets, thinking level, validation/confidence versions, source and
+context. Transient provider availability is execution state and is excluded, so
+a temporary Gemini outage cannot invalidate accepted output. Each run also
+records `cache_eligible`: a run that completed without transient provider
+failure is reusable; a run that degraded to provider-unavailable fallback or hit
+quota exhaustion is retried on a later run. During an outage, a previously
+accepted eligible result is reused and never overwritten with degraded fallback.
+No generation call is made to check a cache key.
+
+### Heavy-model lease
+
+The Ollama heavy-model lease is acquired lazily, only around actual local Qwen
+inference and local model release. `NO_LLM`, `GEMINI_ONLY`, and direct-Gemini
+work never acquire it; a direct-Gemini call runs before any optional local
+fallback lease. Real local inference and unload remain lease-protected, and
+unsafe-model markers and lost-lease behavior still fail closed.
 
 ### Gemini configuration settings
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | `CLIPFACTORY_RECONSTRUCTION_ROUTING_MODE` | `adaptive` | Provider selection policy. |
-| `GEMINI_API_KEY` / `CLIPFACTORY_GEMINI_API_KEY` | — | Presence-detected API key. |
-| `CLIPFACTORY_GEMINI_MODEL` | `gemini-3.6-flash` | Hosted model for reconstruction. |
+| `GEMINI_API_KEY` / `CLIPFACTORY_GEMINI_API_KEY` | — | Secret, presence-detected API key. |
+| `CLIPFACTORY_GEMINI_MODEL` | `gemini-3.8-flash` | Hosted model for reconstruction. |
+| `CLIPFACTORY_GEMINI_THINKING_LEVEL` | `low` | Bounded reasoning (`low`/`medium`/`high`). |
 | `CLIPFACTORY_GEMINI_TIMEOUT_SECONDS` | `30` | Per-request timeout. |
-| `CLIPFACTORY_GEMINI_RETRY_ATTEMPTS` | `1` | Bounded retries for transient failures. |
+| `CLIPFACTORY_GEMINI_RETRY_ATTEMPTS` | `1` | Bounded retries for transient failures only. |
 | `CLIPFACTORY_GEMINI_RETRY_BACKOFF_SECONDS` | `1.5` | Backoff between retries. |
-| `CLIPFACTORY_GEMINI_MAX_TARGETS_PER_JOB` | `5` | Per-job Gemini target budget. |
+| `CLIPFACTORY_GEMINI_MAX_TARGETS_PER_JOB` | `5` | Per-job Gemini target budget (strongest first). |
 | `CLIPFACTORY_GEMINI_MAX_OUTPUT_TOKENS` | `1024` | Tight structured-output budget. |
 
 When Gemini is unavailable, misconfigured, budget-blocked, or fails, a safe
 accepted local result is retained when one exists, otherwise safe Stage 2.5
 text is preserved and the segment is marked unresolved/manual review. Provider
-failures are never silently reported as success.
+failures are never silently reported as success. Permanent 400-class request
+failures, authentication, model-not-found, 429, malformed output, and safety
+refusal are never retried; connection/timeout/eligible 5xx get at most one
+bounded retry.
 
 ## Memory diagnostics
 

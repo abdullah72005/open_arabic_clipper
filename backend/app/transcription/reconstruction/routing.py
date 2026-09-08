@@ -31,7 +31,7 @@ class ReconstructionRoute(str, Enum):
     GEMINI_DIRECT = "GEMINI_DIRECT"
 
 
-ADAPTIVE_ROUTING_VERSION = "adaptive-routing-v1"
+ADAPTIVE_ROUTING_VERSION = "adaptive-routing-v2"
 
 
 @dataclass(frozen=True)
@@ -73,6 +73,9 @@ class AdaptiveRoutingConfig:
     """
 
     mode: RoutingMode = RoutingMode.ADAPTIVE
+    # NO_LLM requires affirmative Stage 2.5 evidence: a non-unchanged correction
+    # method carrying at least this confidence.
+    stage25_trust_confidence: float = 0.90
     # GEMINI_DIRECT: at least this many consecutive very-low-probability words.
     gemini_direct_contiguous_very_low: int = 3
     # GEMINI_DIRECT: at least this fraction of words below the low threshold,
@@ -87,13 +90,11 @@ class AdaptiveRoutingConfig:
     # LOCAL_THEN_GEMINI: escalate a local candidate whose computed score and
     # phonetic similarity are both within this margin of the HIGH gate.
     escalation_near_threshold_margin: float = 0.05
-    # NO_LLM on high-confidence Arabic requires positive word/acoustic evidence;
-    # missing evidence keeps the conservative local check.
-    no_llm_requires_positive_evidence: bool = True
 
     def as_dict(self) -> dict[str, object]:
         return {
             "mode": self.mode.value,
+            "stage25_trust_confidence": self.stage25_trust_confidence,
             "gemini_direct_contiguous_very_low": self.gemini_direct_contiguous_very_low,
             "gemini_direct_low_ratio": self.gemini_direct_low_ratio,
             "gemini_direct_min_low_count": self.gemini_direct_min_low_count,
@@ -102,7 +103,6 @@ class AdaptiveRoutingConfig:
                 self.gemini_direct_protected_overlap_min_very_low
             ),
             "escalation_near_threshold_margin": self.escalation_near_threshold_margin,
-            "no_llm_requires_positive_evidence": self.no_llm_requires_positive_evidence,
         }
 
 
@@ -114,6 +114,7 @@ class AdaptiveRoutingDecision:
     priority: RoutingPriority
     score: float | None = None
     focus_spans: tuple[WordEvidence, ...] = ()
+    severity: float = 0.0
 
 
 def route_segment(
@@ -157,20 +158,26 @@ def route_adaptive(
     language: str | None = None,
     decision: RoutingDecision | None = None,
 ) -> AdaptiveRoutingDecision:
-    """Choose the provider path for one target before any provider is invoked."""
+    """Choose the provider path for one target before any provider is invoked.
+
+    ``NO_LLM`` requires affirmative Stage 2.5 trust (a non-unchanged correction
+    at or above ``stage25_trust_confidence``) together with clean acoustic
+    evidence and no localized protected-token ambiguity. High Whisper word
+    probabilities alone never suppress contextual checking.
+    """
 
     config = config or AdaptiveRoutingConfig()
     decision = decision or route_segment(segment, language=language)
-    if decision.priority is RoutingPriority.LEAVE:
-        return AdaptiveRoutingDecision(
-            ReconstructionRoute.NO_LLM,
-            "insufficient_uncertainty_evidence",
-            ("no_low_probability_evidence",),
-            decision.priority,
-            decision.evidence.score,
-            decision.focus_spans,
-        )
     words, _avg = _segment_evidence(segment)
+    thresholds = RoutingConfig()
+    low = tuple(
+        w
+        for w in words
+        if w.probability is not None and w.probability < thresholds.low_probability_threshold
+    )
+    protected_ambiguity = _protected_overlap(low)
+    trust = _stage25_trustworthy(segment, config)
+    severity = _severity(words, decision, protected_ambiguity)
     hard, evidence = _hard_corruption_evidence(words, decision, config)
     if hard:
         return AdaptiveRoutingDecision(
@@ -180,24 +187,55 @@ def route_adaptive(
             decision.priority,
             decision.evidence.score,
             decision.focus_spans,
+            severity,
         )
-    if decision.priority is RoutingPriority.CONTEXT_CHECK:
-        if config.no_llm_requires_positive_evidence and not _has_positive_evidence(words):
+    if decision.priority is RoutingPriority.LEAVE:
+        if trust and not low and not protected_ambiguity:
             return AdaptiveRoutingDecision(
-                ReconstructionRoute.LOCAL,
-                "high_confidence_arabic_context_check",
-                ("missing_trust_evidence",),
+                ReconstructionRoute.NO_LLM,
+                "insufficient_uncertainty_evidence",
+                ("no_low_probability_evidence", "stage25_trusted"),
                 decision.priority,
                 decision.evidence.score,
                 decision.focus_spans,
+                severity,
             )
+        evidence_label = ("isolated_low_probability_words",) if low else ("stage25_untrusted",)
         return AdaptiveRoutingDecision(
-            ReconstructionRoute.NO_LLM,
-            "high_confidence_trustworthy",
-            ("high_confidence_arabic", "no_low_probability_words"),
+            ReconstructionRoute.LOCAL,
+            "stage25_untrusted_or_isolated_uncertainty",
+            evidence_label,
             decision.priority,
             decision.evidence.score,
             decision.focus_spans,
+            severity,
+        )
+    if decision.priority is RoutingPriority.CONTEXT_CHECK:
+        if trust and not low and not protected_ambiguity and _has_positive_evidence(words):
+            return AdaptiveRoutingDecision(
+                ReconstructionRoute.NO_LLM,
+                "high_confidence_trustworthy",
+                ("high_confidence_arabic", "no_low_probability_words", "stage25_trusted"),
+                decision.priority,
+                decision.evidence.score,
+                decision.focus_spans,
+                severity,
+            )
+        evidence_label = (
+            ("stage25_untrusted",)
+            if not trust
+            else ("missing_trust_evidence",)
+            if not _has_positive_evidence(words)
+            else ("low_probability_words",)
+        )
+        return AdaptiveRoutingDecision(
+            ReconstructionRoute.LOCAL,
+            "high_confidence_arabic_context_check",
+            evidence_label,
+            decision.priority,
+            decision.evidence.score,
+            decision.focus_spans,
+            severity,
         )
     return AdaptiveRoutingDecision(
         ReconstructionRoute.LOCAL,
@@ -206,6 +244,7 @@ def route_adaptive(
         decision.priority,
         decision.evidence.score,
         decision.focus_spans,
+        severity,
     )
 
 
@@ -234,6 +273,27 @@ def _segment_evidence(
     )
     vals = [w.probability for w in words if w.probability is not None]
     return words, (sum(vals) / len(vals) if vals else None)
+
+
+def _stage25_trustworthy(
+    segment: ReconstructionWindow | Mapping[str, object], config: AdaptiveRoutingConfig
+) -> bool:
+    """Affirmative Stage 2.5 trust: a real correction decision at high confidence.
+
+    The unchanged path writes ``correction_confidence=0.0`` and
+    ``correction_method="unchanged"``; that is exactly the untrusted case that
+    must remain eligible for contextual checking.
+    """
+
+    if isinstance(segment, ReconstructionWindow):
+        return False
+    method = str(segment.get("correction_method") or "")
+    if method in {"", "pending", "unchanged"}:
+        return False
+    confidence = segment.get("correction_confidence")
+    if not isinstance(confidence, int | float):
+        return False
+    return float(confidence) >= config.stage25_trust_confidence
 
 
 def _hard_corruption_evidence(
@@ -276,6 +336,37 @@ def _hard_corruption_evidence(
     if len(very_low) >= 2 and low_ratio >= 0.40:
         indicators.append("multiple_severe_uncertainty_indicators")
     return bool(indicators), tuple(indicators)
+
+
+def _severity(
+    words: tuple[WordEvidence, ...],
+    decision: RoutingDecision,
+    protected_ambiguity: bool,
+) -> float:
+    """Deterministic difficulty score used to spend a scarce Gemini budget.
+
+    Components: the existing routing score, a bounded per-contiguous-very-low
+    word bonus, a bonus for multiple very-low words, a bonus for localized
+    uncertainty over protected tokens, and a bonus for multiple severe
+    uncertainty indicators. Only ordering and deterministic tie-breaking matter.
+    """
+
+    thresholds = RoutingConfig()
+    very_low = tuple(
+        w
+        for w in words
+        if w.probability is not None and w.probability < thresholds.very_low_probability_threshold
+    )
+    contiguous = _max_contiguous_very_low(words, thresholds.very_low_probability_threshold)
+    score = decision.evidence.score
+    score += 0.10 * min(contiguous, 5)
+    if len(very_low) >= 2:
+        score += 0.05
+    if protected_ambiguity:
+        score += 0.15
+    if len(very_low) >= 2 and decision.evidence.low_probability_ratio >= 0.40:
+        score += 0.10
+    return score
 
 
 def _max_contiguous_very_low(words: tuple[WordEvidence, ...], threshold: float) -> int:

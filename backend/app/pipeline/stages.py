@@ -9,6 +9,7 @@ from collections.abc import Callable
 from dataclasses import asdict
 from pathlib import Path
 from time import monotonic
+from typing import Protocol, cast
 
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
@@ -36,9 +37,19 @@ from app.transcription.correction import ContextualCorrector
 from app.transcription.engine import TranscriptionResult, WhisperEngine
 from app.transcription.normalization import normalize_transcript
 from app.transcription.reconstruction import ContextualReconstructor
+from app.transcription.reconstruction.providers import (
+    ReconstructionProvider,
+    ReconstructionRequest,
+)
 from app.transcription.reconstruction.service import select_final_text
 from app.transcription.reconstruction.status import aggregate_reconstruction_status
-from app.transcription.reconstruction.types import SegmentReconstruction
+from app.transcription.reconstruction.types import (
+    ProviderHealth,
+    ReconstructionCandidate,
+    RequestSizeDiagnostics,
+    SegmentReconstruction,
+    UnloadOutcome,
+)
 from app.transcription.service import TranscriptionOptions
 
 _logger = logging.getLogger("clipfactory.stages")
@@ -411,6 +422,83 @@ class TranscriptNormalizationExecutor:
         return StageExecutionResult(transcript.normalization_fingerprint, transcript)
 
 
+class _Lease(Protocol):
+    def __enter__(self) -> "_Lease": ...
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> bool: ...
+    @property
+    def ownership_lost(self) -> bool: ...
+    def retain(self) -> None: ...
+
+
+class _LeaseFactory(Protocol):
+    def acquire(self, *, purpose: str, on_ownership_lost: object | None = None) -> _Lease: ...
+
+
+class _LeaseBoundReconstructionProvider:
+    """Wrap the local reconstruction provider with a lazy heavy-model lease.
+
+    The heavy-model/Ollama lease is acquired only when actual local inference or
+    model release happens. NO_LLM, GEMINI_ONLY, and direct-Gemini work never
+    acquire it; a direct-Gemini call runs before any optional local fallback
+    lease. The lease is held lazily from the first local call through model
+    release, preserving the existing Whisper/Ollama serialization guarantee.
+    """
+
+    def __init__(self, inner: ReconstructionProvider, lease_factory: _LeaseFactory) -> None:
+        self._inner = inner
+        self._lease_factory = lease_factory
+        self._lease: _Lease | None = None
+        self.provider_name = getattr(inner, "provider_name", "ollama")
+        self.model = getattr(inner, "model", None)
+
+    def _enter_lease(self) -> _Lease:
+        if self._lease is None:
+            self._lease = self._lease_factory.acquire(purpose="ollama")
+            self._lease.__enter__()
+        return self._lease
+
+    def health(self) -> ProviderHealth:
+        return self._inner.health()
+
+    def runtime_identity(self) -> dict[str, object]:
+        return self._inner.runtime_identity()
+
+    def refresh_runtime_identity(self) -> dict[str, object]:
+        return self._inner.refresh_runtime_identity()
+
+    def last_request_sizes(self) -> tuple[RequestSizeDiagnostics, ...]:
+        lookup = getattr(self._inner, "last_request_sizes", None)
+        return lookup() if lookup is not None else ()
+
+    def reconstruct_segments(
+        self, requests: list[ReconstructionRequest]
+    ) -> dict[int, ReconstructionCandidate]:
+        lease = self._enter_lease()
+        result = self._inner.reconstruct_segments(requests)
+        if lease.ownership_lost:
+            raise HeavyModelLeaseBusy(
+                "heavy-model lease was lost during reconstruction; retry the stage"
+            )
+        return result
+
+    def release(self) -> object:
+        if self._lease is None:
+            return None
+        lease = self._lease
+        self._lease = None
+        try:
+            outcome = cast(object, self._inner.release())
+            if isinstance(outcome, UnloadOutcome) and outcome.warning is not None:
+                lease.retain()
+            if lease.ownership_lost:
+                raise HeavyModelLeaseBusy(
+                    "heavy-model lease was lost during reconstruction; retry the stage"
+                )
+            return outcome
+        finally:
+            lease.__exit__(None, None, None)
+
+
 class ContextualReconstructionExecutor:
     """Persist bounded Stage 2.7 derivations without rewriting prior transcript evidence."""
 
@@ -448,30 +536,40 @@ class ContextualReconstructionExecutor:
         )
         if transcript is None:
             raise StageExecutionError("normalized transcript is missing")
+        reconstructor = self._reconstructor
+        local = getattr(reconstructor, "_provider", None)
+        if local is not None:
+            reconstructor = reconstructor.with_local_provider(
+                _LeaseBoundReconstructionProvider(local, self._lease_factory)
+            )
         started_at = monotonic()
+        stored_eligible = transcript.reconstruction_metadata.get("cache_eligible") is True
         if transcript.reconstruction_fingerprint and not force:
-            current = self._reconstructor.output_fingerprint(
+            check = reconstructor.output_fingerprint(
                 transcript.segments,
                 language=transcript.language,
                 transcription_fingerprint=transcript.input_fingerprint,
                 correction_version=transcript.correction_version,
             )
-            if transcript.reconstruction_fingerprint == current:
-                return StageExecutionResult(current, transcript)
-        with self._lease_factory.acquire(purpose="ollama") as heavy_lease:
-            result = self._reconstructor.reconstruct(
-                transcript.segments,
-                language=transcript.language,
-                transcription_fingerprint=transcript.input_fingerprint,
-                correction_version=transcript.correction_version,
-            )
-            if heavy_lease.ownership_lost:
-                raise HeavyModelLeaseBusy(
-                    "heavy-model lease was lost during reconstruction; retry the stage"
-                )
-            if result.metadata.get("release_warning"):
-                heavy_lease.retain()
-        if transcript.reconstruction_fingerprint == result.fingerprint and not force:
+            if transcript.reconstruction_fingerprint == check.fingerprint and stored_eligible:
+                return StageExecutionResult(check.fingerprint, transcript)
+            if stored_eligible and not check.resolved:
+                # Transient provider outage: identity cannot be confirmed. Keep the
+                # accepted output instead of overwriting it with degraded fallback.
+                return StageExecutionResult(check.fingerprint, transcript)
+        result = reconstructor.reconstruct(
+            transcript.segments,
+            language=transcript.language,
+            transcription_fingerprint=transcript.input_fingerprint,
+            correction_version=transcript.correction_version,
+        )
+        if (
+            transcript.reconstruction_fingerprint == result.fingerprint
+            and stored_eligible
+            and not force
+        ):
+            # A previously degraded run that is now successful shares the stable
+            # fingerprint but must still be persisted so it becomes cache-eligible.
             return StageExecutionResult(result.fingerprint, transcript)
 
         persisted_segments: list[dict[str, object]] = []
@@ -598,6 +696,7 @@ class ContextualReconstructionExecutor:
         if isinstance(gemini_runtime, dict):
             metadata["gemini_model"] = gemini_runtime.get("model")
             metadata["gemini_model_digest"] = gemini_runtime.get("digest")
+        metadata["cache_eligible"] = result.metadata.get("cache_eligible") is True
         metadata.update(result.metadata)
         transcript.reconstruction_metadata = metadata
         self._session.execute(

@@ -48,7 +48,12 @@ def _response(
         parsed=parsed,
         text=text,
         usage_metadata=(
-            SimpleNamespace(prompt_token_count=11, candidates_token_count=7, total_token_count=18)
+            SimpleNamespace(
+                prompt_token_count=11,
+                candidates_token_count=7,
+                total_token_count=18,
+                thoughts_token_count=4,
+            )
             if usage
             else None
         ),
@@ -89,6 +94,10 @@ class FakeModels:
 class FakeClient:
     def __init__(self, **kwargs: object) -> None:
         self.models = FakeModels(**kwargs)
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
 
 
 def _provider(
@@ -104,6 +113,8 @@ def _provider(
         retry_attempts=kwargs.pop("retry_attempts", 1),
         retry_backoff_seconds=kwargs.pop("retry_backoff_seconds", 0.0),
         max_output_tokens=kwargs.pop("max_output_tokens", 256),
+        thinking_level=kwargs.pop("thinking_level", None),
+        owns_client=kwargs.pop("owns_client", True),
         sleep=kwargs.pop("sleep", lambda _seconds: None),
         client_factory=factory,
     )
@@ -163,6 +174,7 @@ def test_gemini_reconstruct_parses_structured_output() -> None:
         "prompt_token_count": 11,
         "candidates_token_count": 7,
         "total_token_count": 18,
+        "thoughts_token_count": 4,
     }
 
 
@@ -279,3 +291,78 @@ def test_gemini_release_is_noop() -> None:
     )
 
     assert provider.release() is None
+
+
+def test_gemini_bad_request_is_not_retried() -> None:
+    class BadRequest(Exception):
+        code = 400
+
+    client = FakeClient(error=BadRequest("bad schema"))
+    provider = _provider(retry_attempts=1, client_factory=lambda: client)
+
+    with pytest.raises(GeminiProviderError) as raised:
+        provider.reconstruct_segments([_request()])
+
+    assert raised.value.category is GeminiErrorCategory.INVALID_REQUEST
+    assert client.models.generate_calls == 1
+
+
+def test_gemini_server_error_gets_bounded_retry() -> None:
+    class ServerError(Exception):
+        code = 500
+
+    client = FakeClient(error=ServerError("boom"))
+    provider = _provider(retry_attempts=1, client_factory=lambda: client)
+
+    with pytest.raises(GeminiProviderError) as raised:
+        provider.reconstruct_segments([_request()])
+
+    assert raised.value.category is GeminiErrorCategory.PROVIDER_ERROR
+    assert client.models.generate_calls == 2
+
+
+def test_gemini_release_closes_owned_sdk_client() -> None:
+    client = FakeClient(response=_response(parsed=_ok_content()))
+    provider = _provider(client_factory=lambda: client)
+
+    provider.reconstruct_segments([_request()])
+    provider.release()
+
+    assert client.closed is True
+
+
+def test_gemini_release_does_not_close_injected_unowned_client() -> None:
+    client = FakeClient(response=_response(parsed=_ok_content()))
+    provider = _provider(
+        owns_client=False,
+        client_factory=lambda: client,
+    )
+
+    provider.reconstruct_segments([_request()])
+    provider.release()
+
+    assert client.closed is False
+
+
+def test_gemini_system_instruction_is_dialect_neutral() -> None:
+    from app.transcription.reconstruction.gemini import gemini_system_instruction
+
+    neutral = gemini_system_instruction(None)
+    assert "Egyptian" not in neutral
+    assert "dialect and register evident in the source" in neutral
+    profiled = gemini_system_instruction("khaleeji")
+    assert "khaleeji" in profiled
+
+
+def test_gemini_thinking_level_is_sent_and_in_identity() -> None:
+    from google.genai import types as genai_types
+
+    client = FakeClient(response=_response(parsed=_ok_content()))
+    provider = _provider(thinking_level="low", client_factory=lambda: client)
+
+    provider.reconstruct_segments([_request()])
+
+    config = client.models.configs[0]
+    assert getattr(config, "thinking_config", None) is not None
+    assert config.thinking_config.thinking_level == genai_types.ThinkingLevel.LOW
+    assert provider.runtime_identity()["thinking_level"] == "low"

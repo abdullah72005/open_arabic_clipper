@@ -23,7 +23,7 @@ from pydantic import BaseModel, Field
 
 from app.transcription.reconstruction.confidence import CONFIDENCE_POLICY_VERSION
 from app.transcription.reconstruction.providers import (
-    SYSTEM_INSTRUCTION,
+    DIALECT_PROFILE_ADDENDUM,
     ProviderResponseError,
     ReconstructionRequest,
     _extract_json_object,
@@ -38,6 +38,33 @@ from app.transcription.reconstruction.types import (
 from app.transcription.reconstruction.validation import VALIDATION_VERSION
 
 _GEMINI_SCHEMA_VERSION = "gemini-reconstruction-v1"
+
+# Dialect-neutral base instruction. Gemini must preserve the dialect/register
+# evident in the source and context and must never default to Egyptian. The
+# shared protection constraints (names, numbers, facts, code switching) apply.
+GEMINI_BASE_INSTRUCTION = (
+    "You are a conservative Arabic ASR post-processor. "
+    "For the target segment, return the most plausible SPOKEN text, preserving "
+    "the dialect and register evident in the source and surrounding context. "
+    "Do NOT default to any specific dialect, and do NOT standardize into Modern "
+    "Standard Arabic (MSA), translate, formalize, summarize, or normalize dialect. "
+    "Preserve all names, numbers, Latin tokens, digits, and code switching "
+    "exactly as they appear. "
+    "Do not add facts, clauses, or change entities. "
+    "Use only the small local context provided. "
+    "If the raw text is already correct, return it unchanged and set unchanged=true. "
+    "Output ONLY a JSON object with this exact shape: "
+    '{"reconstructions": [{"segment_id": int, "corrected_text": string, '
+    '"unchanged": bool, "confidence": number, "explanation": string, "changes": []}]}.'
+)
+
+
+def gemini_system_instruction(profile: str | None = None) -> str:
+    """Return the Gemini system instruction, adding a profile addendum if set."""
+
+    if not profile:
+        return GEMINI_BASE_INSTRUCTION
+    return GEMINI_BASE_INSTRUCTION + "\n" + DIALECT_PROFILE_ADDENDUM.format(profile=profile)
 
 
 class _GeminiReconstructionEntry(BaseModel):
@@ -55,7 +82,7 @@ class _GeminiReconstructionOutput(BaseModel):
 
 _GEMINI_PROMPT_HASH = hashlib.sha256(
     (
-        SYSTEM_INSTRUCTION
+        GEMINI_BASE_INSTRUCTION
         + json.dumps(_GeminiReconstructionOutput.model_json_schema(), sort_keys=True)
     ).encode("utf-8")
 ).hexdigest()
@@ -67,12 +94,25 @@ class GeminiErrorCategory(str, Enum):
     MISSING_KEY = "MISSING_KEY"
     AUTHENTICATION = "AUTHENTICATION"
     MODEL_NOT_FOUND = "MODEL_NOT_FOUND"
+    INVALID_REQUEST = "INVALID_REQUEST"
     CONNECTION = "CONNECTION"
     TIMEOUT = "TIMEOUT"
     RATE_LIMITED = "RATE_LIMITED"
     PROVIDER_ERROR = "PROVIDER_ERROR"
     SAFETY_REFUSAL = "SAFETY_REFUSAL"
     MALFORMED_OUTPUT = "MALFORMED_OUTPUT"
+
+
+# Only these categories receive the single bounded retry. Permanent 400-class
+# request/schema failures, authentication, model-not-found, 429, malformed
+# output, validation rejection, and safety refusal are never retried.
+_RETRYABLE_CATEGORIES = frozenset(
+    {
+        GeminiErrorCategory.CONNECTION,
+        GeminiErrorCategory.TIMEOUT,
+        GeminiErrorCategory.PROVIDER_ERROR,
+    }
+)
 
 
 class GeminiProviderError(Exception):
@@ -96,6 +136,8 @@ class GeminiReconstructionProvider:
         retry_attempts: int = 1,
         retry_backoff_seconds: float = 1.5,
         max_output_tokens: int = 1024,
+        thinking_level: str | None = None,
+        owns_client: bool = True,
         client_factory: Callable[[], object] | None = None,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
@@ -105,6 +147,8 @@ class GeminiReconstructionProvider:
         self._retry_attempts = max(0, int(retry_attempts))
         self._retry_backoff = max(0.0, float(retry_backoff_seconds))
         self._output_tokens = max(1, int(max_output_tokens))
+        self._thinking_level = thinking_level
+        self._owns_client = owns_client
         self._sleep = sleep
         self._key_present = bool(api_key)
         self._client: object | None = None
@@ -118,6 +162,7 @@ class GeminiReconstructionProvider:
             "prompt_token_count": 0,
             "candidates_token_count": 0,
             "total_token_count": 0,
+            "thoughts_token_count": 0,
         }
 
     def _build_client(self, api_key: str) -> object:
@@ -166,7 +211,26 @@ class GeminiReconstructionProvider:
         )
 
     def release(self) -> None:
-        """Hosted Gemini has no local model to unload."""
+        """Close the owned SDK client's HTTP resources when this provider owns it.
+
+        A client injected through ``client_factory`` is owned by the caller when
+        ``owns_client`` is False and is never closed here. Closing is bounded:
+        all job calls complete before the orchestration finally block calls this.
+        """
+
+        client = self._client
+        self._client = None
+        if client is None or not self._owns_client:
+            return
+        close = getattr(client, "close", None)
+        if close is None:
+            return
+        try:
+            close()
+        except Exception as error:
+            raise GeminiProviderError(
+                GeminiErrorCategory.PROVIDER_ERROR, "gemini client close failed"
+            ) from error
 
     def runtime_identity(self) -> dict[str, object]:
         """Return every output-affecting Gemini dependency as stable data."""
@@ -181,6 +245,7 @@ class GeminiReconstructionProvider:
             "retry_attempts": self._retry_attempts,
             "retry_backoff_seconds": self._retry_backoff,
             "max_output_tokens": self._output_tokens,
+            "thinking_level": self._thinking_level,
             "confidence_policy_version": CONFIDENCE_POLICY_VERSION,
             "validation_version": VALIDATION_VERSION,
         }
@@ -230,15 +295,7 @@ class GeminiReconstructionProvider:
             try:
                 return self._call_once(requests)
             except GeminiProviderError as error:
-                if (
-                    error.category
-                    in {
-                        GeminiErrorCategory.CONNECTION,
-                        GeminiErrorCategory.TIMEOUT,
-                        GeminiErrorCategory.PROVIDER_ERROR,
-                    }
-                    and attempt < attempts - 1
-                ):
+                if error.category in _RETRYABLE_CATEGORIES and attempt < attempts - 1:
                     last_error = error
                     self._sleep(self._retry_backoff)
                     continue
@@ -251,12 +308,17 @@ class GeminiReconstructionProvider:
         self, requests: list[ReconstructionRequest]
     ) -> dict[int, ReconstructionCandidate]:
         payload = {"targets": [item.to_payload() for item in requests]}
+        profile = next(
+            (request.dialect_profile for request in requests if request.dialect_profile), None
+        )
         config = types.GenerateContentConfig(
-            system_instruction=SYSTEM_INSTRUCTION,
+            system_instruction=gemini_system_instruction(profile),
             response_mime_type="application/json",
             response_schema=_GeminiReconstructionOutput,
             max_output_tokens=self._output_tokens,
         )
+        if self._thinking_level is not None:
+            config.thinking_config = types.ThinkingConfig(thinking_level=self._thinking_level)
         assert self._client is not None
         client = self._client
         try:
@@ -285,7 +347,12 @@ class GeminiReconstructionProvider:
         usage = getattr(response, "usage_metadata", None)
         if usage is None:
             return
-        for key in ("prompt_token_count", "candidates_token_count", "total_token_count"):
+        for key in (
+            "prompt_token_count",
+            "candidates_token_count",
+            "total_token_count",
+            "thoughts_token_count",
+        ):
             value = getattr(usage, key, None)
             if isinstance(value, int):
                 self._usage[key] += value
@@ -338,7 +405,7 @@ def _response_content(response: Any) -> object:
 
 def _estimate_envelope(request: ReconstructionRequest, output_tokens: int) -> int:
     return request.estimated_tokens(
-        system_instruction=SYSTEM_INSTRUCTION,
+        system_instruction=GEMINI_BASE_INSTRUCTION,
         output_tokens=output_tokens,
         chat_framing_reserve=64,
         safety_reserve=128,
@@ -361,6 +428,10 @@ def _classify_exception(error: Exception) -> GeminiErrorCategory:
         return GeminiErrorCategory.RATE_LIMITED
     if code in {408, 504} or "timeout" in str(error).casefold():
         return GeminiErrorCategory.TIMEOUT
+    if code is not None and 500 <= code < 600:
+        return GeminiErrorCategory.PROVIDER_ERROR
+    if code is not None and 400 <= code < 500:
+        return GeminiErrorCategory.INVALID_REQUEST
     return GeminiErrorCategory.PROVIDER_ERROR
 
 

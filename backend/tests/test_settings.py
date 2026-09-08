@@ -154,11 +154,24 @@ def test_reconstruction_default_mode_is_adaptive() -> None:
 def test_gemini_defaults_and_absent_key_do_not_block_startup() -> None:
     settings = Settings(_env_file=None)
 
-    assert settings.gemini_model == "gemini-3.6-flash"
+    assert settings.gemini_model == "gemini-3.8-flash"
+    assert settings.gemini_thinking_level == "low"
     assert settings.gemini_timeout_seconds == 30.0
     assert settings.gemini_max_targets_per_job == 5
     assert settings.gemini_api_key_present is False
     assert settings.gemini_provider_instance() is None
+
+
+def test_gemini_thinking_level_validates_supported_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CLIPFACTORY_GEMINI_THINKING_LEVEL", "high")
+
+    assert Settings(_env_file=None).gemini_thinking_level == "high"
+
+    monkeypatch.setenv("CLIPFACTORY_GEMINI_THINKING_LEVEL", "extreme")
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)
 
 
 def test_gemini_key_is_presence_detected_from_prefixed_env(
@@ -193,3 +206,40 @@ def test_gemini_key_value_is_never_returned_by_public_api(
     serialized = repr(identity)
     assert "AIza-super-secret-value" not in serialized
     assert "gemini_api_key" not in serialized.casefold()
+
+
+def test_gemini_key_is_secret_in_repr_and_serialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GEMINI_API_KEY", "AIza-super-secret-value")
+
+    settings = Settings(_env_file=None)
+
+    assert "AIza-super-secret-value" not in repr(settings)
+    assert "AIza-super-secret-value" not in str(settings.model_dump())
+    assert "AIza-super-secret-value" not in str(settings.model_dump_json())
+    assert settings.gemini_api_key_present is True
+
+
+def test_gemini_key_is_not_echoed_in_validation_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GEMINI_API_KEY", "AIza-super-secret-value")
+
+    with pytest.raises(ValidationError) as raised:
+        Settings(_env_file=None, gemini_retry_attempts=9)
+
+    assert "AIza-super-secret-value" not in str(raised.value)
+
+
+def test_gemini_provider_unwraps_secret_only_at_construction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CLIPFACTORY_GEMINI_API_KEY", "AIza-super-secret-value")
+
+    settings = Settings(_env_file=None)
+    provider = settings.gemini_provider_instance()
+
+    assert provider is not None
+    assert "AIza-super-secret-value" not in repr(provider.runtime_identity())
+    assert "AIza-super-secret-value" not in repr(provider)

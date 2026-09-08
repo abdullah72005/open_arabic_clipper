@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import cast
 
 from app.core.enums import ReconstructionStatus
@@ -47,6 +47,24 @@ from app.transcription.reconstruction.validation import VALIDATION_VERSION, vali
 from app.transcription.reconstruction.windows import acoustic_evidence, build_reconstruction_window
 
 _MANUAL_METHOD = "operator:manual"
+_STAGE25_METHOD = "stage25"
+
+_PERMANENT_GEMINI_STOP = frozenset(
+    {
+        GeminiErrorCategory.RATE_LIMITED,
+        GeminiErrorCategory.AUTHENTICATION,
+        GeminiErrorCategory.MODEL_NOT_FOUND,
+        GeminiErrorCategory.INVALID_REQUEST,
+    }
+)
+
+
+@dataclass(frozen=True)
+class FingerprintCheck:
+    """Stable output fingerprint plus whether all identities resolved."""
+
+    fingerprint: str
+    resolved: bool
 
 
 class ContextualReconstructor:
@@ -64,6 +82,18 @@ class ContextualReconstructor:
         self._gemini = gemini_provider
         self._routing = routing or AdaptiveRoutingConfig()
         self._gemini_budget = max(0, gemini_budget)
+
+    def with_local_provider(
+        self, provider: ReconstructionProvider | None
+    ) -> "ContextualReconstructor":
+        """Return a reconstructor sharing Gemini/routing but with a new local provider."""
+
+        return ContextualReconstructor(
+            provider,
+            gemini_provider=self._gemini,
+            routing=self._routing,
+            gemini_budget=self._gemini_budget,
+        )
 
     def runtime_identity(self) -> dict[str, object]:
         """Return the stable runtime identity for Stage 2.7 output dependencies."""
@@ -118,7 +148,6 @@ class ContextualReconstructor:
             identity = self.runtime_identity()
             fingerprint = reconstruction_output_fingerprint(
                 provider_identity=identity,
-                provider_available=False,
                 segments=segments,
                 language=language,
                 transcription_fingerprint=transcription_fingerprint,
@@ -127,7 +156,11 @@ class ContextualReconstructor:
             results = tuple(
                 self._fallback(index, segment) for index, segment in enumerate(segments)
             )
-            return ReconstructionResult(results, _joined(results), fingerprint)
+            disabled_metadata: dict[str, object] = {
+                "runtime_identity": identity,
+                "cache_eligible": True,
+            }
+            return ReconstructionResult(results, _joined(results), fingerprint, disabled_metadata)
         started_at = time.monotonic()
         result: ReconstructionResult = ReconstructionResult((), "", "")
         try:
@@ -146,40 +179,35 @@ class ContextualReconstructor:
             identity = self.runtime_identity()
             fingerprint = reconstruction_output_fingerprint(
                 provider_identity=identity,
-                provider_available=local_available,
                 segments=segments,
                 language=language,
                 transcription_fingerprint=transcription_fingerprint,
                 correction_version=correction_version,
-                gemini_available=gemini_available,
             )
             result = ReconstructionResult((), "", fingerprint)
             memory = build_entity_memory(segments)
-            windows = [build_reconstruction_window([segment], 0) for segment in segments]
             decisions = [
-                route_adaptive(window, config=self._routing, language=language)
-                for window in windows
+                route_adaptive(segment, config=self._routing, language=language)
+                for segment in segments
             ]
             requests = [
                 _reconstruction_request(segments, index, language, memory)
                 for index in range(len(segments))
             ]
-            state = _JobState(defaultdict(int), self._gemini_budget, False)
-            results = tuple(
-                self._resolve_segment(
-                    index,
-                    segments[index],
-                    decisions[index],
-                    requests[index],
-                    memory,
-                    local_health,
-                    gemini_health,
-                    local_available,
-                    gemini_available,
-                    state,
-                )
-                for index in range(len(segments))
+            state = _JobState(defaultdict(int), self._gemini_budget, False, None)
+            by_index = self._run_phases(
+                segments,
+                decisions,
+                requests,
+                memory,
+                local_available,
+                gemini_available,
+                local_health,
+                gemini_health,
+                state,
             )
+            ordered = tuple(by_index[index] for index in range(len(segments)))
+            cache_eligible = self._cache_eligible(state, ordered)
             metadata: dict[str, object] = {
                 "runtime_identity": identity,
                 "provider_available": local_available,
@@ -187,33 +215,47 @@ class ContextualReconstructor:
                 "wall_seconds": time.monotonic() - started_at,
                 "prompt_diagnostics": self._prompt_diagnostics(),
                 "routing_counts": dict(state.counts),
+                "cache_eligible": cache_eligible,
             }
             if self._gemini is not None:
                 metadata["gemini_usage"] = self._gemini.usage_summary()
-            result = ReconstructionResult(results, _joined(results), fingerprint, metadata)
+            result = ReconstructionResult(ordered, _joined(ordered), fingerprint, metadata)
         finally:
+            result = self._cleanup(result)
+        return result
+
+    def _cleanup(self, result: ReconstructionResult) -> ReconstructionResult:
+        try:
+            outcome = cast(object, self._provider.release()) if self._provider is not None else None
+        except Exception:
+            result = replace(
+                result,
+                metadata={**result.metadata, "release_warning": "provider_release_failed"},
+            )
+        else:
+            if isinstance(outcome, UnloadOutcome):
+                metadata = {
+                    **result.metadata,
+                    "unload_outcome": {
+                        "requested": outcome.requested,
+                        "confirmed": outcome.confirmed,
+                        "elapsed_seconds": outcome.elapsed_seconds,
+                    },
+                }
+                if outcome.warning is not None:
+                    metadata["release_warning"] = outcome.warning
+                result = replace(result, metadata=metadata)
+        if self._gemini is not None:
             try:
-                outcome = (
-                    cast(object, self._provider.release()) if self._provider is not None else None
-                )
+                self._gemini.release()
             except Exception:
                 result = replace(
                     result,
-                    metadata={**result.metadata, "release_warning": "provider_release_failed"},
-                )
-            else:
-                if isinstance(outcome, UnloadOutcome):
-                    metadata = {
+                    metadata={
                         **result.metadata,
-                        "unload_outcome": {
-                            "requested": outcome.requested,
-                            "confirmed": outcome.confirmed,
-                            "elapsed_seconds": outcome.elapsed_seconds,
-                        },
-                    }
-                    if outcome.warning is not None:
-                        metadata["release_warning"] = outcome.warning
-                    result = replace(result, metadata=metadata)
+                        "gemini_cleanup_warning": "gemini_release_failed",
+                    },
+                )
         return result
 
     def _local_health(self) -> ProviderHealth | None:
@@ -239,77 +281,408 @@ class ContextualReconstructor:
         language: str | None,
         transcription_fingerprint: str,
         correction_version: str,
-    ) -> str:
-        """Compute the Stage 2.7 output fingerprint without any generation call.
+    ) -> FingerprintCheck:
+        """Compute the stable output fingerprint with no generation call.
 
-        Health probes are cheap metadata lookups (never content generation), so
-        a matching stored fingerprint lets the executor skip provider calls.
+        Health probes are cheap metadata lookups used only to resolve identity
+        digests; availability itself is excluded from the fingerprint. A matching
+        stored fingerprint plus stored cache eligibility lets the executor skip
+        provider calls.
         """
 
         local_health = self._local_health()
-        gemini_health = self._gemini_health() if self._gemini is not None else None
-        local_available = (
-            local_health is not None and local_health.availability.value == "AVAILABLE"
+        gemini_health = (
+            self._gemini_health()
+            if self._gemini is not None and self._routing.mode is not RoutingMode.LOCAL_ONLY
+            else None
         )
-        gemini_available = (
-            gemini_health is not None and gemini_health.availability.value == "AVAILABLE"
-        )
-        return reconstruction_output_fingerprint(
+        local_resolved = local_health is None or local_health.availability.value == "AVAILABLE"
+        gemini_resolved = True
+        if self._gemini is not None and self._routing.mode is not RoutingMode.LOCAL_ONLY:
+            gemini_resolved = (
+                gemini_health is not None and gemini_health.availability.value == "AVAILABLE"
+            )
+        fingerprint = reconstruction_output_fingerprint(
             provider_identity=self.runtime_identity(),
-            provider_available=local_available,
             segments=segments,
             language=language,
             transcription_fingerprint=transcription_fingerprint,
             correction_version=correction_version,
-            gemini_available=gemini_available,
         )
+        return FingerprintCheck(fingerprint, local_resolved and gemini_resolved)
 
-    def _resolve_segment(
+    def _gemini_missing_reason(self, state: "_JobState") -> str:
+        """Whether the current Gemini gap is configured-but-down or not configured."""
+
+        if self._gemini is None:
+            return "gemini_not_configured"
+        if state.gemini_exhausted:
+            return state.gemini_stop_reason or "gemini_budget_exhausted"
+        return "gemini_unavailable"
+
+    def _record_gemini_unavailable(self, state: "_JobState") -> None:
+        if self._gemini is not None:
+            state.counts["gemini_unavailable"] += 1
+
+    def _run_phases(
         self,
-        index: int,
-        segment: Mapping[str, object],
-        decision: AdaptiveRoutingDecision,
-        request: ReconstructionRequest,
+        segments: Sequence[Mapping[str, object]],
+        decisions: Sequence[AdaptiveRoutingDecision],
+        requests: Sequence[ReconstructionRequest],
         memory: SourceEntityMemory,
-        local_health: ProviderHealth | None,
-        gemini_health: ProviderHealth | None,
         local_available: bool,
         gemini_available: bool,
+        local_health: ProviderHealth | None,
+        gemini_health: ProviderHealth | None,
         state: "_JobState",
-    ) -> SegmentReconstruction:
-        if segment.get("operator_text"):
-            state.counts["manual"] += 1
-            return self._manual(index, segment, decision)
-        if decision.route is ReconstructionRoute.NO_LLM:
-            state.counts["no_llm"] += 1
-            return self._no_llm(index, segment, decision)
-        if self._routing.mode is RoutingMode.GEMINI_ONLY:
-            return self._gemini_only_segment(
-                index, segment, request, decision, memory, gemini_available, state
-            )
-        if self._routing.mode is RoutingMode.LOCAL_ONLY:
-            return self._local_only_segment(
-                index,
-                segment,
-                request,
-                decision,
+    ) -> dict[int, SegmentReconstruction]:
+        """Resolve every target in bounded phases and restore transcript order."""
+
+        results: dict[int, SegmentReconstruction] = {}
+        direct_ids: list[int] = []
+        local_ids: list[int] = []
+        for index, decision in enumerate(decisions):
+            if segments[index].get("operator_text"):
+                state.counts["manual"] += 1
+                results[index] = self._manual(index, segments[index], decision)
+            elif decision.route is ReconstructionRoute.NO_LLM:
+                state.counts["no_llm"] += 1
+                results[index] = self._no_llm(index, segments[index], decision)
+            elif decision.route is ReconstructionRoute.GEMINI_DIRECT:
+                direct_ids.append(index)
+            else:
+                local_ids.append(index)
+        mode = self._routing.mode
+        if mode is RoutingMode.GEMINI_ONLY:
+            self._gemini_only_phase(
+                segments,
+                decisions,
+                requests,
                 memory,
+                results,
+                direct_ids + local_ids,
+                gemini_available,
+                gemini_health,
+                state,
+            )
+        elif mode is RoutingMode.LOCAL_ONLY:
+            self._local_only_phase(
+                segments,
+                decisions,
+                requests,
+                memory,
+                results,
+                direct_ids,
+                local_ids,
                 local_available,
                 local_health,
                 state,
             )
-        return self._adaptive_segment(
-            index,
-            segment,
-            request,
-            decision,
-            memory,
-            local_available,
-            gemini_available,
-            local_health,
-            gemini_health,
-            state,
+        else:
+            self._adaptive_phase(
+                segments,
+                decisions,
+                requests,
+                memory,
+                results,
+                direct_ids,
+                local_ids,
+                local_available,
+                gemini_available,
+                local_health,
+                gemini_health,
+                state,
+            )
+        for index in range(len(segments)):
+            if index not in results:
+                results[index] = self._fallback(index, segments[index], decision=decisions[index])
+        return results
+
+    def _gemini_only_phase(
+        self,
+        segments: Sequence[Mapping[str, object]],
+        decisions: Sequence[AdaptiveRoutingDecision],
+        requests: Sequence[ReconstructionRequest],
+        memory: SourceEntityMemory,
+        results: dict[int, SegmentReconstruction],
+        targets: list[int],
+        gemini_available: bool,
+        gemini_health: ProviderHealth | None,
+        state: "_JobState",
+    ) -> None:
+        ranked = sorted(targets, key=lambda index: (-decisions[index].severity, index))
+        for index in ranked:
+            decision = decisions[index]
+            if (
+                gemini_available
+                and state.gemini_budget_remaining > 0
+                and not state.gemini_exhausted
+            ):
+                results[index] = self._gemini_attempt(
+                    index,
+                    segments[index],
+                    requests[index],
+                    decision,
+                    memory,
+                    "gemini",
+                    state,
+                    escalation_reason=None,
+                    route_override=ReconstructionRoute.GEMINI_DIRECT.value,
+                    gemini_health=gemini_health,
+                )
+                continue
+            state.counts["gemini_budget_skips"] += 1
+            if not gemini_available:
+                self._record_gemini_unavailable(state)
+                reason = self._gemini_missing_reason(state)
+                provider_error = True
+                status = ReconstructionStatus.PROVIDER_UNAVAILABLE
+            else:
+                reason = state.gemini_stop_reason or "gemini_budget_exhausted"
+                provider_error = False
+                status = ReconstructionStatus.LOW_CONFIDENCE_UNRESOLVED
+            results[index] = self._fallback(
+                index,
+                segments[index],
+                provider_error=provider_error,
+                status=status,
+                method="gemini",
+                decision=decision,
+                route=decision.route.value,
+                escalation_reason=reason,
+            )
+
+    def _local_only_phase(
+        self,
+        segments: Sequence[Mapping[str, object]],
+        decisions: Sequence[AdaptiveRoutingDecision],
+        requests: Sequence[ReconstructionRequest],
+        memory: SourceEntityMemory,
+        results: dict[int, SegmentReconstruction],
+        direct_ids: list[int],
+        local_ids: list[int],
+        local_available: bool,
+        local_health: ProviderHealth | None,
+        state: "_JobState",
+    ) -> None:
+        local_method = (
+            _provider_method(local_health) if local_health is not None else "provider:unknown"
         )
+        for index in direct_ids:
+            state.counts["gemini_budget_skips"] += 1
+            results[index] = self._local_path(
+                index,
+                segments[index],
+                requests[index],
+                decisions[index],
+                memory,
+                local_available,
+                local_health,
+                local_method,
+                state,
+                fallback_reason="gemini_blocked_local_only",
+            )
+        for index in local_ids:
+            results[index] = self._local_path(
+                index,
+                segments[index],
+                requests[index],
+                decisions[index],
+                memory,
+                local_available,
+                local_health,
+                local_method,
+                state,
+            )
+
+    def _adaptive_phase(
+        self,
+        segments: Sequence[Mapping[str, object]],
+        decisions: Sequence[AdaptiveRoutingDecision],
+        requests: Sequence[ReconstructionRequest],
+        memory: SourceEntityMemory,
+        results: dict[int, SegmentReconstruction],
+        direct_ids: list[int],
+        local_ids: list[int],
+        local_available: bool,
+        gemini_available: bool,
+        local_health: ProviderHealth | None,
+        gemini_health: ProviderHealth | None,
+        state: "_JobState",
+    ) -> None:
+        local_method = (
+            _provider_method(local_health) if local_health is not None else "provider:unknown"
+        )
+        # 1-4. Direct candidates: spend the strongest-first Gemini budget first.
+        ranked_direct = sorted(direct_ids, key=lambda index: (-decisions[index].severity, index))
+        for index in ranked_direct:
+            decision = decisions[index]
+            if (
+                gemini_available
+                and state.gemini_budget_remaining > 0
+                and not state.gemini_exhausted
+            ):
+                state.counts["gemini_direct"] += 1
+                results[index] = self._gemini_attempt(
+                    index,
+                    segments[index],
+                    requests[index],
+                    decision,
+                    memory,
+                    local_method,
+                    state,
+                    escalation_reason=None,
+                    route_override=decision.route.value,
+                    gemini_health=gemini_health,
+                    fallback_to_local=local_available,
+                )
+                continue
+            state.counts["gemini_budget_skips"] += 1
+            if not gemini_available:
+                self._record_gemini_unavailable(state)
+                reason = self._gemini_missing_reason(state)
+            else:
+                reason = state.gemini_stop_reason or "gemini_budget_exhausted"
+            results[index] = self._local_path(
+                index,
+                segments[index],
+                requests[index],
+                decision,
+                memory,
+                local_available,
+                local_health,
+                local_method,
+                state,
+                fallback_reason=reason,
+            )
+        # 6. Local-suitable candidates through Qwen; collect escalations.
+        escalations: list[tuple[int, SegmentReconstruction | None, str]] = []
+        for index in local_ids:
+            decision = decisions[index]
+            if not local_available:
+                escalation_reason = "local_provider_unavailable"
+                if (
+                    gemini_available
+                    and state.gemini_budget_remaining > 0
+                    and not state.gemini_exhausted
+                ):
+                    escalations.append((index, None, escalation_reason))
+                else:
+                    state.counts["unresolved"] += 1
+                    results[index] = self._fallback(
+                        index,
+                        segments[index],
+                        provider_error=True,
+                        status=ReconstructionStatus.PROVIDER_UNAVAILABLE,
+                        method="provider:unknown",
+                        decision=decision,
+                        route=decision.route.value,
+                        escalation_reason="local_provider_unavailable",
+                    )
+                continue
+            segment_result = self._local_attempt(
+                index,
+                segments[index],
+                requests[index],
+                decision,
+                memory,
+                local_method,
+                state,
+            )
+            if segment_result.applied and segment_result.confidence_level is ConfidenceLevel.HIGH:
+                results[index] = segment_result
+            else:
+                escalations.append(
+                    (index, segment_result, _local_escalation_reason(segment_result))
+                )
+        # 7-9. Rank escalations and spend remaining budget on the strongest.
+        ranked_escalations = sorted(
+            escalations,
+            key=lambda item: (
+                -self._escalation_priority(decisions[item[0]], item[1], item[2]),
+                item[0],
+            ),
+        )
+        for index, local_seg, escalation_reason in ranked_escalations:
+            decision = decisions[index]
+            if (
+                gemini_available
+                and state.gemini_budget_remaining > 0
+                and not state.gemini_exhausted
+            ):
+                results[index] = self._gemini_attempt(
+                    index,
+                    segments[index],
+                    requests[index],
+                    decision,
+                    memory,
+                    local_seg.final_provider or _STAGE25_METHOD if local_seg else local_method,
+                    state,
+                    escalation_reason=escalation_reason,
+                    route_override="LOCAL_THEN_GEMINI",
+                    gemini_health=gemini_health,
+                    local_seg=local_seg,
+                )
+                continue
+            state.counts["gemini_budget_skips"] += 1
+            if not gemini_available:
+                self._record_gemini_unavailable(state)
+                block_reason = self._gemini_missing_reason(state)
+            else:
+                block_reason = state.gemini_stop_reason or "gemini_budget_exhausted"
+            if local_seg is not None:
+                state.counts["unresolved"] += 1
+                results[index] = replace(
+                    local_seg,
+                    escalation_reason=_merge_escalation(local_seg.escalation_reason, block_reason),
+                )
+            else:
+                state.counts["unresolved"] += 1
+                results[index] = self._fallback(
+                    index,
+                    segments[index],
+                    provider_error=True,
+                    status=ReconstructionStatus.PROVIDER_UNAVAILABLE,
+                    method="provider:unknown",
+                    decision=decision,
+                    route=decision.route.value,
+                    escalation_reason="local_provider_unavailable",
+                )
+
+    def _local_path(
+        self,
+        index: int,
+        segment: Mapping[str, object],
+        request: ReconstructionRequest,
+        decision: AdaptiveRoutingDecision,
+        memory: SourceEntityMemory,
+        local_available: bool,
+        local_health: ProviderHealth | None,
+        local_method: str,
+        state: "_JobState",
+        fallback_reason: str | None = None,
+    ) -> SegmentReconstruction:
+        if not local_available:
+            state.counts["unresolved"] += 1
+            return self._fallback(
+                index,
+                segment,
+                provider_error=True,
+                status=ReconstructionStatus.PROVIDER_UNAVAILABLE,
+                method="provider:unknown",
+                decision=decision,
+                route=decision.route.value,
+                escalation_reason=fallback_reason or "local_provider_unavailable",
+            )
+        segment_result = self._local_attempt(
+            index, segment, request, decision, memory, local_method, state
+        )
+        if fallback_reason is not None:
+            segment_result = replace(segment_result, escalation_reason=fallback_reason)
+        if segment_result.applied and segment_result.confidence_level is ConfidenceLevel.HIGH:
+            return segment_result
+        state.counts["unresolved"] += 1
+        return segment_result
 
     def _manual(
         self, index: int, segment: Mapping[str, object], decision: AdaptiveRoutingDecision
@@ -359,211 +732,7 @@ class ContextualReconstructor:
             focus_spans=decision.focus_spans,
             route=decision.route.value,
             routing_evidence=decision.evidence,
-            final_provider="stage25",
-        )
-
-    def _local_only_segment(
-        self,
-        index: int,
-        segment: Mapping[str, object],
-        request: ReconstructionRequest,
-        decision: AdaptiveRoutingDecision,
-        memory: SourceEntityMemory,
-        local_available: bool,
-        local_health: ProviderHealth | None,
-        state: "_JobState",
-    ) -> SegmentReconstruction:
-        if decision.route is ReconstructionRoute.GEMINI_DIRECT:
-            state.counts["gemini_budget_skips"] += 1
-            local_reason = "gemini_blocked_local_only"
-        else:
-            local_reason = None
-        if not local_available:
-            state.counts["unresolved"] += 1
-            return self._fallback(
-                index,
-                segment,
-                provider_error=True,
-                status=ReconstructionStatus.PROVIDER_UNAVAILABLE,
-                method="provider:unknown",
-                decision=decision,
-                route=decision.route.value,
-                escalation_reason="local_provider_unavailable",
-            )
-        assert local_health is not None
-        method = _provider_method(local_health)
-        return self._local_attempt(
-            index,
-            segment,
-            request,
-            decision,
-            memory,
-            method,
-            escalate_to_gemini=False,
-            gemini_available=False,
-            state=state,
-            fallback_reason=local_reason,
-        )
-
-    def _gemini_only_segment(
-        self,
-        index: int,
-        segment: Mapping[str, object],
-        request: ReconstructionRequest,
-        decision: AdaptiveRoutingDecision,
-        memory: SourceEntityMemory,
-        gemini_available: bool,
-        state: "_JobState",
-    ) -> SegmentReconstruction:
-        if decision.route is ReconstructionRoute.GEMINI_DIRECT:
-            state.counts["gemini_direct"] += 1
-        if gemini_available and state.gemini_budget_remaining > 0 and not state.gemini_exhausted:
-            return self._gemini_attempt(
-                index,
-                segment,
-                request,
-                decision,
-                memory,
-                "gemini",
-                state,
-                escalation_reason=None,
-                route_override=decision.route.value,
-            )
-        if not gemini_available:
-            state.counts["gemini_unavailable"] += 1
-            reason = "gemini_unavailable"
-        else:
-            state.counts["gemini_budget_skips"] += 1
-            reason = "gemini_budget_exhausted"
-        state.counts["unresolved"] += 1
-        return self._fallback(
-            index,
-            segment,
-            provider_error=not gemini_available,
-            status=(
-                ReconstructionStatus.PROVIDER_UNAVAILABLE
-                if not gemini_available
-                else ReconstructionStatus.LOW_CONFIDENCE_UNRESOLVED
-            ),
-            method="gemini",
-            decision=decision,
-            route=decision.route.value,
-            escalation_reason=reason,
-        )
-
-    def _adaptive_segment(
-        self,
-        index: int,
-        segment: Mapping[str, object],
-        request: ReconstructionRequest,
-        decision: AdaptiveRoutingDecision,
-        memory: SourceEntityMemory,
-        local_available: bool,
-        gemini_available: bool,
-        local_health: ProviderHealth | None,
-        gemini_health: ProviderHealth | None,
-        state: "_JobState",
-    ) -> SegmentReconstruction:
-        local_method = _provider_method(local_health) if local_health else "provider:unknown"
-        if decision.route is ReconstructionRoute.GEMINI_DIRECT:
-            state.counts["gemini_direct"] += 1
-            if (
-                gemini_available
-                and state.gemini_budget_remaining > 0
-                and not state.gemini_exhausted
-            ):
-                return self._gemini_attempt(
-                    index,
-                    segment,
-                    request,
-                    decision,
-                    memory,
-                    local_method,
-                    state,
-                    escalation_reason=None,
-                    route_override=decision.route.value,
-                    gemini_health=gemini_health,
-                    fallback_to_local=local_available,
-                )
-            reason = (
-                "gemini_unavailable"
-                if not gemini_available
-                else "gemini_rate_limit_exhausted"
-                if state.gemini_exhausted
-                else "gemini_budget_exhausted"
-            )
-            if not gemini_available:
-                state.counts["gemini_unavailable"] += 1
-            else:
-                state.counts["gemini_budget_skips"] += 1
-            if local_available:
-                return self._local_attempt(
-                    index,
-                    segment,
-                    request,
-                    decision,
-                    memory,
-                    local_method,
-                    escalate_to_gemini=False,
-                    gemini_available=False,
-                    state=state,
-                    fallback_reason=reason,
-                )
-            state.counts["unresolved"] += 1
-            return self._fallback(
-                index,
-                segment,
-                provider_error=not gemini_available,
-                status=(
-                    ReconstructionStatus.PROVIDER_UNAVAILABLE
-                    if not gemini_available
-                    else ReconstructionStatus.LOW_CONFIDENCE_UNRESOLVED
-                ),
-                method="gemini",
-                decision=decision,
-                route=decision.route.value,
-                escalation_reason=reason,
-            )
-        if not local_available:
-            if (
-                gemini_available
-                and state.gemini_budget_remaining > 0
-                and not state.gemini_exhausted
-            ):
-                return self._gemini_attempt(
-                    index,
-                    segment,
-                    request,
-                    decision,
-                    memory,
-                    local_method,
-                    state,
-                    escalation_reason="local_provider_unavailable",
-                    route_override="LOCAL_THEN_GEMINI",
-                    gemini_health=gemini_health,
-                )
-            state.counts["unresolved"] += 1
-            return self._fallback(
-                index,
-                segment,
-                provider_error=True,
-                status=ReconstructionStatus.PROVIDER_UNAVAILABLE,
-                method="provider:unknown",
-                decision=decision,
-                route=decision.route.value,
-                escalation_reason="local_provider_unavailable",
-            )
-        return self._local_attempt(
-            index,
-            segment,
-            request,
-            decision,
-            memory,
-            local_method,
-            escalate_to_gemini=True,
-            gemini_available=gemini_available,
-            state=state,
-            gemini_health=gemini_health,
+            final_provider=_STAGE25_METHOD,
         )
 
     def _local_attempt(
@@ -574,11 +743,7 @@ class ContextualReconstructor:
         decision: AdaptiveRoutingDecision,
         memory: SourceEntityMemory,
         method: str,
-        escalate_to_gemini: bool,
-        gemini_available: bool,
         state: "_JobState",
-        gemini_health: ProviderHealth | None = None,
-        fallback_reason: str | None = None,
     ) -> SegmentReconstruction:
         state.counts["local_attempts"] += 1
         raw = str(segment.get("raw_text", segment.get("text", "")))
@@ -587,7 +752,7 @@ class ContextualReconstructor:
             candidate = generated.get(index, ReconstructionCandidate("raw", raw))
         except (OSError, ProviderResponseError):
             state.counts["local_failures"] += 1
-            local_seg = self._fallback(
+            return self._fallback(
                 index,
                 segment,
                 provider_error=True,
@@ -597,24 +762,8 @@ class ContextualReconstructor:
                 route=decision.route.value,
                 local_attempted=True,
                 local_result_state="failure",
-                final_provider=method,
-                escalation_reason=fallback_reason,
+                final_provider=_STAGE25_METHOD,
             )
-            if escalate_to_gemini:
-                return self._escalate(
-                    index,
-                    segment,
-                    request,
-                    decision,
-                    memory,
-                    local_seg,
-                    gemini_available,
-                    state,
-                    escalation_reason="local_provider_error",
-                    gemini_health=gemini_health,
-                )
-            state.counts["unresolved"] += 1
-            return local_seg
         segment_result = self._decide(
             index,
             segment,
@@ -624,71 +773,14 @@ class ContextualReconstructor:
             routing=decision,
             route=decision.route.value,
             local_attempted=True,
+            local_result_state="accepted",
             final_provider=method,
-            escalation_reason=fallback_reason,
         )
         if segment_result.applied and segment_result.confidence_level is ConfidenceLevel.HIGH:
             state.counts["local_accepted"] += 1
             return segment_result
         state.counts["local_unaccepted"] += 1
-        if escalate_to_gemini:
-            return self._escalate(
-                index,
-                segment,
-                request,
-                decision,
-                memory,
-                segment_result,
-                gemini_available,
-                state,
-                escalation_reason=_local_escalation_reason(segment_result),
-                gemini_health=gemini_health,
-            )
-        state.counts["unresolved"] += 1
-        return segment_result
-
-    def _escalate(
-        self,
-        index: int,
-        segment: Mapping[str, object],
-        request: ReconstructionRequest,
-        decision: AdaptiveRoutingDecision,
-        memory: SourceEntityMemory,
-        local_seg: SegmentReconstruction,
-        gemini_available: bool,
-        state: "_JobState",
-        escalation_reason: str,
-        gemini_health: ProviderHealth | None = None,
-    ) -> SegmentReconstruction:
-        if not gemini_available:
-            state.counts["gemini_unavailable"] += 1
-            state.counts["unresolved"] += 1
-            return replace(
-                local_seg,
-                escalation_reason="gemini_unavailable",
-                final_provider=local_seg.final_provider or "stage25",
-            )
-        if state.gemini_exhausted:
-            state.counts["gemini_budget_skips"] += 1
-            state.counts["unresolved"] += 1
-            return replace(local_seg, escalation_reason="gemini_rate_limit_exhausted")
-        if state.gemini_budget_remaining <= 0:
-            state.counts["gemini_budget_skips"] += 1
-            state.counts["unresolved"] += 1
-            return replace(local_seg, escalation_reason="gemini_budget_exhausted")
-        return self._gemini_attempt(
-            index,
-            segment,
-            request,
-            decision,
-            memory,
-            local_seg.final_provider or "stage25",
-            state,
-            escalation_reason=escalation_reason,
-            route_override="LOCAL_THEN_GEMINI",
-            gemini_health=gemini_health,
-            local_seg=local_seg,
-        )
+        return replace(segment_result, final_provider=_STAGE25_METHOD)
 
     def _gemini_attempt(
         self,
@@ -724,12 +816,20 @@ class ContextualReconstructor:
             )
         except GeminiProviderError as error:
             state.counts["gemini_failures"] += 1
-            if error.category in {
-                GeminiErrorCategory.RATE_LIMITED,
-                GeminiErrorCategory.AUTHENTICATION,
-            }:
+            if error.category is GeminiErrorCategory.RATE_LIMITED:
                 state.counts["gemini_rate_limited"] += 1
                 state.gemini_exhausted = True
+                state.gemini_stop_reason = "gemini_rate_limit_exhausted"
+            elif error.category is GeminiErrorCategory.AUTHENTICATION:
+                state.counts["gemini_authentication_failed"] += 1
+                state.gemini_exhausted = True
+                state.gemini_stop_reason = "gemini_authentication_failed"
+            elif error.category in {
+                GeminiErrorCategory.MODEL_NOT_FOUND,
+                GeminiErrorCategory.INVALID_REQUEST,
+            }:
+                state.gemini_exhausted = True
+                state.gemini_stop_reason = f"gemini_{error.category.value}"
             if local_seg is not None:
                 state.counts["unresolved"] += 1
                 return replace(
@@ -751,21 +851,12 @@ class ContextualReconstructor:
                 route=route_override,
                 gemini_attempted=True,
                 gemini_result_state=f"failure:{error.category.value}",
-                final_provider=method,
+                final_provider=_STAGE25_METHOD,
                 escalation_reason=escalation_reason,
             )
             if fallback_to_local and self._provider is not None:
                 local_seg = self._local_attempt(
-                    index,
-                    segment,
-                    request,
-                    decision,
-                    memory,
-                    local_method,
-                    escalate_to_gemini=False,
-                    gemini_available=False,
-                    state=state,
-                    fallback_reason=f"gemini_{error.category.value}",
+                    index, segment, request, decision, memory, local_method, state
                 )
                 return replace(
                     local_seg,
@@ -797,21 +888,12 @@ class ContextualReconstructor:
                 route=route_override,
                 gemini_attempted=True,
                 gemini_result_state="failure:provider_error",
-                final_provider=method,
+                final_provider=_STAGE25_METHOD,
                 escalation_reason=escalation_reason,
             )
             if fallback_to_local and self._provider is not None:
                 local_seg = self._local_attempt(
-                    index,
-                    segment,
-                    request,
-                    decision,
-                    memory,
-                    local_method,
-                    escalate_to_gemini=False,
-                    gemini_available=False,
-                    state=state,
-                    fallback_reason="gemini_provider_error",
+                    index, segment, request, decision, memory, local_method, state
                 )
                 return replace(
                     local_seg,
@@ -836,6 +918,7 @@ class ContextualReconstructor:
             state.counts["gemini_accepted"] += 1
             return segment_result
         state.counts["gemini_rejected"] += 1
+        segment_result = replace(segment_result, final_provider=_STAGE25_METHOD)
         if local_seg is not None:
             state.counts["unresolved"] += 1
             return replace(
@@ -847,16 +930,7 @@ class ContextualReconstructor:
             )
         if fallback_to_local and self._provider is not None:
             local_seg = self._local_attempt(
-                index,
-                segment,
-                request,
-                decision,
-                memory,
-                local_method,
-                escalate_to_gemini=False,
-                gemini_available=False,
-                state=state,
-                fallback_reason="gemini_rejected",
+                index, segment, request, decision, memory, local_method, state
             )
             return replace(
                 local_seg,
@@ -963,7 +1037,7 @@ class ContextualReconstructor:
                 ReconstructionStatus.MANUAL_OVERRIDE,
                 reconstruction_method=_MANUAL_METHOD,
             )
-        decision = routing or route_adaptive(build_reconstruction_window([segment], 0))
+        decision = routing or route_adaptive(segment)
         score = decision.score
         if candidate.candidate_id == "raw" or candidate.text == corrected or candidate.text == raw:
             return SegmentReconstruction(
@@ -1074,6 +1148,44 @@ class ContextualReconstructor:
             near_acceptance=near,
         )
 
+    def _escalation_priority(
+        self,
+        decision: AdaptiveRoutingDecision,
+        local_seg: SegmentReconstruction | None,
+        escalation_reason: str,
+    ) -> float:
+        """Deterministic escalation ranking: severity, then local evidence."""
+
+        priority = decision.severity
+        if local_seg is not None and local_seg.near_acceptance:
+            priority += 0.25
+        if escalation_reason in {
+            "local_provider_error",
+            "local_unchanged",
+            "local_unresolved",
+            "local_provider_unavailable",
+        }:
+            priority += 0.10
+        return priority
+
+    def _cache_eligible(self, state: "_JobState", results: Sequence[SegmentReconstruction]) -> bool:
+        """True only when the run completed without transient provider failure.
+
+        Deterministic rejections and genuine unresolved outcomes stay eligible;
+        provider-unavailable runs, quota/rate-limit exhaustion, and any provider
+        failure remain retryable on a later run.
+        """
+
+        if state.gemini_exhausted:
+            return False
+        if state.counts["gemini_failures"] or state.counts["local_failures"]:
+            return False
+        if state.counts["gemini_unavailable"]:
+            return False
+        if any(item.status is ReconstructionStatus.PROVIDER_UNAVAILABLE for item in results):
+            return False
+        return True
+
 
 def _local_escalation_reason(segment: SegmentReconstruction) -> str:
     if segment.status is ReconstructionStatus.PROVIDER_UNAVAILABLE:
@@ -1118,10 +1230,17 @@ def select_final_text(
 
 
 class _JobState:
-    def __init__(self, counts: dict[str, int], budget: int, exhausted: bool) -> None:
+    def __init__(
+        self,
+        counts: dict[str, int],
+        budget: int,
+        exhausted: bool,
+        stop_reason: str | None,
+    ) -> None:
         self.counts = counts
         self.gemini_budget_remaining = budget
         self.gemini_exhausted = exhausted
+        self.gemini_stop_reason = stop_reason
 
 
 def _reconstruction_request(
@@ -1147,7 +1266,7 @@ def _reconstruction_request(
         for form in memory.occurrences
         if any(form in item.raw_text or form in item.corrected_text for item in ordered)
     )
-    routing = route_adaptive(window, language=language)
+    routing = route_adaptive(segments[index], language=language)
     return ReconstructionRequest(
         segment_index=index,
         raw_text=target.raw_text,

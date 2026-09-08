@@ -179,13 +179,62 @@ reuses its fingerprint without a duplicate Gemini call. `ADAPTIVE` and
 Gemini; this is configuration, not rights/provenance policy. The cap reserves
 Gemini capacity but is not an account-wide billing/quota manager.
 
-The live smoke used the operator's configured `GEMINI_API_KEY` (never printed,
-logged, or committed) against `gemini-3.6-flash`, verified authentication, model
-availability, structured-output parsing, and readable usage metadata
-(`290` prompt / `87` candidate / `858` total tokens) in one tiny request that
-repaired `دي موقراطية` to `ديمقراطية`. The operator retains the local-first
-default in `local_only` by setting
-`CLIPFACTORY_RECONSTRUCTION_ROUTING_MODE=local_only`.
+The initial live smoke used the operator's configured `GEMINI_API_KEY` (never
+printed, logged, or committed) against `gemini-3.6-flash`, verifying
+authentication, model availability, structured-output parsing, and readable
+usage metadata. The corrective pass superseded the model with
+`gemini-3.8-flash` (see below). The operator retains the local-first default in
+`local_only` by setting `CLIPFACTORY_RECONSTRUCTION_ROUTING_MODE=local_only`.
+
+## Adaptive Gemini corrective pass (2026-09-09)
+
+A focused corrective pass finalized the adaptive router before Sol review:
+
+- **Stage 2.5 trust routing.** `NO_LLM` now requires affirmative Stage 2.5
+  evidence (`correction_method` not `unchanged`/`pending` at
+  `correction_confidence >= 0.90`) plus clean acoustics and no protected-token
+  ambiguity. High Whisper probabilities alone can no longer suppress contextual
+  checking; a confidently wrong segment with an unchanged low-trust correction
+  stays eligible for Qwen. Isolated low-confidence words are labeled accurately.
+- **Strongest-first budget.** `CLIPFACTORY_GEMINI_MAX_TARGETS_PER_JOB` (default
+  `5`) is spent on the five strongest eligible targets by deterministic routing
+  severity, not transcript order. Direct-Gemini targets are ranked and allocated
+  first, then Qwen, then ranked local escalations; ties break by segment index.
+- **Lazy heavy-model lease.** The Ollama lease is acquired only around actual
+  local inference and local release. `NO_LLM`, `GEMINI_ONLY`, and direct-Gemini
+  work never acquire it; a direct-Gemini call runs before any optional local
+  fallback lease. Real local inference stays lease-protected.
+- **Secret handling.** The Gemini key is a Pydantic `SecretStr`, masked in repr,
+  `model_dump`, JSON, and validation errors, and unwrapped only when building the
+  SDK client.
+- **Stable fingerprints and cache eligibility.** Fingerprints cover stable
+  dependency identity only; transient availability is excluded. A temporary
+  outage never invalidates accepted output, and a first-run degraded fallback is
+  retried after provider recovery. `cache_eligible` distinguishes reusable runs.
+- **Dialect-neutral Gemini prompting.** Gemini preserves the dialect/register
+  evident in the source and context; it never defaults to Egyptian. A future
+  `dialect_profile` request hint receives a narrow profile-preservation addendum.
+- **Model and thinking.** Default is `gemini-3.8-flash` with
+  `CLIPFACTORY_GEMINI_THINKING_LEVEL=low` (bounded reasoning), passed through
+  `ThinkingConfig`, with `thoughts_token_count` retained in usage.
+- **Retry classification.** Permanent 400-class request/schema failures,
+  authentication, model-not-found, 429, malformed output, and refusal are never
+  retried; connection/timeout/eligible 5xx get at most one bounded retry.
+- **SDK cleanup.** `GeminiReconstructionProvider.release()` closes the owned SDK
+  client independently of local model release; cleanup failure is a sanitized
+  warning that never replaces a valid result.
+- **Observability.** Routes, auth-vs-rate-limit counts, final-provider (the
+  accepted text source, not a failed attempted provider), and usage metadata are
+  now accurate.
+
+Live verification: one tiny `gemini-3.8-flash` structured-output smoke at
+`thinking_level=low` succeeded (`دي موقراطية` → `ديمقراطية`; usage
+`270` prompt / `81` candidate / `75` thoughts), and a real difficult known
+Stage 2.7 phrase (`فيور 25 نوفمبر`, which `qwen3.5:4b` could not repair) routed
+`GEMINI_DIRECT` and Gemini repaired it to `في يوم 25 نوفمبر`, which passes the
+shared validation at HIGH (`phonetic 0.888`, score `0.933`). The key was never
+printed or logged. The default mode remains `ADAPTIVE`; `local_only` is the
+fully-local override.
 
 STAGE 2.7 MUST CONTINUE
 
