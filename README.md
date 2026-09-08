@@ -82,8 +82,8 @@ Stage 2.5, Stage 2.7, and manual text separately; final text is always manual
 override, then an applied HIGH-confidence reconstruction, then Stage 2.5, then
 raw ASR. The default provider configuration is local Ollama at
 `http://ollama:11434` with `qwen3.5:4b`; it never downloads a model implicitly.
-Start the optional service with `docker compose --profile reconstruction up -d
-ollama`, then have the operator explicitly pull the selected model (for example,
+Ollama starts with the rest of the stack on `docker compose up`; have the
+operator explicitly pull the selected model once (for example,
 `docker compose exec ollama ollama pull qwen3.5:4b`). Set
 `CLIPFACTORY_RECONSTRUCTION_PROVIDER=disabled` to run without a provider, or
 use `openai_compatible` with an operator-configured local endpoint. Invalid,

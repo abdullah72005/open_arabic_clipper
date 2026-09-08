@@ -94,6 +94,16 @@ class FakeRedis:
         return 1
 
 
+class BytesEvalRedis(FakeRedis):
+    """FakeRedis that mimics redis-py's default byte replies for EVAL."""
+
+    def eval(self, script: str, numkeys: int, *args: object) -> object:
+        result = super().eval(script, numkeys, *args)
+        if isinstance(result, str):
+            return result.encode()
+        return result
+
+
 def _lease(
     redis: FakeRedis,
     now: FakeClock,
@@ -127,6 +137,33 @@ def test_acquire_success_sets_unique_owner_token() -> None:
 
     assert lease.token
     assert redis.get(_LEASE_KEY) == lease.token
+
+
+def test_acquire_succeeds_when_redis_eval_returns_bytes() -> None:
+    """Real redis-py returns byte replies; acquisition must still succeed."""
+
+    now = FakeClock()
+    redis = BytesEvalRedis(now)
+    lease = _lease(redis, now, timeout=5)
+
+    lease.acquire()
+
+    assert lease.acquired is True
+    assert redis.get(_LEASE_KEY) == lease.token
+
+
+def test_renewal_detects_ownership_loss_when_redis_eval_returns_bytes() -> None:
+    """Byte replies must not mask a lost lease; renew() must report failure."""
+
+    now = FakeClock()
+    redis = BytesEvalRedis(now)
+    lease = _lease(redis, now, ttl=300)
+    lease.acquire()
+    redis.data[_LEASE_KEY] = "intruder"
+    redis.expires_at[_LEASE_KEY] = now.now + 300
+
+    assert lease.renew() is False
+    assert lease.ownership_lost is True
 
 
 def test_unique_owner_tokens_per_lease() -> None:

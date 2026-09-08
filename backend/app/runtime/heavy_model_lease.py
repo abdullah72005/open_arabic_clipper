@@ -174,6 +174,8 @@ class HeavyModelLease:
                 self._token,
                 int(self._ttl_seconds * 1000),
             )
+            if isinstance(result, bytes):
+                result = result.decode("utf-8", errors="replace")
             if result == "ACQUIRED":
                 self._acquired = True
                 if self._on_acquire is not None:
@@ -206,6 +208,12 @@ class HeavyModelLease:
                 _RENEW_LUA, 1, _LEASE_KEY, self._token, int(self._ttl_seconds * 1000)
             )
         except Exception:
+            renewed = 0
+        if isinstance(renewed, bytes):
+            renewed = renewed.decode("utf-8", errors="replace")
+        try:
+            renewed = int(renewed)
+        except (TypeError, ValueError):
             renewed = 0
         if not renewed:
             self._mark_ownership_lost()
