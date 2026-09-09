@@ -87,6 +87,34 @@
   original-media SHA-256, exact clip audio SHA-256, exact bounds, schema, and
   decoder identity. Whisper child peak memory is measured in the child after
   model work; abnormal exits report UNKNOWN.
+- Transcript refinement has an explicit priority ladder: whole-source is
+  `INDEX` (indexing quality), a shortlisted window is `CANDIDATE` (semantic
+  quality), and a selected final clip is `FINAL_CLIP` (publication/caption
+  quality). Normal whole-source ingestion always runs at INDEX: it preserves raw
+  ASR, Stage 2.5, timestamps, word and acoustic evidence, and defers every
+  provider reconstruction truthfully (unresolved, never a provider failure), so
+  it pays for ASR + Stage 2.5 + cheap uncertainty bookkeeping only. Automatic
+  local Qwen use is disabled by default (`CLIPFACTORY_LOCAL_QWEN_ENABLED=false`);
+  the operator re-enables it explicitly for targeted work, and an intentionally
+  selected `local_only` mode still uses Qwen and never Gemini. Gemini is
+  reserved for targeted candidate/final-clip ambiguity through the existing
+  bounded routing/budget gates and is never used for blanket whole-source
+  cleanup. A reusable `refine_transcript_window(source_id, start_time,
+  end_time, priority)` entry point refines only the bounded requested region
+  (target segments selected from immutable timestamps, bounded nearby context
+  that is never a mutation target), reuses the Stage 2.5/2.7 provider, routing,
+  validation, and checkpoint mechanisms, preserves raw ASR/timestamps, keeps
+  manual override authoritative, and returns a structured outcome (refined text
+  where accepted, confidence, status, provider/routing evidence, unresolved
+  state, target/window identity). Priority and window scope participate in
+  output fingerprints, so an INDEX result can never satisfy a CANDIDATE/FINAL_CLIP
+  request and one window can never satisfy another. The local wall-time ceiling
+  is authoritative over the local-origin Gemini backlog: once it expires no new
+  escalation is enqueued and queued escalations are invalidated (no Gemini call
+  for the backlog, safe Stage 2.5/current text preserved, unresolved/manual
+  review). Stage 2.7.1 (dialect/code-switch recovery) is not implemented; the
+  pipeline only preserves mixed-language evidence and exposes a lightweight
+  evidence-based `code_switch_suspected` signal.
 
 ## Local development facts (not product requirements)
 

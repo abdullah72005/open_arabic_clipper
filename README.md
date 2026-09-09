@@ -97,6 +97,17 @@ Redis with no TTL and blocks new heavy work; run
 `python -m app.cli recover-heavy-model` to clear it after confirming the model
 is no longer resident.
 
+Whole-source transcription is indexing, not publication. Normal whole-source
+ingestion runs at INDEX priority and defers all provider reconstruction
+truthfully (unresolved, never a provider failure), so it pays for ASR + Stage
+2.5 + cheap uncertainty bookkeeping only and makes zero Qwen/Gemini calls.
+Automatic local Qwen use is disabled by default
+(`CLIPFACTORY_LOCAL_QWEN_ENABLED=false`); an operator re-enables it explicitly,
+and a reusable `refine_transcript_window(source_id, start_time, end_time,
+priority)` service entry point refines only a bounded selected window at
+CANDIDATE (semantic) or FINAL_CLIP (publication/caption) quality while
+preserving raw ASR, timestamps, and manual overrides.
+
 An optional hosted Gemini provider (`gemini-3.8-flash`, low thinking, temperature
 `0`, stable v1 API by default) supports deterministic adaptive routing
 (`local_only` / `adaptive` / `gemini_only`;
@@ -112,7 +123,9 @@ and hard-bounded per job
 (`CLIPFACTORY_LOCAL_RECONSTRUCTION_MAX_TARGETS_PER_JOB` default `64`,
 `CLIPFACTORY_LOCAL_RECONSTRUCTION_MAX_WALL_SECONDS` default `1200`), so a
 four-hour source can never create unbounded local inference; skipped targets are
-marked unresolved/manual review and never auto-escalate to Gemini. Each sent
+marked unresolved/manual review and never auto-escalate to Gemini, and once the
+local wall-time ceiling expires, queued local-origin Gemini escalations are
+invalidated (no Gemini call for the backlog). Each sent
 local batch is also split at the provider boundary so its combined chat envelope
 never exceeds the configured context. `adaptive` and
 `gemini_only` may send short transcript snippets and bounded context to Google

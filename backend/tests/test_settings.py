@@ -96,7 +96,14 @@ def test_settings_builds_opt_in_local_correction_provider(monkeypatch: pytest.Mo
     assert provider is not None
 
 
-def test_reconstruction_defaults_to_managed_local_provider() -> None:
+def test_reconstruction_defaults_to_disabled_local_qwen() -> None:
+    """Automatic local Qwen reconstruction is disabled by default.
+
+    Normal whole-source ingestion runs at INDEX priority and must never load or
+    invoke Qwen, so no local provider is constructed unless the operator
+    explicitly enables it with ``local_qwen_enabled``.
+    """
+
     settings = Settings(_env_file=None)
 
     assert settings.reconstruction_provider == "ollama"
@@ -105,6 +112,20 @@ def test_reconstruction_defaults_to_managed_local_provider() -> None:
     assert settings.reconstruction_provider_timeout_seconds == 180
     assert settings.reconstruction_release_after_run is True
     assert settings.reconstruction_provider_max_context_tokens == 4096
+    assert settings.local_qwen_enabled is False
+    assert settings.reconstruction_provider_instance() is None
+
+
+def test_reconstruction_local_qwen_explicitly_enabled_returns_ollama(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An operator explicitly re-enables local Qwen without code changes."""
+
+    monkeypatch.setenv("CLIPFACTORY_LOCAL_QWEN_ENABLED", "true")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.local_qwen_enabled is True
     assert isinstance(settings.reconstruction_provider_instance(), OllamaReconstructionProvider)
 
 
@@ -120,6 +141,7 @@ def test_reconstruction_retains_explicit_openai_compatible_mode() -> None:
         reconstruction_provider="openai_compatible",
         reconstruction_provider_base_url="http://provider:8080",
         reconstruction_provider_model="local-model",
+        local_qwen_enabled=True,
     )
 
     assert isinstance(

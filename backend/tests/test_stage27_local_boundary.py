@@ -18,7 +18,14 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.core.enums import JobKind, JobStatus, PipelineRunStatus, PipelineStage, RightsStatus
+from app.core.enums import (
+    JobKind,
+    JobStatus,
+    PipelineRunStatus,
+    PipelineStage,
+    RefinementPriority,
+    RightsStatus,
+)
 from app.db.base import Base
 from app.models import PipelineRun, ProcessingJob, SourceVideo, Transcript
 from app.pipeline.executor import ReconstructionCancelled
@@ -283,6 +290,7 @@ def _reconstructor(
         gemini_budget=0,
         batch_windows=batch_windows,
         batch_characters=batch_characters,
+        priority=RefinementPriority.CANDIDATE,
         **kwargs,
     )
 
@@ -466,6 +474,7 @@ def test_irreducible_target_escalates_to_gemini_when_policy_permits() -> None:
         gemini_budget=10,
         batch_windows=2,
         batch_characters=1_000_000,
+        priority=RefinementPriority.CANDIDATE,
     )
     result = _run(reconstructor, segments)
     # The valid unit ran locally; the oversized one escalated to Gemini exactly once.
@@ -522,6 +531,7 @@ def test_wall_ceiling_prevents_gemini_escalation_after_expiry() -> None:
         batch_characters=1_000_000,
         monotonic=clock,
         local_wall_seconds=1.0,
+        priority=RefinementPriority.CANDIDATE,
     )
     result = _run(reconstructor, segments)
     assert len(transport.calls) == 1
@@ -611,6 +621,7 @@ def test_cross_session_api_cancellation_is_observed_by_worker(sqlite_engine: obj
                     gemini_budget=0,
                     batch_windows=4,
                     batch_characters=1_000_000,
+                    priority=RefinementPriority.CANDIDATE,
                 ),
             )
         },

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from app.core.enums import ReconstructionStatus
+from app.core.enums import ReconstructionStatus, RefinementPriority
 from app.transcription.reconstruction.confidence import CONFIDENCE_POLICY_VERSION
 from app.transcription.reconstruction.gemini import GeminiErrorCategory, GeminiProviderError
 from app.transcription.reconstruction.providers import (
@@ -183,6 +183,7 @@ def _reconstructor(
         gemini_provider=gemini,
         routing=AdaptiveRoutingConfig(mode=mode),
         gemini_budget=budget,
+        priority=RefinementPriority.CANDIDATE,
     )
     return reconstructor, local, gemini
 

@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 from sqlalchemy.orm import Session
 
-from app.core.enums import PipelineStage, RightsStatus
+from app.core.enums import PipelineStage, RefinementPriority, RightsStatus
 from app.db.base import Base
 from app.media.audio import AudioExtractor
 from app.media.ffprobe import FFprobe
@@ -91,7 +91,10 @@ def test_generated_owned_media_reaches_ready_for_analysis(
                 session=session
             ),
             PipelineStage.CONTEXTUAL_RECONSTRUCTION: ContextualReconstructionExecutor(
-                session=session, reconstructor=ContextualReconstructor(provider=None)
+                session=session,
+                reconstructor=ContextualReconstructor(
+                    provider=None, priority=RefinementPriority.CANDIDATE
+                ),
             ),
             PipelineStage.AUDIO_ANALYSIS: AudioAnalysisExecutor(session=session, storage=storage),
         }

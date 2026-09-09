@@ -3,7 +3,7 @@ import json
 import pytest
 from sqlalchemy.orm import Session
 
-from app.core.enums import JobKind, PipelineStage, RightsStatus
+from app.core.enums import JobKind, PipelineStage, RefinementPriority, RightsStatus
 from app.db.base import Base
 from app.models import SourceVideo, Transcript
 from app.pipeline.stages import ContextualReconstructionExecutor
@@ -175,13 +175,17 @@ def test_reconstruction_output_fingerprint_changes_with_each_identity_component(
 ) -> None:
     segments = [{"start": 0.0, "end": 1.0, "text": "دخم", "corrected_text": "دخم"}]
 
-    baseline = ContextualReconstructor(IdentityProvider(_identity())).reconstruct(
+    baseline = ContextualReconstructor(
+        IdentityProvider(_identity()), priority=RefinementPriority.CANDIDATE
+    ).reconstruct(
         segments,
         language="ar",
         transcription_fingerprint="asr-v1",
         correction_version="egyptian-ar-v1",
     )
-    changed = ContextualReconstructor(IdentityProvider(_identity(**change))).reconstruct(
+    changed = ContextualReconstructor(
+        IdentityProvider(_identity(**change)), priority=RefinementPriority.CANDIDATE
+    ).reconstruct(
         segments,
         language="ar",
         transcription_fingerprint="asr-v1",
@@ -197,7 +201,7 @@ def test_unavailable_run_shares_stable_fingerprint_but_is_not_cache_eligible() -
     segments = [{"start": 0.0, "end": 1.0, "text": "دخم", "corrected_text": "دخم"}]
 
     available = ContextualReconstructor(
-        IdentityProvider(_identity(digest="sha256:live"))
+        IdentityProvider(_identity(digest="sha256:live")), priority=RefinementPriority.CANDIDATE
     ).reconstruct(
         segments,
         language="ar",
@@ -205,7 +209,8 @@ def test_unavailable_run_shares_stable_fingerprint_but_is_not_cache_eligible() -
         correction_version="egyptian-ar-v1",
     )
     unavailable = ContextualReconstructor(
-        UnavailableIdentityProvider(_identity(digest="sha256:live"))
+        UnavailableIdentityProvider(_identity(digest="sha256:live")),
+        priority=RefinementPriority.CANDIDATE,
     ).reconstruct(
         segments,
         language="ar",
@@ -276,7 +281,8 @@ def test_executor_persists_actual_stage27_and_manual_only_affects_final(
             ReconstructionCandidate("provider-0", "ضخمة", provider_confidence=0.95)
         )
         executor = ContextualReconstructionExecutor(
-            session=session, reconstructor=ContextualReconstructor(provider)
+            session=session,
+            reconstructor=ContextualReconstructor(provider, priority=RefinementPriority.CANDIDATE),
         )
         executor.execute(source, force=True)
 
@@ -340,14 +346,14 @@ def test_same_tag_digest_replacement_invalidates_output_fingerprint() -> None:
     provider = _ollama_provider(transport)
     segments = [{"start": 0.0, "end": 1.0, "text": "دخم", "corrected_text": "دخم"}]
 
-    first = ContextualReconstructor(provider).reconstruct(
+    first = ContextualReconstructor(provider, priority=RefinementPriority.CANDIDATE).reconstruct(
         segments,
         language="ar",
         transcription_fingerprint="asr-v1",
         correction_version="egyptian-ar-v1",
     )
     transport.digest = "sha256:new"
-    second = ContextualReconstructor(provider).reconstruct(
+    second = ContextualReconstructor(provider, priority=RefinementPriority.CANDIDATE).reconstruct(
         segments,
         language="ar",
         transcription_fingerprint="asr-v1",
@@ -383,7 +389,10 @@ def test_executor_input_fingerprint_refreshes_live_digest(sqlite_engine: object)
 
         transport = LiveDigestTransport("sha256:old")
         executor = ContextualReconstructionExecutor(
-            session=session, reconstructor=ContextualReconstructor(_ollama_provider(transport))
+            session=session,
+            reconstructor=ContextualReconstructor(
+                _ollama_provider(transport), priority=RefinementPriority.CANDIDATE
+            ),
         )
         fp_old = executor.input_fingerprint(source)
         transport.digest = "sha256:new"
@@ -425,7 +434,10 @@ def test_forced_reconstruction_run_uses_refreshed_digest(sqlite_engine: object) 
 
         transport = LiveDigestTransport("sha256:old")
         executor = ContextualReconstructionExecutor(
-            session=session, reconstructor=ContextualReconstructor(_ollama_provider(transport))
+            session=session,
+            reconstructor=ContextualReconstructor(
+                _ollama_provider(transport), priority=RefinementPriority.CANDIDATE
+            ),
         )
         executor.execute(source, force=True)
         session.refresh(transcript)
@@ -529,6 +541,7 @@ def test_executor_cache_hit_avoids_duplicate_gemini_call(sqlite_engine: object) 
             gemini_provider=gemini,
             routing=AdaptiveRoutingConfig(mode=RoutingMode.ADAPTIVE),
             gemini_budget=5,
+            priority=RefinementPriority.CANDIDATE,
         )
         executor = ContextualReconstructionExecutor(session=session, reconstructor=reconstructor)
         executor.execute(source, force=True)
@@ -600,6 +613,7 @@ def test_successful_gemini_result_reused_during_mocked_outage(sqlite_engine: obj
             gemini_provider=gemini,
             routing=AdaptiveRoutingConfig(mode=RoutingMode.ADAPTIVE),
             gemini_budget=5,
+            priority=RefinementPriority.CANDIDATE,
         )
         executor = ContextualReconstructionExecutor(session=session, reconstructor=reconstructor)
         executor.execute(source, force=True)
@@ -651,6 +665,7 @@ def test_transient_first_run_fallback_becomes_cache_eligible_without_duplicate_g
             gemini_provider=gemini,
             routing=AdaptiveRoutingConfig(mode=RoutingMode.ADAPTIVE),
             gemini_budget=5,
+            priority=RefinementPriority.CANDIDATE,
         )
         executor = ContextualReconstructionExecutor(session=session, reconstructor=reconstructor)
         executor.execute(source, force=True)

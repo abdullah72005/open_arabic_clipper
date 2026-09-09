@@ -14,7 +14,7 @@ from typing import Protocol, cast
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
-from app.core.enums import JobStatus, ReconstructionStatus
+from app.core.enums import JobStatus, ReconstructionStatus, RefinementPriority
 from app.core.settings import get_settings
 from app.media.analysis import parse_silencedetect, silence_ratio, windowed_rms
 from app.media.audio import AudioExtractor
@@ -55,6 +55,7 @@ from app.transcription.reconstruction.types import (
     ProviderHealth,
     QualityFlag,
     ReconstructionCandidate,
+    ReconstructionResult,
     RequestSizeDiagnostics,
     SegmentReconstruction,
     UnloadOutcome,
@@ -529,11 +530,29 @@ class ContextualReconstructionExecutor:
         session: Session,
         reconstructor: ContextualReconstructor,
         lease_factory: HeavyModelLeaseFactory | NoopHeavyModelLeaseFactory | None = None,
+        priority: RefinementPriority | None = None,
     ) -> None:
         self._session = session
         self._reconstructor = reconstructor
         self._lease_factory = lease_factory or NoopHeavyModelLeaseFactory()
+        # The whole-source stage defaults to INDEX (the reconstructor's class
+        # default), so normal ingestion never loads/calls Qwen and never uses
+        # Gemini. An explicit priority (CANDIDATE/FINAL_CLIP) opts into active
+        # refinement mechanics.
+        self._priority = priority or reconstructor.priority
         self._active_job_id: object | None = None
+
+    def _effective_reconstructor(self) -> ContextualReconstructor:
+        """The whole-source executor always runs at its configured priority.
+
+        The default whole-source priority is INDEX: normal ingestion never loads
+        or calls Qwen and never uses Gemini. Test/refinement callers construct
+        the executor with an explicit CANDIDATE/FINAL_CLIP priority instead.
+        """
+
+        if self._reconstructor.priority is self._priority:
+            return self._reconstructor
+        return self._reconstructor.with_priority(self._priority)
 
     def set_active_job(self, job_id: object | None) -> None:
         """Bind the exact currently executing reconstruction job id.
@@ -559,7 +578,7 @@ class ContextualReconstructionExecutor:
                 "normalization_fingerprint": transcript.normalization_fingerprint,
                 "transcription_revision": transcript.transcription_revision,
                 "correction_version": transcript.correction_version,
-                "runtime_identity": self._reconstructor.refresh_runtime_identity(),
+                "runtime_identity": self._effective_reconstructor().refresh_runtime_identity(),
             },
         )
 
@@ -581,7 +600,7 @@ class ContextualReconstructionExecutor:
         return transcript.reconstruction_metadata.get("cache_eligible") is True
 
     def execute(self, source: SourceVideo, *, force: bool = False) -> StageExecutionResult:
-        reconstructor = self._reconstructor
+        reconstructor = self._effective_reconstructor()
         local = getattr(reconstructor, "_provider", None)
         if local is not None:
             reconstructor = reconstructor.with_local_provider(
@@ -689,6 +708,7 @@ class ContextualReconstructionExecutor:
                     language=transcript.language,
                     transcription_fingerprint=transcript.input_fingerprint,
                     correction_version=transcript.correction_version,
+                    priority=self._priority,
                 )
             )
 
@@ -709,12 +729,7 @@ class ContextualReconstructionExecutor:
             sum(item.confidence for item in applied) / len(applied) if applied else 0.0
         )
         transcript.reconstructed_segment_ratio = len(applied) / total if total else 0.0
-        transcript.reconstruction_method = (
-            "stage2_5_fallback"
-            if getattr(self._reconstructor, "_provider", object()) is None
-            and getattr(self._reconstructor, "_gemini", object()) is None
-            else _reconstruction_method(result.segments, result.metadata)
-        )
+        transcript.reconstruction_method = _persisted_reconstruction_method(reconstructor, result)
         transcript.reconstruction_version = "stage2.7-v1"
         transcript.reconstruction_processing_duration = monotonic() - started_at
         status_counts = {status.value: statuses.count(status) for status in set(statuses)}
@@ -871,6 +886,7 @@ class ContextualReconstructionExecutor:
                 language=transcript.language,
                 transcription_fingerprint=transcript.input_fingerprint,
                 correction_version=transcript.correction_version,
+                priority=self._priority,
             )
         transcript.segments = segments
         metadata = dict(transcript.reconstruction_metadata)
@@ -893,6 +909,7 @@ class ContextualReconstructionExecutor:
         language: str | None,
         transcription_fingerprint: str,
         correction_version: str,
+        priority: RefinementPriority,
     ) -> dict[str, object]:
         """Merge one reconstruction outcome into its persisted segment record."""
 
@@ -948,9 +965,70 @@ class ContextualReconstructionExecutor:
             "final_provider": reconstruction.final_provider,
             "escalation_reason": reconstruction.escalation_reason,
             "near_acceptance": reconstruction.near_acceptance,
+            "refinement_priority": priority.value,
+            "needs_refinement": _segment_needs_refinement(status, reconstruction),
+            "code_switch_suspected": _segment_code_switch_suspected(segment),
             "reconstruction_target_fingerprint": target_fingerprint,
             "reconstruction_cache_eligible": _target_cache_eligible(reconstruction),
         }
+
+
+def _persisted_reconstruction_method(
+    reconstructor: ContextualReconstructor,
+    result: ReconstructionResult,
+) -> str:
+    """Truthful reconstruction method for the persisted transcript record.
+
+    INDEX runs intentionally deferred provider reconstruction, so they record
+    ``index_deferred`` rather than a provider fallback or an active method.
+    """
+
+    if result.metadata.get("index_deferred") is True:
+        return "index_deferred"
+    if (
+        getattr(reconstructor, "_provider", object()) is None
+        and getattr(reconstructor, "_gemini", object()) is None
+    ):
+        return "stage2_5_fallback"
+    return _reconstruction_method(result.segments, result.metadata)
+
+
+def _segment_needs_refinement(
+    status: ReconstructionStatus, reconstruction: SegmentReconstruction
+) -> bool:
+    """Derived handoff signal: the segment still needs higher-priority refinement."""
+
+    if status in {
+        ReconstructionStatus.LOW_CONFIDENCE_UNRESOLVED,
+        ReconstructionStatus.PROVIDER_UNAVAILABLE,
+        ReconstructionStatus.FAILED,
+    }:
+        return True
+    if any(flag.value == "RECONSTRUCTION_PROVIDER_ERROR" for flag in reconstruction.quality_flags):
+        return True
+    return bool(reconstruction.escalation_reason)
+
+
+def _segment_code_switch_suspected(segment: Mapping[str, object]) -> bool:
+    """Evidence-based mixed-language signal: any word carries a Latin letter or digit.
+
+    This is derived only from existing word evidence; it is never fabricated from
+    missing text and does not perform code-switch recovery (Stage 2.7.1).
+    """
+
+    words = segment.get("words")
+    if not isinstance(words, list):
+        return False
+    for word in words:
+        if not isinstance(word, Mapping):
+            continue
+        text = str(word.get("word", ""))
+        if any(
+            character.isdigit() or (character.isascii() and character.isalpha())
+            for character in text
+        ):
+            return True
+    return False
 
 
 def _reconstruction_method(

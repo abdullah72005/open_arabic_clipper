@@ -9,7 +9,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import cast
 
-from app.core.enums import ReconstructionStatus
+from app.core.enums import ReconstructionStatus, RefinementPriority
 from app.pipeline.executor import ReconstructionCancelled
 from app.pipeline.fingerprints import reconstruction_output_fingerprint
 from app.transcription.reconstruction.confidence import (
@@ -50,6 +50,10 @@ from app.transcription.reconstruction.windows import acoustic_evidence, build_re
 
 _MANUAL_METHOD = "operator:manual"
 _STAGE25_METHOD = "stage25"
+_INDEX_METHOD = "index_deferred"
+_INDEX_DEFERRED_REASON = "index_priority_deferred"
+_PROVIDER_DISABLED_METHOD = "provider:disabled"
+_PROVIDER_DISABLED_REASON = "no_provider_configured"
 
 _PERMANENT_GEMINI_STOP = frozenset(
     {
@@ -83,6 +87,7 @@ class ContextualReconstructor:
         batch_characters: int | None = None,
         local_max_targets: int | None = None,
         local_wall_seconds: float | None = None,
+        priority: RefinementPriority = RefinementPriority.INDEX,
         monotonic: Callable[[], float] = time.monotonic,
         is_cancelled: Callable[[], bool] | None = None,
         checkpoint: Callable[[dict[int, "SegmentReconstruction"], dict[str, object]], None]
@@ -96,6 +101,7 @@ class ContextualReconstructor:
         self._batch_characters = batch_characters
         self._local_max_targets = local_max_targets
         self._local_wall_seconds = local_wall_seconds
+        self._priority = priority
         self._monotonic = monotonic
         self._is_cancelled = is_cancelled
         self._checkpoint = checkpoint
@@ -114,10 +120,35 @@ class ContextualReconstructor:
             batch_characters=self._batch_characters,
             local_max_targets=self._local_max_targets,
             local_wall_seconds=self._local_wall_seconds,
+            priority=self._priority,
             monotonic=self._monotonic,
             is_cancelled=self._is_cancelled,
             checkpoint=self._checkpoint,
         )
+
+    def with_priority(self, priority: RefinementPriority) -> "ContextualReconstructor":
+        """Return a copy that runs at the given refinement priority."""
+
+        return ContextualReconstructor(
+            self._provider,
+            gemini_provider=self._gemini,
+            routing=self._routing,
+            gemini_budget=self._gemini_budget,
+            batch_windows=self._batch_windows,
+            batch_characters=self._batch_characters,
+            local_max_targets=self._local_max_targets,
+            local_wall_seconds=self._local_wall_seconds,
+            priority=priority,
+            monotonic=self._monotonic,
+            is_cancelled=self._is_cancelled,
+            checkpoint=self._checkpoint,
+        )
+
+    @property
+    def priority(self) -> RefinementPriority:
+        """The refinement priority this reconstructor is configured to run at."""
+
+        return self._priority
 
     def with_orchestration(
         self,
@@ -137,6 +168,7 @@ class ContextualReconstructor:
             batch_characters=self._batch_characters,
             local_max_targets=self._local_max_targets,
             local_wall_seconds=self._local_wall_seconds,
+            priority=self._priority,
             monotonic=self._monotonic,
             is_cancelled=is_cancelled or self._is_cancelled,
             checkpoint=checkpoint or self._checkpoint,
@@ -160,6 +192,7 @@ class ContextualReconstructor:
         identity["local_batch_characters"] = self._batch_characters
         identity["local_max_targets_per_job"] = self._local_max_targets
         identity["local_wall_seconds"] = self._local_wall_seconds
+        identity["priority"] = self._priority.value
         identity["gemini"] = (
             dict(self._gemini.runtime_identity())
             if self._gemini is not None
@@ -168,8 +201,14 @@ class ContextualReconstructor:
         return identity
 
     def refresh_runtime_identity(self) -> dict[str, object]:
-        """Resolve live digests and return the refreshed runtime identity."""
+        """Resolve live digests and return the refreshed runtime identity.
 
+        INDEX runs never resolve live digests: whole-source indexing does not
+        load or probe Qwen, so no local or Gemini network call happens for it.
+        """
+
+        if self._priority is RefinementPriority.INDEX:
+            return self.runtime_identity()
         if self._provider is not None:
             self._provider.refresh_runtime_identity()
         if self._gemini is not None and self._routing.mode is not RoutingMode.LOCAL_ONLY:
@@ -195,7 +234,28 @@ class ContextualReconstructor:
         transcription_fingerprint: str,
         correction_version: str,
         resolved: Mapping[int, SegmentReconstruction] | None = None,
+        target_indexes: Sequence[int] | None = None,
+        priority: RefinementPriority | None = None,
     ) -> ReconstructionResult:
+        """Resolve refinement targets with bounded provider work.
+
+        ``target_indexes`` restricts which transcript segments are mutation
+        targets; all other segments remain immutable context only. ``priority``
+        selects the quality tier: INDEX resolves nothing through a provider and
+        defers uncertainty truthfully; CANDIDATE/FINAL_CLIP run the bounded
+        adaptive provider pipeline.
+        """
+
+        effective_priority = priority or self._priority
+        if effective_priority is RefinementPriority.INDEX:
+            return self._index_reconstruct(
+                segments,
+                language=language,
+                transcription_fingerprint=transcription_fingerprint,
+                correction_version=correction_version,
+                target_indexes=target_indexes,
+                resolved=resolved,
+            )
         if self._provider is None and self._gemini is None:
             identity = self.runtime_identity()
             fingerprint = reconstruction_output_fingerprint(
@@ -204,13 +264,27 @@ class ContextualReconstructor:
                 language=language,
                 transcription_fingerprint=transcription_fingerprint,
                 correction_version=correction_version,
+                target_indexes=target_indexes,
+            )
+            targets = (
+                list(target_indexes) if target_indexes is not None else list(range(len(segments)))
             )
             results = tuple(
-                self._fallback(index, segment) for index, segment in enumerate(segments)
+                self._providerless_segment(
+                    index,
+                    segments[index],
+                    language=language,
+                    reason=_PROVIDER_DISABLED_REASON,
+                    method=_PROVIDER_DISABLED_METHOD,
+                )
+                for index in targets
             )
             disabled_metadata: dict[str, object] = {
                 "runtime_identity": identity,
                 "cache_eligible": True,
+                "priority": effective_priority.value,
+                "provider_calls": 0,
+                "gemini_calls": 0,
             }
             return ReconstructionResult(results, _joined(results), fingerprint, disabled_metadata)
         started_at = self._monotonic()
@@ -235,6 +309,7 @@ class ContextualReconstructor:
                 language=language,
                 transcription_fingerprint=transcription_fingerprint,
                 correction_version=correction_version,
+                target_indexes=target_indexes,
             )
             result = ReconstructionResult((), "", fingerprint)
             memory = build_entity_memory(segments)
@@ -242,12 +317,15 @@ class ContextualReconstructor:
                 route_adaptive(segment, config=self._routing, language=language)
                 for segment in segments
             ]
-            requests = [
-                _reconstruction_request(segments, index, language, memory)
-                for index in range(len(segments))
-            ]
+            targets = (
+                list(target_indexes) if target_indexes is not None else list(range(len(segments)))
+            )
+            requests = {
+                index: _reconstruction_request(segments, index, language, memory)
+                for index in targets
+            }
             state = _JobState(defaultdict(int), self._gemini_budget, False, None, self._monotonic)
-            state.total_segments = len(segments)
+            state.total_segments = len(targets)
             by_index, cancelled = self._run_phases(
                 segments,
                 decisions,
@@ -259,6 +337,7 @@ class ContextualReconstructor:
                 gemini_health,
                 state,
                 resolved=resolved,
+                target_indexes=targets,
             )
             if not cancelled:
                 # Final cooperative cancellation poll immediately before a
@@ -268,7 +347,7 @@ class ContextualReconstructor:
             if cancelled:
                 self._checkpoint_results(by_index, state)
                 raise ReconstructionCancelled("reconstruction cancelled")
-            ordered = tuple(by_index[index] for index in range(len(segments)))
+            ordered = tuple(by_index[index] for index in targets)
             cache_eligible = self._cache_eligible(state, ordered)
             metadata: dict[str, object] = {
                 "runtime_identity": identity,
@@ -280,6 +359,7 @@ class ContextualReconstructor:
                 "cache_eligible": cache_eligible,
                 "local_budget": self._local_budget_metadata(state),
                 "progress": self._progress(by_index, state),
+                "priority": effective_priority.value,
             }
             if self._gemini is not None:
                 metadata["gemini_usage"] = self._gemini.usage_summary()
@@ -287,6 +367,115 @@ class ContextualReconstructor:
         finally:
             result = self._cleanup(result)
         return result
+
+    def _index_reconstruct(
+        self,
+        segments: Sequence[Mapping[str, object]],
+        *,
+        language: str | None,
+        transcription_fingerprint: str,
+        correction_version: str,
+        target_indexes: Sequence[int] | None,
+        resolved: Mapping[int, SegmentReconstruction] | None,
+    ) -> ReconstructionResult:
+        """INDEX: preserve evidence and defer all provider reconstruction.
+
+        This is the default whole-source path. It never loads or calls Qwen,
+        never constructs/uses Gemini, and never makes a provider network call.
+        Unresolved text is acceptable: segments that the adaptive router would
+        have sent to a provider are marked unresolved/deferred (never a provider
+        failure) so later targeted refinement can pick them up from saved
+        evidence. Clean NO_LLM and manual segments keep their existing truthful
+        states.
+        """
+
+        identity = self.runtime_identity()
+        fingerprint = reconstruction_output_fingerprint(
+            provider_identity=identity,
+            segments=segments,
+            language=language,
+            transcription_fingerprint=transcription_fingerprint,
+            correction_version=correction_version,
+            target_indexes=target_indexes,
+        )
+        targets = list(target_indexes) if target_indexes is not None else list(range(len(segments)))
+        resolved = resolved or {}
+        results: dict[int, SegmentReconstruction] = {}
+        for index in targets:
+            if index in resolved:
+                results[index] = resolved[index]
+            else:
+                results[index] = self._index_segment(index, segments[index], language=language)
+        ordered = tuple(results[index] for index in targets)
+        deferred = sum(1 for item in ordered if item.escalation_reason == _INDEX_DEFERRED_REASON)
+        metadata: dict[str, object] = {
+            "runtime_identity": identity,
+            "priority": RefinementPriority.INDEX.value,
+            "index_deferred": True,
+            "index_deferred_segments": deferred,
+            "reconstruction_method": _INDEX_METHOD,
+            "routing_counts": {"index_deferred": deferred},
+            "provider_calls": 0,
+            "gemini_calls": 0,
+            "wall_seconds": 0.0,
+            "cache_eligible": True,
+        }
+        return ReconstructionResult(ordered, _joined(ordered), fingerprint, metadata)
+
+    def _index_segment(
+        self,
+        index: int,
+        segment: Mapping[str, object],
+        *,
+        language: str | None,
+    ) -> SegmentReconstruction:
+        """One INDEX target: route cheaply and defer provider work truthfully."""
+
+        operator_text = segment.get("operator_text")
+        decision = route_adaptive(segment, config=self._routing, language=language)
+        if operator_text:
+            return self._manual(index, segment, decision)
+        if decision.route is ReconstructionRoute.NO_LLM:
+            return self._no_llm(index, segment, decision)
+        return self._fallback(
+            index,
+            segment,
+            status=ReconstructionStatus.LOW_CONFIDENCE_UNRESOLVED,
+            method=_INDEX_METHOD,
+            decision=decision,
+            route=decision.route.value,
+            escalation_reason=_INDEX_DEFERRED_REASON,
+            final_provider=_STAGE25_METHOD,
+        )
+
+    def _providerless_segment(
+        self,
+        index: int,
+        segment: Mapping[str, object],
+        *,
+        language: str | None,
+        reason: str,
+        method: str,
+    ) -> SegmentReconstruction:
+        """Truthful unresolved result when no provider is configured for an
+        active (non-INDEX) refinement tier."""
+
+        operator_text = segment.get("operator_text")
+        decision = route_adaptive(segment, config=self._routing, language=language)
+        if operator_text:
+            return self._manual(index, segment, decision)
+        if decision.route is ReconstructionRoute.NO_LLM:
+            return self._no_llm(index, segment, decision)
+        return self._fallback(
+            index,
+            segment,
+            status=ReconstructionStatus.LOW_CONFIDENCE_UNRESOLVED,
+            method=method,
+            decision=decision,
+            route=decision.route.value,
+            escalation_reason=reason,
+            final_provider=_STAGE25_METHOD,
+        )
 
     def _cleanup(self, result: ReconstructionResult) -> ReconstructionResult:
         try:
@@ -345,15 +534,26 @@ class ContextualReconstructor:
         language: str | None,
         transcription_fingerprint: str,
         correction_version: str,
+        target_indexes: Sequence[int] | None = None,
     ) -> FingerprintCheck:
         """Compute the stable output fingerprint with no generation call.
 
         Health probes are cheap metadata lookups used only to resolve identity
         digests; availability itself is excluded from the fingerprint. A matching
         stored fingerprint plus stored cache eligibility lets the executor skip
-        provider calls.
+        provider calls. INDEX runs never probe providers and always resolve.
         """
 
+        if self._priority is RefinementPriority.INDEX:
+            fingerprint = reconstruction_output_fingerprint(
+                provider_identity=self.runtime_identity(),
+                segments=segments,
+                language=language,
+                transcription_fingerprint=transcription_fingerprint,
+                correction_version=correction_version,
+                target_indexes=target_indexes,
+            )
+            return FingerprintCheck(fingerprint, True)
         local_health = self._local_health()
         gemini_health = (
             self._gemini_health()
@@ -372,6 +572,7 @@ class ContextualReconstructor:
             language=language,
             transcription_fingerprint=transcription_fingerprint,
             correction_version=correction_version,
+            target_indexes=target_indexes,
         )
         return FingerprintCheck(fingerprint, local_resolved and gemini_resolved)
 
@@ -392,7 +593,7 @@ class ContextualReconstructor:
         self,
         segments: Sequence[Mapping[str, object]],
         decisions: Sequence[AdaptiveRoutingDecision],
-        requests: Sequence[ReconstructionRequest],
+        requests: Mapping[int, ReconstructionRequest],
         memory: SourceEntityMemory,
         local_available: bool,
         gemini_available: bool,
@@ -400,20 +601,25 @@ class ContextualReconstructor:
         gemini_health: ProviderHealth | None,
         state: "_JobState",
         resolved: Mapping[int, SegmentReconstruction] | None = None,
+        target_indexes: Sequence[int] | None = None,
     ) -> tuple[dict[int, SegmentReconstruction], bool]:
         """Resolve every target in bounded phases and restore transcript order.
 
         ``resolved`` supplies already-accepted per-target outputs from a prior
         checkpoint whose dependency fingerprint is unchanged; those targets are
-        reused without any provider call. Returns the completed per-index
-        results plus whether cooperative cancellation was requested mid-run.
+        reused without any provider call. ``target_indexes`` restricts which
+        segments are mutation targets (context segments are never targets).
+        Returns the completed per-index results plus whether cooperative
+        cancellation was requested mid-run.
         """
 
         resolved = resolved or {}
+        targets = list(target_indexes) if target_indexes is not None else list(range(len(segments)))
         results: dict[int, SegmentReconstruction] = {}
         direct_ids: list[int] = []
         local_ids: list[int] = []
-        for index, decision in enumerate(decisions):
+        for index in targets:
+            decision = decisions[index]
             if index in resolved:
                 state.counts["reused"] += 1
                 results[index] = resolved[index]
@@ -468,7 +674,7 @@ class ContextualReconstructor:
                 gemini_health,
                 state,
             )
-        for index in range(len(segments)):
+        for index in targets:
             if index not in results:
                 results[index] = self._fallback(index, segments[index], decision=decisions[index])
         return results, state.cancelled
@@ -477,7 +683,7 @@ class ContextualReconstructor:
         self,
         segments: Sequence[Mapping[str, object]],
         decisions: Sequence[AdaptiveRoutingDecision],
-        requests: Sequence[ReconstructionRequest],
+        requests: Mapping[int, ReconstructionRequest],
         memory: SourceEntityMemory,
         results: dict[int, SegmentReconstruction],
         targets: list[int],
@@ -537,7 +743,7 @@ class ContextualReconstructor:
         self,
         segments: Sequence[Mapping[str, object]],
         decisions: Sequence[AdaptiveRoutingDecision],
-        requests: Sequence[ReconstructionRequest],
+        requests: Mapping[int, ReconstructionRequest],
         memory: SourceEntityMemory,
         results: dict[int, SegmentReconstruction],
         direct_ids: list[int],
@@ -572,7 +778,7 @@ class ContextualReconstructor:
         self,
         segments: Sequence[Mapping[str, object]],
         decisions: Sequence[AdaptiveRoutingDecision],
-        requests: Sequence[ReconstructionRequest],
+        requests: Mapping[int, ReconstructionRequest],
         memory: SourceEntityMemory,
         results: dict[int, SegmentReconstruction],
         direct_ids: list[int],
@@ -648,15 +854,17 @@ class ContextualReconstructor:
                 item[0],
             ),
         )
-        for index, local_seg, escalation_reason in ranked_escalations:
+        for position, (index, local_seg, escalation_reason) in enumerate(ranked_escalations):
             if self._poll_cancelled(results, state):
                 break
             decision = decisions[index]
             state.current_phase = "gemini_escalation"
+            backlog_active = self._local_backlog_active(state)
             if (
                 gemini_available
                 and state.gemini_budget_remaining > 0
                 and not state.gemini_exhausted
+                and backlog_active
             ):
                 results[index] = self._gemini_attempt(
                     index,
@@ -675,6 +883,20 @@ class ContextualReconstructor:
                 if self._poll_cancelled(results, state):
                     break
                 continue
+            if not backlog_active:
+                # Local wall ceiling expired: invalidate every remaining queued
+                # local-origin Gemini escalation. No Gemini call is made for the
+                # local backlog; safe Stage 2.5/current results are preserved and
+                # marked unresolved/manual review.
+                for drop_index, drop_seg, _ in ranked_escalations[position:]:
+                    results[drop_index] = self._drop_local_escalation(
+                        drop_index,
+                        segments[drop_index],
+                        decisions[drop_index],
+                        drop_seg,
+                        state,
+                    )
+                break
             state.counts["gemini_budget_skips"] += 1
             if not gemini_available:
                 self._record_gemini_unavailable(state)
@@ -704,7 +926,7 @@ class ContextualReconstructor:
         self,
         segments: Sequence[Mapping[str, object]],
         decisions: Sequence[AdaptiveRoutingDecision],
-        requests: Sequence[ReconstructionRequest],
+        requests: Mapping[int, ReconstructionRequest],
         memory: SourceEntityMemory,
         work: Sequence[tuple[int, str | None, bool]],
         local_available: bool,
@@ -802,7 +1024,16 @@ class ContextualReconstructor:
                     )
                     results[index] = failed
                     if escalate and allow_escalations:
-                        escalations.append((index, failed, "local_context_unfit"))
+                        if self._local_backlog_active(state):
+                            escalations.append((index, failed, "local_context_unfit"))
+                        else:
+                            results[index] = self._drop_local_escalation(
+                                index,
+                                segments[index],
+                                decisions[index],
+                                failed,
+                                state,
+                            )
                     else:
                         state.counts["unresolved"] += 1
                 self._checkpoint_results(results, state)
@@ -843,7 +1074,16 @@ class ContextualReconstructor:
                         )
                         results[index] = failed
                         if escalate and allow_escalations:
-                            escalations.append((index, failed, "local_provider_error"))
+                            if self._local_backlog_active(state):
+                                escalations.append((index, failed, "local_provider_error"))
+                            else:
+                                results[index] = self._drop_local_escalation(
+                                    index,
+                                    segments[index],
+                                    decisions[index],
+                                    failed,
+                                    state,
+                                )
                         else:
                             state.counts["unresolved"] += 1
                     self._checkpoint_results(results, state)
@@ -885,9 +1125,22 @@ class ContextualReconstructor:
                         segment_result = replace(segment_result, final_provider=_STAGE25_METHOD)
                         results[index] = segment_result
                         if escalate and allow_escalations:
-                            escalations.append(
-                                (index, segment_result, _local_escalation_reason(segment_result))
-                            )
+                            if self._local_backlog_active(state):
+                                escalations.append(
+                                    (
+                                        index,
+                                        segment_result,
+                                        _local_escalation_reason(segment_result),
+                                    )
+                                )
+                            else:
+                                results[index] = self._drop_local_escalation(
+                                    index,
+                                    segments[index],
+                                    decisions[index],
+                                    segment_result,
+                                    state,
+                                )
                         else:
                             state.counts["unresolved"] += 1
                 self._checkpoint_results(results, state)
@@ -925,7 +1178,7 @@ class ContextualReconstructor:
         return selected, skipped
 
     def _plan_batches(
-        self, indices: Sequence[int], requests: Sequence[ReconstructionRequest]
+        self, indices: Sequence[int], requests: Mapping[int, ReconstructionRequest]
     ) -> list[list[int]]:
         """Deterministic greedy micro-batches respecting window and character limits.
 
@@ -995,6 +1248,54 @@ class ContextualReconstructor:
         if self._local_wall_seconds is None or state.local_wall_started is None:
             return True
         return (self._monotonic() - state.local_wall_started) < self._local_wall_seconds
+
+    def _local_backlog_active(self, state: "_JobState") -> bool:
+        """Whether local-origin Gemini escalations may still be enqueued/run.
+
+        Once the local wall-time ceiling has expired, no new local-origin Gemini
+        escalation may be enqueued and queued ones are invalidated. This is the
+        correctness boundary that prevents a local failure backlog from spending
+        Gemini quota after the local ceiling.
+        """
+
+        if not self._local_budget_available(state):
+            state.local_time_budget_exhausted = True
+            return False
+        return not state.local_time_budget_exhausted
+
+    def _drop_local_escalation(
+        self,
+        index: int,
+        segment: Mapping[str, object],
+        decision: AdaptiveRoutingDecision,
+        local_seg: SegmentReconstruction | None,
+        state: "_JobState",
+    ) -> SegmentReconstruction:
+        """Convert a local-origin Gemini escalation into a truthful unresolved
+        result after the local wall ceiling expired.
+
+        The safe Stage 2.5/current result is preserved and the target is marked
+        unresolved/manual review; no Gemini call is made for the backlog.
+        """
+
+        state.counts["unresolved"] += 1
+        state.counts["local_escalations_dropped"] += 1
+        if local_seg is not None:
+            return replace(
+                local_seg,
+                escalation_reason=_merge_escalation(
+                    local_seg.escalation_reason, "local_time_budget_exhausted"
+                ),
+            )
+        return self._fallback(
+            index,
+            segment,
+            status=ReconstructionStatus.LOW_CONFIDENCE_UNRESOLVED,
+            decision=decision,
+            route=decision.route.value,
+            escalation_reason="local_time_budget_exhausted",
+            final_provider=_STAGE25_METHOD,
+        )
 
     def _consume_local_target(self, state: "_JobState") -> bool:
         """Reserve one local target attempt within the configured ceilings."""

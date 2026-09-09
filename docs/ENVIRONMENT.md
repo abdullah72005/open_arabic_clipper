@@ -63,17 +63,52 @@ Local Qwen work is selected, ranked, batched, and hard-bounded so a multi-hour
 source can never produce unbounded inference:
 
 ```bash
+CLIPFACTORY_LOCAL_QWEN_ENABLED=false
 CLIPFACTORY_LOCAL_RECONSTRUCTION_MAX_TARGETS_PER_JOB=64
 CLIPFACTORY_LOCAL_RECONSTRUCTION_MAX_WALL_SECONDS=1200
 CLIPFACTORY_RECONSTRUCTION_PROVIDER_BATCH_WINDOWS=8
 CLIPFACTORY_RECONSTRUCTION_PROVIDER_BATCH_CHARACTERS=24000
 ```
 
+**Automatic local Qwen use is disabled by default** (`LOCAL_QWEN_ENABLED=false`).
+Normal whole-source ingestion runs at `INDEX` priority and never loads or calls
+Qwen. An operator explicitly re-enables local Qwen for targeted
+CANDIDATE/FINAL_CLIP refinement:
+
+```bash
+CLIPFACTORY_LOCAL_QWEN_ENABLED=true
+```
+
+When local Qwen is disabled/unavailable and `local_only` is intentionally
+selected, work defers safely (unresolved/provider-unavailable semantics) and
+never silently falls through to Gemini. The Ollama integration, local-provider
+configuration, and `local_only` routing capability are unchanged.
+
 Clean, well-covered unchanged Stage 2.5 segments route to `NO_LLM` and use
 neither LLM; local candidates are attempted strongest-first in micro-batches;
 when a ceiling is reached the remaining targets are marked unresolved/manual
 review and never auto-escalate to Gemini. Accepted per-target work survives
 cancellation and restart through checkpointed per-target fingerprints.
+
+## Transcript refinement priorities
+
+Whole-source transcripts are **indexing quality**, a shortlisted window is
+**semantic quality**, and a selected final clip is **publication/caption
+quality**:
+
+| Priority | Meaning | Provider use |
+| --- | --- | --- |
+| `INDEX` | Whole-source default | None (cheap; defers uncertainty truthfully) |
+| `CANDIDATE` | Shortlisted window | Qwen when enabled, Gemini for difficult spans (bounded) |
+| `FINAL_CLIP` | Selected clip | Quality-oriented targeted Gemini/Qwen for genuine ambiguity |
+
+Expensive provider reconstruction is deferred until a short region is close to
+publication. The reusable targeted-window entry point is bounded by:
+
+```bash
+CLIPFACTORY_RECONSTRUCTION_REFINEMENT_MAX_TARGETS=32
+CLIPFACTORY_RECONSTRUCTION_REFINEMENT_MAX_WINDOW_SECONDS=300
+```
 
 ## Ollama hardware safeguards (Compose)
 

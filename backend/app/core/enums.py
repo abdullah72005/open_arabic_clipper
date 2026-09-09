@@ -75,3 +75,17 @@ class ReconstructionStatus(str, Enum):
     PROVIDER_UNAVAILABLE = "PROVIDER_UNAVAILABLE"
     FAILED = "FAILED"
     MANUAL_OVERRIDE = "MANUAL_OVERRIDE"
+
+
+class RefinementPriority(str, Enum):
+    """Transcript refinement quality tier.
+
+    The quality ladder is: whole-source transcripts are INDEX (indexing quality),
+    a shortlisted window is CANDIDATE (semantic quality), and a selected final
+    clip is FINAL_CLIP (publication/caption quality). Expensive provider
+    reconstruction is deferred until a short region is close to publication.
+    """
+
+    INDEX = "INDEX"
+    CANDIDATE = "CANDIDATE"
+    FINAL_CLIP = "FINAL_CLIP"

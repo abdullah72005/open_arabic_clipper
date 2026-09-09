@@ -4,18 +4,52 @@ Stage 2.7 performs bounded contextual reconstruction after Stage 2.5. It is
 local-first and never overwrites raw ASR text, segment timing, word timing, or
 Stage 2.5 evidence.
 
+## Refinement priorities: whole-source is INDEX
+
+Transcript refinement uses an explicit quality ladder. Whole-source ingestion
+always runs at **INDEX** (indexing quality): it preserves raw ASR, Stage 2.5,
+timestamps, words, confidences, and correction/reconstruction evidence, and
+defers every provider reconstruction truthfully (segments are marked
+unresolved/manual-review with `escalation_reason=index_priority_deferred`,
+never as a provider failure). Normal ingestion therefore pays for ASR + Stage
+2.5 + cheap uncertainty bookkeeping only — no Qwen load, no Gemini calls, no
+broad reconstruction. Unresolved INDEX text is not a pipeline failure and the
+transcript still reaches analysis-ready when otherwise valid.
+
+A shortlisted window is **CANDIDATE** (semantic quality) and a selected final
+clip is **FINAL_CLIP** (publication/caption quality). Expensive work is deferred
+until a short region is actually close to publication, at which point a caller
+uses the reusable `refine_transcript_window(source_id, start_time, end_time,
+priority)` service entry point (see below). Stage 2.7.1 (dialect/code-switch
+recovery) is not implemented; the pipeline preserves mixed-language evidence and
+exposes a lightweight evidence-based `code_switch_suspected` signal only.
+
 ## Provider operation
 
 The default configuration is the optional local Ollama provider at
-`http://ollama:11434` using `qwen3.5:4b`. Starting the Compose profile does not
-pull any model. An operator must explicitly obtain the configured model before
-reconstruction is available.
+`http://ollama:11434` using `qwen3.5:4b`. **Automatic local Qwen use is disabled
+by default** (`CLIPFACTORY_LOCAL_QWEN_ENABLED=false`), so no local provider is
+constructed and INDEX ingestion never loads or calls Qwen. An operator
+explicitly re-enables local Qwen for targeted CANDIDATE/FINAL_CLIP refinement:
+
+```bash
+CLIPFACTORY_LOCAL_QWEN_ENABLED=true
+```
+
+Starting the Compose profile does not pull any model. An operator must
+explicitly obtain the configured model before targeted refinement is available.
 
 ```bash
 docker compose --profile reconstruction up -d ollama
 docker compose exec ollama ollama pull qwen3.5:4b
 docker compose exec backend python -m app.cli reconstruction-health
 ```
+
+With Qwen disabled (the default), `reconstruction-health` reports
+`MISCONFIGURED` with a message explaining the re-enable flag; this is the
+expected default and is not an outage. When local-only is intentionally selected
+but Qwen is disabled/unavailable, targeted work defers safely (unresolved/
+provider-unavailable semantics) and never silently uses Gemini.
 
 ## Hosted Gemini provider and routing modes
 
@@ -352,6 +386,70 @@ after the ceiling. `cache_eligible` is false
 so a later run reconsiders eligible unresolved work (accepted per-target results
 are reused, not repeated). A clean transcript may legitimately make zero Qwen
 and zero Gemini calls.
+
+## Local wall-time ceiling is authoritative over the Gemini backlog
+
+The local wall-time ceiling also invalidates local-origin Gemini escalations
+that were queued before it expired. The problematic sequence — Qwen fails before
+the ceiling, the target is queued for Gemini escalation, the ceiling then
+expires, and the queued escalation still calls Gemini — is closed at two points:
+
+- **No enqueue after expiry.** A local failure/unresolved target is only added
+  to the escalation backlog while the local wall-time ceiling is still active.
+- **Drop queued backlog.** Immediately before each queued local-origin
+  escalation executes, the ceiling is rechecked; once it has expired, every
+  remaining queued escalation is invalidated (counted as
+  `local_escalations_dropped`), no Gemini call is made for the backlog, the safe
+  Stage 2.5/current result is preserved, and the target is marked
+  unresolved/manual review with `local_time_budget_exhausted`.
+
+Already accepted/checkpointed per-target work is never discarded, and
+cancellation semantics and resource cleanup are unchanged. Direct-Gemini work
+(not local-origin) is not gated by the local ceiling.
+
+## Targeted window refinement entry point
+
+Future Stage 3/3.5 callers request higher-quality reconstruction for an
+already-selected short window through the reusable service entry point:
+
+```python
+refine_transcript_window(
+    session, source_id, start_time, end_time, priority,
+    reconstructor,
+    max_targets=..., max_window_seconds=..., checkpoint=..., is_cancelled=...,
+)
+```
+
+`priority` accepts `CANDIDATE` and `FINAL_CLIP` (and `INDEX`, which defers).
+Behavior:
+
+- Only the bounded requested source-time region is processed. Target segments
+  are selected from immutable source timestamps (`start`/`end`), never from
+  derived text.
+- A small bounded nearby context window is included in provider prompts without
+  making context segments mutation targets.
+- Bounds are enforced: `0 <= start_time < end_time`, the window must not exceed
+  the transcript duration, `CLIPFACTORY_RECONSTRUCTION_REFINEMENT_MAX_WINDOW_SECONDS`
+  (default 300) caps the interval, and
+  `CLIPFACTORY_RECONSTRUCTION_REFINEMENT_MAX_TARGETS` (default 32) caps the
+  target count.
+- It reuses the existing Stage 2.5 and Stage 2.7 provider, routing, validation,
+  and checkpoint mechanisms; cancellation and per-target checkpoints are wired
+  through when supplied.
+- Raw ASR text and all timestamps are preserved exactly; manual override remains
+  authoritative for `final_text`.
+- It returns a structured `RefinementOutcome` (refined text where accepted,
+  confidence, status, provider/routing evidence, unresolved state, and
+  target/window identity) and persists results only to the selected target
+  segments.
+- Priority and window scope participate in output fingerprints, so a whole-source
+  INDEX result can never satisfy a CANDIDATE/FINAL_CLIP request and one window
+  can never satisfy another.
+
+Per-segment handoff signals future stages can consume: `refinement_priority`,
+`needs_refinement` (derived from status/escalation evidence), and
+`code_switch_suspected` (derived from Latin/digit word evidence; no recovery
+logic).
 
 ## Ollama hardware safeguards (Compose)
 

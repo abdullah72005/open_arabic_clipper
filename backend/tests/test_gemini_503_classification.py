@@ -13,6 +13,7 @@ import traceback
 
 import pytest
 
+from app.core.enums import RefinementPriority
 from app.transcription.reconstruction.confidence import CONFIDENCE_POLICY_VERSION
 from app.transcription.reconstruction.gemini import (
     GeminiErrorCategory,
@@ -171,6 +172,7 @@ def test_http_503_exhausted_falls_back_safely_with_sanitized_evidence() -> None:
         gemini_provider=gemini,
         routing=AdaptiveRoutingConfig(mode=RoutingMode.ADAPTIVE),
         gemini_budget=10,
+        priority=RefinementPriority.CANDIDATE,
     )
     result = reconstructor.reconstruct(
         [segment],

@@ -21,32 +21,38 @@ def reconstruction_output_fingerprint(
     language: str | None,
     transcription_fingerprint: str,
     correction_version: str,
+    target_indexes: Sequence[int] | None = None,
 ) -> str:
     """Fingerprint Stage 2.7 output from stable dependency identity only.
 
     ``provider_identity`` carries the full stable runtime identity: local
     provider, routing mode and policy thresholds (including evidence-coverage and
-    clean-average trust rules), Gemini provider/model/schema/api version and
-    temperature, budgets, batching and local-work ceilings, and
+    clean-average trust rules), refinement priority, Gemini provider/model/schema/
+    API version and temperature, budgets, batching and local-work ceilings, and
     confidence/validation versions. Transient provider availability is execution
     state, not identity, and is deliberately excluded so a temporary outage
     cannot invalidate accepted output. Cache eligibility is tracked separately by
     the executor. Never include credentials.
 
-    Version 4 adds every route-relevant input the adaptive router now consumes:
-    Stage 2.5 method/confidence/applied state and its stable change digest, word
-    probabilities, and acoustic evidence. Any change to those inputs invalidates
-    the fingerprint.
+    Version 5 adds the refinement priority/scope identity: ``target_indexes``
+    plus a whole-source versus window marker, so a whole-source INDEX result can
+    never satisfy a window-scoped CANDIDATE/FINAL_CLIP refinement and one
+    requested window can never satisfy another. Version 4 added every
+    route-relevant input the adaptive router now consumes (Stage 2.5
+    method/confidence/applied state and change digest, word probabilities,
+    acoustic evidence).
     """
 
     return canonical_fingerprint(
         "reconstruction-output",
-        "4",
+        "5",
         {
             "language": language,
             "transcription_fingerprint": transcription_fingerprint,
             "correction_version": correction_version,
             "runtime_identity": dict(provider_identity),
+            "scope": "window" if target_indexes is not None else "whole_source",
+            "target_indexes": tuple(target_indexes) if target_indexes is not None else None,
             "segments": [_segment_dependency(segments, index) for index in range(len(segments))],
         },
     )

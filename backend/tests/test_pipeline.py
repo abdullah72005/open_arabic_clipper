@@ -6,7 +6,14 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.core.enums import JobKind, JobStatus, PipelineRunStatus, PipelineStage, RightsStatus
+from app.core.enums import (
+    JobKind,
+    JobStatus,
+    PipelineRunStatus,
+    PipelineStage,
+    RefinementPriority,
+    RightsStatus,
+)
 from app.db.base import Base
 from app.models import PipelineRun, ProcessingJob, SourceVideo, Transcript
 from app.pipeline.authorization import AutopilotAuthorizationError, require_autopilot_authorization
@@ -481,7 +488,9 @@ def test_reconstruction_stage_holds_heavy_lease_around_ollama(
         lease_factory = NoopHeavyModelLeaseFactory()
         executor = ContextualReconstructionExecutor(
             session=session,
-            reconstructor=ContextualReconstructor(LocalProvider()),
+            reconstructor=ContextualReconstructor(
+                LocalProvider(), priority=RefinementPriority.CANDIDATE
+            ),
             lease_factory=lease_factory,
         )
 
@@ -610,6 +619,7 @@ def test_no_llm_and_gemini_only_jobs_run_without_ollama_lease(
             reconstructor=ContextualReconstructor(
                 LocalProvider(),
                 routing=AdaptiveRoutingConfig(mode=RoutingMode.ADAPTIVE),
+                priority=RefinementPriority.CANDIDATE,
             ),
             lease_factory=NoLeaseFactory(),  # type: ignore[arg-type]
         )
@@ -623,6 +633,7 @@ def test_no_llm_and_gemini_only_jobs_run_without_ollama_lease(
                 LocalProvider(),
                 gemini_provider=GeminiOnlyProvider(),  # type: ignore[arg-type]
                 routing=AdaptiveRoutingConfig(mode=RoutingMode.GEMINI_ONLY),
+                priority=RefinementPriority.CANDIDATE,
             ),
             lease_factory=NoLeaseFactory(),  # type: ignore[arg-type]
         )
@@ -716,6 +727,7 @@ def test_real_local_inference_still_requires_the_lease(sqlite_engine: object) ->
             reconstructor=ContextualReconstructor(
                 LocalProvider(),
                 routing=AdaptiveRoutingConfig(mode=RoutingMode.ADAPTIVE),
+                priority=RefinementPriority.CANDIDATE,
             ),
             lease_factory=BusyLeaseFactory(),  # type: ignore[arg-type]
         )
@@ -805,7 +817,9 @@ def test_heavy_lease_contention_raises_retryable_busy(sqlite_engine: object) -> 
         session.commit()
         executor = ContextualReconstructionExecutor(
             session=session,
-            reconstructor=ContextualReconstructor(LocalProvider()),
+            reconstructor=ContextualReconstructor(
+                LocalProvider(), priority=RefinementPriority.CANDIDATE
+            ),
             lease_factory=BusyLeaseFactory(),  # type: ignore[arg-type]
         )
 
@@ -926,7 +940,9 @@ def test_reconstruction_retains_lease_when_unload_times_out(sqlite_engine: objec
         factory = RecordingLeaseFactory()
         executor = ContextualReconstructionExecutor(
             session=session,
-            reconstructor=ContextualReconstructor(WarningProvider()),
+            reconstructor=ContextualReconstructor(
+                WarningProvider(), priority=RefinementPriority.CANDIDATE
+            ),
             lease_factory=factory,  # type: ignore[arg-type]
         )
 

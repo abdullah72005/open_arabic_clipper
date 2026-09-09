@@ -60,6 +60,12 @@ class Settings(BaseSettings):
     correction_provider_api_key: str | None = Field(default=None, max_length=4_096)
     correction_provider_timeout_seconds: float = Field(default=30.0, gt=0, le=300)
     reconstruction_provider: Literal["disabled", "openai_compatible", "ollama"] = "ollama"
+    # Automatic local Qwen reconstruction is disabled by default
+    # (LOCAL_QWEN_ENABLED=false). Whole-source ingestion uses INDEX priority and
+    # never loads or calls Qwen; an operator explicitly re-enables local Qwen
+    # with CLIPFACTORY_LOCAL_QWEN_ENABLED=true for targeted CANDIDATE/FINAL_CLIP
+    # refinement.
+    local_qwen_enabled: bool = False
     reconstruction_provider_base_url: str | None = Field(
         default="http://ollama:11434", max_length=2_048
     )
@@ -74,6 +80,11 @@ class Settings(BaseSettings):
     reconstruction_provider_batch_characters: int = Field(default=24_000, gt=0, le=48_000)
     local_reconstruction_max_targets_per_job: int = Field(default=64, ge=0, le=100_000)
     local_reconstruction_max_wall_seconds: float = Field(default=1_200.0, gt=0, le=86_400)
+    # Bounds for the reusable targeted-window refinement entry point. These only
+    # limit an explicitly requested window; they never re-introduce whole-source
+    # provider work.
+    reconstruction_refinement_max_targets: int = Field(default=32, ge=1, le=1_000)
+    reconstruction_refinement_max_window_seconds: float = Field(default=300.0, gt=0, le=3_600)
     reconstruction_routing_mode: Literal["local_only", "adaptive", "gemini_only"] = "adaptive"
     gemini_api_key: SecretStr | None = Field(
         default=None,
@@ -160,9 +171,17 @@ class Settings(BaseSettings):
     def reconstruction_provider_instance(
         self, model: str | None = None
     ) -> ReconstructionProvider | None:
-        """Return a local Stage 2.7 provider only when explicitly configured."""
+        """Return a local Stage 2.7 provider only when explicitly configured.
+
+        Automatic local Qwen use is disabled by default: no local provider is
+        built unless the operator sets ``local_qwen_enabled`` (or explicitly
+        disables/selects a provider through ``reconstruction_provider``). This is
+        what keeps normal INDEX ingestion from loading or invoking Qwen.
+        """
 
         if self.reconstruction_provider == "disabled":
+            return None
+        if not self.local_qwen_enabled:
             return None
         resolved_model = model or self.reconstruction_provider_model
         if not self.reconstruction_provider_base_url or not resolved_model:

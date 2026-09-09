@@ -2,7 +2,7 @@ from uuid import uuid4
 
 from sqlalchemy.orm import Session
 
-from app.core.enums import PipelineRunStatus, PipelineStage, RightsStatus
+from app.core.enums import PipelineRunStatus, PipelineStage, RefinementPriority, RightsStatus
 from app.db.base import Base
 from app.models import PipelineRun, SourceVideo, Transcript
 from app.pipeline.executor import StageExecutionResult
@@ -98,16 +98,21 @@ def test_reconstruction_input_fingerprint_tracks_runtime_identity(
 
         baseline = ContextualReconstructionExecutor(
             session=session,
-            reconstructor=ContextualReconstructor(IdentityProvider(_identity("qwen3.5:4b"))),
+            reconstructor=ContextualReconstructor(
+                IdentityProvider(_identity("qwen3.5:4b")), priority=RefinementPriority.CANDIDATE
+            ),
         )
         changed_model = ContextualReconstructionExecutor(
             session=session,
-            reconstructor=ContextualReconstructor(IdentityProvider(_identity("qwen3:8b"))),
+            reconstructor=ContextualReconstructor(
+                IdentityProvider(_identity("qwen3:8b")), priority=RefinementPriority.CANDIDATE
+            ),
         )
         changed_digest = ContextualReconstructionExecutor(
             session=session,
             reconstructor=ContextualReconstructor(
-                IdentityProvider({**_identity("qwen3.5:4b"), "digest": "sha256:other"})
+                IdentityProvider({**_identity("qwen3.5:4b"), "digest": "sha256:other"}),
+                priority=RefinementPriority.CANDIDATE,
             ),
         )
 

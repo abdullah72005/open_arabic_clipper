@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 from sqlalchemy.orm import Session
 
+from app.core.enums import RefinementPriority
 from app.runtime.model_process import DirectRunner
 from app.transcription.service import TranscriptionOptions
 from app.workers.celery_app import celery_app
@@ -473,7 +474,10 @@ def test_reconstruction_persists_derived_text_without_replacing_prior_evidence(
         session.commit()
 
         transcript = ContextualReconstructionExecutor(
-            session=session, reconstructor=ContextualReconstructor(provider=None)
+            session=session,
+            reconstructor=ContextualReconstructor(
+                provider=None, priority=RefinementPriority.CANDIDATE
+            ),
         ).execute(source)
 
         assert transcript.raw_text == "خطي بالك يا صحبي"

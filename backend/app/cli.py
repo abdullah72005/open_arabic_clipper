@@ -94,7 +94,8 @@ def reconstruction_health() -> None:
             settings.reconstruction_provider,
             settings.reconstruction_provider_model,
             None,
-            "reconstruction provider is disabled",
+            "local Qwen reconstruction is disabled by default; set "
+            "CLIPFACTORY_LOCAL_QWEN_ENABLED=true to enable local providers",
         )
     )
     typer.echo(

@@ -13,6 +13,52 @@ provider response falls back to Stage 2.5, records a truthful unavailable
 status, and the source still reaches analysis. Automatic clip selection,
 rendering, publishing, and authorization remain out of scope.
 
+## Stage 2.7 finalization: INDEX ingestion and targeted refinement (2026-09-10)
+
+Whole-source transcription is indexing, not publication. Normal whole-source
+ingestion now runs at **INDEX** priority and defers every provider
+reconstruction truthfully instead of spending Qwen/Gemini time across arbitrary
+source segments:
+
+- **Refinement priorities.** `INDEX` (whole-source default, indexing quality),
+  `CANDIDATE` (shortlisted window, semantic quality), and `FINAL_CLIP` (selected
+  clip, publication/caption quality). Priority participates in reconstruction
+  fingerprints, so an INDEX result can never satisfy a CANDIDATE/FINAL_CLIP
+  request and one window can never satisfy another.
+- **INDEX is cheap and evidence-preserving.** Normal ingestion pays for ASR +
+  Stage 2.5 + cheap uncertainty bookkeeping. It makes zero Qwen calls (Qwen is
+  not loaded) and zero Gemini calls, preserves raw ASR/Stage 2.5/timestamps/word
+  and acoustic evidence, marks deferred spans unresolved (never a provider
+  failure), and still reaches the analysis-ready success state.
+- **Local Qwen disabled by default.** `CLIPFACTORY_LOCAL_QWEN_ENABLED=false` is
+  the default; the operator re-enables local Qwen explicitly for targeted work.
+  Ollama integration, local-provider config, provider tests, and `local_only`
+  routing remain intact. Intentional `local_only` still uses Qwen (never Gemini)
+  when configured.
+- **Gemini is reserved for targeted candidate/final work.** No blanket
+  whole-source cleanup; the bounded routing/budget gates and per-job target cap
+  are unchanged.
+- **Reusable targeted refinement.** `refine_transcript_window(source_id,
+  start_time, end_time, priority)` refines only the bounded requested region,
+  reuses the Stage 2.5/2.7 provider/routing/validation/checkpoint mechanisms,
+  preserves raw ASR/timestamps and manual overrides, and returns a structured
+  outcome (refined text, confidence, status, provider/routing evidence,
+  unresolved state, target/window identity). Bounds: max window 300 s, max 32
+  targets (both configurable).
+- **Local-wall ceiling is authoritative over the Gemini backlog.** Once the
+  ceiling expires, no new local-origin escalation is enqueued and queued
+  escalations are invalidated (`local_escalations_dropped`); no Gemini call is
+  made for the backlog, safe Stage 2.5/current text is preserved, and targets are
+  marked unresolved/manual review.
+- **Uncertainty handoff.** Persisted `refinement_priority`, derived
+  `needs_refinement` and `code_switch_suspected` (evidence-based; no Stage 2.7.1
+  recovery), plus the existing status/confidence/focus-span/provider/routing
+  evidence, give future stages what they need to decide targeted refinement.
+
+Stage 2.7.1 (dialect/code-switch recovery) is not implemented by this change.
+The known regression benchmark findings below remain historical evidence and are
+not readiness proof.
+
 Stage 2.7 has not yet passed its required private, authorized unseen-audio
 benchmark. No quality, latency, RAM, VRAM, or Stage 3 readiness claim is made
 until that evaluation manifest and human review are available. The known

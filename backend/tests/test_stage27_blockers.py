@@ -19,7 +19,14 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.core.enums import JobKind, JobStatus, PipelineRunStatus, PipelineStage, RightsStatus
+from app.core.enums import (
+    JobKind,
+    JobStatus,
+    PipelineRunStatus,
+    PipelineStage,
+    RefinementPriority,
+    RightsStatus,
+)
 from app.db.base import Base
 from app.models import PipelineRun, ProcessingJob, SourceVideo, Transcript
 from app.pipeline.executor import ReconstructionCancelled
@@ -261,6 +268,7 @@ def _reconstructor(
         gemini_provider=gemini,
         routing=AdaptiveRoutingConfig(mode=mode),
         gemini_budget=budget,
+        priority=RefinementPriority.CANDIDATE,
         **kwargs,
     )
 

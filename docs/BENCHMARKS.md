@@ -162,6 +162,20 @@ Cuba clip (`e0f06a86…`, phrases `فيور 25 نوفمبر`, `آخره يشيل
 No unseen-corpus human references were available, so no quality or readiness
 claim is made. The private known corpus is regression evidence only.
 
+## Why blanket whole-source reconstruction was retired (2026-09-10)
+
+The Stage 2.7 finalization retired automatic whole-source provider
+reconstruction. Whole-source transcription is indexing quality; expensive Qwen/
+Gemini reconstruction is deferred until a short region is selected for
+candidate/final-clip work. This is a product decision, not a model-quality
+finding: the earlier 36–40-minute whole-source Qwen pass over a three-minute
+source demonstrated that per-segment whole-source reconstruction cannot scale,
+and per-target quality on the frozen known-regression corpus was already
+marginal for `qwen3.5:4b`. Normal ingestion now runs at INDEX priority, makes
+zero Qwen/Gemini calls, and preserves deferred/unresolved evidence for targeted
+`refine_transcript_window` refinement. These historical rows remain regression
+evidence only; they are not unseen-readiness proof.
+
 ## Small practical acceptance review (2026-09-08)
 
 After the infrastructure fixes (persistent unsafe state, lease-loss handling,
