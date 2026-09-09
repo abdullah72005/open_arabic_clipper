@@ -249,12 +249,28 @@ class OpenAICompatibleReconstructionProvider:
     def reconstruct_segments(
         self, requests: list[ReconstructionRequest]
     ) -> dict[int, ReconstructionCandidate]:
+        """Execute exactly one real provider request for the given targets.
+
+        This method never silently splits its input into several HTTP calls. The
+        orchestration layer plans context-safe actual request groups with
+        ``plan_aggregate_batches`` and invokes this method once per group, so
+        cancellation, local wall-time checks, and checkpoints can run between
+        every real request. As a defensive boundary, an over-budget combined set
+        that was not pre-planned raises before any HTTP dispatch instead of
+        looping.
+        """
+
         profile = next(
             (request.dialect_profile for request in requests if request.dialect_profile), None
         )
         system_instruction = self._system_instruction(profile)
-        batches = self._context_safe_batches(requests, system_instruction)
-        sent_requests = [request for batch in batches for request in batch]
+        planned = self.plan_aggregate_batches(requests)
+        if self._max_context_tokens is not None and len(planned) != 1:
+            raise ProviderResponseError(
+                "provider request exceeds context budget; orchestration must plan "
+                "context-safe batches"
+            )
+        batch = planned[0] if planned else []
         self._last_request_sizes = tuple(
             RequestSizeDiagnostics(
                 segment_index=request.segment_index,
@@ -267,23 +283,20 @@ class OpenAICompatibleReconstructionProvider:
                     system_instruction, self._output_tokens
                 )(request),
             )
-            for request in sent_requests
+            for request in batch
         )
-        candidates: dict[int, ReconstructionCandidate] = {}
-        for batch in batches:
-            output_tokens = _batch_output_tokens(self._output_tokens, len(batch))
-            content = self._call(
-                system_instruction,
-                {"targets": [item.to_payload() for item in batch]},
-                output_tokens=output_tokens,
-            )
-            candidates.update(_parse_reconstructions(content, batch))
-        return candidates
+        output_tokens = _batch_output_tokens(self._output_tokens, len(batch))
+        content = self._call(
+            system_instruction,
+            {"targets": [item.to_payload() for item in batch]},
+            output_tokens=output_tokens,
+        )
+        return _parse_reconstructions(content, batch)
 
-    def _context_safe_batches(
-        self, requests: list[ReconstructionRequest], system_instruction: str
+    def plan_aggregate_batches(
+        self, requests: list[ReconstructionRequest]
     ) -> list[list[ReconstructionRequest]]:
-        """Return request groups whose real aggregate chat envelope fits the budget.
+        """Plan context-safe actual request groups without executing any HTTP call.
 
         The service-layer planner bounds the number of windows and characters;
         this is the correctness bound at the real request boundary. Every request
@@ -291,13 +304,18 @@ class OpenAICompatibleReconstructionProvider:
         greedily grouped (in stable order) while the exact combined envelope that
         will be sent — system instruction, full ``{"targets": [...]}`` payload,
         chat-framing reserve, safety reserve, and the scaled output budget for the
-        group — stays within ``max_context_tokens``. No group is ever sent that
-        exceeds the configured context limit, and a single target that still
+        group — stays within ``max_context_tokens``. Each returned group is one
+        actual provider request that orchestration schedules, polls cancellation
+        and wall-time around, and checkpoints after. A single target that still
         cannot fit raises before any HTTP dispatch (no recursive split/retry).
         """
 
+        profile = next(
+            (request.dialect_profile for request in requests if request.dialect_profile), None
+        )
+        system_instruction = self._system_instruction(profile)
         if self._max_context_tokens is None:
-            return [requests]
+            return [list(requests)]
         single_envelope = self._envelope_estimate(system_instruction, self._output_tokens)
         requests = [
             _shrink_request_to_budget(

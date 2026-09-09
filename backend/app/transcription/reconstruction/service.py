@@ -760,19 +760,21 @@ class ContextualReconstructor:
                 "local_target_budget_exhausted",
             )
         attempted: set[int] = set()
-        for batch in self._plan_batches(selected, requests):
+        for unit_requests in self._actual_local_units(selected, requests):
+            unit_indices = [request.segment_index for request in unit_requests]
             if self._poll_cancelled(results, state):
                 break
             if not self._local_budget_available(state):
                 state.local_time_budget_exhausted = True
                 break
             self._checkpoint_results(results, state)
-            batch_requests = [requests[index] for index in batch]
             try:
-                candidates = self._provider.reconstruct_segments(batch_requests)  # type: ignore[union-attr]
+                candidates = self._provider.reconstruct_segments(unit_requests)  # type: ignore[union-attr]
             except (OSError, ProviderResponseError):
-                state.counts["local_failures"] += len(batch)
-                for index in batch:
+                # Only this actual request's targets fail; earlier actual requests
+                # stay checkpointed and reusable.
+                state.counts["local_failures"] += len(unit_indices)
+                for index in unit_indices:
                     state.counts["local_attempts"] += 1
                     state.local_targets_used += 1
                     attempted.add(index)
@@ -798,7 +800,7 @@ class ContextualReconstructor:
                 if self._poll_cancelled(results, state):
                     break
                 continue
-            for index in batch:
+            for index in unit_indices:
                 state.counts["local_attempts"] += 1
                 state.local_targets_used += 1
                 attempted.add(index)
@@ -899,6 +901,30 @@ class ContextualReconstructor:
         if current:
             batches.append(current)
         return batches
+
+    def _actual_local_units(
+        self, selected: Sequence[int], requests: Sequence[ReconstructionRequest]
+    ) -> list[list[ReconstructionRequest]]:
+        """Flatten window/character micro-batches into actual provider request units.
+
+        Each returned unit is exactly one real local HTTP/provider request that
+        orchestration schedules, polls cancellation and the local wall-time
+        budget around, and checkpoints after. Window and character limits remain
+        secondary bounds; the provider's pure ``plan_aggregate_batches`` helper
+        performs the aggregate context-envelope split without executing any HTTP
+        call, so no hidden provider loop can issue requests that escape
+        cancellation/budget/checkpoint handling.
+        """
+
+        planner = getattr(self._provider, "plan_aggregate_batches", None)
+        units: list[list[ReconstructionRequest]] = []
+        for batch in self._plan_batches(selected, requests):
+            batch_requests = [requests[index] for index in batch]
+            if planner is not None:
+                units.extend(planner(batch_requests))
+            else:
+                units.append(batch_requests)
+        return units
 
     def _local_budget_available(self, state: "_JobState") -> bool:
         """False once the bounded local wall-time budget is exhausted."""

@@ -14,7 +14,7 @@ from typing import Protocol, cast
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
-from app.core.enums import JobKind, JobStatus, ReconstructionStatus
+from app.core.enums import JobStatus, ReconstructionStatus
 from app.core.settings import get_settings
 from app.media.analysis import parse_silencedetect, silence_ratio, windowed_rms
 from app.media.audio import AudioExtractor
@@ -480,6 +480,17 @@ class _LeaseBoundReconstructionProvider:
         lookup = getattr(self._inner, "last_request_sizes", None)
         return lookup() if lookup is not None else ()
 
+    def plan_aggregate_batches(
+        self, requests: list[ReconstructionRequest]
+    ) -> list[list[ReconstructionRequest]]:
+        """Delegate pure context-safe planning; no lease and no HTTP dispatch."""
+
+        planner = getattr(self._inner, "plan_aggregate_batches", None)
+        if planner is None:
+            return [list(requests)]
+        planned = planner(requests)
+        return [list(batch) for batch in planned]
+
     def reconstruct_segments(
         self, requests: list[ReconstructionRequest]
     ) -> dict[int, ReconstructionCandidate]:
@@ -522,6 +533,18 @@ class ContextualReconstructionExecutor:
         self._session = session
         self._reconstructor = reconstructor
         self._lease_factory = lease_factory or NoopHeavyModelLeaseFactory()
+        self._active_job_id: object | None = None
+
+    def set_active_job(self, job_id: object | None) -> None:
+        """Bind the exact currently executing reconstruction job id.
+
+        Cancellation polling reads this job's status with a fresh scalar query,
+        so a cancellation committed by the API in a separate session is observed
+        by the worker without depending on the worker's ORM identity map or
+        session commit timing.
+        """
+
+        self._active_job_id = job_id
 
     def input_fingerprint(self, source: SourceVideo) -> str:
         transcript = self._session.scalar(
@@ -623,7 +646,7 @@ class ContextualReconstructionExecutor:
         reconstructor.refresh_runtime_identity()
         identity = reconstructor.runtime_identity()
         reconstructor = reconstructor.with_orchestration(
-            is_cancelled=lambda: self._job_cancelled(source.id),
+            is_cancelled=lambda: self._job_cancelled(),
             checkpoint=lambda results, progress: self._persist_checkpoint(
                 transcript, results, progress, identity
             ),
@@ -761,18 +784,22 @@ class ContextualReconstructionExecutor:
         self._session.refresh(transcript)
         return StageExecutionResult(result.fingerprint, transcript)
 
-    def _job_cancelled(self, source_id: object) -> bool:
-        """Cooperative cancellation: the latest reconstruction job was cancelled."""
+    def _job_cancelled(self) -> bool:
+        """Cooperative cancellation: read the exact executing job's current status.
 
-        job = self._session.scalar(
-            select(ProcessingJob)
-            .where(
-                ProcessingJob.source_video_id == source_id,
-                ProcessingJob.kind == JobKind.RECONSTRUCTION,
-            )
-            .order_by(ProcessingJob.created_at.desc())
+        A scalar status column query bypasses the worker session's ORM identity
+        map, so a ``CANCELLED`` state committed by the API in a separate session
+        is observed on the worker's next poll without requiring the worker to
+        commit, refresh, or use ``populate_existing``. ``None`` (no bound job,
+        e.g. direct executor use) means no cancellation signal.
+        """
+
+        if self._active_job_id is None:
+            return False
+        status = self._session.scalar(
+            select(ProcessingJob.status).where(ProcessingJob.id == self._active_job_id)
         )
-        return job is not None and job.status is JobStatus.CANCELLED
+        return status is JobStatus.CANCELLED
 
     def _reusable_targets(
         self,

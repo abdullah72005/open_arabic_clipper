@@ -349,5 +349,38 @@ attempted through the production settings path and failed with a sanitized
 `PROVIDER_ERROR` category (external/API-side); it was not retried and no key was
 printed, logged, or committed.
 
+## Local-batch boundary and cross-session cancellation fixes (2026-09-09)
+
+A third corrective pass fixed the two remaining P1 blockers without redesigning
+Stage 2.7:
+
+- **Every actual local request is a visible orchestration unit.** Aggregate
+  context-safe planning moved from a hidden provider loop into orchestration.
+  The provider exposes a pure `plan_aggregate_batches` helper (no HTTP) that
+  splits each window/character micro-batch into actual request units whose exact
+  combined chat envelope fits `max_context_tokens`; `reconstruct_segments`
+  executes exactly one HTTP call per unit. Orchestration polls cooperative
+  cancellation and the local wall-time budget before every actual request and
+  checkpoints after every actual request. If one actual request fails after
+  earlier ones succeeded, only its targets fail/escalate/unresolve; the earlier
+  targets' accepted candidates stay checkpointed and reusable.
+- **Cancellation status is read fresh across sessions.** `PipelineRunner` binds
+  the exact executing reconstruction job id to the executor, and
+  `_job_cancelled` reads that job's status with a fresh scalar column query
+  (bypassing the worker session's ORM identity map), so a `CANCELLED` commit
+  made by the API in a separate session is observed by the worker on its next
+  poll without a commit or refresh. Queued and active cancellation, `CANCELLED`
+  job/run persistence, and no-next-stage scheduling are preserved.
+
+Deterministic verification (fake transports, fake clocks, SQLite sessions) now
+includes: a service-level eight-target micro-batch context-split into multiple
+actual requests with every sent envelope fitting; cancellation after the first
+actual request preventing the second; the fake clock hitting the wall-time
+ceiling after the first actual request; a second actual-request failure
+preserving the first request's accepted checkpointed candidates; the provider
+refusing to hide an over-budget combined request behind a loop; and a two-session
+test where an API-session `CANCELLED` commit stops the worker before any further
+provider call with the run and job left `CANCELLED`.
+
 STAGE 2.7 MUST CONTINUE
 

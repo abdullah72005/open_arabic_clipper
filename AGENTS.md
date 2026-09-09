@@ -36,18 +36,23 @@
   2.5 results and trusted Stage 2.5 repairs that resolved their uncertainty use
   `NO_LLM`; residual evidence routes normal uncertainty to Qwen (batched and
   hard-bounded per job) and clearly difficult spans to Gemini under a finite
-  strongest-first budget. Local batches are additionally split at the provider
-  boundary so the exact combined chat envelope (system instruction, full
-  `{"targets": [...]}` payload, framing/safety reserves, scaled output budget)
-  never exceeds `max_context_tokens`. A degraded (not cache-eligible)
+  strongest-first budget. Aggregate context-safe local planning is owned by
+  orchestration: a pure provider planner (never an HTTP call) splits each
+  window/character micro-batch into visible actual requests whose exact combined
+  chat envelope (system instruction, full `{"targets": [...]}` payload,
+  framing/safety reserves, scaled output budget) never exceeds
+  `max_context_tokens`, and `reconstruct_segments` executes exactly one HTTP
+  call per actual request. A degraded (not cache-eligible)
   reconstruction run is never skipped by the runner: it re-enters the executor
   on a later normal request and reuses accepted per-target work without
   repeating providers. Cancellation is cooperative and polled before and after
-  every provider attempt or batch and once before a successful return; it keeps
-  the job `CANCELLED`, never schedules the next stage, and preserves
-  checkpointed accepted per-target work for restart via per-target
-  fingerprints. Every executor exit path (including a fresh cache hit) releases
-  owned provider resources and scrubs the Gemini key. `contextual_reconstructed_text` joins each segment's
+  every actual provider request and once before a successful return; it reads
+  the exact executing job's status with a fresh scalar query so an API-session
+  cancel is visible to the worker without a commit; it keeps the job
+  `CANCELLED`, never schedules the next stage, and preserves checkpointed
+  accepted per-target work for restart via per-target fingerprints. Every
+  executor exit path (including a fresh cache hit) releases owned provider
+  resources and scrubs the Gemini key. `contextual_reconstructed_text` joins each segment's
   actual Stage 2.7 output; manual overrides change only `final_text`.
   Rights/provenance are tracked throughout the pipeline but do not block local
   analysis; publishing eligibility is evaluated separately. Stage 2.7 also

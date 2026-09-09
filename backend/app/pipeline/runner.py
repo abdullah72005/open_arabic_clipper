@@ -104,6 +104,14 @@ class PipelineRunner:
             job.completed_at = None
         self._session.commit()
 
+        if job is not None:
+            # Bind the exact executing job so stage executors that poll
+            # cancellation (reconstruction) read this job's live status rather
+            # than "the latest job for the source".
+            setter = getattr(executor, "set_active_job", None)
+            if setter is not None:
+                setter(job.id)
+
         try:
             if "force" in inspect.signature(executor.execute).parameters:
                 result = executor.execute(source, force=force)

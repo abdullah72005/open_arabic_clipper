@@ -302,19 +302,24 @@ targets because no call can safely start. Provider release runs in one outer
 ### Aggregate context safety at the request boundary
 
 The window and character ceilings are secondary bounds. The real correctness
-bound is enforced inside the local provider on the exact envelope that will be
-sent. Each target is first shrunk so its own single-target envelope fits, then
-the requests are greedily grouped (in stable order) while the aggregate envelope
-that will actually be sent — the system instruction, the full combined
-`{"targets": [...]}` JSON payload, the chat-framing reserve, the safety reserve,
-and the scaled output budget for that group — stays within
-`max_context_tokens` (default 4096). A group that would overflow is split into
-the next group, so an eight-target batch that individually fits can never be
-sent as one over-budget request. A single target that still cannot fit raises a
-contained provider error before any HTTP dispatch. Segment order, IDs,
-per-target validation, and safe malformed-batch fallback are preserved; the
-output-token budget scales with the number of targets actually in each sent
-group.
+bound is the aggregate context envelope, and context-safe planning is owned by
+orchestration. For each window/character micro-batch, orchestration calls the
+provider's pure planning helper (`plan_aggregate_batches`, which never executes
+an HTTP call) to split the targets into actual request units: each unit is
+greedily sized so the exact envelope that will be sent — the system
+instruction, the full combined `{"targets": [...]}` JSON payload, the
+chat-framing reserve, the safety reserve, and the scaled output budget for that
+unit — stays within `max_context_tokens` (default 4096). Each unit is then one
+**visible** actual provider request that orchestration schedules, polls
+cooperative cancellation and the local wall-time budget around, and checkpoints
+after. A single target that still cannot fit raises a contained provider error
+before any HTTP dispatch; `reconstruct_segments` itself never hides additional
+sequential HTTP calls. Segment order, IDs, per-target validation, and safe
+malformed-batch fallback are preserved; the output-token budget scales with the
+number of targets in each sent unit. If one actual request fails after earlier
+ones succeeded, only that request's targets fail/escalate/unresolve — the
+earlier targets' accepted candidates are already checkpointed and remain
+reusable.
 
 ## Local work ceilings
 
@@ -365,11 +370,16 @@ Cancelling a running or queued reconstruction job (`POST /jobs/{job_id}/cancel`)
 is cooperative:
 
 - A single centralized poll is checked before and after every provider attempt
-  or batch: each local Qwen batch, each Gemini-only attempt, each direct-Gemini
-  attempt, each local-to-Gemini escalation, and once immediately before a
-  successful return (so cancellation landing after the final local batch is
-  never missed). No new Qwen or Gemini work is scheduled after cancellation, and
-  the in-flight HTTP request is bounded by the configured provider timeout.
+  or actual request: each local Qwen actual request, each Gemini-only attempt,
+  each direct-Gemini attempt, each local-to-Gemini escalation, and once
+  immediately before a successful return (so cancellation landing after the
+  final local request is never missed). No new Qwen or Gemini work is scheduled
+  after cancellation, and the in-flight HTTP request is bounded by the
+  configured provider timeout.
+- Cancellation reads the exact currently executing job's status with a fresh
+  scalar column query, so a `CANCELLED` state committed by the API in a
+  separate session is observed by the worker on its next poll (no reliance on
+  the worker's ORM identity map or session commit timing).
 - A cancelled job stays `CANCELLED`; it is never overwritten as successful, and
   the next pipeline stage is never scheduled. The source stays truthful and
   retryable.

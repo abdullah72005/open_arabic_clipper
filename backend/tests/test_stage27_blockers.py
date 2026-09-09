@@ -32,14 +32,16 @@ from app.transcription.reconstruction.gemini import (
     GeminiReconstructionProvider,
 )
 from app.transcription.reconstruction.ollama import OllamaReconstructionProvider
-from app.transcription.reconstruction.providers import ReconstructionRequest
+from app.transcription.reconstruction.providers import (
+    ProviderResponseError,
+    ReconstructionRequest,
+)
 from app.transcription.reconstruction.routing import AdaptiveRoutingConfig, RoutingMode
 from app.transcription.reconstruction.service import ContextualReconstructor
 from app.transcription.reconstruction.types import (
     ProviderAvailability,
     ProviderHealth,
     ReconstructionCandidate,
-    estimate_tokens,
 )
 from app.transcription.reconstruction.validation import VALIDATION_VERSION
 
@@ -268,8 +270,9 @@ def _reconstructor(
 # ---------------------------------------------------------------------------
 
 
-def test_aggregate_local_batches_are_split_to_fit_context() -> None:
-    """Requests that each fit alone are split when combined would exceed context."""
+def test_provider_never_hides_aggregate_splitting() -> None:
+    """A combined over-budget request is rejected before HTTP, never split in a
+    hidden provider loop. Context-safe splitting is owned by orchestration."""
 
     captured: list[dict[str, object]] = []
     big_previous = ("سياق",) * 700
@@ -282,19 +285,8 @@ def test_aggregate_local_batches_are_split_to_fit_context() -> None:
         _timeout: float,
     ) -> bytes:
         assert body is not None
-        payload = json.loads(body)
-        captured.append(payload)
-        targets = json.loads(payload["messages"][1]["content"])["targets"]
-        content = {
-            "reconstructions": [
-                {"segment_id": t["segment_id"], "corrected_text": "هدف", "unchanged": True}
-                for t in targets
-            ]
-        }
-        return json.dumps(
-            {"choices": [{"message": {"content": json.dumps(content, ensure_ascii=False)}}]},
-            ensure_ascii=False,
-        ).encode()
+        captured.append(json.loads(body))
+        return b"{}"
 
     provider = OllamaReconstructionProvider(
         base_url="http://ollama:11434",
@@ -306,37 +298,17 @@ def test_aggregate_local_batches_are_split_to_fit_context() -> None:
     )
     requests = [
         ReconstructionRequest(
-            segment_index=0,
-            raw_text="هدف",
-            corrected_text="هدف",
-            previous=big_previous,
+            segment_index=0, raw_text="هدف", corrected_text="هدف", previous=big_previous
         ),
         ReconstructionRequest(
-            segment_index=1,
-            raw_text="هدف",
-            corrected_text="هدف",
-            previous=big_previous,
+            segment_index=1, raw_text="هدف", corrected_text="هدف", previous=big_previous
         ),
     ]
 
-    result = provider.reconstruct_segments(requests)
+    with pytest.raises(ProviderResponseError, match="context budget"):
+        provider.reconstruct_segments(requests)
 
-    # Combined would exceed 4096, so the provider must have made two calls, one
-    # target each.
-    assert len(captured) == 2
-    for call in captured:
-        assert len(json.loads(call["messages"][1]["content"])["targets"]) == 1
-    # Every actually-sent aggregate envelope fits the configured context.
-    for call in captured:
-        system_tokens = estimate_tokens(str(call["messages"][0]["content"]))
-        user_tokens = estimate_tokens(str(call["messages"][1]["content"]))
-        targets = json.loads(call["messages"][1]["content"])["targets"]
-        budget = system_tokens + user_tokens + 64 + 256 * len(targets) + 128
-        assert budget <= 4096
-    # Candidates still map to the exact requested segments.
-    assert set(result) == {0, 1}
-    assert result[0].text == "هدف"
-    assert result[1].text == "هدف"
+    assert captured == []  # zero HTTP calls: no hidden provider loop
 
 
 # ---------------------------------------------------------------------------
