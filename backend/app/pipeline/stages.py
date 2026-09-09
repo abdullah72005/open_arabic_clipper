@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import subprocess
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import asdict
 from pathlib import Path
 from time import monotonic
@@ -14,14 +14,21 @@ from typing import Protocol, cast
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
-from app.core.enums import ReconstructionStatus
+from app.core.enums import JobKind, JobStatus, ReconstructionStatus
 from app.core.settings import get_settings
 from app.media.analysis import parse_silencedetect, silence_ratio, windowed_rms
 from app.media.audio import AudioExtractor
 from app.media.ffprobe import FFprobe
-from app.models import AudioAnalysis, AudioArtifact, SourceVideo, Transcript, TranscriptChunk
+from app.models import (
+    AudioAnalysis,
+    AudioArtifact,
+    ProcessingJob,
+    SourceVideo,
+    Transcript,
+    TranscriptChunk,
+)
 from app.pipeline.executor import StageExecutionResult
-from app.pipeline.fingerprints import canonical_fingerprint
+from app.pipeline.fingerprints import canonical_fingerprint, reconstruction_target_fingerprint
 from app.pipeline.runner import StageExecutionError
 from app.runtime.heavy_model_lease import (
     HeavyModelLeaseBusy,
@@ -44,11 +51,14 @@ from app.transcription.reconstruction.providers import (
 from app.transcription.reconstruction.service import select_final_text
 from app.transcription.reconstruction.status import aggregate_reconstruction_status
 from app.transcription.reconstruction.types import (
+    ConfidenceLevel,
     ProviderHealth,
+    QualityFlag,
     ReconstructionCandidate,
     RequestSizeDiagnostics,
     SegmentReconstruction,
     UnloadOutcome,
+    WordEvidence,
 )
 from app.transcription.service import TranscriptionOptions
 
@@ -557,11 +567,27 @@ class ContextualReconstructionExecutor:
                 # Transient provider outage: identity cannot be confirmed. Keep the
                 # accepted output instead of overwriting it with degraded fallback.
                 return StageExecutionResult(check.fingerprint, transcript)
+        reconstructor.refresh_runtime_identity()
+        identity = reconstructor.runtime_identity()
+        reconstructor = reconstructor.with_orchestration(
+            is_cancelled=lambda: self._job_cancelled(source.id),
+            checkpoint=lambda results, progress: self._persist_checkpoint(
+                transcript, results, progress, identity
+            ),
+        )
+        resolved = self._reusable_targets(
+            transcript,
+            identity,
+            language=transcript.language,
+            transcription_fingerprint=transcript.input_fingerprint,
+            correction_version=transcript.correction_version,
+        )
         result = reconstructor.reconstruct(
             transcript.segments,
             language=transcript.language,
             transcription_fingerprint=transcript.input_fingerprint,
             correction_version=transcript.correction_version,
+            resolved=resolved,
         )
         if (
             transcript.reconstruction_fingerprint == result.fingerprint
@@ -575,56 +601,19 @@ class ContextualReconstructionExecutor:
         persisted_segments: list[dict[str, object]] = []
         statuses: list[ReconstructionStatus] = []
         for segment, reconstruction in zip(transcript.segments, result.segments, strict=True):
-            raw = str(segment.get("raw_text", segment.get("text", "")))
-            corrected = str(segment.get("corrected_text", raw))
-            operator_text = segment.get("operator_text")
-            operator = str(operator_text) if operator_text else None
-            final_text = select_final_text(
-                operator_text=operator,
-                reconstructed=reconstruction.contextual_reconstructed_text,
-                reconstruction_applied=reconstruction.applied,
-                level=reconstruction.confidence_level,
-                corrected=corrected,
-                raw=raw,
-            )
             status = _segment_reconstruction_status(segment, reconstruction)
             statuses.append(status)
             persisted_segments.append(
-                {
-                    **segment,
-                    "contextual_reconstructed_text": reconstruction.contextual_reconstructed_text,
-                    "reconstruction_candidate_text": reconstruction.candidate_text,
-                    "reconstruction_applied": reconstruction.applied,
-                    "reconstruction_confidence": reconstruction.confidence,
-                    "reconstruction_confidence_level": reconstruction.confidence_level.value,
-                    "reconstruction_quality_flags": [
-                        flag.value for flag in reconstruction.quality_flags
-                    ],
-                    "routing_score": reconstruction.routing_score,
-                    "routing_reasons": list(reconstruction.routing_reasons),
-                    "focus_spans": [
-                        {
-                            "word": word.text,
-                            "start": word.start,
-                            "end": word.end,
-                            "probability": word.probability,
-                        }
-                        for word in reconstruction.focus_spans
-                    ],
-                    "reconstruction_status": status.value,
-                    "reconstruction_method": reconstruction.reconstruction_method,
-                    "final_text": final_text,
-                    "normalized_text": normalize_transcript(final_text),
-                    "reconstruction_route": reconstruction.route,
-                    "routing_evidence": list(reconstruction.routing_evidence),
-                    "local_attempted": reconstruction.local_attempted,
-                    "local_result_state": reconstruction.local_result_state,
-                    "gemini_attempted": reconstruction.gemini_attempted,
-                    "gemini_result_state": reconstruction.gemini_result_state,
-                    "final_provider": reconstruction.final_provider,
-                    "escalation_reason": reconstruction.escalation_reason,
-                    "near_acceptance": reconstruction.near_acceptance,
-                }
+                self._apply_segment(
+                    segment,
+                    reconstruction,
+                    status,
+                    identity,
+                    transcript.segments,
+                    language=transcript.language,
+                    transcription_fingerprint=transcript.input_fingerprint,
+                    correction_version=transcript.correction_version,
+                )
             )
 
         transcript.segments = persisted_segments
@@ -719,6 +708,170 @@ class ContextualReconstructionExecutor:
         self._session.refresh(transcript)
         return StageExecutionResult(result.fingerprint, transcript)
 
+    def _job_cancelled(self, source_id: object) -> bool:
+        """Cooperative cancellation: the latest reconstruction job was cancelled."""
+
+        job = self._session.scalar(
+            select(ProcessingJob)
+            .where(
+                ProcessingJob.source_video_id == source_id,
+                ProcessingJob.kind == JobKind.RECONSTRUCTION,
+            )
+            .order_by(ProcessingJob.created_at.desc())
+        )
+        return job is not None and job.status is JobStatus.CANCELLED
+
+    def _reusable_targets(
+        self,
+        transcript: Transcript,
+        identity: dict[str, object],
+        *,
+        language: str | None,
+        transcription_fingerprint: str,
+        correction_version: str,
+    ) -> dict[int, SegmentReconstruction]:
+        """Reuse accepted per-target work whose dependency fingerprint is unchanged.
+
+        A restart after cancellation or a late provider failure keeps the
+        already-accepted Gemini/local results without re-calling a provider; only
+        eligible unresolved work is reconsidered.
+        """
+
+        resolved: dict[int, SegmentReconstruction] = {}
+        for index, segment in enumerate(transcript.segments):
+            if segment.get("operator_text"):
+                continue
+            stored_fingerprint = segment.get("reconstruction_target_fingerprint")
+            if not isinstance(stored_fingerprint, str) or not stored_fingerprint:
+                continue
+            if segment.get("reconstruction_cache_eligible") is not True:
+                continue
+            current_fingerprint = reconstruction_target_fingerprint(
+                provider_identity=identity,
+                segments=transcript.segments,
+                target_index=index,
+                language=language,
+                transcription_fingerprint=transcription_fingerprint,
+                correction_version=correction_version,
+            )
+            if stored_fingerprint != current_fingerprint:
+                continue
+            rebuilt = _segment_from_stored(index, segment)
+            if rebuilt is not None:
+                resolved[index] = rebuilt
+        return resolved
+
+    def _persist_checkpoint(
+        self,
+        transcript: Transcript,
+        results: dict[int, SegmentReconstruction],
+        progress: dict[str, object],
+        identity: dict[str, object],
+    ) -> None:
+        """Durably persist completed per-target results mid-run.
+
+        Checkpointed batches survive cancellation and worker restarts so a
+        restart does not discard every preceding expensive result. The segment
+        list is rebuilt and reassigned so SQLAlchemy detects the JSON mutation.
+        """
+
+        if not results:
+            return
+        segments = list(transcript.segments)
+        for index, reconstruction in results.items():
+            if not 0 <= index < len(segments):
+                continue
+            status = _segment_reconstruction_status(segments[index], reconstruction)
+            segments[index] = self._apply_segment(
+                segments[index],
+                reconstruction,
+                status,
+                identity,
+                segments,
+                language=transcript.language,
+                transcription_fingerprint=transcript.input_fingerprint,
+                correction_version=transcript.correction_version,
+            )
+        transcript.segments = segments
+        metadata = dict(transcript.reconstruction_metadata)
+        metadata["partial"] = True
+        metadata["cache_eligible"] = False
+        metadata["progress"] = progress
+        if isinstance(progress.get("routing_counts"), dict):
+            metadata["routing_counts"] = progress["routing_counts"]
+        transcript.reconstruction_metadata = metadata
+        self._session.commit()
+
+    def _apply_segment(
+        self,
+        segment: dict[str, object],
+        reconstruction: SegmentReconstruction,
+        status: ReconstructionStatus,
+        identity: dict[str, object],
+        segments: list[dict[str, object]],
+        *,
+        language: str | None,
+        transcription_fingerprint: str,
+        correction_version: str,
+    ) -> dict[str, object]:
+        """Merge one reconstruction outcome into its persisted segment record."""
+
+        raw = str(segment.get("raw_text", segment.get("text", "")))
+        corrected = str(segment.get("corrected_text", raw))
+        operator_text = segment.get("operator_text")
+        operator = str(operator_text) if operator_text else None
+        final_text = select_final_text(
+            operator_text=operator,
+            reconstructed=reconstruction.contextual_reconstructed_text,
+            reconstruction_applied=reconstruction.applied,
+            level=reconstruction.confidence_level,
+            corrected=corrected,
+            raw=raw,
+        )
+        target_fingerprint = reconstruction_target_fingerprint(
+            provider_identity=identity,
+            segments=segments,
+            target_index=reconstruction.segment_index,
+            language=language,
+            transcription_fingerprint=transcription_fingerprint,
+            correction_version=correction_version,
+        )
+        return {
+            **segment,
+            "contextual_reconstructed_text": reconstruction.contextual_reconstructed_text,
+            "reconstruction_candidate_text": reconstruction.candidate_text,
+            "reconstruction_applied": reconstruction.applied,
+            "reconstruction_confidence": reconstruction.confidence,
+            "reconstruction_confidence_level": reconstruction.confidence_level.value,
+            "reconstruction_quality_flags": [flag.value for flag in reconstruction.quality_flags],
+            "routing_score": reconstruction.routing_score,
+            "routing_reasons": list(reconstruction.routing_reasons),
+            "focus_spans": [
+                {
+                    "word": word.text,
+                    "start": word.start,
+                    "end": word.end,
+                    "probability": word.probability,
+                }
+                for word in reconstruction.focus_spans
+            ],
+            "reconstruction_status": status.value,
+            "reconstruction_method": reconstruction.reconstruction_method,
+            "final_text": final_text,
+            "normalized_text": normalize_transcript(final_text),
+            "reconstruction_route": reconstruction.route,
+            "routing_evidence": list(reconstruction.routing_evidence),
+            "local_attempted": reconstruction.local_attempted,
+            "local_result_state": reconstruction.local_result_state,
+            "gemini_attempted": reconstruction.gemini_attempted,
+            "gemini_result_state": reconstruction.gemini_result_state,
+            "final_provider": reconstruction.final_provider,
+            "escalation_reason": reconstruction.escalation_reason,
+            "near_acceptance": reconstruction.near_acceptance,
+            "reconstruction_target_fingerprint": target_fingerprint,
+            "reconstruction_cache_eligible": _target_cache_eligible(reconstruction),
+        }
+
 
 def _reconstruction_method(
     segments: tuple[SegmentReconstruction, ...], metadata: dict[str, object] | None = None
@@ -760,6 +913,120 @@ def _segment_reconstruction_status(
     if reconstruction.confidence_level.value == "LOW":
         return ReconstructionStatus.LOW_CONFIDENCE_UNRESOLVED
     return ReconstructionStatus.UNCHANGED_HIGH_CONFIDENCE
+
+
+def _target_cache_eligible(reconstruction: SegmentReconstruction) -> bool:
+    """Per-target reuse eligibility: a terminal outcome that needs no provider.
+
+    Provider-accepted HIGH results are reusable without a provider call; NO_LLM
+    and manual outcomes never call providers anyway and are recorded as eligible
+    so their stored records are self-consistent.
+    """
+
+    if reconstruction.route in {"MANUAL", "NO_LLM"}:
+        return True
+    return reconstruction.applied and reconstruction.confidence_level is ConfidenceLevel.HIGH
+
+
+def _segment_from_stored(index: int, segment: Mapping[str, object]) -> SegmentReconstruction | None:
+    """Rebuild a reusable SegmentReconstruction from persisted checkpoint fields."""
+
+    route = str(segment.get("reconstruction_route") or "")
+    if route not in {"LOCAL", "GEMINI_DIRECT", "LOCAL_THEN_GEMINI"}:
+        return None
+    if segment.get("reconstruction_applied") is not True:
+        return None
+    if segment.get("reconstruction_confidence_level") != ConfidenceLevel.HIGH.value:
+        return None
+    status = _parse_reconstruction_status(segment.get("reconstruction_status"))
+    if status is None or status in {
+        ReconstructionStatus.PROVIDER_UNAVAILABLE,
+        ReconstructionStatus.FAILED,
+        ReconstructionStatus.LOW_CONFIDENCE_UNRESOLVED,
+    }:
+        return None
+    raw = str(segment.get("raw_text", segment.get("text", "")))
+    corrected = str(segment.get("corrected_text", raw))
+    reconstructed = str(segment.get("contextual_reconstructed_text") or corrected)
+    confidence_value = segment.get("reconstruction_confidence")
+    confidence = float(confidence_value) if isinstance(confidence_value, int | float) else 0.0
+    flags_list: list[QualityFlag] = []
+    for flag in _as_list(segment.get("reconstruction_quality_flags")):
+        if isinstance(flag, str):
+            try:
+                flags_list.append(QualityFlag(flag))
+            except ValueError:
+                continue
+    flags = tuple(flags_list)
+    routing_reasons = tuple(
+        str(reason) for reason in _as_list(segment.get("routing_reasons")) if reason
+    )
+    routing_evidence = tuple(
+        str(evidence) for evidence in _as_list(segment.get("routing_evidence")) if evidence
+    )
+    focus = tuple(
+        WordEvidence(
+            str(span.get("word", "")),
+            _number(span.get("start")),
+            _number(span.get("end")),
+            _number(span.get("probability")),
+        )
+        for span in _as_list(segment.get("focus_spans"))
+        if isinstance(span, Mapping)
+    )
+    routing_score = segment.get("routing_score")
+    return SegmentReconstruction(
+        index,
+        raw,
+        corrected,
+        reconstructed,
+        segment.get("reconstruction_candidate_text"),
+        True,
+        confidence,
+        ConfidenceLevel.HIGH,
+        flags,
+        status,
+        routing_score=float(routing_score) if isinstance(routing_score, int | float) else None,
+        routing_reasons=routing_reasons,
+        focus_spans=focus,
+        validated_changes=tuple(
+            change
+            for change in _as_list(segment.get("validated_changes"))
+            if isinstance(change, Mapping)
+        ),
+        reconstruction_method=segment.get("reconstruction_method"),
+        candidate_id=segment.get("candidate_id"),
+        decision_reason=segment.get("decision_reason"),
+        explanation=str(segment.get("explanation") or ""),
+        route=route,
+        routing_evidence=routing_evidence,
+        local_attempted=bool(segment.get("local_attempted")),
+        local_result_state=segment.get("local_result_state"),
+        gemini_attempted=bool(segment.get("gemini_attempted")),
+        gemini_result_state=segment.get("gemini_result_state"),
+        final_provider=segment.get("final_provider"),
+        escalation_reason=segment.get("escalation_reason"),
+        near_acceptance=bool(segment.get("near_acceptance")),
+    )
+
+
+def _as_list(value: object) -> list[object]:
+    return [item for item in value] if isinstance(value, list) else []
+
+
+def _parse_reconstruction_status(value: object) -> ReconstructionStatus | None:
+    if isinstance(value, ReconstructionStatus):
+        return value
+    if isinstance(value, str):
+        try:
+            return ReconstructionStatus(value)
+        except ValueError:
+            return None
+    return None
+
+
+def _number(value: object) -> float | None:
+    return float(value) if isinstance(value, int | float) else None
 
 
 def _raw_transcript_confidence(segments: list[dict[str, object]]) -> float:

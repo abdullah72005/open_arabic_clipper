@@ -28,6 +28,15 @@ masked in settings repr/serialization/validation errors. The key is never
 logged, exposed through the API or fingerprints, or committed. If the key is
 absent the application starts and runs normally with the local path only.
 
+The SDK client is constructed **lazily**, only when a generation request is
+actually about to run. Availability is configuration-level (key present + model
+configured); there is no per-job `models.get` metadata probe, and the bounded
+generation request is the real availability check with classified failure
+handling. A cache hit, an all-`NO_LLM` job, and `LOCAL_ONLY` work therefore make
+zero Gemini generation, metadata, or network calls and ideally construct no
+Gemini client. Generation is deterministic for reconstruction: temperature
+defaults to `0` and the stable v1 API version is used explicitly.
+
 Three routing modes are controlled by `CLIPFACTORY_RECONSTRUCTION_ROUTING_MODE`:
 
 | Mode | Behavior |
@@ -45,15 +54,31 @@ Free-tier limits are shared per Google project, so all Gemini consumers
 
 ### Routing on real Stage 2.5 trust
 
-`NO_LLM` is chosen only with affirmative Stage 2.5 evidence: a non-unchanged
-correction method (`correction_method` not `unchanged`/`pending`) carrying
-confidence at or above `stage25_trust_confidence` (`0.90`), together with clean
-acoustic evidence and no localized protected-token ambiguity. High Whisper word
-probabilities alone never suppress contextual checking: a confidently wrong
-Whisper segment whose correction was `unchanged` with `correction_confidence=0.0`
-remains eligible for the Qwen path. A single isolated low-confidence word is
-reported accurately and never labeled `no_low_probability_evidence`. Missing
-word probabilities are never automatically hard.
+`NO_LLM` is chosen only from affirmative evidence, and the decision is made on
+the raw-ASR words Stage 2.5 did **not** resolve:
+
+- **Clean unchanged result.** An unchanged Stage 2.5 result
+  (`correction_method="unchanged"`) routes to `NO_LLM` when it is backed by
+  adequate word coverage (`evidence_coverage_min` 0.80 of words carrying a
+  probability), a high average word probability (`clean_average_probability`
+  0.85), no low-probability span, no protected-token ambiguity, no contiguous
+  uncertain span, no suspicious multi-word corruption, and no hard-corruption
+  indicator. A clean high-probability segment never calls Qwen or Gemini merely
+  because Stage 2.5 left it unchanged.
+- **Trusted repair.** A high-confidence accepted Stage 2.5 repair
+  (`correction_applied`, `correction_confidence >= 0.90`) removes the
+  low-probability words its `correction_changes` cover from the residual
+  evidence. A clean remainder routes to `NO_LLM` instead of reprocessing the
+  repair. If an independent severe span remains unresolved, the remaining
+  evidence still routes to the appropriate LLM path.
+- **Missing evidence is not trust.** A segment without adequate word coverage
+  stays eligible for a conservative local check and is never Gemini-direct
+  merely because evidence is absent.
+
+A single isolated low-confidence word is reported accurately and never labeled
+`no_low_probability_evidence`. Routing thresholds and the policy version
+(`adaptive-routing-v3`) participate in runtime identity and fingerprints, so any
+threshold or coverage change invalidates prior runs.
 
 ### Strongest-first Gemini budget
 
@@ -76,14 +101,26 @@ coordinated project-level budgeting because quotas are shared per Google project
 
 Reconstruction fingerprints cover stable dependency identity only: provider
 configuration, model identity/digest, prompt/schema, routing policy and
-thresholds, budgets, thinking level, validation/confidence versions, source and
-context. Transient provider availability is execution state and is excluded, so
-a temporary Gemini outage cannot invalidate accepted output. Each run also
-records `cache_eligible`: a run that completed without transient provider
-failure is reusable; a run that degraded to provider-unavailable fallback or hit
-quota exhaustion is retried on a later run. During an outage, a previously
-accepted eligible result is reused and never overwritten with degraded fallback.
-No generation call is made to check a cache key.
+thresholds, local batching and work-ceiling settings, budgets, Gemini API
+version and temperature, thinking level, validation/confidence versions, source
+and context. Each segment's fingerprint also covers Stage 2.5 method, confidence,
+applied state, a stable change digest, word probabilities, acoustic evidence,
+language, dialect-profile carrier, and bounded surrounding context. Transient
+provider availability is execution state and is excluded, so a temporary Gemini
+outage cannot invalidate accepted output or change the stable model identity
+(Gemini identity is configuration-derived; no `models.get` probe runs).
+
+Each run also records `cache_eligible`: a run that completed without transient
+provider failure or budget exhaustion is reusable; a run that degraded to
+provider-unavailable fallback, hit quota exhaustion, or exhausted a local work
+ceiling is retried on a later run. **Per-target reuse** means a restart after
+cancellation or a late provider failure keeps already-accepted per-target work
+(stored per-target dependency fingerprint plus per-target eligibility) without
+re-calling a provider; only failed or eligible-unresolved targets are
+reconsidered. Checkpoints persist completed batches through the existing
+transcript metadata, so a cancellation or worker restart does not discard every
+preceding expensive result. Manual overrides stay terminal. No generation call
+is made to check a cache key.
 
 ### Heavy-model lease
 
@@ -101,6 +138,8 @@ unsafe-model markers and lost-lease behavior still fail closed.
 | `GEMINI_API_KEY` / `CLIPFACTORY_GEMINI_API_KEY` | — | Secret, presence-detected API key. |
 | `CLIPFACTORY_GEMINI_MODEL` | `gemini-3.8-flash` | Hosted model for reconstruction. |
 | `CLIPFACTORY_GEMINI_THINKING_LEVEL` | `low` | Bounded reasoning (`low`/`medium`/`high`). |
+| `CLIPFACTORY_GEMINI_TEMPERATURE` | `0` | Deterministic reconstruction generation. |
+| `CLIPFACTORY_GEMINI_API_VERSION` | `v1` | Explicit stable Gemini API version. |
 | `CLIPFACTORY_GEMINI_TIMEOUT_SECONDS` | `30` | Per-request timeout. |
 | `CLIPFACTORY_GEMINI_RETRY_ATTEMPTS` | `1` | Bounded retries for transient failures only. |
 | `CLIPFACTORY_GEMINI_RETRY_BACKOFF_SECONDS` | `1.5` | Backoff between retries. |
@@ -239,12 +278,79 @@ tuned in the correctness plan.
 
 ## Per-segment failure isolation
 
-Reconstruction calls are one target per provider call. A failure for one target
-(provider error, network timeout) falls back only that segment to Stage 2.5 with
+Local Qwen work runs in deterministic micro-batches bounded by
+`CLIPFACTORY_RECONSTRUCTION_PROVIDER_BATCH_WINDOWS` (default 8 targets) and
+`CLIPFACTORY_RECONSTRUCTION_PROVIDER_BATCH_CHARACTERS` (default 24 000 serialized
+characters), in stable order with exact segment-ID mapping. Each candidate still
+passes shared validation independently: one invalid candidate never rejects a
+valid sibling. A malformed or failed batch degrades safely to isolated
+unresolved/escalation results; there is no recursive splitting or retry storm
+(one provider request per planned batch). A failure for one target (provider
+error, network timeout) falls back only that segment to Stage 2.5 with
 `PROVIDER_UNAVAILABLE`; earlier successful segments keep their applied
 reconstruction. A provider-health failure before any call still falls back all
 targets because no call can safely start. Provider release runs in one outer
 `finally`; a release failure is logged but never replaces a valid result.
+
+## Local work ceilings
+
+Local Qwen work is hard-bounded per job so a long source can never produce
+unbounded inference:
+
+- `CLIPFACTORY_LOCAL_RECONSTRUCTION_MAX_TARGETS_PER_JOB` (default `64`) caps the
+  number of local target attempts. Candidates are ranked strongest-first by
+  deterministic routing severity, so the limited budget goes to the most
+  uncertain targets rather than the earliest segments.
+- `CLIPFACTORY_LOCAL_RECONSTRUCTION_MAX_WALL_SECONDS` (default `1200`) caps local
+  reconstruction wall time.
+
+When a ceiling is reached, scheduling of additional Qwen requests stops, the
+job neither fails nor stalls, safe Stage 2.5 text is preserved, skipped targets
+are marked unresolved/manual review with `local_target_budget_exhausted` or
+`local_time_budget_exhausted`, the transcript still reaches a terminal state,
+and no additional Gemini quota is spent to compensate. `cache_eligible` is false
+so a later run reconsiders eligible unresolved work (accepted per-target results
+are reused, not repeated). A clean transcript may legitimately make zero Qwen
+and zero Gemini calls.
+
+## Ollama hardware safeguards (Compose)
+
+The Ollama container pins safe, operator-tunable limits for the documented
+~10.7 GiB WSL environment:
+
+| Control | Default | Meaning |
+| --- | --- | --- |
+| `OLLAMA_NUM_PARALLEL` | `1` | One inference at a time. |
+| `OLLAMA_MAX_LOADED_MODELS` | `1` | One loaded model. |
+| `OLLAMA_MAX_QUEUE` | `4` | Bounded request queue. |
+| `OLLAMA_CONTEXT_LENGTH` | `4096` | Matches the reconstruction context budget. |
+| `OLLAMA_CPUS` | `9` | Compose CPU cap (protects machine responsiveness; may raise per-inference latency). |
+| `OLLAMA_MEM_LIMIT` | `6g` | Compose memory cap. |
+| `OLLAMA_MEMSWAP_LIMIT` | `8g` | Bounded memory+swap allowance instead of unlimited swapping. |
+
+If the resource ceiling prevents Qwen from loading or completing, a truthful
+provider failure is recorded, Stage 2.5 output is preserved, escalation happens
+only within the existing Gemini policy and budget, otherwise the target is
+marked unresolved/manual review, and nothing retries indefinitely. Routing,
+batching, caching, and the work ceilings above provide the main wall-time
+improvement; the CPU cap primarily protects machine responsiveness.
+
+## Cancellation and retry
+
+Cancelling a running or queued reconstruction job (`POST /jobs/{job_id}/cancel`)
+is cooperative:
+
+- Cancellation is checked before and after every provider batch. No new Qwen or
+  Gemini work is scheduled after cancellation, and the in-flight HTTP request is
+  bounded by the configured provider timeout.
+- A cancelled job stays `CANCELLED`; it is never overwritten as successful, and
+  the next pipeline stage is never scheduled. The source stays truthful and
+  retryable.
+- Already-checkpointed per-target results are preserved. A retry (or a fresh
+  reconstruction run) reuses accepted eligible targets without re-calling a
+  provider and reconsiders only failed or eligible-unresolved targets.
+- Provider and heavy-model lease cleanup still runs on cancellation, and raw ASR
+  and timestamps are never altered.
 
 ## Prompt budgeting
 
@@ -261,12 +367,18 @@ error before any HTTP dispatch.
 Every output-affecting dependency participates in the reconstruction runtime
 identity: provider protocol, configured model, live model digest (or an explicit
 `digest_unavailable` marker, never a fake tag), one-pass prompt hash and schema
-version, full context/output budget, confidence-policy version, deterministic
-validation version. Both the executor input fingerprint and the reconstruction
-output fingerprint include this identity with canonical JSON ordering. A model,
-digest, prompt, policy, validation, or context change invalidates prior
-successful Stage 2.7 runs, and a provider-unavailable run has a distinct
-fingerprint that cannot collide with an available-model run.
+version, full context/output budget, local batch and work-ceiling settings,
+routing mode/policy version and thresholds, Gemini model/schema/API version and
+temperature, budgets, confidence-policy version, deterministic validation
+version. Both the executor input fingerprint and the reconstruction output
+fingerprint include this identity with canonical JSON ordering. The output
+fingerprint additionally covers every route-relevant per-segment input: raw and
+corrected text, bounds, Stage 2.5 method/confidence/applied state and stable
+change digest, word probabilities, acoustic evidence, language, dialect-profile
+carrier, and bounded surrounding context. A model, digest, prompt, policy,
+validation, correction, or evidence change invalidates prior successful Stage 2.7
+runs, and a provider-unavailable run has a distinct fingerprint that cannot
+collide with an available-model run.
 
 ## Text and quality truth
 

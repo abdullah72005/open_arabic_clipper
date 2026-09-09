@@ -27,6 +27,20 @@ class ProviderResponseError(ValueError):
     """Provider output cannot safely map to requested stable segment IDs."""
 
 
+_BATCH_OUTPUT_TOKEN_CAP = 4_096
+
+
+def _batch_output_tokens(base_output_tokens: int, request_count: int) -> int:
+    """Scale the output budget to the bounded number of requested targets.
+
+    A micro-batch of ``request_count`` targets may legitimately need up to
+    ``base_output_tokens`` per target; the budget is capped so a pathological
+    batch can never request unbounded output.
+    """
+
+    return min(_BATCH_OUTPUT_TOKEN_CAP, base_output_tokens * max(1, request_count))
+
+
 class ModelNotFoundError(ProviderResponseError):
     """The configured model is absent from the provider's model listing."""
 
@@ -239,17 +253,19 @@ class OpenAICompatibleReconstructionProvider:
             (request.dialect_profile for request in requests if request.dialect_profile), None
         )
         system_instruction = self._system_instruction(profile)
+        output_tokens = _batch_output_tokens(self._output_tokens, len(requests))
         if self._max_context_tokens is not None:
+            envelope = self._envelope_estimate(system_instruction, output_tokens)
             requests = [
                 _shrink_request_to_budget(
                     request,
                     self._max_context_tokens,
-                    envelope=self._envelope_estimate(system_instruction),
+                    envelope=envelope,
                 )
                 for request in requests
             ]
             for request in requests:
-                estimated = self._envelope_estimate(system_instruction)(request)
+                estimated = envelope(request)
                 if estimated > self._max_context_tokens:
                     raise ProviderResponseError(
                         f"request for segment {request.segment_index} exceeds context budget "
@@ -263,13 +279,16 @@ class OpenAICompatibleReconstructionProvider:
                         "utf-8"
                     )
                 ),
-                estimated_input_tokens=self._envelope_estimate(system_instruction)(request),
+                estimated_input_tokens=self._envelope_estimate(system_instruction, output_tokens)(
+                    request
+                ),
             )
             for request in requests
         )
         content = self._call(
             system_instruction,
             {"targets": [item.to_payload() for item in requests]},
+            output_tokens=output_tokens,
         )
         return _parse_reconstructions(content, requests)
 
@@ -279,22 +298,26 @@ class OpenAICompatibleReconstructionProvider:
             instruction = instruction + " /no_think"
         return instruction_for_profile(instruction, profile)
 
-    def _envelope_estimate(self, system_instruction: str) -> Callable[[ReconstructionRequest], int]:
+    def _envelope_estimate(
+        self, system_instruction: str, output_tokens: int
+    ) -> Callable[[ReconstructionRequest], int]:
         def estimate(request: ReconstructionRequest) -> int:
             return request.estimated_tokens(
                 system_instruction=system_instruction,
-                output_tokens=self._output_tokens,
+                output_tokens=output_tokens,
                 chat_framing_reserve=self._chat_framing_reserve,
                 safety_reserve=self._safety_reserve,
             )
 
         return estimate
 
-    def _call(self, instruction: str, payload: dict[str, object]) -> dict[str, object]:
+    def _call(
+        self, instruction: str, payload: dict[str, object], output_tokens: int
+    ) -> dict[str, object]:
         body = {
             "model": self.model,
             "temperature": 0,
-            "max_tokens": self._output_tokens,
+            "max_tokens": output_tokens,
             "messages": [
                 {"role": "system", "content": instruction},
                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},

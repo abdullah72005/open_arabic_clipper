@@ -27,19 +27,35 @@
   Reconstruction output carries one `provider_confidence` scalar and is validated
   at a strict provider boundary; failures are isolated per segment. Stage 2.7
   input/output fingerprints include the full runtime identity (provider, model,
-  digest, prompt hash/schema, budgets, confidence-policy and validation
-  versions), so any of those changes invalidates prior Stage 2.7 runs.
-  `contextual_reconstructed_text` joins each segment's actual Stage 2.7 output;
-  manual overrides change only `final_text`. Rights/provenance are tracked
-  throughout the pipeline but do not block local analysis; publishing eligibility
-  is evaluated separately. Stage 2.7 also supports an optional hosted Gemini
-  provider through `CLIPFACTORY_RECONSTRUCTION_ROUTING_MODE`
+  digest, prompt hash/schema, budgets, batching and local-work ceilings, routing
+  mode/policy version and thresholds, Gemini schema/API version and temperature,
+  confidence-policy and validation versions) plus every route-relevant segment
+  input (Stage 2.5 method/confidence/applied state and change digest, word and
+  acoustic evidence, bounded context), so any of those changes invalidates prior
+  Stage 2.7 runs. Routing is deterministic: clean, well-covered unchanged Stage
+  2.5 results and trusted Stage 2.5 repairs that resolved their uncertainty use
+  `NO_LLM`; residual evidence routes normal uncertainty to Qwen (batched and
+  hard-bounded per job) and clearly difficult spans to Gemini under a finite
+  strongest-first budget. `contextual_reconstructed_text` joins each segment's
+  actual Stage 2.7 output; manual overrides change only `final_text`.
+  Rights/provenance are tracked throughout the pipeline but do not block local
+  analysis; publishing eligibility is evaluated separately. Stage 2.7 also
+  supports an optional hosted Gemini provider through
+  `CLIPFACTORY_RECONSTRUCTION_ROUTING_MODE`
   (`local_only`/`adaptive`/`gemini_only`, default `adaptive`). The shared request
   carries a future optional dialect/language-profile hint; Gemini candidates pass
   the same shared validation/confidence gates and a deterministic router enforces
-  a finite per-job Gemini target budget. `adaptive` and `gemini_only` may send
+  a finite per-job Gemini target budget. Gemini availability is
+  configuration-level with a lazily constructed SDK client: there are no
+  per-job metadata probes, generation is deterministic (`temperature=0`, API
+  version `v1`), and cache hits/all-`NO_LLM`/`LOCAL_ONLY` jobs make zero Gemini
+  network calls. Cancellation is cooperative: it is checked around every
+  provider batch, keeps the job `CANCELLED`, never schedules the next stage, and
+  preserves checkpointed accepted per-target work for restart via per-target
+  fingerprints. `adaptive` and `gemini_only` may send
   short transcript snippets to Google Gemini; the API key is presence-checked
-  only and never logged, exposed, or committed. Unsafe heavy-model residency is a persistent
+  only, unwrapped only at lazy client construction, and never logged, exposed, or
+  committed. Unsafe heavy-model residency is a persistent
   Redis marker with no TTL that survives restart, CLI exit, and lease TTL
   expiry; `python -m app.cli recover-heavy-model` clears it only after
   confirming the model is no longer resident. A lost heavy-model lease cancels

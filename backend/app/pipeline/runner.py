@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 
 from app.core.enums import JobKind, JobStatus, PipelineRunStatus, PipelineStage
 from app.models import PipelineRun, ProcessingJob, SourceVideo
-from app.pipeline.executor import StageExecutionResult, StageExecutor
+from app.pipeline.executor import ReconstructionCancelled, StageExecutionResult, StageExecutor
 
 
 class StageExecutionError(RuntimeError):
@@ -83,6 +83,13 @@ class PipelineRunner:
             self._session.add(run)
         elif run.status in {PipelineRunStatus.FAILED, PipelineRunStatus.CANCELLED}:
             run.attempt += 1
+        if job is not None and job.status is JobStatus.CANCELLED:
+            # Cancelled before execution: never overwrite the cancelled state with
+            # a successful or running state, and never advance the source.
+            run.status = PipelineRunStatus.CANCELLED
+            run.completed_at = now
+            self._session.commit()
+            return PipelineResult(run.id, job.id, skipped=False)
         run.status = PipelineRunStatus.RUNNING
         run.error_message = None
         run.started_at = now
@@ -155,6 +162,21 @@ class PipelineRunner:
         self, run: PipelineRun, job: ProcessingJob | None, error: Exception
     ) -> None:
         completed_at = datetime.now(timezone.utc)
+        if isinstance(error, ReconstructionCancelled) or (
+            job is not None and job.status is JobStatus.CANCELLED
+        ):
+            # Cooperative cancellation: keep the job cancelled, never overwrite it
+            # as successful or failed, and never advance the source lifecycle.
+            run.status = PipelineRunStatus.CANCELLED
+            run.error_message = None
+            run.completed_at = completed_at
+            if job is not None:
+                job.status = JobStatus.CANCELLED
+                job.error_code = None
+                job.error_message = None
+                job.completed_at = completed_at
+            self._session.commit()
+            return
         message = str(error)
         run.status = PipelineRunStatus.FAILED
         run.error_message = message

@@ -72,6 +72,8 @@ class Settings(BaseSettings):
     reconstruction_safety_reserve: int = Field(default=128, gt=0, le=4_096)
     reconstruction_provider_batch_windows: int = Field(default=8, gt=0, le=16)
     reconstruction_provider_batch_characters: int = Field(default=24_000, gt=0, le=48_000)
+    local_reconstruction_max_targets_per_job: int = Field(default=64, ge=0, le=100_000)
+    local_reconstruction_max_wall_seconds: float = Field(default=1_200.0, gt=0, le=86_400)
     reconstruction_routing_mode: Literal["local_only", "adaptive", "gemini_only"] = "adaptive"
     gemini_api_key: SecretStr | None = Field(
         default=None,
@@ -79,6 +81,8 @@ class Settings(BaseSettings):
     )
     gemini_model: str = Field(default="gemini-3.8-flash", max_length=256)
     gemini_thinking_level: Literal["low", "medium", "high"] = "low"
+    gemini_temperature: float = Field(default=0.0, ge=0, le=2)
+    gemini_api_version: str = Field(default="v1", min_length=1, max_length=32)
     gemini_timeout_seconds: float = Field(default=30.0, gt=0, le=300)
     gemini_retry_attempts: int = Field(default=1, ge=0, le=3)
     gemini_retry_backoff_seconds: float = Field(default=1.5, gt=0, le=30)
@@ -195,6 +199,10 @@ class Settings(BaseSettings):
             gemini_provider=self.gemini_provider_instance(),
             routing=AdaptiveRoutingConfig(mode=RoutingMode(self.reconstruction_routing_mode)),
             gemini_budget=self.gemini_max_targets_per_job,
+            batch_windows=self.reconstruction_provider_batch_windows,
+            batch_characters=self.reconstruction_provider_batch_characters,
+            local_max_targets=self.local_reconstruction_max_targets_per_job,
+            local_wall_seconds=self.local_reconstruction_max_wall_seconds,
         )
 
     def gemini_provider_instance(self) -> GeminiReconstructionProvider | None:
@@ -211,6 +219,8 @@ class Settings(BaseSettings):
             retry_backoff_seconds=self.gemini_retry_backoff_seconds,
             max_output_tokens=self.gemini_max_output_tokens,
             thinking_level=self.gemini_thinking_level,
+            temperature=self.gemini_temperature,
+            api_version=self.gemini_api_version,
         )
 
     @property

@@ -74,10 +74,12 @@ class FakeModels:
         self.error = error
         self.get_error = get_error
         self.generate_calls = 0
+        self.get_calls = 0
         self.contents: list[object] = []
         self.configs: list[object] = []
 
     def get(self, model: str) -> object:
+        self.get_calls += 1
         if self.get_error is not None:
             raise self.get_error
         return SimpleNamespace(name=f"models/{model}", version="3.6")
@@ -120,7 +122,9 @@ def _provider(
     )
 
 
-def test_gemini_health_available_with_live_digest() -> None:
+def test_gemini_health_is_config_level_without_metadata_probe() -> None:
+    """Health is configuration-level; it never performs a models.get probe."""
+
     client = FakeClient(response=_response(parsed=_ok_content()))
     provider = _provider(client_factory=lambda: client)
 
@@ -131,9 +135,10 @@ def test_gemini_health_available_with_live_digest() -> None:
         "gemini",
         "gemini-3.6-flash",
         health.model_digest,
-        "gemini model available",
+        "gemini configured",
     )
     assert health.model_digest is not None
+    assert client.models.get_calls == 0
 
 
 def test_gemini_health_misconfigured_when_key_missing() -> None:
@@ -148,16 +153,22 @@ def test_gemini_health_misconfigured_when_key_missing() -> None:
     )
 
 
-def test_gemini_health_unavailable_on_auth_failure() -> None:
+def test_gemini_health_never_probes_network_for_auth_failure() -> None:
+    """An authentication failure is only surfaced by a generation request."""
+
     class AuthError(Exception):
         code = 401
 
-    provider = _provider(client_factory=lambda: FakeClient(get_error=AuthError("bad key")))
+    client = FakeClient(error=AuthError("bad key"))
+    provider = _provider(client_factory=lambda: client)
 
     health = provider.health()
 
-    assert health.availability is ProviderAvailability.UNAVAILABLE
-    assert health.detail == "gemini_AUTHENTICATION"
+    assert health.availability is ProviderAvailability.AVAILABLE
+    assert client.models.get_calls == 0
+    with pytest.raises(GeminiProviderError) as raised:
+        provider.reconstruct_segments([_request()])
+    assert raised.value.category is GeminiErrorCategory.AUTHENTICATION
 
 
 def test_gemini_reconstruct_parses_structured_output() -> None:

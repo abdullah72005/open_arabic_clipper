@@ -151,6 +151,70 @@ def test_reconstruction_default_mode_is_adaptive() -> None:
     assert settings.reconstruction_routing_mode == "adaptive"
 
 
+def test_local_reconstruction_bounds_have_conservative_defaults() -> None:
+    """Local Qwen work is ceilinged so a long source cannot run for days."""
+
+    settings = Settings(_env_file=None)
+
+    assert settings.local_reconstruction_max_targets_per_job == 64
+    assert settings.local_reconstruction_max_wall_seconds == 1200
+    assert settings.reconstruction_provider_batch_windows == 8
+    assert settings.reconstruction_provider_batch_characters == 24_000
+
+
+def test_local_reconstruction_bounds_parse_from_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CLIPFACTORY_LOCAL_RECONSTRUCTION_MAX_TARGETS_PER_JOB", "16")
+    monkeypatch.setenv("CLIPFACTORY_LOCAL_RECONSTRUCTION_MAX_WALL_SECONDS", "300")
+    monkeypatch.setenv("CLIPFACTORY_RECONSTRUCTION_PROVIDER_BATCH_WINDOWS", "4")
+    monkeypatch.setenv("CLIPFACTORY_RECONSTRUCTION_PROVIDER_BATCH_CHARACTERS", "12000")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.local_reconstruction_max_targets_per_job == 16
+    assert settings.local_reconstruction_max_wall_seconds == 300
+    assert settings.reconstruction_provider_batch_windows == 4
+    assert settings.reconstruction_provider_batch_characters == 12_000
+
+
+def test_local_reconstruction_bounds_reject_zero() -> None:
+    # A zero wall budget is never valid; a zero target budget is a valid way to
+    # disable local reconstruction entirely.
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, local_reconstruction_max_wall_seconds=0)
+    zero_targets = Settings(_env_file=None, local_reconstruction_max_targets_per_job=0)
+    assert zero_targets.local_reconstruction_max_targets_per_job == 0
+
+
+def test_gemini_temperature_defaults_to_zero_and_parses() -> None:
+    settings = Settings(_env_file=None)
+
+    assert settings.gemini_temperature == 0.0
+    assert settings.gemini_api_version == "v1"
+
+    overridden = Settings(_env_file=None, gemini_temperature=0.5, gemini_api_version="v1beta")
+    assert overridden.gemini_temperature == 0.5
+    assert overridden.gemini_api_version == "v1beta"
+
+
+def test_ollama_compose_hardware_safeguards_are_configured() -> None:
+    """Compose pins Ollama parallelism, loaded models, queue, context, CPU, RAM,
+    and swap to safe defaults for the documented ~10.7 GiB WSL environment."""
+
+    import re
+    from pathlib import Path
+
+    compose = (Path(__file__).resolve().parents[2] / "compose.yaml").read_text(encoding="utf-8")
+    assert re.search(r"OLLAMA_NUM_PARALLEL:\s*\"1\"", compose)
+    assert re.search(r"OLLAMA_MAX_LOADED_MODELS:\s*\"1\"", compose)
+    assert re.search(r"OLLAMA_MAX_QUEUE:\s*\"\$\{OLLAMA_MAX_QUEUE:-4\}\"", compose)
+    assert re.search(r"OLLAMA_CONTEXT_LENGTH:\s*\"\$\{OLLAMA_CONTEXT_LENGTH:-4096\}\"", compose)
+    assert re.search(r"cpus:\s*\"\$\{OLLAMA_CPUS:-9\}\"", compose)
+    assert re.search(r"mem_limit:\s*\"\$\{OLLAMA_MEM_LIMIT:-6g\}\"", compose)
+    assert re.search(r"memswap_limit:\s*\"\$\{OLLAMA_MEMSWAP_LIMIT:-8g\}\"", compose)
+
+
 def test_gemini_defaults_and_absent_key_do_not_block_startup() -> None:
     settings = Settings(_env_file=None)
 

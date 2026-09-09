@@ -202,14 +202,22 @@ def test_route_adaptive_easy_high_confidence_is_no_llm() -> None:
     assert decision.route is ReconstructionRoute.NO_LLM
 
 
-def test_route_adaptive_high_probabilities_but_untrusted_stage25_is_not_no_llm() -> None:
-    segment = _segment(words=_words([0.98, 0.99], ["ده", "كلام"]), stage25=False)
+def test_route_adaptive_clean_unchanged_stage25_is_no_llm() -> None:
+    segment = _segment(words=_words([0.98, 0.99], ["ده", "كلام"]))
+    segment["correction_applied"] = False
+    segment["correction_confidence"] = 0.0
+    segment["correction_method"] = "unchanged"
     decision = route_adaptive(segment, AdaptiveRoutingConfig())
-    assert decision.route is ReconstructionRoute.LOCAL
-    assert decision.evidence == ("stage25_untrusted",) or "stage25_untrusted" in decision.evidence
+    assert decision.route is ReconstructionRoute.NO_LLM
+    assert decision.evidence == (
+        "clean_high_probability_evidence",
+        "no_low_probability_words",
+        "no_protected_token_ambiguity",
+        "evidence_coverage=1.00",
+    )
 
 
-def test_route_adaptive_unchanged_stage25_with_clean_acoustic_is_local() -> None:
+def test_route_adaptive_unchanged_stage25_with_clean_acoustic_is_no_llm() -> None:
     segment = _segment(
         words=_words([0.98, 0.99], ["ده", "كلام"]),
     )
@@ -217,7 +225,7 @@ def test_route_adaptive_unchanged_stage25_with_clean_acoustic_is_local() -> None
     segment["correction_confidence"] = 0.0
     segment["correction_method"] = "unchanged"
     decision = route_adaptive(segment, AdaptiveRoutingConfig())
-    assert decision.route is ReconstructionRoute.LOCAL
+    assert decision.route is ReconstructionRoute.NO_LLM
 
 
 def test_route_adaptive_isolated_low_word_reports_accurate_evidence() -> None:
@@ -280,16 +288,20 @@ def test_good_stage25_never_invokes_any_llm() -> None:
     assert segment.final_provider == "stage25"
 
 
-def test_high_whisper_confidence_with_untrusted_stage25_uses_local() -> None:
+def test_high_whisper_confidence_with_clean_unchanged_stage25_uses_no_llm() -> None:
     reconstructor, local, gemini = _reconstructor(
         FakeLocal(), FakeGemini(), mode=RoutingMode.ADAPTIVE
     )
-    result = _run(reconstructor, [_segment(words=_words([0.98, 0.99], ["ده", "كلام"]))])
-    segment = result.segments[0]
-    assert local is not None and local.calls == 1
+    segment = _segment(words=_words([0.98, 0.99], ["ده", "كلام"]))
+    segment["correction_applied"] = False
+    segment["correction_confidence"] = 0.0
+    segment["correction_method"] = "unchanged"
+    result = _run(reconstructor, [segment])
+    segment_result = result.segments[0]
+    assert local is not None and local.calls == 0
     assert gemini is not None and gemini.calls == 0
-    assert segment.route == "LOCAL"
-    assert segment.applied is True
+    assert segment_result.route == "NO_LLM"
+    assert segment_result.applied is False
 
 
 def test_mild_uncertainty_uses_local_and_never_gemini_when_local_accepted() -> None:

@@ -7,7 +7,7 @@ from uuid import UUID
 from celery import Task  # type: ignore[import-untyped]
 from sqlalchemy.orm import Session
 
-from app.core.enums import JobKind, PipelineStage
+from app.core.enums import JobKind, JobStatus, PipelineStage
 from app.core.settings import get_settings
 from app.db.session import create_session_factory
 from app.media.audio import AudioExtractor
@@ -95,6 +95,12 @@ def run_pipeline_stage(
             session.add(job)
             session.commit()
             parsed_job_id = job.id
+        if parsed_job_id is not None:
+            pending_job = session.get(ProcessingJob, parsed_job_id)
+            if pending_job is not None and pending_job.status is JobStatus.CANCELLED:
+                # A job cancelled while queued must never run nor schedule the
+                # next stage.
+                return {"job_id": str(parsed_job_id), "skipped": False, "cancelled": True}
         runner = PipelineRunner(session, _stage_executors(session))
         try:
             result = runner.run(UUID(source_id), parsed_stage, job_id=parsed_job_id, force=force)

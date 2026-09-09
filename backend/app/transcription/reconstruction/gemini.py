@@ -6,6 +6,15 @@ validation so a Gemini candidate is never trusted more than a local one. All
 provider-specific behavior lives here: client construction, request/output
 adaptation, token-usage extraction, sanitized error classification, and the
 Gemini runtime identity.
+
+Gemini availability is deliberately configuration-level, not a per-job
+``models.get`` metadata probe. The SDK client is constructed lazily only when a
+generation request is actually about to run, so a cache hit, an all-NO_LLM job,
+and LOCAL_ONLY work never build a client and never touch the network. The real
+availability check is the bounded generation request itself; failures are
+classified and handled by the shared policy. The model identity (and therefore
+the fingerprint) is stable because it is derived from the configured model,
+never from a transient metadata probe.
 """
 
 from __future__ import annotations
@@ -15,7 +24,7 @@ import json
 import time
 from collections.abc import Callable
 from enum import Enum
-from typing import Any, cast
+from typing import Any
 
 from google import genai
 from google.genai import types
@@ -38,6 +47,7 @@ from app.transcription.reconstruction.types import (
 from app.transcription.reconstruction.validation import VALIDATION_VERSION
 
 _GEMINI_SCHEMA_VERSION = "gemini-reconstruction-v1"
+_GEMINI_API_VERSION = "v1"
 
 # Dialect-neutral base instruction. Gemini must preserve the dialect/register
 # evident in the source and context and must never default to Egyptian. The
@@ -137,6 +147,8 @@ class GeminiReconstructionProvider:
         retry_backoff_seconds: float = 1.5,
         max_output_tokens: int = 1024,
         thinking_level: str | None = None,
+        temperature: float = 0.0,
+        api_version: str = _GEMINI_API_VERSION,
         owns_client: bool = True,
         client_factory: Callable[[], object] | None = None,
         sleep: Callable[[float], None] = time.sleep,
@@ -148,15 +160,18 @@ class GeminiReconstructionProvider:
         self._retry_backoff = max(0.0, float(retry_backoff_seconds))
         self._output_tokens = max(1, int(max_output_tokens))
         self._thinking_level = thinking_level
+        self._temperature = max(0.0, float(temperature))
+        self._api_version = api_version or _GEMINI_API_VERSION
         self._owns_client = owns_client
         self._sleep = sleep
         self._key_present = bool(api_key)
+        # The raw key is held only to build the SDK client lazily and is scrubbed
+        # on release. It is never logged, serialized, or persisted.
+        self._api_key: str | None = api_key if self._key_present else None
+        self._client_factory = client_factory
         self._client: object | None = None
-        if self._key_present:
-            self._client = (
-                client_factory() if client_factory else self._build_client(cast(str, api_key))
-            )
-        self._digest: str | None = None
+        # Stable identity derived from configuration only; never a live probe.
+        self._digest: str = _stable_model_digest(model)
         self._last_request_sizes: tuple[RequestSizeDiagnostics, ...] = ()
         self._usage: dict[str, int] = {
             "prompt_token_count": 0,
@@ -165,14 +180,41 @@ class GeminiReconstructionProvider:
             "thoughts_token_count": 0,
         }
 
-    def _build_client(self, api_key: str) -> object:
+    def _build_client(self) -> object:
+        api_key = self._api_key or ""
         return genai.Client(
             api_key=api_key,
-            http_options=types.HttpOptions(timeout=int(self._timeout * 1000)),
+            http_options=types.HttpOptions(
+                api_version=self._api_version,
+                timeout=int(self._timeout * 1000),
+            ),
         )
 
+    def _client_instance(self) -> object | None:
+        """Build the SDK client once, only when a generation is actually needed."""
+
+        if self._client is not None:
+            return self._client
+        if not self._key_present:
+            return None
+        try:
+            if self._client_factory is not None:
+                client = self._client_factory()
+            else:
+                client = self._build_client()
+        except Exception:
+            raise GeminiProviderError(
+                GeminiErrorCategory.PROVIDER_ERROR, "gemini client construction failed"
+            ) from None
+        self._client = client
+        return client
+
     def health(self) -> ProviderHealth:
-        """Check key presence and model availability without generating content."""
+        """Configuration-level readiness; never performs a metadata network probe.
+
+        The actual bounded generation request is the availability check; failures
+        are classified by the shared provider policy.
+        """
 
         if not self._key_present:
             return ProviderHealth(
@@ -182,44 +224,25 @@ class GeminiReconstructionProvider:
                 None,
                 "gemini api key is not configured",
             )
-        if self._client is None:
-            return ProviderHealth(
-                ProviderAvailability.MISCONFIGURED,
-                "gemini",
-                self.model,
-                None,
-                "gemini client is unavailable",
-            )
-        try:
-            model = self._client.models.get(model=self.model)  # type: ignore[attr-defined]
-        except Exception as error:
-            category = _classify_exception(error)
-            return ProviderHealth(
-                ProviderAvailability.UNAVAILABLE,
-                "gemini",
-                self.model,
-                None,
-                f"gemini_{category.value}",
-            )
-        self._digest = _model_digest(model)
         return ProviderHealth(
             ProviderAvailability.AVAILABLE,
             "gemini",
             self.model,
             self._digest,
-            "gemini model available",
+            "gemini configured",
         )
 
     def release(self) -> None:
         """Close the owned SDK client's HTTP resources when this provider owns it.
 
         A client injected through ``client_factory`` is owned by the caller when
-        ``owns_client`` is False and is never closed here. Closing is bounded:
-        all job calls complete before the orchestration finally block calls this.
+        ``owns_client`` is False and is never closed here. The API key is
+        scrubbed so no provider instance keeps it after cleanup.
         """
 
         client = self._client
         self._client = None
+        self._api_key = None
         if client is None or not self._owns_client:
             return
         close = getattr(client, "close", None)
@@ -227,10 +250,10 @@ class GeminiReconstructionProvider:
             return
         try:
             close()
-        except Exception as error:
+        except Exception:
             raise GeminiProviderError(
                 GeminiErrorCategory.PROVIDER_ERROR, "gemini client close failed"
-            ) from error
+            ) from None
 
     def runtime_identity(self) -> dict[str, object]:
         """Return every output-affecting Gemini dependency as stable data."""
@@ -238,9 +261,11 @@ class GeminiReconstructionProvider:
         return {
             "provider": "gemini",
             "model": self.model,
-            "digest": self._digest or "digest_unavailable",
+            "digest": self._digest,
             "prompt_hash": _GEMINI_PROMPT_HASH,
             "schema_version": _GEMINI_SCHEMA_VERSION,
+            "api_version": self._api_version,
+            "temperature": self._temperature,
             "timeout_seconds": self._timeout,
             "retry_attempts": self._retry_attempts,
             "retry_backoff_seconds": self._retry_backoff,
@@ -251,15 +276,8 @@ class GeminiReconstructionProvider:
         }
 
     def refresh_runtime_identity(self) -> dict[str, object]:
-        """Resolve the live Gemini model digest now and return the refreshed identity."""
+        """Identity is configuration-derived and stable; refresh never networks."""
 
-        if self._key_present and self._client is not None:
-            try:
-                model = self._client.models.get(model=self.model)  # type: ignore[attr-defined]
-            except Exception:
-                self._digest = None
-            else:
-                self._digest = _model_digest(model)
         return self.runtime_identity()
 
     def last_request_sizes(self) -> tuple[RequestSizeDiagnostics, ...]:
@@ -271,12 +289,17 @@ class GeminiReconstructionProvider:
     def reconstruct_segments(
         self, requests: list[ReconstructionRequest]
     ) -> dict[int, ReconstructionCandidate]:
-        if not self._key_present or self._client is None:
+        if not self._key_present:
             raise GeminiProviderError(
                 GeminiErrorCategory.MISSING_KEY, "gemini api key is not configured"
             )
         if not requests:
             return {}
+        client = self._client_instance()
+        if client is None:
+            raise GeminiProviderError(
+                GeminiErrorCategory.MISSING_KEY, "gemini api key is not configured"
+            )
         self._last_request_sizes = tuple(
             RequestSizeDiagnostics(
                 segment_index=request.segment_index,
@@ -293,7 +316,7 @@ class GeminiReconstructionProvider:
         last_error: GeminiProviderError | None = None
         for attempt in range(attempts):
             try:
-                return self._call_once(requests)
+                return self._call_once(client, requests)
             except GeminiProviderError as error:
                 if error.category in _RETRYABLE_CATEGORIES and attempt < attempts - 1:
                     last_error = error
@@ -305,7 +328,7 @@ class GeminiReconstructionProvider:
         )
 
     def _call_once(
-        self, requests: list[ReconstructionRequest]
+        self, client: object, requests: list[ReconstructionRequest]
     ) -> dict[int, ReconstructionCandidate]:
         payload = {"targets": [item.to_payload() for item in requests]}
         profile = next(
@@ -316,11 +339,10 @@ class GeminiReconstructionProvider:
             response_mime_type="application/json",
             response_schema=_GeminiReconstructionOutput,
             max_output_tokens=self._output_tokens,
+            temperature=self._temperature,
         )
         if self._thinking_level is not None:
             config.thinking_config = types.ThinkingConfig(thinking_level=self._thinking_level)
-        assert self._client is not None
-        client = self._client
         try:
             response = client.models.generate_content(  # type: ignore[attr-defined]
                 model=self.model,
@@ -328,7 +350,7 @@ class GeminiReconstructionProvider:
                 config=config,
             )
         except Exception as error:
-            raise GeminiProviderError(_classify_exception(error)) from error
+            raise GeminiProviderError(_classify_exception(error)) from None
         self._accumulate_usage(response)
         issue = _response_issue(response)
         if issue is not None:
@@ -338,10 +360,10 @@ class GeminiReconstructionProvider:
             raise GeminiProviderError(GeminiErrorCategory.MALFORMED_OUTPUT)
         try:
             return _parse_reconstructions(content, requests)
-        except ProviderResponseError as error:
+        except ProviderResponseError:
             raise GeminiProviderError(
                 GeminiErrorCategory.MALFORMED_OUTPUT, "gemini structured output failed validation"
-            ) from error
+            ) from None
 
     def _accumulate_usage(self, response: Any) -> None:
         usage = getattr(response, "usage_metadata", None)
@@ -358,10 +380,10 @@ class GeminiReconstructionProvider:
                 self._usage[key] += value
 
 
-def _model_digest(model: object) -> str:
-    name = getattr(model, "name", None) or getattr(model, "model", None) or ""
-    version = getattr(model, "version", None) or ""
-    return hashlib.sha256(f"{name}:{version}".encode("utf-8")).hexdigest()
+def _stable_model_digest(model: str) -> str:
+    """Deterministic configuration-derived digest; never depends on availability."""
+
+    return hashlib.sha256(f"gemini-model:{model}".encode("utf-8")).hexdigest()
 
 
 def _response_issue(response: Any) -> GeminiErrorCategory | None:

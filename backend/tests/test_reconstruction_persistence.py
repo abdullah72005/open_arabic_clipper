@@ -615,8 +615,11 @@ def test_successful_gemini_result_reused_during_mocked_outage(sqlite_engine: obj
         assert source.transcript.contextual_reconstructed_text == accepted_text
 
 
-def test_transient_first_run_fallback_is_retried_after_recovery(sqlite_engine: object) -> None:
-    """A first-run degraded fallback is not cached forever once the provider recovers."""
+def test_transient_first_run_fallback_becomes_cache_eligible_without_duplicate_gemini(
+    sqlite_engine: object,
+) -> None:
+    """A degraded first run is retried for eligibility but never re-generates
+    an accepted local target once Gemini recovers."""
 
     Base.metadata.create_all(sqlite_engine)
     with Session(sqlite_engine) as session:
@@ -658,8 +661,10 @@ def test_transient_first_run_fallback_is_retried_after_recovery(sqlite_engine: o
         gemini.available = True
         executor.execute(source, force=False)
         session.refresh(source)
-        assert gemini.calls == 1  # degraded first run retried after recovery
+        # The accepted local target is reused; transient availability is never
+        # identity, so no duplicate Gemini call happens after recovery.
+        assert gemini.calls == 0
         assert source.transcript.reconstruction_metadata["cache_eligible"] is True
         assert source.transcript.contextual_reconstructed_text == "ضخمة"
         executor.execute(source, force=False)
-        assert gemini.calls == 1
+        assert gemini.calls == 0

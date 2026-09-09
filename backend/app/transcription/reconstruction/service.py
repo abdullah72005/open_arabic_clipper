@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import json
 import time
 from collections import defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import cast
 
 from app.core.enums import ReconstructionStatus
+from app.pipeline.executor import ReconstructionCancelled
 from app.pipeline.fingerprints import reconstruction_output_fingerprint
 from app.transcription.reconstruction.confidence import (
     CONFIDENCE_POLICY_VERSION,
@@ -77,11 +79,26 @@ class ContextualReconstructor:
         gemini_provider: GeminiReconstructionProvider | None = None,
         routing: AdaptiveRoutingConfig | None = None,
         gemini_budget: int = 0,
+        batch_windows: int | None = None,
+        batch_characters: int | None = None,
+        local_max_targets: int | None = None,
+        local_wall_seconds: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
+        is_cancelled: Callable[[], bool] | None = None,
+        checkpoint: Callable[[dict[int, "SegmentReconstruction"], dict[str, object]], None]
+        | None = None,
     ) -> None:
         self._provider = provider
         self._gemini = gemini_provider
         self._routing = routing or AdaptiveRoutingConfig()
         self._gemini_budget = max(0, gemini_budget)
+        self._batch_windows = batch_windows
+        self._batch_characters = batch_characters
+        self._local_max_targets = local_max_targets
+        self._local_wall_seconds = local_wall_seconds
+        self._monotonic = monotonic
+        self._is_cancelled = is_cancelled
+        self._checkpoint = checkpoint
 
     def with_local_provider(
         self, provider: ReconstructionProvider | None
@@ -93,6 +110,36 @@ class ContextualReconstructor:
             gemini_provider=self._gemini,
             routing=self._routing,
             gemini_budget=self._gemini_budget,
+            batch_windows=self._batch_windows,
+            batch_characters=self._batch_characters,
+            local_max_targets=self._local_max_targets,
+            local_wall_seconds=self._local_wall_seconds,
+            monotonic=self._monotonic,
+            is_cancelled=self._is_cancelled,
+            checkpoint=self._checkpoint,
+        )
+
+    def with_orchestration(
+        self,
+        *,
+        is_cancelled: Callable[[], bool] | None = None,
+        checkpoint: Callable[[dict[int, "SegmentReconstruction"], dict[str, object]], None]
+        | None = None,
+    ) -> "ContextualReconstructor":
+        """Return a copy wired to cooperative cancellation and durable checkpoints."""
+
+        return ContextualReconstructor(
+            self._provider,
+            gemini_provider=self._gemini,
+            routing=self._routing,
+            gemini_budget=self._gemini_budget,
+            batch_windows=self._batch_windows,
+            batch_characters=self._batch_characters,
+            local_max_targets=self._local_max_targets,
+            local_wall_seconds=self._local_wall_seconds,
+            monotonic=self._monotonic,
+            is_cancelled=is_cancelled or self._is_cancelled,
+            checkpoint=checkpoint or self._checkpoint,
         )
 
     def runtime_identity(self) -> dict[str, object]:
@@ -109,6 +156,10 @@ class ContextualReconstructor:
         identity["routing_policy_version"] = ADAPTIVE_ROUTING_VERSION
         identity["routing_policy"] = self._routing.as_dict()
         identity["gemini_budget"] = self._gemini_budget
+        identity["local_batch_windows"] = self._batch_windows
+        identity["local_batch_characters"] = self._batch_characters
+        identity["local_max_targets_per_job"] = self._local_max_targets
+        identity["local_wall_seconds"] = self._local_wall_seconds
         identity["gemini"] = (
             dict(self._gemini.runtime_identity())
             if self._gemini is not None
@@ -143,6 +194,7 @@ class ContextualReconstructor:
         language: str | None,
         transcription_fingerprint: str,
         correction_version: str,
+        resolved: Mapping[int, SegmentReconstruction] | None = None,
     ) -> ReconstructionResult:
         if self._provider is None and self._gemini is None:
             identity = self.runtime_identity()
@@ -161,7 +213,7 @@ class ContextualReconstructor:
                 "cache_eligible": True,
             }
             return ReconstructionResult(results, _joined(results), fingerprint, disabled_metadata)
-        started_at = time.monotonic()
+        started_at = self._monotonic()
         result: ReconstructionResult = ReconstructionResult((), "", "")
         try:
             local_health = self._local_health()
@@ -194,8 +246,9 @@ class ContextualReconstructor:
                 _reconstruction_request(segments, index, language, memory)
                 for index in range(len(segments))
             ]
-            state = _JobState(defaultdict(int), self._gemini_budget, False, None)
-            by_index = self._run_phases(
+            state = _JobState(defaultdict(int), self._gemini_budget, False, None, self._monotonic)
+            state.total_segments = len(segments)
+            by_index, cancelled = self._run_phases(
                 segments,
                 decisions,
                 requests,
@@ -205,17 +258,23 @@ class ContextualReconstructor:
                 local_health,
                 gemini_health,
                 state,
+                resolved=resolved,
             )
+            if cancelled:
+                self._checkpoint_results(by_index, state)
+                raise ReconstructionCancelled("reconstruction cancelled")
             ordered = tuple(by_index[index] for index in range(len(segments)))
             cache_eligible = self._cache_eligible(state, ordered)
             metadata: dict[str, object] = {
                 "runtime_identity": identity,
                 "provider_available": local_available,
                 "gemini_available": gemini_available,
-                "wall_seconds": time.monotonic() - started_at,
+                "wall_seconds": self._monotonic() - started_at,
                 "prompt_diagnostics": self._prompt_diagnostics(),
                 "routing_counts": dict(state.counts),
                 "cache_eligible": cache_eligible,
+                "local_budget": self._local_budget_metadata(state),
+                "progress": self._progress(by_index, state),
             }
             if self._gemini is not None:
                 metadata["gemini_usage"] = self._gemini.usage_summary()
@@ -335,14 +394,25 @@ class ContextualReconstructor:
         local_health: ProviderHealth | None,
         gemini_health: ProviderHealth | None,
         state: "_JobState",
-    ) -> dict[int, SegmentReconstruction]:
-        """Resolve every target in bounded phases and restore transcript order."""
+        resolved: Mapping[int, SegmentReconstruction] | None = None,
+    ) -> tuple[dict[int, SegmentReconstruction], bool]:
+        """Resolve every target in bounded phases and restore transcript order.
 
+        ``resolved`` supplies already-accepted per-target outputs from a prior
+        checkpoint whose dependency fingerprint is unchanged; those targets are
+        reused without any provider call. Returns the completed per-index
+        results plus whether cooperative cancellation was requested mid-run.
+        """
+
+        resolved = resolved or {}
         results: dict[int, SegmentReconstruction] = {}
         direct_ids: list[int] = []
         local_ids: list[int] = []
         for index, decision in enumerate(decisions):
-            if segments[index].get("operator_text"):
+            if index in resolved:
+                state.counts["reused"] += 1
+                results[index] = resolved[index]
+            elif segments[index].get("operator_text"):
                 state.counts["manual"] += 1
                 results[index] = self._manual(index, segments[index], decision)
             elif decision.route is ReconstructionRoute.NO_LLM:
@@ -396,7 +466,7 @@ class ContextualReconstructor:
         for index in range(len(segments)):
             if index not in results:
                 results[index] = self._fallback(index, segments[index], decision=decisions[index])
-        return results
+        return results, state.cancelled
 
     def _gemini_only_phase(
         self,
@@ -412,7 +482,10 @@ class ContextualReconstructor:
     ) -> None:
         ranked = sorted(targets, key=lambda index: (-decisions[index].severity, index))
         for index in ranked:
+            if state.cancelled:
+                break
             decision = decisions[index]
+            state.current_phase = "gemini"
             if (
                 gemini_available
                 and state.gemini_budget_remaining > 0
@@ -430,6 +503,7 @@ class ContextualReconstructor:
                     route_override=ReconstructionRoute.GEMINI_DIRECT.value,
                     gemini_health=gemini_health,
                 )
+                self._checkpoint_results(results, state)
                 continue
             state.counts["gemini_budget_skips"] += 1
             if not gemini_available:
@@ -468,32 +542,24 @@ class ContextualReconstructor:
         local_method = (
             _provider_method(local_health) if local_health is not None else "provider:unknown"
         )
+        work: list[tuple[int, str | None, bool]] = []
         for index in direct_ids:
             state.counts["gemini_budget_skips"] += 1
-            results[index] = self._local_path(
-                index,
-                segments[index],
-                requests[index],
-                decisions[index],
-                memory,
-                local_available,
-                local_health,
-                local_method,
-                state,
-                fallback_reason="gemini_blocked_local_only",
-            )
+            work.append((index, "gemini_blocked_local_only", False))
         for index in local_ids:
-            results[index] = self._local_path(
-                index,
-                segments[index],
-                requests[index],
-                decisions[index],
-                memory,
-                local_available,
-                local_health,
-                local_method,
-                state,
-            )
+            work.append((index, None, False))
+        local_results, _ = self._run_local_queue(
+            segments,
+            decisions,
+            requests,
+            memory,
+            work,
+            local_available,
+            local_method,
+            state,
+            allow_escalations=False,
+        )
+        results.update(local_results)
 
     def _adaptive_phase(
         self,
@@ -514,9 +580,14 @@ class ContextualReconstructor:
             _provider_method(local_health) if local_health is not None else "provider:unknown"
         )
         # 1-4. Direct candidates: spend the strongest-first Gemini budget first.
-        ranked_direct = sorted(direct_ids, key=lambda index: (-decisions[index].severity, index))
-        for index in ranked_direct:
+        # Targets that cannot use Gemini are queued for bounded local work and
+        # never re-escalate to Gemini (they already exhausted or lack it).
+        work: list[tuple[int, str | None, bool]] = []
+        for index in sorted(direct_ids, key=lambda index: (-decisions[index].severity, index)):
+            if state.cancelled:
+                break
             decision = decisions[index]
+            state.current_phase = "gemini"
             if (
                 gemini_available
                 and state.gemini_budget_remaining > 0
@@ -536,6 +607,7 @@ class ContextualReconstructor:
                     gemini_health=gemini_health,
                     fallback_to_local=local_available,
                 )
+                self._checkpoint_results(results, state)
                 continue
             state.counts["gemini_budget_skips"] += 1
             if not gemini_available:
@@ -543,58 +615,22 @@ class ContextualReconstructor:
                 reason = self._gemini_missing_reason(state)
             else:
                 reason = state.gemini_stop_reason or "gemini_budget_exhausted"
-            results[index] = self._local_path(
-                index,
-                segments[index],
-                requests[index],
-                decision,
-                memory,
-                local_available,
-                local_health,
-                local_method,
-                state,
-                fallback_reason=reason,
-            )
-        # 6. Local-suitable candidates through Qwen; collect escalations.
-        escalations: list[tuple[int, SegmentReconstruction | None, str]] = []
+            work.append((index, reason, False))
+        # 6. Local-suitable candidates through Qwen in bounded micro-batches.
         for index in local_ids:
-            decision = decisions[index]
-            if not local_available:
-                escalation_reason = "local_provider_unavailable"
-                if (
-                    gemini_available
-                    and state.gemini_budget_remaining > 0
-                    and not state.gemini_exhausted
-                ):
-                    escalations.append((index, None, escalation_reason))
-                else:
-                    state.counts["unresolved"] += 1
-                    results[index] = self._fallback(
-                        index,
-                        segments[index],
-                        provider_error=True,
-                        status=ReconstructionStatus.PROVIDER_UNAVAILABLE,
-                        method="provider:unknown",
-                        decision=decision,
-                        route=decision.route.value,
-                        escalation_reason="local_provider_unavailable",
-                    )
-                continue
-            segment_result = self._local_attempt(
-                index,
-                segments[index],
-                requests[index],
-                decision,
-                memory,
-                local_method,
-                state,
-            )
-            if segment_result.applied and segment_result.confidence_level is ConfidenceLevel.HIGH:
-                results[index] = segment_result
-            else:
-                escalations.append(
-                    (index, segment_result, _local_escalation_reason(segment_result))
-                )
+            work.append((index, None, True))
+        local_results, escalations = self._run_local_queue(
+            segments,
+            decisions,
+            requests,
+            memory,
+            work,
+            local_available,
+            local_method,
+            state,
+            allow_escalations=True,
+        )
+        results.update(local_results)
         # 7-9. Rank escalations and spend remaining budget on the strongest.
         ranked_escalations = sorted(
             escalations,
@@ -604,7 +640,10 @@ class ContextualReconstructor:
             ),
         )
         for index, local_seg, escalation_reason in ranked_escalations:
+            if state.cancelled:
+                break
             decision = decisions[index]
+            state.current_phase = "gemini_escalation"
             if (
                 gemini_available
                 and state.gemini_budget_remaining > 0
@@ -623,6 +662,7 @@ class ContextualReconstructor:
                     gemini_health=gemini_health,
                     local_seg=local_seg,
                 )
+                self._checkpoint_results(results, state)
                 continue
             state.counts["gemini_budget_skips"] += 1
             if not gemini_available:
@@ -649,40 +689,307 @@ class ContextualReconstructor:
                     escalation_reason="local_provider_unavailable",
                 )
 
-    def _local_path(
+    def _run_local_queue(
+        self,
+        segments: Sequence[Mapping[str, object]],
+        decisions: Sequence[AdaptiveRoutingDecision],
+        requests: Sequence[ReconstructionRequest],
+        memory: SourceEntityMemory,
+        work: Sequence[tuple[int, str | None, bool]],
+        local_available: bool,
+        local_method: str,
+        state: "_JobState",
+        allow_escalations: bool,
+    ) -> tuple[
+        dict[int, SegmentReconstruction],
+        list[tuple[int, SegmentReconstruction | None, str]],
+    ]:
+        """Run the bounded local micro-batch scheduler.
+
+        ``work`` carries ``(index, fallback_reason, escalate)``. Targets are
+        ranked strongest-first, capped by the per-job local target ceiling,
+        processed in deterministic micro-batches bounded by window and character
+        limits, and checkpointed after every batch. One invalid candidate never
+        rejects valid siblings, and a malformed batch degrades to isolated
+        unresolved results without recursive splitting or retry storms.
+        """
+
+        results: dict[int, SegmentReconstruction] = {}
+        escalations: list[tuple[int, SegmentReconstruction | None, str]] = []
+        if not work:
+            return results, escalations
+        if not local_available:
+            for index, fallback_reason, escalate in work:
+                if escalate and allow_escalations:
+                    escalations.append((index, None, "local_provider_unavailable"))
+                else:
+                    state.counts["unresolved"] += 1
+                    results[index] = self._fallback(
+                        index,
+                        segments[index],
+                        provider_error=True,
+                        status=ReconstructionStatus.PROVIDER_UNAVAILABLE,
+                        method="provider:unknown",
+                        decision=decisions[index],
+                        route=decisions[index].route.value,
+                        escalation_reason=fallback_reason or "local_provider_unavailable",
+                    )
+            return results, escalations
+        state.current_phase = "local"
+        if state.local_wall_started is None:
+            state.local_wall_started = self._monotonic()
+        selected, skipped = self._select_local_targets(work, decisions, state)
+        for index in skipped:
+            state.counts["unresolved"] += 1
+            state.local_target_budget_exhausted = True
+            results[index] = self._local_budget_skip(
+                index,
+                segments[index],
+                decisions[index],
+                "local_target_budget_exhausted",
+            )
+        attempted: set[int] = set()
+        for batch in self._plan_batches(selected, requests):
+            if self._cancelled():
+                state.cancelled = True
+                state.counts["cancellation_requested"] += 1
+                break
+            if not self._local_budget_available(state):
+                state.local_time_budget_exhausted = True
+                break
+            self._checkpoint_results(results, state)
+            batch_requests = [requests[index] for index in batch]
+            try:
+                candidates = self._provider.reconstruct_segments(batch_requests)  # type: ignore[union-attr]
+            except (OSError, ProviderResponseError):
+                state.counts["local_failures"] += len(batch)
+                for index in batch:
+                    state.counts["local_attempts"] += 1
+                    state.local_targets_used += 1
+                    attempted.add(index)
+                    escalate = next((flag for item, _, flag in work if item == index), False)
+                    failed = self._fallback(
+                        index,
+                        segments[index],
+                        provider_error=True,
+                        status=ReconstructionStatus.PROVIDER_UNAVAILABLE,
+                        method=local_method,
+                        decision=decisions[index],
+                        route=decisions[index].route.value,
+                        local_attempted=True,
+                        local_result_state="failure",
+                        final_provider=_STAGE25_METHOD,
+                    )
+                    results[index] = failed
+                    if escalate and allow_escalations:
+                        escalations.append((index, failed, "local_provider_error"))
+                    else:
+                        state.counts["unresolved"] += 1
+                self._checkpoint_results(results, state)
+                continue
+            for index in batch:
+                state.counts["local_attempts"] += 1
+                state.local_targets_used += 1
+                attempted.add(index)
+                raw = str(segments[index].get("raw_text", segments[index].get("text", "")))
+                candidate = candidates.get(index, ReconstructionCandidate("raw", raw))
+                fallback_reason = next((reason for item, reason, _ in work if item == index), None)
+                escalate = next((flag for item, _, flag in work if item == index), False)
+                segment_result = self._decide(
+                    index,
+                    segments[index],
+                    candidate,
+                    memory,
+                    local_method,
+                    routing=decisions[index],
+                    route=decisions[index].route.value,
+                    local_attempted=True,
+                    local_result_state="accepted",
+                    final_provider=local_method,
+                )
+                if fallback_reason is not None:
+                    segment_result = replace(segment_result, escalation_reason=fallback_reason)
+                if (
+                    segment_result.applied
+                    and segment_result.confidence_level is ConfidenceLevel.HIGH
+                ):
+                    state.counts["local_accepted"] += 1
+                    results[index] = segment_result
+                else:
+                    state.counts["local_unaccepted"] += 1
+                    segment_result = replace(segment_result, final_provider=_STAGE25_METHOD)
+                    results[index] = segment_result
+                    if escalate and allow_escalations:
+                        escalations.append(
+                            (index, segment_result, _local_escalation_reason(segment_result))
+                        )
+                    else:
+                        state.counts["unresolved"] += 1
+            self._checkpoint_results(results, state)
+        if not state.cancelled and state.local_time_budget_exhausted:
+            for index in selected:
+                if index in attempted:
+                    continue
+                state.counts["unresolved"] += 1
+                results[index] = self._local_budget_skip(
+                    index,
+                    segments[index],
+                    decisions[index],
+                    "local_time_budget_exhausted",
+                )
+        return results, escalations
+
+    def _select_local_targets(
+        self,
+        work: Sequence[tuple[int, str | None, bool]],
+        decisions: Sequence[AdaptiveRoutingDecision],
+        state: "_JobState",
+    ) -> tuple[list[int], list[int]]:
+        """Rank local candidates strongest-first and cap by the target ceiling."""
+
+        ordered = sorted(work, key=lambda item: (-decisions[item[0]].severity, item[0]))
+        if self._local_max_targets is None:
+            return [item[0] for item in ordered], []
+        available = max(0, self._local_max_targets - state.local_targets_used)
+        selected = [item[0] for item in ordered[:available]]
+        skipped = [item[0] for item in ordered[available:]]
+        return selected, skipped
+
+    def _plan_batches(
+        self, indices: Sequence[int], requests: Sequence[ReconstructionRequest]
+    ) -> list[list[int]]:
+        """Deterministic greedy micro-batches respecting window and character limits.
+
+        Without explicit batch configuration each target is sent as its own
+        bounded request so a provider failure is isolated per target.
+        """
+
+        if self._batch_windows is None and self._batch_characters is None:
+            return [[index] for index in indices]
+        batches: list[list[int]] = []
+        current: list[int] = []
+        current_characters = 0
+        for index in indices:
+            size = len(json.dumps({"targets": [requests[index].to_payload()]}, ensure_ascii=False))
+            if current and self._batch_windows is not None and len(current) >= self._batch_windows:
+                batches.append(current)
+                current, current_characters = [], 0
+            if (
+                current
+                and self._batch_characters is not None
+                and current_characters + size > self._batch_characters
+            ):
+                batches.append(current)
+                current, current_characters = [], 0
+            current.append(index)
+            current_characters += size
+        if current:
+            batches.append(current)
+        return batches
+
+    def _local_budget_available(self, state: "_JobState") -> bool:
+        """False once the bounded local wall-time budget is exhausted."""
+
+        if self._local_wall_seconds is None or state.local_wall_started is None:
+            return True
+        return (self._monotonic() - state.local_wall_started) < self._local_wall_seconds
+
+    def _consume_local_target(self, state: "_JobState") -> bool:
+        """Reserve one local target attempt within the configured ceilings."""
+
+        if (
+            self._local_max_targets is not None
+            and state.local_targets_used >= self._local_max_targets
+        ):
+            state.local_target_budget_exhausted = True
+            return False
+        if self._local_wall_seconds is not None:
+            if state.local_wall_started is None:
+                state.local_wall_started = self._monotonic()
+            if (self._monotonic() - state.local_wall_started) >= self._local_wall_seconds:
+                state.local_time_budget_exhausted = True
+                return False
+        state.local_targets_used += 1
+        return True
+
+    def _local_budget_skip(
         self,
         index: int,
         segment: Mapping[str, object],
-        request: ReconstructionRequest,
         decision: AdaptiveRoutingDecision,
-        memory: SourceEntityMemory,
-        local_available: bool,
-        local_health: ProviderHealth | None,
-        local_method: str,
-        state: "_JobState",
-        fallback_reason: str | None = None,
+        reason: str,
     ) -> SegmentReconstruction:
-        if not local_available:
-            state.counts["unresolved"] += 1
-            return self._fallback(
-                index,
-                segment,
-                provider_error=True,
-                status=ReconstructionStatus.PROVIDER_UNAVAILABLE,
-                method="provider:unknown",
-                decision=decision,
-                route=decision.route.value,
-                escalation_reason=fallback_reason or "local_provider_unavailable",
-            )
-        segment_result = self._local_attempt(
-            index, segment, request, decision, memory, local_method, state
+        """Truthful unresolved result when a local work ceiling is reached."""
+
+        return self._fallback(
+            index,
+            segment,
+            status=ReconstructionStatus.LOW_CONFIDENCE_UNRESOLVED,
+            decision=decision,
+            route=decision.route.value,
+            escalation_reason=reason,
+            final_provider=_STAGE25_METHOD,
         )
-        if fallback_reason is not None:
-            segment_result = replace(segment_result, escalation_reason=fallback_reason)
-        if segment_result.applied and segment_result.confidence_level is ConfidenceLevel.HIGH:
-            return segment_result
-        state.counts["unresolved"] += 1
-        return segment_result
+
+    def _cancelled(self) -> bool:
+        """Cooperative cancellation query; None means cancellation is unavailable."""
+
+        if self._is_cancelled is None:
+            return False
+        return bool(self._is_cancelled())
+
+    def _checkpoint_results(
+        self, results: dict[int, SegmentReconstruction], state: "_JobState"
+    ) -> None:
+        """Persist completed per-target results through the executor checkpoint."""
+
+        if self._checkpoint is None:
+            return
+        self._checkpoint(dict(results), self._progress(results, state))
+
+    def _progress(
+        self,
+        results: dict[int, SegmentReconstruction],
+        state: "_JobState",
+    ) -> dict[str, object]:
+        """Lightweight durable progress used by checkpoints and final metadata."""
+
+        local_budget_remaining: int | None = None
+        if self._local_max_targets is not None:
+            local_budget_remaining = max(0, self._local_max_targets - state.local_targets_used)
+        wall_remaining: float | None = None
+        if self._local_wall_seconds is not None and state.local_wall_started is not None:
+            wall_remaining = max(
+                0.0, self._local_wall_seconds - (self._monotonic() - state.local_wall_started)
+            )
+        return {
+            "total_segments": state.total_segments,
+            "phase": state.current_phase,
+            "no_llm_completed": state.counts["no_llm"] + state.counts["manual"],
+            "local_eligible": state.counts["local_attempts"] + state.counts["unresolved"],
+            "local_completed": state.counts["local_accepted"] + state.counts["local_unaccepted"],
+            "gemini_eligible": state.counts["gemini_direct"] + state.counts["gemini_escalations"],
+            "gemini_completed": state.counts["gemini_accepted"] + state.counts["gemini_rejected"],
+            "unresolved": state.counts["unresolved"],
+            "local_target_budget_remaining": local_budget_remaining,
+            "local_wall_seconds_remaining": wall_remaining,
+            "cancellation_requested": bool(state.cancelled),
+            "routing_counts": dict(state.counts),
+        }
+
+    def _local_budget_metadata(self, state: "_JobState") -> dict[str, object]:
+        return {
+            "max_targets_per_job": self._local_max_targets,
+            "max_wall_seconds": self._local_wall_seconds,
+            "targets_used": state.local_targets_used,
+            "target_budget_exhausted": state.local_target_budget_exhausted,
+            "time_budget_exhausted": state.local_time_budget_exhausted,
+            "wall_seconds_used": (
+                self._monotonic() - state.local_wall_started
+                if state.local_wall_started is not None
+                else None
+            ),
+        }
 
     def _manual(
         self, index: int, segment: Mapping[str, object], decision: AdaptiveRoutingDecision
@@ -745,6 +1052,14 @@ class ContextualReconstructor:
         method: str,
         state: "_JobState",
     ) -> SegmentReconstruction:
+        if not self._consume_local_target(state):
+            state.counts["unresolved"] += 1
+            reason = (
+                "local_time_budget_exhausted"
+                if state.local_time_budget_exhausted
+                else "local_target_budget_exhausted"
+            )
+            return self._local_budget_skip(index, segment, decision, reason)
         state.counts["local_attempts"] += 1
         raw = str(segment.get("raw_text", segment.get("text", "")))
         try:
@@ -1172,11 +1487,13 @@ class ContextualReconstructor:
         """True only when the run completed without transient provider failure.
 
         Deterministic rejections and genuine unresolved outcomes stay eligible;
-        provider-unavailable runs, quota/rate-limit exhaustion, and any provider
-        failure remain retryable on a later run.
+        provider-unavailable runs, quota/rate-limit exhaustion, local work
+        ceilings, and any provider failure remain retryable on a later run.
         """
 
         if state.gemini_exhausted:
+            return False
+        if state.local_target_budget_exhausted or state.local_time_budget_exhausted:
             return False
         if state.counts["gemini_failures"] or state.counts["local_failures"]:
             return False
@@ -1236,11 +1553,20 @@ class _JobState:
         budget: int,
         exhausted: bool,
         stop_reason: str | None,
+        monotonic: Callable[[], float],
     ) -> None:
         self.counts = counts
         self.gemini_budget_remaining = budget
         self.gemini_exhausted = exhausted
         self.gemini_stop_reason = stop_reason
+        self.monotonic = monotonic
+        self.total_segments = 0
+        self.current_phase = "idle"
+        self.local_targets_used = 0
+        self.local_wall_started: float | None = None
+        self.local_target_budget_exhausted = False
+        self.local_time_budget_exhausted = False
+        self.cancelled = False
 
 
 def _reconstruction_request(
