@@ -158,8 +158,10 @@ accepted local result is retained when one exists, otherwise safe Stage 2.5
 text is preserved and the segment is marked unresolved/manual review. Provider
 failures are never silently reported as success. Permanent 400-class request
 failures, authentication, model-not-found, 429, malformed output, and safety
-refusal are never retried; connection/timeout/eligible 5xx get at most one
-bounded retry.
+refusal are never retried; connection, timeout, and eligible 5xx (including
+HTTP 503, surfaced as the precise sanitized `SERVICE_UNAVAILABLE` category) get
+at most one bounded retry — an initial request plus one retry, so a single
+generation never exceeds two attempts.
 
 ## Memory diagnostics
 
@@ -342,7 +344,11 @@ When a ceiling is reached, scheduling of additional Qwen requests stops, the
 job neither fails nor stalls, safe Stage 2.5 text is preserved, skipped targets
 are marked unresolved/manual review with `local_target_budget_exhausted` or
 `local_time_budget_exhausted`, the transcript still reaches a terminal state,
-and no additional Gemini quota is spent to compensate. `cache_eligible` is false
+and no additional Gemini quota is spent to compensate. The wall-time ceiling is
+enforced before each micro-batch is even planned: once it expires, no further
+batch is planned or dispatched, no target is classified unfit, and no Gemini
+escalation is enqueued, so a later oversized target can never spend Gemini quota
+after the ceiling. `cache_eligible` is false
 so a later run reconsiders eligible unresolved work (accepted per-target results
 are reused, not repeated). A clean transcript may legitimately make zero Qwen
 and zero Gemini calls.

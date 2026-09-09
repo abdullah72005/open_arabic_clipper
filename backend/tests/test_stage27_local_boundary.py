@@ -206,6 +206,16 @@ class _Toggle:
         self.count = 0
 
 
+def _make_clock() -> tuple[dict[str, float], Any]:
+    state: dict[str, float] = {"now": 0.0}
+
+    def clock() -> float:
+        state["now"] += 0.5
+        return state["now"]
+
+    return state, clock
+
+
 class _FakeGemini:
     def __init__(self, candidate: ReconstructionCandidate | None = None) -> None:
         self.model = "gemini-3.6-flash"
@@ -463,6 +473,89 @@ def test_irreducible_target_escalates_to_gemini_when_policy_permits() -> None:
     assert gemini.calls == 1
     assert result.segments[0].applied is True
     assert result.segments[1].gemini_attempted is True
+
+
+# Blocker 4: hard local wall-time ceiling is enforced before planning each batch
+
+
+def test_wall_ceiling_prevents_planning_irreducible_later_target() -> None:
+    """After the ceiling expires, a later irreducible target is never planned or
+    dispatched: it gets local_time_budget_exhausted with zero failures/attempts."""
+
+    transport = _Transport(accept_text=True)
+    provider = _ollama_provider(transport)
+    segments = [_big_local_segment(0, words=2), _oversized_segment(1)]
+    _state, clock = _make_clock()
+    reconstructor = _reconstructor(
+        provider,
+        batch_windows=1,
+        monotonic=clock,
+        local_wall_seconds=1.0,
+    )
+    result = _run(reconstructor, segments)
+    assert len(transport.calls) == 1  # only the valid first request ran
+    assert result.segments[0].applied is True
+    assert result.segments[1].applied is False
+    assert result.segments[1].escalation_reason == "local_time_budget_exhausted"
+    assert result.segments[1].local_result_state is None
+    counts = result.metadata["routing_counts"]
+    assert counts.get("local_failures", 0) == 0  # not planned, not classified unfit
+    assert counts["local_attempts"] == 1  # only the valid target was attempted
+    assert result.metadata["local_budget"]["time_budget_exhausted"] is True
+
+
+def test_wall_ceiling_prevents_gemini_escalation_after_expiry() -> None:
+    """In adaptive mode, after the ceiling expires no local_context_unfit
+    escalation and zero Gemini calls happen for the later irreducible target."""
+
+    transport = _Transport(accept_text=True)
+    local = _ollama_provider(transport)
+    gemini = _FakeGemini()
+    segments = [_big_local_segment(0, words=2), _oversized_segment(1)]
+    _state, clock = _make_clock()
+    reconstructor = ContextualReconstructor(
+        local,
+        gemini_provider=gemini,
+        routing=AdaptiveRoutingConfig(mode=RoutingMode.ADAPTIVE),
+        gemini_budget=10,
+        batch_windows=1,
+        batch_characters=1_000_000,
+        monotonic=clock,
+        local_wall_seconds=1.0,
+    )
+    result = _run(reconstructor, segments)
+    assert len(transport.calls) == 1
+    assert gemini.calls == 0  # no local_context_unfit escalation after the ceiling
+    assert result.segments[0].applied is True
+    assert result.segments[1].applied is False
+    assert result.segments[1].gemini_attempted is False
+    assert result.segments[1].escalation_reason == "local_time_budget_exhausted"
+
+
+def test_irreducible_isolation_still_runs_with_available_wall_budget() -> None:
+    """With the wall-time budget still available, valid -> irreducible -> valid
+    isolation still works: both valid units execute, only the oversized one is unfit."""
+
+    transport = _Transport(accept_text=True)
+    provider = _ollama_provider(transport)
+    segments = [
+        _big_local_segment(0, words=2),
+        _oversized_segment(1),
+        _big_local_segment(2, words=2),
+    ]
+    _state, clock = _make_clock()
+    reconstructor = _reconstructor(
+        provider,
+        batch_windows=3,
+        monotonic=clock,
+        local_wall_seconds=100.0,
+    )
+    result = _run(reconstructor, segments)
+    assert len(transport.calls) == 2  # both valid units executed
+    assert result.segments[0].applied is True
+    assert result.segments[2].applied is True
+    assert result.segments[1].applied is False
+    assert result.segments[1].local_result_state == "unfit"
 
 
 # ---------------------------------------------------------------------------

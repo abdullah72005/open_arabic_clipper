@@ -108,18 +108,22 @@ class GeminiErrorCategory(str, Enum):
     CONNECTION = "CONNECTION"
     TIMEOUT = "TIMEOUT"
     RATE_LIMITED = "RATE_LIMITED"
+    SERVICE_UNAVAILABLE = "SERVICE_UNAVAILABLE"
     PROVIDER_ERROR = "PROVIDER_ERROR"
     SAFETY_REFUSAL = "SAFETY_REFUSAL"
     MALFORMED_OUTPUT = "MALFORMED_OUTPUT"
 
 
-# Only these categories receive the single bounded retry. Permanent 400-class
-# request/schema failures, authentication, model-not-found, 429, malformed
-# output, validation rejection, and safety refusal are never retried.
+# Only these transient categories receive the single bounded retry. Permanent
+# 400-class request/schema failures, authentication, model-not-found, 429,
+# malformed output, validation rejection, and safety refusal are never retried.
+# HTTP 503 (SERVICE_UNAVAILABLE) is a transient server-side provider failure and
+# is retried once like connection/timeout outages.
 _RETRYABLE_CATEGORIES = frozenset(
     {
         GeminiErrorCategory.CONNECTION,
         GeminiErrorCategory.TIMEOUT,
+        GeminiErrorCategory.SERVICE_UNAVAILABLE,
         GeminiErrorCategory.PROVIDER_ERROR,
     }
 )
@@ -450,6 +454,8 @@ def _classify_exception(error: Exception) -> GeminiErrorCategory:
         return GeminiErrorCategory.RATE_LIMITED
     if code in {408, 504} or "timeout" in str(error).casefold():
         return GeminiErrorCategory.TIMEOUT
+    if code == 503:
+        return GeminiErrorCategory.SERVICE_UNAVAILABLE
     if code is not None and 500 <= code < 600:
         return GeminiErrorCategory.PROVIDER_ERROR
     if code is not None and 400 <= code < 500:

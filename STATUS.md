@@ -402,5 +402,24 @@ adaptive mode the irreducible target escalates to Gemini exactly once while the
 valid unit runs locally. Cancellation, wall-time, aggregate-envelope, per-target
 reuse, and cross-session cancellation guarantees are unchanged and green.
 
+## Wall-ceiling and Gemini 503 verification (2026-09-09)
+
+A narrow corrective pass closed a hard-ceiling bypass and sharpened Gemini
+503 observability. The local wall-time ceiling is now checked **before** each
+micro-batch is planned, not only before each actual request: once it expires,
+the batch is never planned, no target is classified unfit, no local
+attempt/failure is recorded for it, and no `local_context_unfit` Gemini
+escalation is enqueued — the existing tail handling marks remaining targets
+`local_time_budget_exhausted`. Deterministic fake-clock tests prove: a later
+irreducible target after the ceiling yields zero local failures/attempts and
+zero Gemini calls (local-only and adaptive); isolation of a middle irreducible
+target still runs both valid sides when budget is available. Gemini HTTP 503 is
+classified as the precise sanitized `SERVICE_UNAVAILABLE` category, is retried
+exactly once (initial + one bounded retry, two attempts maximum), and after
+exhaustion produces a safe fallback with `failure:SERVICE_UNAVAILABLE`
+evidence; 429/401/403/malformed-output remain single-attempt and non-retryable.
+Fake-SDK tests also prove a sentinel fake key never appears in exceptions,
+tracebacks, or metadata.
+
 STAGE 2.7 MUST CONTINUE
 

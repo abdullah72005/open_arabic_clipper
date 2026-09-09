@@ -721,7 +721,10 @@ class ContextualReconstructor:
         ranked strongest-first, capped by the per-job local target ceiling,
         processed in deterministic micro-batches bounded by window and character
         limits, and checkpointed after every batch. Each micro-batch is planned
-        immediately before it executes (never eagerly for future batches), so a
+        immediately before it executes (never eagerly for future batches), after
+        a cooperative cancellation poll and a hard local wall-time ceiling check:
+        once the ceiling expires no further batch is planned or dispatched, no
+        target is classified unfit, and no Gemini escalation is enqueued. A
         later target that cannot fit context is isolated on its own and earlier
         or later valid work still runs. One invalid candidate never rejects
         valid siblings, and a malformed batch degrades to isolated unresolved
@@ -766,6 +769,12 @@ class ContextualReconstructor:
         for batch in self._plan_batches(selected, requests):
             if self._poll_cancelled(results, state):
                 break
+            if not self._local_budget_available(state):
+                # Hard wall-time ceiling: stop before planning this micro-batch so
+                # a later irreducible target is never planned, never classified
+                # unfit, never counts an attempt/failure, and never escalates.
+                state.local_time_budget_exhausted = True
+                break
             batch_requests = [requests[index] for index in batch]
             units, irreducible = self._plan_local_units(batch_requests)
             if irreducible:
@@ -799,13 +808,15 @@ class ContextualReconstructor:
                 self._checkpoint_results(results, state)
                 if self._poll_cancelled(results, state):
                     break
+            first_unit = True
             for unit_requests in units:
                 unit_indices = [request.segment_index for request in unit_requests]
                 if self._poll_cancelled(results, state):
                     break
-                if not self._local_budget_available(state):
+                if not first_unit and not self._local_budget_available(state):
                     state.local_time_budget_exhausted = True
                     break
+                first_unit = False
                 self._checkpoint_results(results, state)
                 try:
                     candidates = self._provider.reconstruct_segments(unit_requests)  # type: ignore[union-attr]

@@ -39,7 +39,10 @@
   strongest-first budget. Aggregate context-safe local planning is owned by
   orchestration: a pure provider planner (never an HTTP call) splits each
   window/character micro-batch — planned immediately before it executes, never
-  eagerly for future batches — into visible actual requests whose exact
+  eagerly for future batches and only after a hard local wall-time ceiling
+  check, so once the ceiling expires no further batch is planned, no target is
+  classified unfit, and no Gemini escalation is enqueued — into visible actual
+  requests whose exact
   combined chat envelope (system instruction, full `{"targets": [...]}` payload,
   framing/safety reserves, scaled output budget) never exceeds
   `max_context_tokens`, and `reconstruct_segments` executes exactly one HTTP
