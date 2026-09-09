@@ -253,24 +253,8 @@ class OpenAICompatibleReconstructionProvider:
             (request.dialect_profile for request in requests if request.dialect_profile), None
         )
         system_instruction = self._system_instruction(profile)
-        output_tokens = _batch_output_tokens(self._output_tokens, len(requests))
-        if self._max_context_tokens is not None:
-            envelope = self._envelope_estimate(system_instruction, output_tokens)
-            requests = [
-                _shrink_request_to_budget(
-                    request,
-                    self._max_context_tokens,
-                    envelope=envelope,
-                )
-                for request in requests
-            ]
-            for request in requests:
-                estimated = envelope(request)
-                if estimated > self._max_context_tokens:
-                    raise ProviderResponseError(
-                        f"request for segment {request.segment_index} exceeds context budget "
-                        f"({estimated} > {self._max_context_tokens} tokens)"
-                    )
+        batches = self._context_safe_batches(requests, system_instruction)
+        sent_requests = [request for batch in batches for request in batch]
         self._last_request_sizes = tuple(
             RequestSizeDiagnostics(
                 segment_index=request.segment_index,
@@ -279,18 +263,85 @@ class OpenAICompatibleReconstructionProvider:
                         "utf-8"
                     )
                 ),
-                estimated_input_tokens=self._envelope_estimate(system_instruction, output_tokens)(
-                    request
-                ),
+                estimated_input_tokens=self._envelope_estimate(
+                    system_instruction, self._output_tokens
+                )(request),
+            )
+            for request in sent_requests
+        )
+        candidates: dict[int, ReconstructionCandidate] = {}
+        for batch in batches:
+            output_tokens = _batch_output_tokens(self._output_tokens, len(batch))
+            content = self._call(
+                system_instruction,
+                {"targets": [item.to_payload() for item in batch]},
+                output_tokens=output_tokens,
+            )
+            candidates.update(_parse_reconstructions(content, batch))
+        return candidates
+
+    def _context_safe_batches(
+        self, requests: list[ReconstructionRequest], system_instruction: str
+    ) -> list[list[ReconstructionRequest]]:
+        """Return request groups whose real aggregate chat envelope fits the budget.
+
+        The service-layer planner bounds the number of windows and characters;
+        this is the correctness bound at the real request boundary. Every request
+        is first shrunk so its own single-target envelope fits, then requests are
+        greedily grouped (in stable order) while the exact combined envelope that
+        will be sent — system instruction, full ``{"targets": [...]}`` payload,
+        chat-framing reserve, safety reserve, and the scaled output budget for the
+        group — stays within ``max_context_tokens``. No group is ever sent that
+        exceeds the configured context limit, and a single target that still
+        cannot fit raises before any HTTP dispatch (no recursive split/retry).
+        """
+
+        if self._max_context_tokens is None:
+            return [requests]
+        single_envelope = self._envelope_estimate(system_instruction, self._output_tokens)
+        requests = [
+            _shrink_request_to_budget(
+                request,
+                self._max_context_tokens,
+                envelope=single_envelope,
             )
             for request in requests
+        ]
+        for request in requests:
+            estimated = single_envelope(request)
+            if estimated > self._max_context_tokens:
+                raise ProviderResponseError(
+                    f"request for segment {request.segment_index} exceeds context budget "
+                    f"({estimated} > {self._max_context_tokens} tokens)"
+                )
+        batches: list[list[ReconstructionRequest]] = []
+        current: list[ReconstructionRequest] = []
+        for request in requests:
+            if current:
+                trial = [*current, request]
+                if self._aggregate_envelope(trial, system_instruction) > self._max_context_tokens:
+                    batches.append(current)
+                    current = []
+            current.append(request)
+        if current:
+            batches.append(current)
+        return batches
+
+    def _aggregate_envelope(
+        self, requests: list[ReconstructionRequest], system_instruction: str
+    ) -> int:
+        """Conservative token estimate of the exact combined chat envelope sent."""
+
+        payload = json.dumps(
+            {"targets": [item.to_payload() for item in requests]}, ensure_ascii=False
         )
-        content = self._call(
-            system_instruction,
-            {"targets": [item.to_payload() for item in requests]},
-            output_tokens=output_tokens,
+        return (
+            estimate_tokens(system_instruction)
+            + estimate_tokens(payload)
+            + self._chat_framing_reserve
+            + _batch_output_tokens(self._output_tokens, len(requests))
+            + self._safety_reserve
         )
-        return _parse_reconstructions(content, requests)
 
     def _system_instruction(self, profile: str | None = None) -> str:
         instruction = SYSTEM_INSTRUCTION

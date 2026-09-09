@@ -122,6 +122,13 @@ transcript metadata, so a cancellation or worker restart does not discard every
 preceding expensive result. Manual overrides stay terminal. No generation call
 is made to check a cache key.
 
+Every executor exit path — a fresh cache hit, cached-output preservation during
+an outage, all-NO_LLM, normal completion, cancellation, and provider failure —
+releases owned provider resources idempotently. A fresh cache-hit worker
+therefore scrubs the Gemini API key and closes owned SDK clients without ever
+building a client or making a network call; unowned injected clients are never
+closed.
+
 ### Heavy-model lease
 
 The Ollama heavy-model lease is acquired lazily, only around actual local Qwen
@@ -292,6 +299,23 @@ reconstruction. A provider-health failure before any call still falls back all
 targets because no call can safely start. Provider release runs in one outer
 `finally`; a release failure is logged but never replaces a valid result.
 
+### Aggregate context safety at the request boundary
+
+The window and character ceilings are secondary bounds. The real correctness
+bound is enforced inside the local provider on the exact envelope that will be
+sent. Each target is first shrunk so its own single-target envelope fits, then
+the requests are greedily grouped (in stable order) while the aggregate envelope
+that will actually be sent — the system instruction, the full combined
+`{"targets": [...]}` JSON payload, the chat-framing reserve, the safety reserve,
+and the scaled output budget for that group — stays within
+`max_context_tokens` (default 4096). A group that would overflow is split into
+the next group, so an eight-target batch that individually fits can never be
+sent as one over-budget request. A single target that still cannot fit raises a
+contained provider error before any HTTP dispatch. Segment order, IDs,
+per-target validation, and safe malformed-batch fallback are preserved; the
+output-token budget scales with the number of targets actually in each sent
+group.
+
 ## Local work ceilings
 
 Local Qwen work is hard-bounded per job so a long source can never produce
@@ -324,7 +348,7 @@ The Ollama container pins safe, operator-tunable limits for the documented
 | `OLLAMA_MAX_LOADED_MODELS` | `1` | One loaded model. |
 | `OLLAMA_MAX_QUEUE` | `4` | Bounded request queue. |
 | `OLLAMA_CONTEXT_LENGTH` | `4096` | Matches the reconstruction context budget. |
-| `OLLAMA_CPUS` | `9` | Compose CPU cap (protects machine responsiveness; may raise per-inference latency). |
+| `OLLAMA_CPUS` | `6` | Compose CPU cap (protects machine responsiveness; may raise per-inference latency). |
 | `OLLAMA_MEM_LIMIT` | `6g` | Compose memory cap. |
 | `OLLAMA_MEMSWAP_LIMIT` | `8g` | Bounded memory+swap allowance instead of unlimited swapping. |
 
@@ -340,9 +364,12 @@ improvement; the CPU cap primarily protects machine responsiveness.
 Cancelling a running or queued reconstruction job (`POST /jobs/{job_id}/cancel`)
 is cooperative:
 
-- Cancellation is checked before and after every provider batch. No new Qwen or
-  Gemini work is scheduled after cancellation, and the in-flight HTTP request is
-  bounded by the configured provider timeout.
+- A single centralized poll is checked before and after every provider attempt
+  or batch: each local Qwen batch, each Gemini-only attempt, each direct-Gemini
+  attempt, each local-to-Gemini escalation, and once immediately before a
+  successful return (so cancellation landing after the final local batch is
+  never missed). No new Qwen or Gemini work is scheduled after cancellation, and
+  the in-flight HTTP request is bounded by the configured provider timeout.
 - A cancelled job stays `CANCELLED`; it is never overwritten as successful, and
   the next pipeline stage is never scheduled. The source stays truthful and
   retryable.
@@ -351,6 +378,20 @@ is cooperative:
   provider and reconsiders only failed or eligible-unresolved targets.
 - Provider and heavy-model lease cleanup still runs on cancellation, and raw ASR
   and timestamps are never altered.
+
+### Degraded-run retry semantics
+
+A fully cache-eligible reconstruction run may be skipped on a later normal
+request (the runner matches the succeeded run's input fingerprint and the
+executor confirms `cache_eligible`). A degraded run — one with
+unresolved/provider-failed/rate-limited/local-ceiling targets, so
+`cache_eligible` is false — is **not** skipped: `PipelineRunner` re-enters the
+reconstruction executor on a later non-force request (only for the
+reconstruction stage; other stages skip as before). The executor then reuses the
+accepted per-target results without provider calls and retries only the eligible
+unfinished targets. A safe degraded result may remain terminal for the current
+attempt, but it never suppresses a later recovery attempt and never requires
+`--force`.
 
 ## Prompt budgeting
 

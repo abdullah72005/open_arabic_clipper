@@ -35,7 +35,7 @@ services:
       OLLAMA_MAX_LOADED_MODELS: "1"
       OLLAMA_MAX_QUEUE: "${OLLAMA_MAX_QUEUE:-4}"
       OLLAMA_CONTEXT_LENGTH: "${OLLAMA_CONTEXT_LENGTH:-4096}"
-    cpus: "${OLLAMA_CPUS:-9}"
+    cpus: "${OLLAMA_CPUS:-6}"
     mem_limit: "${OLLAMA_MEM_LIMIT:-6g}"
     memswap_limit: "${OLLAMA_MEMSWAP_LIMIT:-8g}"
     pids_limit: 512

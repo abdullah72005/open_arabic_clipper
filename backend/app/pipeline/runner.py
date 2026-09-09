@@ -63,6 +63,7 @@ class PipelineRunner:
             and run.status is PipelineRunStatus.SUCCEEDED
             and input_fingerprint
             and run.input_fingerprint == input_fingerprint
+            and self._skip_is_allowed(executor, source)
         ):
             return PipelineResult(run.id, job_id, skipped=True)
 
@@ -138,6 +139,20 @@ class PipelineRunner:
         if source is None:
             raise LookupError(f"source video {source_id} does not exist")
         return source
+
+    def _skip_is_allowed(self, executor: StageExecutor, source: SourceVideo) -> bool:
+        """Whether a matching succeeded run may be skipped.
+
+        Most stages skip whenever their input fingerprint matches. A stage may
+        opt out by exposing ``skip_is_allowed(source)``; the reconstruction
+        executor uses it so a degraded (not cache-eligible) run re-enters the
+        executor on a later normal request instead of being skipped forever.
+        """
+
+        checker = getattr(executor, "skip_is_allowed", None)
+        if checker is None:
+            return True
+        return bool(checker(source))
 
     def _latest_run(self, source_id: UUID, stage: PipelineStage) -> PipelineRun | None:
         return self._session.scalar(

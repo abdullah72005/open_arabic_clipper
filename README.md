@@ -112,15 +112,21 @@ and hard-bounded per job
 (`CLIPFACTORY_LOCAL_RECONSTRUCTION_MAX_TARGETS_PER_JOB` default `64`,
 `CLIPFACTORY_LOCAL_RECONSTRUCTION_MAX_WALL_SECONDS` default `1200`), so a
 four-hour source can never create unbounded local inference; skipped targets are
-marked unresolved/manual review and never auto-escalate to Gemini. `adaptive` and
+marked unresolved/manual review and never auto-escalate to Gemini. Each sent
+local batch is also split at the provider boundary so its combined chat envelope
+never exceeds the configured context. `adaptive` and
 `gemini_only` may send short transcript snippets and bounded context to Google
 Gemini; set `local_only` for a fully local pipeline. The key is a secret, held
 as `SecretStr`, unwrapped only at lazy client construction, and never logged or
-committed; there are no per-job Gemini metadata probes. A temporary Gemini
+committed; there are no per-job Gemini metadata probes, and a fresh cache-hit
+worker scrubs the key without any network call. A temporary Gemini
 outage never overwrites accepted output: fingerprints are stable identity only
 and cache eligibility is tracked separately. Cancelling a reconstruction job is
-cooperative: the job stays `CANCELLED`, the next stage is not scheduled, and
-already-accepted per-target work survives restart without re-calling a provider.
+cooperative and polled on every provider route: the job stays `CANCELLED`, the
+next stage is not scheduled, and already-accepted per-target work survives
+restart without re-calling a provider. A degraded (not cache-eligible)
+reconstruction is automatically retried on a later normal request without
+repeating accepted targets.
 
 Stage 2.7 cache reuse is dependency-aware: stage runs persist canonical input
 and output fingerprints (plus per-target fingerprints), and changed upstream

@@ -294,7 +294,7 @@ routing, batching, ceilings, cancellation, caching, and hardware controls:
   orchestration failure); the lazy lease is held only for real local inference.
 - **Ollama hardware safeguards.** Compose pins `OLLAMA_NUM_PARALLEL=1`,
   `OLLAMA_MAX_LOADED_MODELS=1`, a bounded queue, `OLLAMA_CONTEXT_LENGTH=4096`,
-  `OLLAMA_CPUS=9`, `OLLAMA_MEM_LIMIT=6g`, and `OLLAMA_MEMSWAP_LIMIT=8g`,
+  `OLLAMA_CPUS=6`, `OLLAMA_MEM_LIMIT=6g`, and `OLLAMA_MEMSWAP_LIMIT=8g`,
   operator-tunable via the environment.
 - **Progress and observability.** Lightweight progress (totals, local eligible/
   completed, Gemini eligible/completed, unresolved, phase, budget remaining,
@@ -310,6 +310,44 @@ batches prevents later provider calls and keeps the job `CANCELLED`. Real Qwen,
 Whisper, video replay, and repeated live Gemini runs are prohibited in this
 corrective pass, so no real wall-time claim is made; the deterministic call-count
 improvements and enforced upper bounds above are the acceptance evidence.
+
+## Sol-review blocker fixes (2026-09-09)
+
+A second corrective pass fixed the four validated release blockers plus the
+cache-hit lifecycle defect without redesigning Stage 2.7:
+
+- **Aggregate local batches are context-safe.** The local provider now evaluates
+  the exact combined chat envelope that will be sent (system instruction, full
+  `{"targets": [...]}` payload, chat-framing and safety reserves, scaled output
+  budget) and greedily splits groups so no sent request ever exceeds
+  `max_context_tokens`; window/character ceilings remain secondary bounds. A
+  regression proves requests that each fit alone are split into two calls and
+  every sent envelope fits.
+- **Degraded reconstruction retries normally.** `PipelineRunner` consults an
+  optional executor `skip_is_allowed`; the reconstruction executor allows a skip
+  only when the stored run is fully cache-eligible. A degraded run (unresolved/
+  provider-failed/rate-limited/local-ceiling) re-enters the executor on a later
+  non-force request, reuses accepted per-target work with zero provider calls,
+  and retries only eligible unfinished targets.
+- **Cancellation works on every route.** One centralized poll runs before and
+  after each local batch, Gemini-only attempt, direct-Gemini attempt, and
+  escalation, plus once immediately before a successful return. Cancellation
+  landing after the final local batch is never missed, and a cancelled Gemini
+  job can no longer finish successfully or schedule the next stage.
+- **Ollama CPU default is six.** `OLLAMA_CPUS` defaults to `6` (operator
+  overridable) in Compose, `.env.example`, and documentation; memory, swap,
+  queue, loaded-model, and parallelism safeguards are unchanged.
+- **Fresh cache-hit cleanup.** The executor now releases owned provider
+  resources on every exit path, so a fresh cache-hit worker scrubs the Gemini
+  key and closes owned SDK clients without building a client or making a network
+  call; a regression proves the key is scrubbed with zero generation.
+
+Bounded verification (fake providers, stored transcripts) passes: 411 backend
+tests plus the 21 immutable-ASR capture tests; Ruff and formatting clean; scoped
+mypy shows no new errors. One tiny live Gemini structured-output smoke was
+attempted through the production settings path and failed with a sanitized
+`PROVIDER_ERROR` category (external/API-side); it was not retried and no key was
+printed, logged, or committed.
 
 STAGE 2.7 MUST CONTINUE
 

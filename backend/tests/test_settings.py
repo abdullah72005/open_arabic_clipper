@@ -210,7 +210,7 @@ def test_ollama_compose_hardware_safeguards_are_configured() -> None:
     assert re.search(r"OLLAMA_MAX_LOADED_MODELS:\s*\"1\"", compose)
     assert re.search(r"OLLAMA_MAX_QUEUE:\s*\"\$\{OLLAMA_MAX_QUEUE:-4\}\"", compose)
     assert re.search(r"OLLAMA_CONTEXT_LENGTH:\s*\"\$\{OLLAMA_CONTEXT_LENGTH:-4096\}\"", compose)
-    assert re.search(r"cpus:\s*\"\$\{OLLAMA_CPUS:-9\}\"", compose)
+    assert re.search(r"cpus:\s*\"\$\{OLLAMA_CPUS:-6\}\"", compose)
     assert re.search(r"mem_limit:\s*\"\$\{OLLAMA_MEM_LIMIT:-6g\}\"", compose)
     assert re.search(r"memswap_limit:\s*\"\$\{OLLAMA_MEMSWAP_LIMIT:-8g\}\"", compose)
 

@@ -540,18 +540,71 @@ class ContextualReconstructionExecutor:
             },
         )
 
-    def execute(self, source: SourceVideo, *, force: bool = False) -> StageExecutionResult:
+    def skip_is_allowed(self, source: SourceVideo) -> bool:
+        """Whether a matching succeeded reconstruction run may be skipped.
+
+        A fully cache-eligible run is reusable and may be skipped normally. A
+        degraded run (unresolved/provider-failure/rate-limit/local-ceiling
+        targets, so ``cache_eligible`` is false) must re-enter the executor on a
+        later normal request so it can retry only its unfinished targets after
+        provider recovery.
+        """
+
         transcript = self._session.scalar(
             select(Transcript).where(Transcript.source_video_id == source.id)
         )
         if transcript is None:
-            raise StageExecutionError("normalized transcript is missing")
+            return False
+        return transcript.reconstruction_metadata.get("cache_eligible") is True
+
+    def execute(self, source: SourceVideo, *, force: bool = False) -> StageExecutionResult:
         reconstructor = self._reconstructor
         local = getattr(reconstructor, "_provider", None)
         if local is not None:
             reconstructor = reconstructor.with_local_provider(
                 _LeaseBoundReconstructionProvider(local, self._lease_factory)
             )
+        try:
+            return self._execute_with(reconstructor, source, force=force)
+        finally:
+            self._release_reconstructor(reconstructor)
+
+    def _release_reconstructor(self, reconstructor: ContextualReconstructor) -> None:
+        """Idempotently release owned provider resources on every executor exit.
+
+        This covers executor early returns (fresh cache hit and cached-output
+        preservation during an outage) that happen before
+        ``ContextualReconstructor.reconstruct()`` runs its own cleanup, so a
+        fresh cache-hit worker scrubs the Gemini key and closes owned clients
+        without ever performing a generation or network call. Unowned injected
+        clients are never closed.
+        """
+
+        provider = getattr(reconstructor, "_provider", None)
+        if provider is not None:
+            try:
+                provider.release()
+            except Exception:
+                pass
+        gemini = getattr(reconstructor, "_gemini", None)
+        if gemini is not None:
+            try:
+                gemini.release()
+            except Exception:
+                pass
+
+    def _execute_with(
+        self,
+        reconstructor: ContextualReconstructor,
+        source: SourceVideo,
+        *,
+        force: bool = False,
+    ) -> StageExecutionResult:
+        transcript = self._session.scalar(
+            select(Transcript).where(Transcript.source_video_id == source.id)
+        )
+        if transcript is None:
+            raise StageExecutionError("normalized transcript is missing")
         started_at = monotonic()
         stored_eligible = transcript.reconstruction_metadata.get("cache_eligible") is True
         if transcript.reconstruction_fingerprint and not force:

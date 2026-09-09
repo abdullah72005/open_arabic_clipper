@@ -260,6 +260,11 @@ class ContextualReconstructor:
                 state,
                 resolved=resolved,
             )
+            if not cancelled:
+                # Final cooperative cancellation poll immediately before a
+                # successful return (e.g. cancellation landing after the last
+                # provider batch).
+                cancelled = self._poll_cancelled(by_index, state)
             if cancelled:
                 self._checkpoint_results(by_index, state)
                 raise ReconstructionCancelled("reconstruction cancelled")
@@ -482,7 +487,7 @@ class ContextualReconstructor:
     ) -> None:
         ranked = sorted(targets, key=lambda index: (-decisions[index].severity, index))
         for index in ranked:
-            if state.cancelled:
+            if self._poll_cancelled(results, state):
                 break
             decision = decisions[index]
             state.current_phase = "gemini"
@@ -504,6 +509,8 @@ class ContextualReconstructor:
                     gemini_health=gemini_health,
                 )
                 self._checkpoint_results(results, state)
+                if self._poll_cancelled(results, state):
+                    break
                 continue
             state.counts["gemini_budget_skips"] += 1
             if not gemini_available:
@@ -584,7 +591,7 @@ class ContextualReconstructor:
         # never re-escalate to Gemini (they already exhausted or lack it).
         work: list[tuple[int, str | None, bool]] = []
         for index in sorted(direct_ids, key=lambda index: (-decisions[index].severity, index)):
-            if state.cancelled:
+            if self._poll_cancelled(results, state):
                 break
             decision = decisions[index]
             state.current_phase = "gemini"
@@ -608,6 +615,8 @@ class ContextualReconstructor:
                     fallback_to_local=local_available,
                 )
                 self._checkpoint_results(results, state)
+                if self._poll_cancelled(results, state):
+                    break
                 continue
             state.counts["gemini_budget_skips"] += 1
             if not gemini_available:
@@ -640,7 +649,7 @@ class ContextualReconstructor:
             ),
         )
         for index, local_seg, escalation_reason in ranked_escalations:
-            if state.cancelled:
+            if self._poll_cancelled(results, state):
                 break
             decision = decisions[index]
             state.current_phase = "gemini_escalation"
@@ -663,6 +672,8 @@ class ContextualReconstructor:
                     local_seg=local_seg,
                 )
                 self._checkpoint_results(results, state)
+                if self._poll_cancelled(results, state):
+                    break
                 continue
             state.counts["gemini_budget_skips"] += 1
             if not gemini_available:
@@ -750,9 +761,7 @@ class ContextualReconstructor:
             )
         attempted: set[int] = set()
         for batch in self._plan_batches(selected, requests):
-            if self._cancelled():
-                state.cancelled = True
-                state.counts["cancellation_requested"] += 1
+            if self._poll_cancelled(results, state):
                 break
             if not self._local_budget_available(state):
                 state.local_time_budget_exhausted = True
@@ -786,6 +795,8 @@ class ContextualReconstructor:
                     else:
                         state.counts["unresolved"] += 1
                 self._checkpoint_results(results, state)
+                if self._poll_cancelled(results, state):
+                    break
                 continue
             for index in batch:
                 state.counts["local_attempts"] += 1
@@ -826,6 +837,8 @@ class ContextualReconstructor:
                     else:
                         state.counts["unresolved"] += 1
             self._checkpoint_results(results, state)
+            if self._poll_cancelled(results, state):
+                break
         if not state.cancelled and state.local_time_budget_exhausted:
             for index in selected:
                 if index in attempted:
@@ -931,12 +944,26 @@ class ContextualReconstructor:
             final_provider=_STAGE25_METHOD,
         )
 
-    def _cancelled(self) -> bool:
-        """Cooperative cancellation query; None means cancellation is unavailable."""
+    def _poll_cancelled(
+        self, results: dict[int, SegmentReconstruction], state: "_JobState"
+    ) -> bool:
+        """One centralized cooperative-cancellation poll.
 
-        if self._is_cancelled is None:
+        On detection it records the requested state, checkpoints the completed
+        safe results so far, and returns True so the caller stops scheduling any
+        further Qwen or Gemini work. Subsequent polls short-circuit on the
+        already-set ``state.cancelled`` so a single request is never double
+        counted.
+        """
+
+        if state.cancelled:
+            return True
+        if self._is_cancelled is None or not self._is_cancelled():
             return False
-        return bool(self._is_cancelled())
+        state.cancelled = True
+        state.counts["cancellation_requested"] += 1
+        self._checkpoint_results(results, state)
+        return True
 
     def _checkpoint_results(
         self, results: dict[int, SegmentReconstruction], state: "_JobState"
