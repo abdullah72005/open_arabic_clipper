@@ -38,11 +38,15 @@
   hard-bounded per job) and clearly difficult spans to Gemini under a finite
   strongest-first budget. Aggregate context-safe local planning is owned by
   orchestration: a pure provider planner (never an HTTP call) splits each
-  window/character micro-batch into visible actual requests whose exact combined
-  chat envelope (system instruction, full `{"targets": [...]}` payload,
+  window/character micro-batch — planned immediately before it executes, never
+  eagerly for future batches — into visible actual requests whose exact
+  combined chat envelope (system instruction, full `{"targets": [...]}` payload,
   framing/safety reserves, scaled output budget) never exceeds
   `max_context_tokens`, and `reconstruct_segments` executes exactly one HTTP
-  call per actual request. A degraded (not cache-eligible)
+  call per actual request. A target that still cannot fit after bounded
+  shrinking is isolated on its own (fallback/escalation/unresolved per policy)
+  so it never aborts earlier or later valid local work. A degraded (not
+  cache-eligible)
   reconstruction run is never skipped by the runner: it re-enters the executor
   on a later normal request and reuses accepted per-target work without
   repeating providers. Cancellation is cooperative and polled before and after

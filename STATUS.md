@@ -384,3 +384,23 @@ provider call with the run and job left `CANCELLED`.
 
 STAGE 2.7 MUST CONTINUE
 
+## Planning-isolation fix (2026-09-09)
+
+A final corrective pass closed the last remaining P1 blocker: a later oversized
+target (one that cannot fit `max_context_tokens` even after bounded shrinking)
+could previously abort the whole local phase during **eager** planning of all
+future micro-batches, before any valid unit ran or checkpointed. Planning is now
+per-micro-batch and lazy: each window/character micro-batch is planned
+immediately before it executes. A planner rejection is caught at the micro-batch
+boundary, only the irreducible target is isolated on its own
+(fallback/unresolved, or Gemini escalation only when policy and budget permit),
+and earlier/later valid units still run and checkpoint. Deterministic tests
+prove: a later irreducible target does not abort the earlier valid unit (its
+call happens, its result is checkpointed, only the oversized target is affected);
+an irreducible target between two valid units leaves both sides running; and in
+adaptive mode the irreducible target escalates to Gemini exactly once while the
+valid unit runs locally. Cancellation, wall-time, aggregate-envelope, per-target
+reuse, and cross-session cancellation guarantees are unchanged and green.
+
+STAGE 2.7 MUST CONTINUE
+

@@ -303,21 +303,26 @@ targets because no call can safely start. Provider release runs in one outer
 
 The window and character ceilings are secondary bounds. The real correctness
 bound is the aggregate context envelope, and context-safe planning is owned by
-orchestration. For each window/character micro-batch, orchestration calls the
-provider's pure planning helper (`plan_aggregate_batches`, which never executes
-an HTTP call) to split the targets into actual request units: each unit is
-greedily sized so the exact envelope that will be sent — the system
-instruction, the full combined `{"targets": [...]}` JSON payload, the
-chat-framing reserve, the safety reserve, and the scaled output budget for that
-unit — stays within `max_context_tokens` (default 4096). Each unit is then one
-**visible** actual provider request that orchestration schedules, polls
-cooperative cancellation and the local wall-time budget around, and checkpoints
-after. A single target that still cannot fit raises a contained provider error
-before any HTTP dispatch; `reconstruct_segments` itself never hides additional
-sequential HTTP calls. Segment order, IDs, per-target validation, and safe
-malformed-batch fallback are preserved; the output-token budget scales with the
-number of targets in each sent unit. If one actual request fails after earlier
-ones succeeded, only that request's targets fail/escalate/unresolve — the
+orchestration. Each window/character micro-batch is planned **immediately before
+it executes**, never eagerly for future batches, so a later target that cannot
+fit context cannot abort earlier or later valid work during planning. For each
+micro-batch, orchestration calls the provider's pure planning helper
+(`plan_aggregate_batches`, which never executes an HTTP call) to split the
+targets into actual request units: each unit is greedily sized so the exact
+envelope that will be sent — the system instruction, the full combined
+`{"targets": [...]}` JSON payload, the chat-framing reserve, the safety reserve,
+and the scaled output budget for that unit — stays within `max_context_tokens`
+(default 4096). Each unit is then one **visible** actual provider request that
+orchestration schedules, polls cooperative cancellation and the local wall-time
+budget around, and checkpoints after. A single target that still cannot fit
+after bounded shrinking is isolated on its own: it falls back/escalates/unresolves
+through the existing safe paths (Gemini escalation only when policy and budget
+permit) and valid siblings are still scheduled, so one oversized target never
+aborts the whole local phase; `reconstruct_segments` itself never hides
+additional sequential HTTP calls. Segment order, IDs, per-target validation, and
+safe malformed-batch fallback are preserved; the output-token budget scales with
+the number of targets in each sent unit. If one actual request fails after
+earlier ones succeeded, only that request's targets fail/escalate/unresolve — the
 earlier targets' accepted candidates are already checkpointed and remain
 reusable.
 
@@ -410,8 +415,11 @@ instruction, the serialized user wrapper, a chat-framing reserve, the configured
 output budget (256), and a safety reserve. The adapter uses a conservative UTF-8
 estimate, then deterministically shrinks following context, previous context,
 entities, and word evidence in that order, never dropping the target segment ID
-or its raw/Stage 2.5 text. An irreducible request raises a contained provider
-error before any HTTP dispatch.
+or its raw/Stage 2.5 text. An irreducible request (still over budget after
+shrinking) is isolated per target by orchestration — it raises a contained
+planner error caught at the micro-batch boundary and falls back/escalates
+without affecting valid siblings or later batches — never before any HTTP
+dispatch of valid work.
 
 ## Runtime identity and fingerprints
 

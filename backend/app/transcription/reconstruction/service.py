@@ -720,9 +720,12 @@ class ContextualReconstructor:
         ``work`` carries ``(index, fallback_reason, escalate)``. Targets are
         ranked strongest-first, capped by the per-job local target ceiling,
         processed in deterministic micro-batches bounded by window and character
-        limits, and checkpointed after every batch. One invalid candidate never
-        rejects valid siblings, and a malformed batch degrades to isolated
-        unresolved results without recursive splitting or retry storms.
+        limits, and checkpointed after every batch. Each micro-batch is planned
+        immediately before it executes (never eagerly for future batches), so a
+        later target that cannot fit context is isolated on its own and earlier
+        or later valid work still runs. One invalid candidate never rejects
+        valid siblings, and a malformed batch degrades to isolated unresolved
+        results without recursive splitting or retry storms.
         """
 
         results: dict[int, SegmentReconstruction] = {}
@@ -760,21 +763,18 @@ class ContextualReconstructor:
                 "local_target_budget_exhausted",
             )
         attempted: set[int] = set()
-        for unit_requests in self._actual_local_units(selected, requests):
-            unit_indices = [request.segment_index for request in unit_requests]
+        for batch in self._plan_batches(selected, requests):
             if self._poll_cancelled(results, state):
                 break
-            if not self._local_budget_available(state):
-                state.local_time_budget_exhausted = True
-                break
-            self._checkpoint_results(results, state)
-            try:
-                candidates = self._provider.reconstruct_segments(unit_requests)  # type: ignore[union-attr]
-            except (OSError, ProviderResponseError):
-                # Only this actual request's targets fail; earlier actual requests
-                # stay checkpointed and reusable.
-                state.counts["local_failures"] += len(unit_indices)
-                for index in unit_indices:
+            batch_requests = [requests[index] for index in batch]
+            units, irreducible = self._plan_local_units(batch_requests)
+            if irreducible:
+                # A planner rejection (a target still over context after bounded
+                # shrinking) isolates only that target; earlier valid work stays
+                # checkpointed and later valid units still run, so one oversized
+                # target never aborts the whole local phase.
+                state.counts["local_failures"] += len(irreducible)
+                for index in irreducible:
                     state.counts["local_attempts"] += 1
                     state.local_targets_used += 1
                     attempted.add(index)
@@ -788,58 +788,101 @@ class ContextualReconstructor:
                         decision=decisions[index],
                         route=decisions[index].route.value,
                         local_attempted=True,
-                        local_result_state="failure",
+                        local_result_state="unfit",
                         final_provider=_STAGE25_METHOD,
                     )
                     results[index] = failed
                     if escalate and allow_escalations:
-                        escalations.append((index, failed, "local_provider_error"))
+                        escalations.append((index, failed, "local_context_unfit"))
                     else:
                         state.counts["unresolved"] += 1
                 self._checkpoint_results(results, state)
                 if self._poll_cancelled(results, state):
                     break
-                continue
-            for index in unit_indices:
-                state.counts["local_attempts"] += 1
-                state.local_targets_used += 1
-                attempted.add(index)
-                raw = str(segments[index].get("raw_text", segments[index].get("text", "")))
-                candidate = candidates.get(index, ReconstructionCandidate("raw", raw))
-                fallback_reason = next((reason for item, reason, _ in work if item == index), None)
-                escalate = next((flag for item, _, flag in work if item == index), False)
-                segment_result = self._decide(
-                    index,
-                    segments[index],
-                    candidate,
-                    memory,
-                    local_method,
-                    routing=decisions[index],
-                    route=decisions[index].route.value,
-                    local_attempted=True,
-                    local_result_state="accepted",
-                    final_provider=local_method,
-                )
-                if fallback_reason is not None:
-                    segment_result = replace(segment_result, escalation_reason=fallback_reason)
-                if (
-                    segment_result.applied
-                    and segment_result.confidence_level is ConfidenceLevel.HIGH
-                ):
-                    state.counts["local_accepted"] += 1
-                    results[index] = segment_result
-                else:
-                    state.counts["local_unaccepted"] += 1
-                    segment_result = replace(segment_result, final_provider=_STAGE25_METHOD)
-                    results[index] = segment_result
-                    if escalate and allow_escalations:
-                        escalations.append(
-                            (index, segment_result, _local_escalation_reason(segment_result))
+            for unit_requests in units:
+                unit_indices = [request.segment_index for request in unit_requests]
+                if self._poll_cancelled(results, state):
+                    break
+                if not self._local_budget_available(state):
+                    state.local_time_budget_exhausted = True
+                    break
+                self._checkpoint_results(results, state)
+                try:
+                    candidates = self._provider.reconstruct_segments(unit_requests)  # type: ignore[union-attr]
+                except (OSError, ProviderResponseError):
+                    # Only this actual request's targets fail; earlier actual requests
+                    # stay checkpointed and reusable.
+                    state.counts["local_failures"] += len(unit_indices)
+                    for index in unit_indices:
+                        state.counts["local_attempts"] += 1
+                        state.local_targets_used += 1
+                        attempted.add(index)
+                        escalate = next((flag for item, _, flag in work if item == index), False)
+                        failed = self._fallback(
+                            index,
+                            segments[index],
+                            provider_error=True,
+                            status=ReconstructionStatus.PROVIDER_UNAVAILABLE,
+                            method=local_method,
+                            decision=decisions[index],
+                            route=decisions[index].route.value,
+                            local_attempted=True,
+                            local_result_state="failure",
+                            final_provider=_STAGE25_METHOD,
                         )
+                        results[index] = failed
+                        if escalate and allow_escalations:
+                            escalations.append((index, failed, "local_provider_error"))
+                        else:
+                            state.counts["unresolved"] += 1
+                    self._checkpoint_results(results, state)
+                    if self._poll_cancelled(results, state):
+                        break
+                    continue
+                for index in unit_indices:
+                    state.counts["local_attempts"] += 1
+                    state.local_targets_used += 1
+                    attempted.add(index)
+                    raw = str(segments[index].get("raw_text", segments[index].get("text", "")))
+                    candidate = candidates.get(index, ReconstructionCandidate("raw", raw))
+                    fallback_reason = next(
+                        (reason for item, reason, _ in work if item == index), None
+                    )
+                    escalate = next((flag for item, _, flag in work if item == index), False)
+                    segment_result = self._decide(
+                        index,
+                        segments[index],
+                        candidate,
+                        memory,
+                        local_method,
+                        routing=decisions[index],
+                        route=decisions[index].route.value,
+                        local_attempted=True,
+                        local_result_state="accepted",
+                        final_provider=local_method,
+                    )
+                    if fallback_reason is not None:
+                        segment_result = replace(segment_result, escalation_reason=fallback_reason)
+                    if (
+                        segment_result.applied
+                        and segment_result.confidence_level is ConfidenceLevel.HIGH
+                    ):
+                        state.counts["local_accepted"] += 1
+                        results[index] = segment_result
                     else:
-                        state.counts["unresolved"] += 1
-            self._checkpoint_results(results, state)
-            if self._poll_cancelled(results, state):
+                        state.counts["local_unaccepted"] += 1
+                        segment_result = replace(segment_result, final_provider=_STAGE25_METHOD)
+                        results[index] = segment_result
+                        if escalate and allow_escalations:
+                            escalations.append(
+                                (index, segment_result, _local_escalation_reason(segment_result))
+                            )
+                        else:
+                            state.counts["unresolved"] += 1
+                self._checkpoint_results(results, state)
+                if self._poll_cancelled(results, state):
+                    break
+            if state.cancelled or state.local_time_budget_exhausted:
                 break
         if not state.cancelled and state.local_time_budget_exhausted:
             for index in selected:
@@ -902,29 +945,38 @@ class ContextualReconstructor:
             batches.append(current)
         return batches
 
-    def _actual_local_units(
-        self, selected: Sequence[int], requests: Sequence[ReconstructionRequest]
-    ) -> list[list[ReconstructionRequest]]:
-        """Flatten window/character micro-batches into actual provider request units.
+    def _plan_local_units(
+        self, batch_requests: list[ReconstructionRequest]
+    ) -> tuple[list[list[ReconstructionRequest]], list[int]]:
+        """Plan one outer micro-batch into actual provider request units lazily.
 
-        Each returned unit is exactly one real local HTTP/provider request that
-        orchestration schedules, polls cancellation and the local wall-time
-        budget around, and checkpoints after. Window and character limits remain
-        secondary bounds; the provider's pure ``plan_aggregate_batches`` helper
-        performs the aggregate context-envelope split without executing any HTTP
-        call, so no hidden provider loop can issue requests that escape
+        Planning runs immediately before the batch executes, never for future
+        batches, so a later irreducible target cannot abort earlier/later local
+        work during eager planning. The provider's pure ``plan_aggregate_batches``
+        helper performs the aggregate context-envelope split without executing
+        any HTTP call. If it rejects a target as irreducible (still over context
+        after bounded shrinking), only that target is isolated and reported for
+        fallback/escalation; valid siblings are still scheduled as their own
+        actual units so no hidden provider loop can issue requests that escape
         cancellation/budget/checkpoint handling.
         """
 
         planner = getattr(self._provider, "plan_aggregate_batches", None)
-        units: list[list[ReconstructionRequest]] = []
-        for batch in self._plan_batches(selected, requests):
-            batch_requests = [requests[index] for index in batch]
-            if planner is not None:
-                units.extend(planner(batch_requests))
-            else:
-                units.append(batch_requests)
-        return units
+        if planner is None:
+            return [batch_requests], []
+        try:
+            return planner(batch_requests), []
+        except ProviderResponseError:
+            units: list[list[ReconstructionRequest]] = []
+            irreducible: list[int] = []
+            for request in batch_requests:
+                try:
+                    planned = planner([request])
+                except ProviderResponseError:
+                    irreducible.append(request.segment_index)
+                    continue
+                units.extend(planned)
+            return units, irreducible
 
     def _local_budget_available(self, state: "_JobState") -> bool:
         """False once the bounded local wall-time budget is exhausted."""

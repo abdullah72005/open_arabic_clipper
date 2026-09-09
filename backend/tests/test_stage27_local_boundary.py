@@ -58,6 +58,17 @@ def _big_local_segment(index: int, words: int = 110) -> dict[str, object]:
     }
 
 
+def _oversized_segment(index: int) -> dict[str, object]:
+    """A local-suitable target whose raw text cannot fit the 4096 context even
+    after bounded shrinking (raw text is never dropped by the shrinker)."""
+
+    segment = _big_local_segment(index, words=2)
+    huge = "ك" * 5000
+    segment["text"] = huge
+    segment["raw_text"] = huge
+    return segment
+
+
 class FakeLocal:
     def __init__(self, candidate: ReconstructionCandidate | None = None) -> None:
         self.calls = 0
@@ -195,6 +206,52 @@ class _Toggle:
         self.count = 0
 
 
+class _FakeGemini:
+    def __init__(self, candidate: ReconstructionCandidate | None = None) -> None:
+        self.model = "gemini-3.6-flash"
+        self.calls = 0
+        self.requests: list[ReconstructionRequest] = []
+        self.candidate = candidate or ReconstructionCandidate(
+            "provider-0", "ضخمة", provider_confidence=1.0
+        )
+
+    def health(self) -> ProviderHealth:
+        return ProviderHealth(
+            ProviderAvailability.AVAILABLE, "gemini", "gemini-3.6-flash", "sha256:g", "ok"
+        )
+
+    def runtime_identity(self) -> dict[str, object]:
+        return {
+            "provider": "gemini",
+            "model": "gemini-3.6-flash",
+            "digest": "sha256:g",
+            "prompt_hash": "p",
+            "schema_version": "s",
+            "timeout_seconds": 30.0,
+            "retry_attempts": 0,
+            "retry_backoff_seconds": 0.0,
+            "max_output_tokens": 256,
+            "confidence_policy_version": CONFIDENCE_POLICY_VERSION,
+            "validation_version": VALIDATION_VERSION,
+        }
+
+    def refresh_runtime_identity(self) -> dict[str, object]:
+        return self.runtime_identity()
+
+    def release(self) -> None:
+        pass
+
+    def reconstruct_segments(
+        self, requests: list[ReconstructionRequest]
+    ) -> dict[int, ReconstructionCandidate]:
+        self.calls += 1
+        self.requests.extend(requests)
+        return {request.segment_index: self.candidate for request in requests}
+
+    def usage_summary(self) -> dict[str, int]:
+        return {"prompt_token_count": 10, "candidates_token_count": 5, "total_token_count": 15}
+
+
 def _ollama_provider(transport: _Transport) -> OllamaReconstructionProvider:
     return OllamaReconstructionProvider(
         base_url="http://ollama:11434",
@@ -313,6 +370,99 @@ def test_partial_actual_request_failure_preserves_earlier_success() -> None:
     # Only request 2's targets failed.
     assert result.segments[1].applied is False
     assert result.segments[1].local_result_state == "failure"
+
+
+# Blocker 3: eager planning isolates one later irreducible target
+
+
+def test_later_irreducible_target_is_isolated_without_aborting_local_phase() -> None:
+    """A later target that cannot fit context (after bounded shrinking) never
+    aborts the earlier valid unit: the valid unit executes and is checkpointed,
+    only the oversized target falls back/unresolves, and reconstruction returns."""
+
+    transport = _Transport(accept_text=True)
+    provider = _ollama_provider(transport)
+    segments = [_big_local_segment(0, words=2), _oversized_segment(1)]
+    checkpoints: list[dict[int, object]] = []
+    reconstructor = _reconstructor(
+        provider,
+        batch_windows=2,
+        checkpoint=lambda results, progress: checkpoints.append(dict(results)),
+    )
+    result = _run(reconstructor, segments)
+    # The valid unit made its provider call; the oversized one was never sent.
+    assert len(transport.calls) == 1
+    sent_targets = {
+        segment_id
+        for call in transport.calls
+        for segment_id in (
+            target["segment_id"] for target in json.loads(call["messages"][1]["content"])["targets"]
+        )
+    }
+    assert sent_targets == {0}
+    # Earlier valid result is checkpointed and reusable.
+    assert result.segments[0].applied is True
+    assert any(0 in snapshot and getattr(snapshot[0], "applied", False) for snapshot in checkpoints)
+    # Only the irreducible target is affected; reconstruction did not abort.
+    assert result.segments[1].applied is False
+    assert result.segments[1].local_result_state == "unfit"
+    assert result.segments[1].status.name == "PROVIDER_UNAVAILABLE"
+
+
+def test_irreducible_target_between_valid_units_keeps_both_sides_running() -> None:
+    """[valid, oversized, valid]: both valid units execute; only the oversized
+    target is isolated, so a later valid unit still runs after the oversized one."""
+
+    transport = _Transport(accept_text=True)
+    provider = _ollama_provider(transport)
+    segments = [
+        _big_local_segment(0, words=2),
+        _oversized_segment(1),
+        _big_local_segment(2, words=2),
+    ]
+    reconstructor = _reconstructor(provider, batch_windows=3)
+    result = _run(reconstructor, segments)
+    # Both valid units executed (one actual request each); oversized never sent.
+    assert len(transport.calls) == 2
+    sent_targets = sorted(
+        {
+            segment_id
+            for call in transport.calls
+            for segment_id in (
+                target["segment_id"]
+                for target in json.loads(call["messages"][1]["content"])["targets"]
+            )
+        }
+    )
+    assert sent_targets == [0, 2]
+    assert result.segments[0].applied is True
+    assert result.segments[2].applied is True
+    assert result.segments[1].applied is False
+    assert result.segments[1].local_result_state == "unfit"
+
+
+def test_irreducible_target_escalates_to_gemini_when_policy_permits() -> None:
+    """In adaptive mode an irreducible oversized local target escalates to Gemini
+    (budget permitting) while the valid unit still runs locally."""
+
+    transport = _Transport(accept_text=True)
+    local = _ollama_provider(transport)
+    gemini = _FakeGemini()
+    segments = [_big_local_segment(0, words=2), _oversized_segment(1)]
+    reconstructor = ContextualReconstructor(
+        local,
+        gemini_provider=gemini,
+        routing=AdaptiveRoutingConfig(mode=RoutingMode.ADAPTIVE),
+        gemini_budget=10,
+        batch_windows=2,
+        batch_characters=1_000_000,
+    )
+    result = _run(reconstructor, segments)
+    # The valid unit ran locally; the oversized one escalated to Gemini exactly once.
+    assert len(transport.calls) == 1
+    assert gemini.calls == 1
+    assert result.segments[0].applied is True
+    assert result.segments[1].gemini_attempted is True
 
 
 # ---------------------------------------------------------------------------
