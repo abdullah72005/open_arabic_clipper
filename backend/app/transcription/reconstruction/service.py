@@ -2031,6 +2031,7 @@ def _reconstruction_request(
         if any(form in item.raw_text or form in item.corrected_text for item in ordered)
     )
     routing = route_adaptive(segments[index], language=language)
+    inherited_profile = segments[index].get("dialect_profile")
     return ReconstructionRequest(
         segment_index=index,
         raw_text=target.raw_text,
@@ -2043,6 +2044,7 @@ def _reconstruction_request(
         routing_reasons=(routing.reason,),
         focus_spans=routing.focus_spans,
         language=language,
+        dialect_profile=str(inherited_profile) if inherited_profile is not None else None,
     )
 
 

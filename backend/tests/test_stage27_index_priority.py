@@ -71,6 +71,12 @@ def _segment(
         "correction_confidence": 0.0,
         "correction_method": "unchanged",
         "correction_changes": [],
+        "dialect_profile": None,
+        "dialect_confidence": 0.0,
+        "dialect_selection": "unknown",
+        "dialect_policy_version": "dialect-policy-v1",
+        "code_switch_suspected": False,
+        "code_switch_tokens": [],
     }
     if operator_text:
         segment["operator_text"] = operator_text
@@ -79,7 +85,7 @@ def _segment(
 
 def _code_switch_segment(index: int) -> dict[str, object]:
     raw = "هنعمل deploy بعد الـ review"
-    return _segment(
+    segment = _segment(
         index,
         raw=raw,
         corrected=raw,
@@ -91,6 +97,12 @@ def _code_switch_segment(index: int) -> dict[str, object]:
             {"word": "review", "probability": 0.94},
         ],
     )
+    segment["dialect_profile"] = "EGYPTIAN"
+    segment["dialect_confidence"] = 0.95
+    segment["dialect_selection"] = "detected"
+    segment["code_switch_suspected"] = True
+    segment["code_switch_tokens"] = ["deploy", "review"]
+    return segment
 
 
 def _identity(provider: str = "ollama") -> dict[str, object]:

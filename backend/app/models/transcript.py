@@ -7,6 +7,7 @@ from uuid import UUID
 
 from sqlalchemy import (
     JSON,
+    Boolean,
     CheckConstraint,
     DateTime,
     Enum,
@@ -21,6 +22,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.enums import ReconstructionStatus
 from app.db.base import Base
+from app.transcription.dialect import ArabicDialectProfile
 
 if TYPE_CHECKING:
     from app.models.source_video import SourceVideo
@@ -36,6 +38,10 @@ class Transcript(Base):
             "transcription_revision >= 0",
             name="ck_transcripts_transcription_revision_nonnegative",
         ),
+        CheckConstraint(
+            "dialect_confidence >= 0 AND dialect_confidence <= 1",
+            name="ck_transcripts_dialect_confidence_bounds",
+        ),
     )
 
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
@@ -45,6 +51,18 @@ class Transcript(Base):
     language: Mapped[str | None] = mapped_column(String(32))
     detected_language_probability: Mapped[float | None] = mapped_column(Float)
     whisper_model: Mapped[str] = mapped_column(String(64))
+    dialect_profile: Mapped[ArabicDialectProfile | None] = mapped_column(
+        Enum(
+            ArabicDialectProfile,
+            name="arabic_dialect_profile",
+            native_enum=False,
+            create_constraint=True,
+        ),
+        nullable=True,
+    )
+    dialect_confidence: Mapped[float] = mapped_column(Float, nullable=False, default=0)
+    dialect_evidence: Mapped[dict[str, object]] = mapped_column(JSON, default=dict)
+    code_switch_suspected: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     transcription_options: Mapped[dict[str, object]] = mapped_column(JSON, default=dict)
     input_fingerprint: Mapped[str] = mapped_column(String(64), index=True)
     transcription_revision: Mapped[int] = mapped_column(

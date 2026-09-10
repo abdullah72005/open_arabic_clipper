@@ -41,6 +41,12 @@ from app.services.source_quality import assess_source, quality_input_fingerprint
 from app.services.storage import StorageCategory, StorageService
 from app.transcription.chunking import ChunkConfig, build_chunks
 from app.transcription.correction import ContextualCorrector
+from app.transcription.dialect import (
+    DIALECT_POLICY_VERSION,
+    PRESERVATION_POLICY_VERSION,
+    DialectDetector,
+    code_switch_evidence,
+)
 from app.transcription.engine import TranscriptionResult, WhisperEngine
 from app.transcription.normalization import normalize_transcript
 from app.transcription.reconstruction import ContextualReconstructor
@@ -170,6 +176,10 @@ class TranscriptionExecutor:
         transcript.language = result.language
         transcript.detected_language_probability = result.language_probability
         transcript.whisper_model = self._options.model
+        transcript.dialect_profile = None
+        transcript.dialect_confidence = 0.0
+        transcript.dialect_evidence = {}
+        transcript.code_switch_suspected = False
         transcript.transcription_options = {
             "model": self._options.model,
             "device": self._options.device,
@@ -298,9 +308,16 @@ class AudioExtractionExecutor:
 class TranscriptNormalizationExecutor:
     """Normalize a persisted transcript without rewriting its raw ASR evidence."""
 
-    def __init__(self, *, session: Session, corrector: ContextualCorrector | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        session: Session,
+        corrector: ContextualCorrector | None = None,
+        detector: DialectDetector | None = None,
+    ) -> None:
         self._session = session
         self._corrector = corrector or ContextualCorrector.from_default_lexicon()
+        self._detector = detector or DialectDetector()
 
     def input_fingerprint(self, source: SourceVideo) -> str:
         transcript = self._session.scalar(
@@ -310,11 +327,18 @@ class TranscriptNormalizationExecutor:
             return ""
         return canonical_fingerprint(
             "normalization-input",
-            "1",
+            "2",
             {
                 "transcription_fingerprint": transcript.input_fingerprint,
                 "transcription_revision": transcript.transcription_revision,
-                "correction_version": "egyptian-ar-v1",
+                "dialect_override": (
+                    source.dialect_profile_override.value
+                    if source.dialect_profile_override is not None
+                    else None
+                ),
+                "detector_policy_version": DIALECT_POLICY_VERSION,
+                "correction_identity": self._corrector.correction_identity(),
+                "preservation_policy_version": PRESERVATION_POLICY_VERSION,
             },
         )
 
@@ -332,7 +356,13 @@ class TranscriptNormalizationExecutor:
             for index, segment in enumerate(transcript.segments)
             if segment.get("operator_text")
         }
-        corrections = self._corrector.correct(transcript.segments)
+        detection = self._detector.detect(
+            transcript.segments,
+            language=transcript.language,
+            override=source.dialect_profile_override,
+        )
+        profile = detection.profile
+        corrections = self._corrector.correct(transcript.segments, profile=profile)
         normalized_segments: list[dict[str, object]] = []
         for segment, correction in zip(transcript.segments, corrections, strict=True):
             previous = previous_overrides.get(correction.segment_index)
@@ -342,6 +372,8 @@ class TranscriptNormalizationExecutor:
                 else None
             )
             final_text = operator_text or correction.corrected_text
+            switch = code_switch_evidence(correction.raw_text)
+            code_switch_suspected = profile is not None and switch.suspected
             normalized_segments.append(
                 {
                     **segment,
@@ -355,9 +387,21 @@ class TranscriptNormalizationExecutor:
                     "operator_text": operator_text,
                     "final_text": final_text,
                     "normalized_text": normalize_transcript(final_text),
+                    "dialect_profile": profile.value if profile is not None else None,
+                    "dialect_confidence": detection.confidence,
+                    "dialect_selection": detection.selection.value,
+                    "dialect_policy_version": DIALECT_POLICY_VERSION,
+                    "code_switch_suspected": code_switch_suspected,
+                    "code_switch_tokens": list(switch.tokens),
                 }
             )
         transcript.segments = normalized_segments
+        transcript.dialect_profile = profile
+        transcript.dialect_confidence = detection.confidence
+        transcript.dialect_evidence = detection.evidence
+        transcript.code_switch_suspected = any(
+            bool(segment["code_switch_suspected"]) for segment in normalized_segments
+        )
         transcript.corrected_text = " ".join(
             str(segment["corrected_text"]) for segment in normalized_segments
         ).strip()
@@ -367,7 +411,7 @@ class TranscriptNormalizationExecutor:
         transcript.normalized_text = normalize_transcript(transcript.final_text)
         transcript.normalization_fingerprint = canonical_fingerprint(
             "normalization-output",
-            "1",
+            "2",
             {
                 "segments": normalized_segments,
                 "transcription_revision": transcript.transcription_revision,
@@ -573,11 +617,24 @@ class ContextualReconstructionExecutor:
             return ""
         return canonical_fingerprint(
             "reconstruction-input",
-            "1",
+            "2",
             {
                 "normalization_fingerprint": transcript.normalization_fingerprint,
                 "transcription_revision": transcript.transcription_revision,
                 "correction_version": transcript.correction_version,
+                "dialect_profile": (
+                    transcript.dialect_profile.value
+                    if transcript.dialect_profile is not None
+                    else None
+                ),
+                "dialect_confidence": transcript.dialect_confidence,
+                "dialect_selection": (
+                    transcript.dialect_evidence.get("selection_method")
+                    if isinstance(transcript.dialect_evidence, dict)
+                    else None
+                ),
+                "dialect_policy_version": DIALECT_POLICY_VERSION,
+                "code_switch_suspected": transcript.code_switch_suspected,
                 "runtime_identity": self._effective_reconstructor().refresh_runtime_identity(),
             },
         )
@@ -967,7 +1024,6 @@ class ContextualReconstructionExecutor:
             "near_acceptance": reconstruction.near_acceptance,
             "refinement_priority": priority.value,
             "needs_refinement": _segment_needs_refinement(status, reconstruction),
-            "code_switch_suspected": _segment_code_switch_suspected(segment),
             "reconstruction_target_fingerprint": target_fingerprint,
             "reconstruction_cache_eligible": _target_cache_eligible(reconstruction),
         }
@@ -1007,28 +1063,6 @@ def _segment_needs_refinement(
     if any(flag.value == "RECONSTRUCTION_PROVIDER_ERROR" for flag in reconstruction.quality_flags):
         return True
     return bool(reconstruction.escalation_reason)
-
-
-def _segment_code_switch_suspected(segment: Mapping[str, object]) -> bool:
-    """Evidence-based mixed-language signal: any word carries a Latin letter or digit.
-
-    This is derived only from existing word evidence; it is never fabricated from
-    missing text and does not perform code-switch recovery (Stage 2.7.1).
-    """
-
-    words = segment.get("words")
-    if not isinstance(words, list):
-        return False
-    for word in words:
-        if not isinstance(word, Mapping):
-            continue
-        text = str(word.get("word", ""))
-        if any(
-            character.isdigit() or (character.isascii() and character.isalpha())
-            for character in text
-        ):
-            return True
-    return False
 
 
 def _reconstruction_method(

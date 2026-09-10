@@ -34,18 +34,22 @@ def reconstruction_output_fingerprint(
     cannot invalidate accepted output. Cache eligibility is tracked separately by
     the executor. Never include credentials.
 
-    Version 5 adds the refinement priority/scope identity: ``target_indexes``
-    plus a whole-source versus window marker, so a whole-source INDEX result can
-    never satisfy a window-scoped CANDIDATE/FINAL_CLIP refinement and one
-    requested window can never satisfy another. Version 4 added every
-    route-relevant input the adaptive router now consumes (Stage 2.5
-    method/confidence/applied state and change digest, word probabilities,
-    acoustic evidence).
+    Version 6 adds the source-level dialect identity and code-switch evidence
+    per segment (effective dialect profile, confidence, selection source, policy
+    version, and exact code-switch tokens) so a dialect/override/policy change
+    invalidates Stage 2.7 derived work at its correct boundary without touching
+    raw ASR. Version 5 added the refinement priority/scope identity:
+    ``target_indexes`` plus a whole-source versus window marker, so a
+    whole-source INDEX result can never satisfy a window-scoped
+    CANDIDATE/FINAL_CLIP refinement and one requested window can never satisfy
+    another. Version 4 added every route-relevant input the adaptive router now
+    consumes (Stage 2.5 method/confidence/applied state and change digest, word
+    probabilities, acoustic evidence).
     """
 
     return canonical_fingerprint(
         "reconstruction-output",
-        "5",
+        "6",
         {
             "language": language,
             "transcription_fingerprint": transcription_fingerprint,
@@ -77,7 +81,7 @@ def reconstruction_target_fingerprint(
 
     return canonical_fingerprint(
         "reconstruction-target",
-        "1",
+        "2",
         {
             "language": language,
             "transcription_fingerprint": transcription_fingerprint,
@@ -112,6 +116,11 @@ def _segment_dependency(segments: Sequence[Mapping[str, object]], index: int) ->
         "no_speech_prob": segment.get("no_speech_prob"),
         "language": segment.get("language"),
         "dialect_profile": segment.get("dialect_profile"),
+        "dialect_confidence": segment.get("dialect_confidence"),
+        "dialect_selection": segment.get("dialect_selection"),
+        "dialect_policy_version": segment.get("dialect_policy_version"),
+        "code_switch_suspected": segment.get("code_switch_suspected"),
+        "code_switch_tokens": _code_switch_tokens(segment.get("code_switch_tokens")),
         "previous_context": tuple(_text(item, "corrected_text", "text") for item in previous),
         "following_context": tuple(_text(item, "corrected_text", "text") for item in following),
     }
@@ -122,6 +131,12 @@ def _text(segment: Mapping[str, object], preferred: str, fallback: str) -> str:
     if value is None:
         value = segment.get(fallback)
     return str(value or "")
+
+
+def _code_switch_tokens(value: object) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        return ()
+    return tuple(str(token) for token in value if isinstance(token, str))
 
 
 def _stable_changes(changes: object) -> tuple[dict[str, str], ...]:

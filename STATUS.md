@@ -1,17 +1,89 @@
 # Runtime status
 
-Stage 2.7 extends the local-first ingest/transcription foundation through
+Stage 2.7.1 extends the local-first ingest/transcription foundation through
 `READY_FOR_ANALYSIS`. It prepares cached mono 16 kHz WAV audio, transcribes
 locally with faster-whisper, preserves raw timestamped ASR evidence, derives
-conservative contextual Egyptian Arabic correction into separate Stage 2.5
-fields, then applies a bounded one-pass Stage 2.7 contextual reconstruction
-through the managed local Ollama provider without altering raw text, timestamps,
-word timestamps, or manual feedback. Final text priority is manual override,
-then HIGH-confidence Stage 2.7, then Stage 2.5, then raw ASR. The default
+conservative dialect-aware Arabic correction into separate Stage 2.5 fields,
+then applies a bounded one-pass Stage 2.7 contextual reconstruction through the
+managed local Ollama provider without altering raw text, timestamps, word
+timestamps, or manual feedback. Final text priority is manual override, then
+HIGH-confidence Stage 2.7, then Stage 2.5, then raw ASR. The default
 reconstruction provider is local Ollama (`qwen3.5:4b`); a missing or invalid
 provider response falls back to Stage 2.5, records a truthful unavailable
 status, and the source still reaches analysis. Automatic clip selection,
 rendering, publishing, and authorization remain out of scope.
+
+## Stage 2.7.1 dialect-aware preservation (2026-09-10)
+
+Stage 2.7.1 adds conservative source-level Arabic dialect awareness and exact
+Arabic-English code-switch preservation:
+
+- **Dialect profiles.** `EGYPTIAN`, `SAUDI`, `GULF`, `LEVANTINE`, `MSA`, and
+  `UNKNOWN_ARABIC`. `None` means Arabic profiling is not applicable (no Arabic
+  evidence); `UNKNOWN_ARABIC` means Arabic is present but the regional/formal
+  profile is uncertain, mixed, unsupported, or insufficiently evidenced and
+  always favors no change. Dialect describes the speech actually present in the
+  source; it is not a target audience or localization choice, and there is no
+  deployment-wide dialect default.
+- **Lightweight deterministic detection.** A pure detector (no network, no
+  LLM, no model loading, no audio decoding) classifies the source during Stage
+  2.5 normalization from immutable raw segment text, using a bounded
+  representative sample of at most 48 segments. A known profile needs at least
+  two distinct markers, a weighted score of at least 4, a lead of at least 2
+  over the runner-up, and a score of at least 1.5×max(runner_up, 1); MSA
+  additionally needs strong formal evidence and no meaningful competing
+  colloquial score. Competing, weak, or mixed evidence resolves to
+  `UNKNOWN_ARABIC`; non-Arabic material resolves to `None`. Detected confidence
+  is bounded to [0.80, 0.99] with a deterministic formula; unknown/not-applicable
+  use 0.0. Evidence is bounded and stores no transcript bodies.
+- **Operator override.** An optional `dialect_profile_override` may be supplied
+  when a source is created through URL ingest JSON or multipart upload. It wins
+  with confidence 1.0, participates in normalization fingerprints, and an
+  explicit `UNKNOWN_ARABIC` override means "do not force a dialect." The initial
+  implementation accepts the override at source creation only; there is no
+  post-ingest editing workflow in this stage. Duplicate source creation never
+  mutates an existing source's override.
+- **Egyptian Stage 2.5 isolation.** The Egyptian lexicon and its optional
+  provider apply only when the effective profile is confidently or explicitly
+  EGYPTIAN. SAUDI, GULF, LEVANTINE, MSA, UNKNOWN_ARABIC, and non-Arabic material
+  pass through unchanged with zero optional Stage 2.5 provider calls, and
+  candidate-null segments are never sent to the optional correction provider.
+- **Code-switch and protected tokens.** Exact Latin words/names,
+  abbreviations, technical forms, and Western/Arabic-Indic numbers (including
+  compound numeric/date forms) are extracted as ordered protected tokens and
+  preserved through Stage 2.5 and every accepted Stage 2.7 candidate; a
+  candidate that removes, replaces, reorders, changes case, Arabicizes, or
+  invents a protected token is rejected. `code_switch_suspected` is true when an
+  Arabic source segment contains Latin-bearing evidence (numbers alone and
+  English-only sources are not flagged). Omitted-English audio recovery is
+  deferred to Stage 3.5.
+- **Shared provider contract.** Both the local Qwen/OpenAI-compatible provider
+  and the hosted Gemini provider receive the same dialect-neutral,
+  preservation-first reconstruction instruction and validated profile-specific
+  addenda (the local provider's old Egyptian-only base instruction was removed
+  and Gemini's divergent neutral instruction was folded into the shared
+  builder). The dormant `dialect_profile` request field is populated from the
+  target segment's inherited effective profile, and local aggregate request
+  planning sizes the exact profile-specific instruction.
+- **Fingerprints.** Normalization input/output fingerprints are versioned and
+  now cover the stored operator override, detector policy version, effective
+  profile/confidence/selection, the dialect-aware correction identity
+  (correction policy, detector policy, Egyptian lexicon version, output
+  thresholds), and the preservation policy version. Reconstruction whole-output
+  and per-target fingerprints are versioned and include per-segment dialect
+  identity and code-switch tokens. Dialect/profile/override changes invalidate
+  Stage 2.5 and Stage 2.7 derived work at their correct boundaries without
+  retranscribing audio; per-target checkpoint reuse respects dialect identity.
+- **INDEX remains cheap.** Whole-source ingestion still performs zero Qwen and
+  zero Gemini calls, never constructs/probes providers for dialect detection,
+  preserves uncertainty and code-switch evidence, and reaches
+  `READY_FOR_ANALYSIS`. Dialect presence or code switching is never itself a
+  reason to spend Gemini quota. CANDIDATE/FINAL_CLIP targeted refinement
+  consumes the stored target profile through the shared request contract, and
+  `refine_transcript_window` never redetects or overwrites the source dialect.
+
+The known regression benchmark findings below remain historical evidence and are
+not readiness proof.
 
 ## Stage 2.7 finalization: INDEX ingestion and targeted refinement (2026-09-10)
 
@@ -51,11 +123,11 @@ source segments:
   made for the backlog, safe Stage 2.5/current text is preserved, and targets are
   marked unresolved/manual review.
 - **Uncertainty handoff.** Persisted `refinement_priority`, derived
-  `needs_refinement` and `code_switch_suspected` (evidence-based; no Stage 2.7.1
-  recovery), plus the existing status/confidence/focus-span/provider/routing
-  evidence, give future stages what they need to decide targeted refinement.
+  `needs_refinement` and `code_switch_suspected` (Stage 2.7.1 evidence-based;
+  no omitted-English audio recovery, which is deferred to Stage 3.5), plus the
+  existing status/confidence/focus-span/provider/routing evidence, give future
+  stages what they need to decide targeted refinement.
 
-Stage 2.7.1 (dialect/code-switch recovery) is not implemented by this change.
 The known regression benchmark findings below remain historical evidence and are
 not readiness proof.
 
@@ -140,9 +212,11 @@ implemented and tested. A known-regression corpus was captured on
   `آخره يشيلت نصر واحد`, `فيه 71`) on the frozen capture.
 - Full `large-v3` recovered `فيور` (one ASR_AUDIO fix) but missed `اتناشر`;
   below the two-fix gate, so `large-v3-turbo` remains the default.
-- The unseen-corpus human references are not yet available; Stage 2.7.1 cannot
-  be authorized. A stricter 8B/ASR reliability and quality evaluation remains
-  open.
+- The unseen-corpus human references are not yet available; the stricter
+  model/ASR benchmark gate cannot be authorized. A stricter 8B/ASR reliability
+  and quality evaluation remains open. This is historical benchmark evidence;
+  Stage 2.7.1 dialect awareness is implemented and separately verified by
+  deterministic tests, not by these model-quality findings.
 
 ## Infrastructure and telemetry fixes (2026-09-08)
 
@@ -192,10 +266,11 @@ The production stack is unchanged: ASR `large-v3-turbo`, reconstruction
 `qwen3.5:4b`. The infrastructure gates pass and the small practical acceptance
 review shows the current transcript is semantically usable with rare
 meaning-changing errors, so the unrepaired known-regression phrases no longer
-block infrastructure readiness. Stage 2.7.1 is not authorized yet: until the
-strict unseen-audio benchmark and a stricter 8B/ASR reliability and quality
-evaluation are available, manual correction or Stage-3 exclusion of harmful
-transcript segments remains the short practical quality path.
+block infrastructure readiness. The strict unseen-audio benchmark and a stricter
+8B/ASR reliability and quality evaluation remain open; until then, manual
+correction or Stage-3 exclusion of harmful transcript segments remains the short
+practical quality path. Stage 2.7.1 dialect awareness is implemented and is not
+the same gate as model-quality authorization.
 
 ## Hosted Gemini adaptive routing (2026-09-09)
 

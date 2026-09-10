@@ -2,10 +2,10 @@
 
 ClipFactory is a local-first foundation for safely ingesting media, probing its
 metadata, and transcribing owned or authorized media. Stage 2 extracts a cached
-mono 16 kHz WAV, runs local faster-whisper with automatic Arabic (Egyptian/MSA),
-English, and mixed-speech detection, preserves raw ASR evidence, applies
-conservative contextual Egyptian-Arabic correction, and records silence/quality
-signals through `READY_FOR_ANALYSIS`. It does not
+mono 16 kHz WAV, runs local faster-whisper with automatic Arabic, English, and
+mixed-speech detection, preserves raw ASR evidence, applies conservative
+dialect-aware Arabic correction, and records silence/quality signals through
+`READY_FOR_ANALYSIS`. It does not
 select clips, reframe, render, publish, or automatically authorize content.
 
 Only process material you own or are explicitly authorized to process. URL
@@ -71,11 +71,32 @@ Stage 2.5 preserves `raw_text` and every raw segment `text`/timestamp permanentl
 It adds `corrected_text`, `final_text`, confidence indicators, correction method,
 version, and per-segment correction metadata. The default local corrector uses
 the versioned Egyptian phrase lexicon only; it never requires a network or an
-LLM. To opt into a local OpenAI-compatible endpoint such as Ollama, configure
+LLM. The Egyptian lexicon applies only when the source is confidently or
+explicitly Egyptian; other dialects and unknown Arabic pass through unchanged.
+To opt into a local OpenAI-compatible endpoint such as Ollama, configure
 `CLIPFACTORY_CORRECTION_PROVIDER=openai_compatible` plus provider base URL and
 model. Provider responses are batched, context-bounded, schema-validated, and
-may only approve a declared lexicon candidate; they fall back to raw/lexicon
-output on any failure or unsafe change.
+may only approve a declared Egyptian lexicon candidate; they fall back to
+raw/lexicon output on any failure or unsafe change.
+
+Stage 2.7.1 adds conservative source-level Arabic dialect awareness. During
+Stage 2.5 normalization a pure, deterministic detector (no network, no LLM, no
+model loading, no audio decoding) classifies the speech actually present in the
+source from immutable raw segment text into one of `EGYPTIAN`, `SAUDI`, `GULF`,
+`LEVANTINE`, `MSA`, or `UNKNOWN_ARABIC`. `None` means no Arabic evidence;
+`UNKNOWN_ARABIC` means Arabic is present but the profile is uncertain, mixed,
+or insufficiently evidenced and always favors no change. The effective profile
+and confidence are persisted on the transcript and inherited by every segment.
+Detected Latin words, names, abbreviations, technical tokens, and numbers are
+preserved exactly (spelling, order, casing, digits) through Stage 2.5 and every
+accepted Stage 2.7 candidate; `code_switch_suspected` signals Latin-bearing
+evidence inside an Arabic source, while numbers alone and English-only sources
+are not flagged. An optional `dialect_profile_override` may be supplied when a
+source is created through URL ingest or multipart upload and takes precedence
+over detection with confidence 1.0; it is stored on the source and included in
+normalization fingerprints so a future supported rerun invalidates derived work
+without retranscribing audio. Dialect is source evidence, not a target audience
+or localization choice, and there is no deployment-wide dialect default.
 
 Stage 2.7 runs after Stage 2.5 and before audio analysis. It retains raw ASR,
 Stage 2.5, Stage 2.7, and manual text separately; final text is always manual

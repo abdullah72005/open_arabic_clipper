@@ -9,6 +9,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.enums import PipelineStage, RightsStatus
 from app.db.base import Base
+from app.transcription.dialect import ArabicDialectProfile
 
 if TYPE_CHECKING:
     from app.models.audio_analysis import AudioAnalysis
@@ -28,6 +29,15 @@ class SourceVideo(Base):
     source_uri: Mapped[str] = mapped_column(String(2048), nullable=False, index=True)
     original_filename: Mapped[str | None] = mapped_column(String(512))
     content_hash: Mapped[str | None] = mapped_column(String(64), unique=True)
+    dialect_profile_override: Mapped[ArabicDialectProfile | None] = mapped_column(
+        Enum(
+            ArabicDialectProfile,
+            name="arabic_dialect_profile",
+            native_enum=False,
+            create_constraint=True,
+        ),
+        nullable=True,
+    )
     rights_status: Mapped[RightsStatus] = mapped_column(
         Enum(RightsStatus, name="rights_status", native_enum=False, create_constraint=True),
         nullable=False,

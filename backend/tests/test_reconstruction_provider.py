@@ -89,12 +89,125 @@ def test_provider_uses_structured_one_pass_contract() -> None:
     assert captured[0]["temperature"] == 0
     assert captured[0]["max_tokens"] == 256
     assert "response_format" not in captured[0]
-    assert "EGYPTIAN ARABIC" in captured[0]["messages"][0]["content"]
+    assert "EGYPTIAN ARABIC" not in captured[0]["messages"][0]["content"]
+    assert (
+        "Preserve the dialect and register actually evidenced"
+        in captured[0]["messages"][0]["content"]
+    )
+    assert (
+        "Preserve detected Arabic-English code switching" in captured[0]["messages"][0]["content"]
+    )
     assert "Output ONLY a JSON object" in captured[0]["messages"][0]["content"]
     payload = captured[0]["messages"][1]["content"]
     assert "كان بيقودها الريس" in payload
     assert "قبل" in payload
     assert "بعد" in payload
+
+
+def test_provider_appends_validated_egyptian_addendum_for_egyptian_profile() -> None:
+    """A profile-specific request receives only the validated preservation addendum."""
+
+    captured: list[dict[str, object]] = []
+
+    def request(
+        method: str,
+        url: str,
+        body: bytes | None,
+        _headers: dict[str, str],
+        _timeout: float,
+    ) -> bytes:
+        assert body is not None
+        captured.append(json.loads(body))
+        return _response(
+            {
+                "reconstructions": [
+                    {
+                        "segment_id": 4,
+                        "corrected_text": "كان بيقودها الرئيس",
+                        "unchanged": False,
+                        "confidence": 0.92,
+                        "explanation": "restore likely elided hamza",
+                        "changes": [],
+                    }
+                ]
+            }
+        )
+
+    provider = OpenAICompatibleReconstructionProvider(
+        base_url="http://ollama:11434",
+        model="qwen3.5:4b",
+        timeout_seconds=12,
+        request=request,
+    )
+    provider.reconstruct_segments(
+        [
+            ReconstructionRequest(
+                segment_index=4,
+                raw_text="كان بيقودها الريس",
+                corrected_text="كان بيقودها الريس",
+                language="ar",
+                dialect_profile="EGYPTIAN",
+            )
+        ]
+    )
+
+    content = captured[0]["messages"][0]["content"]
+    assert "The source is Egyptian Arabic" in content
+    assert "do not convert them to Modern Standard Arabic" in content
+    assert (
+        "For the target segment, return the most plausible SPOKEN EGYPTIAN ARABIC text"
+        not in content
+    )
+
+
+def test_provider_ignores_unvalidated_profile_names() -> None:
+    """Unknown profile strings never interpolate arbitrary text into the prompt."""
+
+    captured: list[dict[str, object]] = []
+
+    def request(
+        method: str,
+        url: str,
+        body: bytes | None,
+        _headers: dict[str, str],
+        _timeout: float,
+    ) -> bytes:
+        assert body is not None
+        captured.append(json.loads(body))
+        return _response(
+            {
+                "reconstructions": [
+                    {
+                        "segment_id": 4,
+                        "corrected_text": "هدف",
+                        "unchanged": True,
+                        "confidence": 0.9,
+                        "explanation": "",
+                        "changes": [],
+                    }
+                ]
+            }
+        )
+
+    provider = OpenAICompatibleReconstructionProvider(
+        base_url="http://ollama:11434",
+        model="qwen3.5:4b",
+        timeout_seconds=12,
+        request=request,
+    )
+    provider.reconstruct_segments(
+        [
+            ReconstructionRequest(
+                segment_index=4,
+                raw_text="هدف",
+                corrected_text="هدف",
+                dialect_profile="DO-NOT-INTERPOLATE",
+            )
+        ]
+    )
+
+    content = captured[0]["messages"][0]["content"]
+    assert "DO-NOT-INTERPOLATE" not in content
 
 
 def test_provider_rejects_missing_target_response() -> None:

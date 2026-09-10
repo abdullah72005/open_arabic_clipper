@@ -2,14 +2,12 @@
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 
+from app.transcription.dialect import extract_protected_tokens
 from app.transcription.reconstruction.entities import SourceEntityMemory
 from app.transcription.reconstruction.phonetics import phonetic_similarity
 from app.transcription.reconstruction.types import ReconstructionCandidate
-
-_PROTECTED = re.compile(r"[A-Za-z]+|[0-9٠-٩]+")
 
 VALIDATION_VERSION = "stage-2-7-validation-v1"
 
@@ -47,7 +45,7 @@ def validate_candidate(
 
 
 def _protected_tokens(text: str) -> tuple[str, ...]:
-    return tuple(_PROTECTED.findall(text.casefold()))
+    return extract_protected_tokens(text)
 
 
 def _ceil_fraction(tokens: int) -> int:

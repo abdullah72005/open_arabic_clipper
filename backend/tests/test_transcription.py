@@ -393,10 +393,12 @@ def test_normalization_persists_raw_corrected_final_text_and_timestamp(
     from app.db.base import Base
     from app.models import SourceVideo, Transcript
     from app.pipeline.stages import TranscriptNormalizationExecutor
+    from app.transcription.dialect import ArabicDialectProfile
 
     Base.metadata.create_all(sqlite_engine)
     with Session(sqlite_engine) as session:
         source = SourceVideo(source_uri=str(tmp_path / "source.mp4"), content_hash="source")
+        source.dialect_profile_override = ArabicDialectProfile.EGYPTIAN
         session.add(source)
         session.flush()
         session.add(

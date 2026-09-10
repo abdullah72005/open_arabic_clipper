@@ -444,15 +444,15 @@ class OpenAICompatibleReconstructionProvider:
 
 
 SYSTEM_INSTRUCTION = (
-    "You are a conservative Arabic ASR post-processor for Egyptian Arabic speech. "
-    "For the target segment, return the most plausible SPOKEN EGYPTIAN ARABIC text. "
-    "Preserve Egyptian colloquial word choices, pronunciation-driven spelling, "
-    "and dialect. "
-    "Do NOT standardize into Modern Standard Arabic (MSA). "
-    "Example: ASR 'ثلاثة يام' should become 'تلات أيام' (spoken Egyptian), "
-    "not 'ثلاثة أيام' (MSA). "
-    "Preserve all names, numbers, Latin tokens, and digits exactly as they appear. "
-    "Do not add facts, clauses, or change entities. "
+    "You are a conservative Arabic ASR post-processor. "
+    "Repair only probable speech-recognition errors. "
+    "Preserve the dialect and register actually evidenced in the source and context. "
+    "Preserve detected Arabic-English code switching. "
+    "Preserve names, abbreviations, technical tokens, and numbers exactly. "
+    "Leave already plausible text unchanged. "
+    "Do not translate, summarize, paraphrase, formalize, colloquialize, standardize, "
+    "or add missing clauses or facts. "
+    "Do not invent words absent from the text evidence. "
     "Use only the small local context provided. "
     "If the raw text is already correct, return it unchanged and set unchanged=true. "
     "Output ONLY a JSON object with this exact shape: "
@@ -460,25 +460,59 @@ SYSTEM_INSTRUCTION = (
     '"unchanged": bool, "confidence": number, "explanation": string, "changes": []}]}.'
 )
 
-_PROMPT_SCHEMA_VERSION = "stage-2-7-one-pass-v1"
+_PROMPT_SCHEMA_VERSION = "stage-2-7-one-pass-v2"
 _PROMPT_HASH = hashlib.sha256(SYSTEM_INSTRUCTION.encode("utf-8")).hexdigest()
 
 # Backward-compatible alias for existing consumers of the shared instruction.
 _SYSTEM_INSTRUCTION = SYSTEM_INSTRUCTION
 
-DIALECT_PROFILE_ADDENDUM = (
-    'The source uses the "{profile}" dialect profile. Preserve that profile\'s '
-    "word choices and pronunciation-driven spelling exactly; do not shift "
-    "register, translate, or standardize."
-)
+# Validated dialect-profile preservation addenda. Every provider receives the
+# same dialect-neutral base instruction plus, when a profile is supplied, the
+# narrow profile-specific addendum below. Nothing is interpolated from
+# unvalidated input.
+PROFILE_ADDENDA: dict[str, str] = {
+    "EGYPTIAN": (
+        "The source is Egyptian Arabic. Preserve Egyptian colloquial word choices "
+        "and pronunciation-driven spelling; do not convert them to Modern Standard "
+        "Arabic or any other dialect."
+    ),
+    "SAUDI": (
+        "The source is Saudi Arabic. Preserve Saudi speech; do not Egyptianize, "
+        "generic-Gulf-normalize, or formalize it."
+    ),
+    "GULF": (
+        "The source is Gulf Arabic. Preserve Gulf speech; do not Egyptianize, "
+        "Saudi-normalize, or formalize it."
+    ),
+    "LEVANTINE": (
+        "The source is Levantine Arabic. Preserve Levantine speech; do not "
+        "Egyptianize or formalize it."
+    ),
+    "MSA": (
+        "The source is Modern Standard Arabic (Fusha). Preserve formal MSA wording; "
+        "do not colloquialize it."
+    ),
+    "UNKNOWN_ARABIC": (
+        "The Arabic dialect is unknown or mixed. Preserve the observed forms "
+        "conservatively; do not force any regional dialect or Modern Standard Arabic."
+    ),
+}
 
 
 def instruction_for_profile(base: str, profile: str | None) -> str:
-    """Append a narrow dialect-profile preservation addendum when supplied."""
+    """Append a validated dialect-profile preservation addendum when supplied.
+
+    ``profile`` may be any stable profile name string from
+    ``ArabicDialectProfile``. Unknown or missing profiles append nothing, so a
+    provider never receives an arbitrary interpolated dialect instruction.
+    """
 
     if not profile:
         return base
-    return base + "\n" + DIALECT_PROFILE_ADDENDUM.format(profile=profile)
+    addendum = PROFILE_ADDENDA.get(profile)
+    if addendum is None:
+        return base
+    return base + "\n" + addendum
 
 
 def _shrink_request_to_budget(
