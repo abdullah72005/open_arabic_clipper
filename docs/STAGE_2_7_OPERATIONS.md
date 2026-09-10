@@ -445,6 +445,15 @@ Behavior:
 - Priority and window scope participate in output fingerprints, so a whole-source
   INDEX result can never satisfy a CANDIDATE/FINAL_CLIP request and one window
   can never satisfy another.
+- The transcript-level summary stays truthful for the whole source, not just the
+  window: `reconstruction_status`, `reconstruction_confidence`,
+  `reconstructed_segment_ratio`, and `reconstruction_metadata.cache_eligible`
+  are recomputed over every segment. A CANDIDATE refinement of a subset never
+  reports the source as `APPLIED`/ratio `1.0`/cache-eligible while untouched
+  segments remain unresolved, and the `index_deferred`/`index_deferred_segments`
+  markers reflect only the segments still deferred. Window-specific detail
+  (requested bounds, target indexes, applied/unresolved counts) is carried in the
+  `RefinementOutcome.metadata`, separate from the source-wide summary.
 
 Per-segment handoff signals future stages can consume: `refinement_priority`,
 `needs_refinement` (derived from status/escalation evidence), and

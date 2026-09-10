@@ -13,13 +13,18 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.enums import (
+    JobStatus,
+    PipelineRunStatus,
+    PipelineStage,
     ReconstructionStatus,
     RefinementPriority,
     RightsStatus,
 )
 from app.db.base import Base
-from app.models import SourceVideo, Transcript
+from app.models import PipelineRun, ProcessingJob, SourceVideo, Transcript
 from app.pipeline.executor import ReconstructionCancelled
+from app.pipeline.fingerprints import reconstruction_target_fingerprint
+from app.pipeline.runner import PipelineRunner
 from app.pipeline.stages import ContextualReconstructionExecutor
 from app.transcription.reconstruction.confidence import CONFIDENCE_POLICY_VERSION
 from app.transcription.reconstruction.providers import (
@@ -409,8 +414,10 @@ def test_candidate_refinement_invokes_bounded_provider_work_on_window(
             assert "contextual_reconstructed_text" not in transcript.segments[index]
             assert "reconstruction_status" not in transcript.segments[index]
         assert transcript.reconstruction_metadata["priority"] == CANDIDATE.value
-        assert transcript.reconstruction_metadata["window"] == {"start": 1.5, "end": 3.5}
-        assert transcript.reconstruction_metadata["target_indexes"] == [1, 2, 3]
+        # Window-specific detail lives in the outcome, not the source summary.
+        assert outcome.metadata["window"] == {"start": 1.5, "end": 3.5}
+        assert outcome.metadata["target_indexes"] == [1, 2, 3]
+        assert outcome.metadata["applied_in_window"] == 3
 
 
 def test_final_clip_priority_is_accepted_by_refinement_contract(sqlite_engine: object) -> None:
@@ -704,3 +711,220 @@ def test_missing_gemini_refinement_degrades_gracefully(sqlite_engine: object) ->
             for segment in outcome.results
         )
         assert outcome.unresolved_indexes == (0, 1, 2)
+
+
+# Review fixes: cancellation on fast paths
+
+
+def test_reconstruct_index_fast_path_polls_cancellation() -> None:
+    """The INDEX early return polls cancellation before succeeding."""
+
+    reconstructor = ContextualReconstructor(None, is_cancelled=lambda: True)
+
+    with pytest.raises(ReconstructionCancelled):
+        reconstructor.reconstruct(
+            [_segment(0)],
+            language="ar",
+            transcription_fingerprint="asr-fp",
+            correction_version="egyptian-ar-v1",
+        )
+
+
+def test_reconstruct_providerless_fast_path_polls_cancellation() -> None:
+    """The no-provider CANDIDATE/FINAL_CLIP early return polls cancellation."""
+
+    reconstructor = ContextualReconstructor(
+        None, gemini_provider=None, is_cancelled=lambda: True, priority=CANDIDATE
+    )
+
+    with pytest.raises(ReconstructionCancelled):
+        reconstructor.reconstruct(
+            [_segment(0)],
+            language="ar",
+            transcription_fingerprint="asr-fp",
+            correction_version="egyptian-ar-v1",
+        )
+
+
+def _cancelled_runner_scenario(
+    sqlite_engine: object,
+    executor: ContextualReconstructionExecutor,
+) -> None:
+    segments = [_segment(i) for i in range(3)]
+    source_id = _setup_transcript(sqlite_engine, segments)
+    with Session(sqlite_engine) as worker:
+        executor._job_cancelled = lambda: True  # type: ignore[method-assign]
+        runner = PipelineRunner(worker, {PipelineStage.CONTEXTUAL_RECONSTRUCTION: executor})
+        with pytest.raises(ReconstructionCancelled):
+            runner.run(source_id, PipelineStage.CONTEXTUAL_RECONSTRUCTION)
+
+        run = worker.scalar(
+            select(PipelineRun)
+            .where(PipelineRun.source_video_id == source_id)
+            .order_by(PipelineRun.created_at.desc())
+        )
+        job = worker.scalar(
+            select(ProcessingJob)
+            .where(ProcessingJob.source_video_id == source_id)
+            .order_by(ProcessingJob.created_at.desc())
+        )
+        assert run.status is PipelineRunStatus.CANCELLED
+        assert job.status is JobStatus.CANCELLED
+        # Lifecycle never advanced past INGEST (reconstruction was cancelled).
+        source = worker.get(SourceVideo, source_id)
+        assert source is not None
+        assert source.lifecycle_state is PipelineStage.INGEST
+
+
+def test_cancellation_during_index_fast_path_keeps_job_cancelled(
+    sqlite_engine: object,
+) -> None:
+    with Session(sqlite_engine) as worker:
+        executor = ContextualReconstructionExecutor(
+            session=worker,
+            reconstructor=ContextualReconstructor(None, gemini_provider=None),
+        )
+        _cancelled_runner_scenario(sqlite_engine, executor)
+
+
+def test_cancellation_during_providerless_fast_path_keeps_job_cancelled(
+    sqlite_engine: object,
+) -> None:
+    with Session(sqlite_engine) as worker:
+        executor = ContextualReconstructionExecutor(
+            session=worker,
+            reconstructor=ContextualReconstructor(None, gemini_provider=None, priority=CANDIDATE),
+        )
+        _cancelled_runner_scenario(sqlite_engine, executor)
+
+
+# Review fixes: explicit priority override drives identity/fingerprints
+
+
+def _reconstruct_kwargs() -> dict[str, object]:
+    return dict(
+        language="ar",
+        transcription_fingerprint="asr-fp",
+        correction_version="egyptian-ar-v1",
+    )
+
+
+def test_explicit_priority_override_drives_runtime_identity_and_fingerprint() -> None:
+    segments = [_segment(i) for i in range(3)]
+    kwargs = _reconstruct_kwargs()
+    base = ContextualReconstructor(None, gemini_provider=None)  # default INDEX
+
+    index_result = base.reconstruct(segments, **kwargs)
+    candidate_result = base.reconstruct(segments, **kwargs, priority=CANDIDATE)
+    final_result = base.reconstruct(segments, **kwargs, priority=FINAL_CLIP)
+
+    assert index_result.metadata["runtime_identity"]["priority"] == "INDEX"
+    assert candidate_result.metadata["runtime_identity"]["priority"] == "CANDIDATE"
+    assert final_result.metadata["runtime_identity"]["priority"] == "FINAL_CLIP"
+    assert (
+        len(
+            {
+                index_result.fingerprint,
+                candidate_result.fingerprint,
+                final_result.fingerprint,
+            }
+        )
+        == 3
+    )
+
+
+def test_explicit_candidate_priority_never_collides_with_index_for_identical_segments() -> None:
+    segments = [_segment(i) for i in range(3)]
+    kwargs = _reconstruct_kwargs()
+
+    index_result = ContextualReconstructor(CountingLocal(), gemini_provider=None).reconstruct(
+        segments, **kwargs
+    )
+    candidate_result = ContextualReconstructor(CountingLocal(), gemini_provider=None).reconstruct(
+        segments, **kwargs, priority=CANDIDATE
+    )
+
+    assert candidate_result.fingerprint != index_result.fingerprint
+    assert candidate_result.metadata["runtime_identity"]["priority"] == "CANDIDATE"
+    assert index_result.metadata["runtime_identity"]["priority"] == "INDEX"
+
+
+def test_explicit_priority_override_drives_per_target_fingerprint_identity() -> None:
+    segments = [_segment(0)]
+    index_identity = ContextualReconstructor(None).runtime_identity()
+    candidate_identity = ContextualReconstructor(None, priority=CANDIDATE).runtime_identity()
+
+    index_target = reconstruction_target_fingerprint(
+        provider_identity=index_identity,
+        segments=segments,
+        target_index=0,
+        language="ar",
+        transcription_fingerprint="asr-fp",
+        correction_version="egyptian-ar-v1",
+    )
+    candidate_target = reconstruction_target_fingerprint(
+        provider_identity=candidate_identity,
+        segments=segments,
+        target_index=0,
+        language="ar",
+        transcription_fingerprint="asr-fp",
+        correction_version="egyptian-ar-v1",
+    )
+
+    assert index_target != candidate_target
+
+
+# Review fixes: source-wide state stays truthful after targeted refinement
+
+
+def test_targeted_refinement_keeps_source_wide_state_truthful(sqlite_engine: object) -> None:
+    segments = [_segment(i) for i in range(5)]
+    source_id = _setup_transcript(sqlite_engine, segments)
+
+    with Session(sqlite_engine) as session:
+        # Whole-source INDEX leaves every segment unresolved/deferred.
+        _executor(
+            session,
+            ContextualReconstructor(None, gemini_provider=None),
+        ).execute(session.get(SourceVideo, source_id), force=True)
+        session.commit()
+        transcript = session.scalar(
+            select(Transcript).where(Transcript.source_video_id == source_id)
+        )
+        assert transcript is not None
+        assert transcript.reconstruction_status is ReconstructionStatus.LOW_CONFIDENCE_UNRESOLVED
+        assert transcript.reconstruction_metadata["index_deferred_segments"] == 5
+
+        # Successful CANDIDATE refinement of a two-segment subset.
+        outcome = refine_transcript_window(
+            session,
+            source_id,
+            start_time=0.0,
+            end_time=2.0,
+            priority=CANDIDATE,
+            reconstructor=_local_only_reconstructor(CountingLocal()),
+        )
+        session.commit()
+        transcript = session.scalar(
+            select(Transcript).where(Transcript.source_video_id == source_id)
+        )
+
+        assert outcome.accepted_indexes == (0, 1)
+        # Source-wide summary must stay truthful over untouched unresolved segments.
+        assert transcript.reconstruction_status is ReconstructionStatus.LOW_CONFIDENCE_UNRESOLVED
+        assert transcript.reconstruction_confidence > 0.0
+        assert transcript.reconstructed_segment_ratio == 2 / 5
+        assert transcript.reconstruction_metadata["cache_eligible"] is False
+        assert transcript.reconstruction_metadata["index_deferred_segments"] == 3
+        # Untouched segments keep their deferred evidence.
+        for index in (2, 3, 4):
+            assert (
+                transcript.segments[index]["reconstruction_status"]
+                == ReconstructionStatus.LOW_CONFIDENCE_UNRESOLVED.value
+            )
+            assert transcript.segments[index]["escalation_reason"] == "index_priority_deferred"
+        # Window-specific outcome metadata is separate from the source summary.
+        assert outcome.metadata["window"] == {"start": 0.0, "end": 2.0}
+        assert outcome.metadata["target_indexes"] == [0, 1]
+        assert outcome.metadata["applied_in_window"] == 2
+        assert "window" not in transcript.reconstruction_metadata

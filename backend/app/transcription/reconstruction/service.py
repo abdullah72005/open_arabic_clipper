@@ -243,11 +243,23 @@ class ContextualReconstructor:
         targets; all other segments remain immutable context only. ``priority``
         selects the quality tier: INDEX resolves nothing through a provider and
         defers uncertainty truthfully; CANDIDATE/FINAL_CLIP run the bounded
-        adaptive provider pipeline.
+        adaptive provider pipeline. An explicit ``priority`` override drives all
+        identity consistently by delegating to a copy configured at that
+        priority, so a default INDEX reconstructor invoked with an explicit
+        CANDIDATE/FINAL_CLIP priority never shares an identity or fingerprint
+        with INDEX.
         """
 
-        effective_priority = priority or self._priority
-        if effective_priority is RefinementPriority.INDEX:
+        if priority is not None and priority is not self._priority:
+            return self.with_priority(priority).reconstruct(
+                segments,
+                language=language,
+                transcription_fingerprint=transcription_fingerprint,
+                correction_version=correction_version,
+                resolved=resolved,
+                target_indexes=target_indexes,
+            )
+        if self._priority is RefinementPriority.INDEX:
             return self._index_reconstruct(
                 segments,
                 language=language,
@@ -269,8 +281,8 @@ class ContextualReconstructor:
             targets = (
                 list(target_indexes) if target_indexes is not None else list(range(len(segments)))
             )
-            results = tuple(
-                self._providerless_segment(
+            results: dict[int, SegmentReconstruction] = {
+                index: self._providerless_segment(
                     index,
                     segments[index],
                     language=language,
@@ -278,15 +290,20 @@ class ContextualReconstructor:
                     method=_PROVIDER_DISABLED_METHOD,
                 )
                 for index in targets
-            )
+            }
+            state = _JobState(defaultdict(int), 0, False, None, self._monotonic)
+            state.total_segments = len(targets)
+            if self._poll_cancelled(results, state):
+                raise ReconstructionCancelled("reconstruction cancelled")
+            ordered = tuple(results[index] for index in targets)
             disabled_metadata: dict[str, object] = {
                 "runtime_identity": identity,
                 "cache_eligible": True,
-                "priority": effective_priority.value,
+                "priority": self._priority.value,
                 "provider_calls": 0,
                 "gemini_calls": 0,
             }
-            return ReconstructionResult(results, _joined(results), fingerprint, disabled_metadata)
+            return ReconstructionResult(ordered, _joined(ordered), fingerprint, disabled_metadata)
         started_at = self._monotonic()
         result: ReconstructionResult = ReconstructionResult((), "", "")
         try:
@@ -359,7 +376,7 @@ class ContextualReconstructor:
                 "cache_eligible": cache_eligible,
                 "local_budget": self._local_budget_metadata(state),
                 "progress": self._progress(by_index, state),
-                "priority": effective_priority.value,
+                "priority": self._priority.value,
             }
             if self._gemini is not None:
                 metadata["gemini_usage"] = self._gemini.usage_summary()
@@ -406,11 +423,15 @@ class ContextualReconstructor:
                 results[index] = resolved[index]
             else:
                 results[index] = self._index_segment(index, segments[index], language=language)
+        state = _JobState(defaultdict(int), 0, False, None, self._monotonic)
+        state.total_segments = len(targets)
+        if self._poll_cancelled(results, state):
+            raise ReconstructionCancelled("reconstruction cancelled")
         ordered = tuple(results[index] for index in targets)
         deferred = sum(1 for item in ordered if item.escalation_reason == _INDEX_DEFERRED_REASON)
         metadata: dict[str, object] = {
             "runtime_identity": identity,
-            "priority": RefinementPriority.INDEX.value,
+            "priority": self._priority.value,
             "index_deferred": True,
             "index_deferred_segments": deferred,
             "reconstruction_method": _INDEX_METHOD,

@@ -12,7 +12,7 @@ silently mutates unrelated segments.
 from __future__ import annotations
 
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from uuid import UUID
 
@@ -170,13 +170,11 @@ def refine_transcript_window(
         identity = reconstructor.runtime_identity()
 
     updated = list(segments)
-    statuses: list[ReconstructionStatus] = []
     for reconstruction in result.segments:
         index = reconstruction.segment_index
         if not 0 <= index < len(updated):
             raise RefinementError("refinement produced an out-of-range segment index")
         status = _segment_reconstruction_status(updated[index], reconstruction)
-        statuses.append(status)
         updated[index] = _apply_refinement_segment(
             updated[index],
             reconstruction,
@@ -204,13 +202,26 @@ def refine_transcript_window(
         for segment in updated
     ).strip()
     transcript.normalized_text = normalize_transcript(transcript.final_text)
-    applied = [item for item in result.segments if item.applied]
+    # Source-wide summary over every segment, not only the refined window. A
+    # whole-source INDEX run that left untouched segments unresolved must never
+    # report the source as APPLIED, ratio 1.0, cache-eligible, or free of
+    # deferred evidence.
+    applied_segments = [
+        segment for segment in updated if segment.get("reconstruction_applied") is True
+    ]
     transcript.reconstruction_fingerprint = result.fingerprint
-    transcript.reconstruction_status = aggregate_reconstruction_status(statuses)
-    transcript.reconstruction_confidence = (
-        sum(item.confidence for item in applied) / len(applied) if applied else 0.0
+    transcript.reconstruction_status = aggregate_reconstruction_status(
+        [_persisted_segment_status(segment) for segment in updated]
     )
-    transcript.reconstructed_segment_ratio = len(applied) / len(targets) if targets else 0.0
+    transcript.reconstruction_confidence = (
+        sum(float(segment.get("reconstruction_confidence") or 0.0) for segment in applied_segments)
+        / len(applied_segments)
+        if applied_segments
+        else 0.0
+    )
+    transcript.reconstructed_segment_ratio = (
+        len(applied_segments) / len(updated) if updated else 0.0
+    )
     transcript.reconstruction_method = (
         result.metadata.get("reconstruction_method")
         if isinstance(result.metadata.get("reconstruction_method"), str)
@@ -218,7 +229,7 @@ def refine_transcript_window(
     )
     transcript.reconstruction_version = "stage2.7-v1"
     transcript.reconstruction_metadata = _merge_refinement_metadata(
-        transcript, result, priority, start_time, end_time, targets
+        transcript, result, priority, updated
     )
     session.execute(delete(TranscriptChunk).where(TranscriptChunk.transcript_id == transcript.id))
     session.add_all(
@@ -245,7 +256,7 @@ def refine_transcript_window(
         target_indexes=targets,
         results=result.segments,
         fingerprint=result.fingerprint,
-        metadata=transcript.reconstruction_metadata,
+        metadata=_build_refinement_metadata(result, priority, targets, start_time, end_time),
     )
 
 
@@ -331,23 +342,33 @@ def _merge_refinement_metadata(
     transcript: Transcript,
     result: ReconstructionResult,
     priority: RefinementPriority,
-    start_time: float,
-    end_time: float,
-    targets: tuple[int, ...],
+    updated: list[dict[str, object]],
 ) -> dict[str, object]:
-    """Extend prior transcript metadata with the targeted refinement record."""
+    """Extend the source-wide transcript metadata after a targeted refinement.
+
+    The source-wide summary is recomputed over every segment: ``cache_eligible``
+    is true only when the whole source is terminal (no segment still needs
+    refinement), and INDEX deferred markers reflect only the segments that
+    remain deferred after this window refinement. Window-specific detail
+    (requested bounds, target indexes) lives in the ``RefinementOutcome``
+    metadata, not here.
+    """
 
     metadata: dict[str, object] = dict(transcript.reconstruction_metadata)
-    if priority is not RefinementPriority.INDEX:
-        # A prior whole-source INDEX run's deferred markers are stale once an
-        # active refinement touched the transcript.
+    deferred = sum(
+        1 for segment in updated if segment.get("escalation_reason") == "index_priority_deferred"
+    )
+    if deferred:
+        metadata["index_deferred"] = True
+        metadata["index_deferred_segments"] = deferred
+    else:
         metadata.pop("index_deferred", None)
         metadata.pop("index_deferred_segments", None)
     result_metadata = result.metadata
     metadata["priority"] = priority.value
-    metadata["cache_eligible"] = result_metadata.get("cache_eligible") is True
-    metadata["window"] = {"start": start_time, "end": end_time}
-    metadata["target_indexes"] = list(targets)
+    metadata["cache_eligible"] = all(
+        not _persisted_needs_refinement(segment) for segment in updated
+    )
     if isinstance(result_metadata.get("runtime_identity"), dict):
         metadata["runtime_identity"] = result_metadata["runtime_identity"]
     if isinstance(result_metadata.get("routing_counts"), dict):
@@ -355,3 +376,76 @@ def _merge_refinement_metadata(
     if isinstance(result_metadata.get("gemini_usage"), dict):
         metadata["gemini_usage"] = result_metadata["gemini_usage"]
     return metadata
+
+
+def _build_refinement_metadata(
+    result: ReconstructionResult,
+    priority: RefinementPriority,
+    targets: tuple[int, ...],
+    start_time: float,
+    end_time: float,
+) -> dict[str, object]:
+    """Window-specific outcome metadata, kept separate from the source summary."""
+
+    unresolved = sum(
+        1
+        for item in result.segments
+        if item.status
+        in {
+            ReconstructionStatus.LOW_CONFIDENCE_UNRESOLVED,
+            ReconstructionStatus.PROVIDER_UNAVAILABLE,
+            ReconstructionStatus.FAILED,
+        }
+        or item.escalation_reason
+    )
+    metadata: dict[str, object] = {
+        "priority": priority.value,
+        "window": {"start": start_time, "end": end_time},
+        "target_indexes": list(targets),
+        "target_count": len(targets),
+        "applied_in_window": sum(1 for item in result.segments if item.applied),
+        "unresolved_in_window": unresolved,
+        "provider_calls": result.metadata.get("provider_calls", 0),
+        "gemini_calls": result.metadata.get("gemini_calls", 0),
+    }
+    if isinstance(result.metadata.get("routing_counts"), dict):
+        metadata["routing_counts"] = result.metadata["routing_counts"]
+    if isinstance(result.metadata.get("gemini_usage"), dict):
+        metadata["gemini_usage"] = result.metadata["gemini_usage"]
+    if isinstance(result.metadata.get("runtime_identity"), dict):
+        metadata["runtime_identity"] = result.metadata["runtime_identity"]
+    return metadata
+
+
+def _persisted_segment_status(segment: Mapping[str, object]) -> ReconstructionStatus:
+    """Derive the truthful reconstruction status of one persisted segment.
+
+    A segment that never went through Stage 2.7 has no reconstruction evidence,
+    so it is conservatively treated as unresolved (needs refinement) rather than
+    claiming a clean/terminal state.
+    """
+
+    raw = segment.get("reconstruction_status")
+    if isinstance(raw, str):
+        try:
+            return ReconstructionStatus(raw)
+        except ValueError:
+            pass
+    return ReconstructionStatus.LOW_CONFIDENCE_UNRESOLVED
+
+
+def _persisted_needs_refinement(segment: Mapping[str, object]) -> bool:
+    """Whether one persisted segment still needs higher-priority refinement."""
+
+    if _persisted_segment_status(segment) in {
+        ReconstructionStatus.LOW_CONFIDENCE_UNRESOLVED,
+        ReconstructionStatus.PROVIDER_UNAVAILABLE,
+        ReconstructionStatus.FAILED,
+    }:
+        return True
+    flags = segment.get("reconstruction_quality_flags")
+    if isinstance(flags, list) and any(
+        str(flag) == "RECONSTRUCTION_PROVIDER_ERROR" for flag in flags
+    ):
+        return True
+    return bool(segment.get("escalation_reason"))
