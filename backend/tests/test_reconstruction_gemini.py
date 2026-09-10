@@ -360,9 +360,12 @@ def test_gemini_system_instruction_is_dialect_neutral() -> None:
 
     neutral = gemini_system_instruction(None)
     assert "Egyptian" not in neutral
-    assert "dialect and register evident in the source" in neutral
-    profiled = gemini_system_instruction("khaleeji")
-    assert "khaleeji" in profiled
+    assert "Preserve the dialect and register actually evidenced" in neutral
+    assert "Preserve detected Arabic-English code switching" in neutral
+    profiled = gemini_system_instruction("GULF")
+    assert "Gulf speech" in profiled
+    unknown = gemini_system_instruction("UNKNOWN_ARABIC")
+    assert "do not force any regional dialect" in unknown
 
 
 def test_gemini_thinking_level_is_sent_and_in_identity() -> None:

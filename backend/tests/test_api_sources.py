@@ -154,7 +154,7 @@ def test_upload_reads_the_request_file_in_bounded_chunks(
 
     with session_factory() as database:
         response = route.endpoint(  # type: ignore[union-attr]
-            Response(), fake_upload, RightsStatus.OWNED, database
+            Response(), fake_upload, RightsStatus.OWNED, None, database
         )
 
     assert response.rights_status is RightsStatus.OWNED

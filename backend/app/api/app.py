@@ -32,6 +32,7 @@ from app.services.health import CheckStatus, HealthService
 from app.services.source_adapters import SourceValidationError, normalize_source_url
 from app.services.storage import StorageCategory, StorageService
 from app.transcription.chunking import ChunkConfig, build_chunks
+from app.transcription.dialect import ArabicDialectProfile
 from app.transcription.normalization import normalize_transcript
 from app.transcription.reconstruction.providers import ReconstructionProvider
 from app.workers.tasks import run_pipeline_stage
@@ -53,12 +54,14 @@ class CeleryDispatcher:
 class SourceURLRequest(BaseModel):
     url: str = Field(min_length=1, max_length=2048)
     rights_status: RightsStatus = RightsStatus.UNKNOWN
+    dialect_profile_override: ArabicDialectProfile | None = None
 
 
 class SourceResponse(BaseModel):
     id: UUID
     source_uri: str
     original_filename: str | None
+    dialect_profile_override: ArabicDialectProfile | None
     rights_status: RightsStatus
     lifecycle_state: PipelineStage
     created_at: datetime
@@ -98,6 +101,10 @@ class TranscriptResponse(BaseModel):
     detected_language_probability: float | None
     whisper_model: str
     transcription_options: dict[str, object]
+    dialect_profile: ArabicDialectProfile | None
+    dialect_confidence: float
+    dialect_evidence: dict[str, object]
+    code_switch_suspected: bool
     raw_text: str
     normalized_text: str
     corrected_text: str
@@ -186,6 +193,7 @@ def create_app(
         response: Response,
         file: UploadFile = File(...),
         rights_status: RightsStatus = Form(RightsStatus.UNKNOWN),
+        dialect_profile_override: ArabicDialectProfile | None = Form(None),
         database: Session = Depends(session),
     ) -> SourceResponse:
         filename = _safe_filename(file.filename)
@@ -219,6 +227,7 @@ def create_app(
                 source_uri="",
                 original_filename=filename,
                 content_hash=digest.hexdigest(),
+                dialect_profile_override=dialect_profile_override,
                 rights_status=rights_status,
             )
             database.add(source)
@@ -247,7 +256,11 @@ def create_app(
         if existing is not None:
             response.status_code = status.HTTP_200_OK
             return _duplicate_response(existing)
-        source = SourceVideo(source_uri=normalized, rights_status=request.rights_status)
+        source = SourceVideo(
+            source_uri=normalized,
+            dialect_profile_override=request.dialect_profile_override,
+            rights_status=request.rights_status,
+        )
         database.add(source)
         database.flush()
         job = _new_job(source.id)
@@ -534,6 +547,10 @@ def _transcript_response(transcript: Transcript) -> TranscriptResponse:
         detected_language_probability=transcript.detected_language_probability,
         whisper_model=transcript.whisper_model,
         transcription_options=transcript.transcription_options,
+        dialect_profile=transcript.dialect_profile,
+        dialect_confidence=transcript.dialect_confidence,
+        dialect_evidence=transcript.dialect_evidence,
+        code_switch_suspected=transcript.code_switch_suspected,
         raw_text=transcript.raw_text,
         normalized_text=transcript.normalized_text,
         corrected_text=transcript.corrected_text,

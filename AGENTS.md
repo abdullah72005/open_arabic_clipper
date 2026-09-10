@@ -3,8 +3,8 @@
 ## Product and stage
 
 - Product name: `open_arabic_clipper` (working product label: ClipFactory).
-- Current scope: Stage 2.7 — local-first ingest/probe, cached audio,
-  faster-whisper transcription, conservative contextual Egyptian correction,
+- Current scope: Stage 2.7.1 — local-first ingest/probe, cached audio,
+  faster-whisper transcription, conservative dialect-aware Arabic correction,
   bounded contextual reconstruction through a managed local provider, storage,
   jobs, dashboard, and operational tooling through `READY_FOR_ANALYSIS`.
 - Explicitly out of scope until later stages: Stage 3 AI clip selection,
@@ -112,9 +112,29 @@
   is authoritative over the local-origin Gemini backlog: once it expires no new
   escalation is enqueued and queued escalations are invalidated (no Gemini call
   for the backlog, safe Stage 2.5/current text preserved, unresolved/manual
-  review). Stage 2.7.1 (dialect/code-switch recovery) is not implemented; the
-  pipeline only preserves mixed-language evidence and exposes a lightweight
-  evidence-based `code_switch_suspected` signal.
+  review). Stage 2.7.1 adds dialect-aware preservation: a pure deterministic
+  detector (no network, no LLM, no model loading, no audio decoding) classifies
+  the source from immutable raw segment text into `EGYPTIAN`, `SAUDI`, `GULF`,
+  `LEVANTINE`, `MSA`, or `UNKNOWN_ARABIC`; `None` means no Arabic evidence and
+  `UNKNOWN_ARABIC` means Arabic is present but uncertain/mixed and always favors
+  no change. The effective profile/confidence/evidence persist on the transcript
+  and are inherited by every derived segment. The Egyptian Stage 2.5 lexicon and
+  its optional provider apply only when the profile is confidently or explicitly
+  EGYPTIAN; every other profile passes valid text through unchanged. Exact
+  protected tokens (Latin words/names, abbreviations, technical forms, Western
+  and Arabic-Indic numbers) are preserved through Stage 2.5 and every accepted
+  Stage 2.7 candidate, with slash/`+`/`#`/URL technical forms kept as exact
+  atomic tokens (URLs include query, fragment, parameter, and percent-encoded
+  syntax); `code_switch_suspected` is true only for a segment that itself
+  contains both Arabic-script evidence and Latin-letter-bearing protected-token
+  evidence (numbers alone and English-only segments are not flagged), and
+  omitted-English audio recovery is deferred to Stage 3.5. The
+  shared reconstruction instruction is dialect-neutral and preservation-first
+  for both local and Gemini providers, with validated profile-specific addenda.
+  An optional source-creation `dialect_profile_override` wins with confidence
+  1.0 and participates in normalization fingerprints. Dialect is source
+  evidence, not a target audience, and there is no deployment-wide dialect
+  default.
 
 ## Local development facts (not product requirements)
 

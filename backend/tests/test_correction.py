@@ -1,6 +1,7 @@
 from copy import deepcopy
 
 from app.transcription.correction import ContextualCorrector, context_window
+from app.transcription.dialect import ArabicDialectProfile
 
 
 def test_corrects_known_egyptian_confusions_without_mutating_raw_segments() -> None:
@@ -15,7 +16,9 @@ def test_corrects_known_egyptian_confusions_without_mutating_raw_segments() -> N
     ]
     original = deepcopy(segments)
 
-    corrections = ContextualCorrector.from_default_lexicon().correct(segments)
+    corrections = ContextualCorrector.from_default_lexicon().correct(
+        segments, profile=ArabicDialectProfile.EGYPTIAN
+    )
 
     assert [correction.corrected_text for correction in corrections] == [
         "عامل ايه يا جماعة",
@@ -37,7 +40,8 @@ def test_keeps_low_confidence_and_protected_code_switching_raw() -> None:
             {"start": 0.0, "end": 1.0, "text": "بص الـ backend كان فيه issue في الـ database"},
             {"start": 1.0, "end": 2.0, "text": "Ahmed fixed backend issue 2026"},
             {"start": 2.0, "end": 3.0, "text": "مفيش حد جه"},
-        ]
+        ],
+        profile=ArabicDialectProfile.EGYPTIAN,
     )
 
     assert [correction.corrected_text for correction in corrections] == [

@@ -32,11 +32,12 @@ from pydantic import BaseModel, Field
 
 from app.transcription.reconstruction.confidence import CONFIDENCE_POLICY_VERSION
 from app.transcription.reconstruction.providers import (
-    DIALECT_PROFILE_ADDENDUM,
+    SYSTEM_INSTRUCTION,
     ProviderResponseError,
     ReconstructionRequest,
     _extract_json_object,
     _parse_reconstructions,
+    instruction_for_profile,
 )
 from app.transcription.reconstruction.types import (
     ProviderAvailability,
@@ -49,32 +50,17 @@ from app.transcription.reconstruction.validation import VALIDATION_VERSION
 _GEMINI_SCHEMA_VERSION = "gemini-reconstruction-v1"
 _GEMINI_API_VERSION = "v1"
 
-# Dialect-neutral base instruction. Gemini must preserve the dialect/register
-# evident in the source and context and must never default to Egyptian. The
-# shared protection constraints (names, numbers, facts, code switching) apply.
-GEMINI_BASE_INSTRUCTION = (
-    "You are a conservative Arabic ASR post-processor. "
-    "For the target segment, return the most plausible SPOKEN text, preserving "
-    "the dialect and register evident in the source and surrounding context. "
-    "Do NOT default to any specific dialect, and do NOT standardize into Modern "
-    "Standard Arabic (MSA), translate, formalize, summarize, or normalize dialect. "
-    "Preserve all names, numbers, Latin tokens, digits, and code switching "
-    "exactly as they appear. "
-    "Do not add facts, clauses, or change entities. "
-    "Use only the small local context provided. "
-    "If the raw text is already correct, return it unchanged and set unchanged=true. "
-    "Output ONLY a JSON object with this exact shape: "
-    '{"reconstructions": [{"segment_id": int, "corrected_text": string, '
-    '"unchanged": bool, "confidence": number, "explanation": string, "changes": []}]}.'
-)
-
 
 def gemini_system_instruction(profile: str | None = None) -> str:
-    """Return the Gemini system instruction, adding a profile addendum if set."""
+    """Return the shared dialect-neutral system instruction for Gemini.
 
-    if not profile:
-        return GEMINI_BASE_INSTRUCTION
-    return GEMINI_BASE_INSTRUCTION + "\n" + DIALECT_PROFILE_ADDENDUM.format(profile=profile)
+    Gemini uses the same preservation-first instruction and validated
+    profile-specific addenda as the local provider; provider-specific behavior
+    stays limited to transport, response schema, SDK behavior, sizing, and error
+    handling.
+    """
+
+    return instruction_for_profile(SYSTEM_INSTRUCTION, profile)
 
 
 class _GeminiReconstructionEntry(BaseModel):
@@ -92,7 +78,7 @@ class _GeminiReconstructionOutput(BaseModel):
 
 _GEMINI_PROMPT_HASH = hashlib.sha256(
     (
-        GEMINI_BASE_INSTRUCTION
+        SYSTEM_INSTRUCTION
         + json.dumps(_GeminiReconstructionOutput.model_json_schema(), sort_keys=True)
     ).encode("utf-8")
 ).hexdigest()
@@ -431,7 +417,7 @@ def _response_content(response: Any) -> object:
 
 def _estimate_envelope(request: ReconstructionRequest, output_tokens: int) -> int:
     return request.estimated_tokens(
-        system_instruction=GEMINI_BASE_INSTRUCTION,
+        system_instruction=gemini_system_instruction(),
         output_tokens=output_tokens,
         chat_framing_reserve=64,
         safety_reserve=128,

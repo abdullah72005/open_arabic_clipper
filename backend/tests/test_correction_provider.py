@@ -3,6 +3,7 @@ import json
 import pytest
 
 from app.transcription.correction import ContextualCorrector
+from app.transcription.dialect import ArabicDialectProfile
 from app.transcription.providers import (
     CorrectionRequest,
     OpenAICompatibleCorrectionProvider,
@@ -37,10 +38,12 @@ def test_contextual_provider_receives_bounded_windows_and_can_correct_target() -
         [
             {"start": float(index), "end": float(index + 1), "text": text}
             for index, text in enumerate(["عامل إيه", "يا جماعة", "خطي بالك", "الموضوع", "مش سهل"])
-        ]
+        ],
+        profile=ArabicDialectProfile.EGYPTIAN,
     )
 
-    request = provider.requests[2]
+    request = provider.requests[0]
+    assert request.segment_index == 2
     assert request.previous == ("عامل إيه", "يا جماعة")
     assert request.raw_text == "خطي بالك"
     assert request.following == ("الموضوع", "مش سهل")
@@ -78,7 +81,8 @@ def test_provider_cannot_apply_a_small_rewrite_to_an_arabic_name() -> None:
             ]
 
     corrections = ContextualCorrector.from_default_lexicon(provider=NameChangingProvider()).correct(
-        [{"start": 0.0, "end": 1.0, "text": "محمد صلاح"}]
+        [{"start": 0.0, "end": 1.0, "text": "محمد صلاح"}],
+        profile=ArabicDialectProfile.EGYPTIAN,
     )
 
     assert corrections[0].corrected_text == "محمد صلاح"

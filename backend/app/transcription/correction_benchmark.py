@@ -10,6 +10,7 @@ from pathlib import Path
 from time import perf_counter
 
 from app.transcription.correction import ContextualCorrector, normalize_for_comparison
+from app.transcription.dialect import ArabicDialectProfile
 from app.transcription.normalization import normalize_transcript
 
 
@@ -48,9 +49,15 @@ def default_fixture_path() -> Path:
 
 
 def run_correction_fixture_benchmark(
-    path: Path, corrector: ContextualCorrector | None
+    path: Path,
+    corrector: ContextualCorrector | None,
+    profile: ArabicDialectProfile = ArabicDialectProfile.EGYPTIAN,
 ) -> CorrectionBenchmarkReport:
-    """Compare current baseline normalization with optional correction on the same cases."""
+    """Compare current baseline normalization with optional correction on the same cases.
+
+    The fixture corpus is Egyptian Arabic; the benchmark intentionally exercises
+    the Egyptian lexicon, so it passes the Egyptian profile explicitly.
+    """
 
     fixtures = json.loads(path.read_text(encoding="utf-8"))["fixtures"]
     started = perf_counter()
@@ -74,7 +81,8 @@ def run_correction_fixture_benchmark(
                     {"text": str(fixture["previous"])},
                     {"text": raw},
                     {"text": str(fixture["next"])},
-                ]
+                ],
+                profile=profile,
             )[1]
             corrected = correction.corrected_text
             applied = correction.applied

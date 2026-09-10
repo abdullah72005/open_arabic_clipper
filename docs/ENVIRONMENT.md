@@ -17,7 +17,7 @@ the application remains portable and config-driven.
 | Git | 2.34.1 |
 | Free disk | 259 GiB free on the mounted Windows volume (952 GiB total) |
 | Network | HTTPS checks to PyPI and npm registry succeeded |
-| Ollama | `ollama/ollama` runs under the `reconstruction` profile; `qwen3:8b` pulled with digest `500a1f067a9f…b41` |
+| Ollama | `ollama/ollama` runs under the `reconstruction` profile; the required Stage 2.7 model `qwen3.5:4b` (digest `2a654d98e6fb…eefd`) is pulled and configured by default; historical `qwen3:8b` (digest `500a1f067a9f…b41`) is also pulled for benchmark comparison |
 
 ## Hosted Gemini cloud configuration (2026-09-09)
 

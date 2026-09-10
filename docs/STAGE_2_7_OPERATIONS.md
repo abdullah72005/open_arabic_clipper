@@ -20,9 +20,47 @@ A shortlisted window is **CANDIDATE** (semantic quality) and a selected final
 clip is **FINAL_CLIP** (publication/caption quality). Expensive work is deferred
 until a short region is actually close to publication, at which point a caller
 uses the reusable `refine_transcript_window(source_id, start_time, end_time,
-priority)` service entry point (see below). Stage 2.7.1 (dialect/code-switch
-recovery) is not implemented; the pipeline preserves mixed-language evidence and
-exposes a lightweight evidence-based `code_switch_suspected` signal only.
+priority)` service entry point (see below).
+
+## Dialect awareness (Stage 2.7.1)
+
+Stage 2.7.1 adds conservative source-level Arabic dialect awareness and exact
+Arabic-English code-switch preservation. During Stage 2.5 normalization a pure,
+deterministic detector classifies the source from immutable raw segment text:
+
+- **Profiles.** `EGYPTIAN`, `SAUDI`, `GULF`, `LEVANTINE`, `MSA`, or
+  `UNKNOWN_ARABIC`; `None` means no Arabic evidence. `UNKNOWN_ARABIC` means
+  Arabic is present but uncertain/mixed and always favors no change. Dialect is
+  source evidence, not a target audience; there is no deployment-wide default.
+- **Lightweight.** No network, no LLM, no model loading, no audio decoding, no
+  per-segment classifier. Marker scoring comes from a bounded representative
+  sample of at most 48 segments and stores no transcript bodies; Arabic
+  applicability itself scans every immutable raw segment, so an Arabic segment
+  outside the sample is never lost (it resolves to `UNKNOWN_ARABIC`, not
+  `None`).
+- **Override.** An optional `dialect_profile_override` may be provided when a
+  source is created through URL ingest JSON or multipart upload. It wins with
+  confidence 1.0, is stored on the source, participates in normalization
+  fingerprints, and an explicit `UNKNOWN_ARABIC` override means "do not force a
+  dialect." The initial implementation accepts the override at source creation
+  only; there is no post-ingest editing workflow in this stage.
+- **Egyptian isolation.** The Egyptian Stage 2.5 lexicon and its optional
+  provider apply only when the effective profile is confidently or explicitly
+  EGYPTIAN. Other profiles and non-Arabic material pass through unchanged with
+  zero optional Stage 2.5 provider calls.
+- **Code switching.** Latin words/names, abbreviations, technical tokens, and
+  numbers are preserved exactly through Stage 2.5 and every accepted Stage 2.7
+  candidate; slash/`+`/`#`/URL technical forms are kept as exact atomic tokens
+  (URLs include query, fragment, parameter, and percent-encoded syntax).
+  `code_switch_suspected` is true only for a segment that itself contains both
+  Arabic-script evidence and Latin-letter protected tokens (numbers alone and
+  English-only segments are not flagged).
+  Omitted-English audio recovery is deferred to Stage 3.5.
+- **Shared provider contract.** Local Qwen and hosted Gemini receive the same
+  dialect-neutral, preservation-first instruction plus validated profile-specific
+  addenda; the shared reconstruction request carries the target segment's
+  inherited effective dialect profile, and local prompt planning sizes the exact
+  profile-specific instruction.
 
 ## Provider operation
 
@@ -457,8 +495,9 @@ Behavior:
 
 Per-segment handoff signals future stages can consume: `refinement_priority`,
 `needs_refinement` (derived from status/escalation evidence), and
-`code_switch_suspected` (derived from Latin/digit word evidence; no recovery
-logic).
+`code_switch_suspected` (true only when the segment itself contains both
+Arabic-script and Latin-letter protected-token evidence; numbers alone and
+English-only segments are not flagged; no recovery logic).
 
 ## Ollama hardware safeguards (Compose)
 
@@ -613,7 +652,7 @@ docker compose exec backend python -m app.cli benchmark-reconstruction \
   stage-2-7/known-regression-v1.json --allow-known-regression-set --capture-asr
 docker compose exec backend python -m app.cli benchmark-reconstruction \
   stage-2-7/known-regression-v1.json --allow-known-regression-set \
-  --model qwen3:8b --from-capture <capture-id>
+  --model qwen3.5:4b --from-capture <capture-id>
 ```
 
 `--capture-asr` runs Whisper exactly once per clip and writes a hashed,

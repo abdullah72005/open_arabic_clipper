@@ -24,7 +24,6 @@ from app.models import Transcript, TranscriptChunk
 from app.pipeline.fingerprints import reconstruction_target_fingerprint
 from app.pipeline.stages import (
     _reconstruction_method,
-    _segment_code_switch_suspected,
     _segment_needs_refinement,
     _segment_reconstruction_status,
     _target_cache_eligible,
@@ -332,7 +331,6 @@ def _apply_refinement_segment(
         "near_acceptance": reconstruction.near_acceptance,
         "refinement_priority": priority.value,
         "needs_refinement": _segment_needs_refinement(status, reconstruction),
-        "code_switch_suspected": _segment_code_switch_suspected(segment),
         "reconstruction_target_fingerprint": target_fingerprint,
         "reconstruction_cache_eligible": _target_cache_eligible(reconstruction),
     }

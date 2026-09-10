@@ -7,11 +7,21 @@
    metadata.
 5. The worker extracts cached mono 16 kHz WAV audio and runs local faster-whisper.
 6. Raw source/segment text, segment ordering, timestamps, and word timestamps are persisted.
-7. Stage 2.5 derives conservative contextual Egyptian correction into separate
-   corrected/final fields. It never realigns audio or overwrites raw evidence.
+7. Stage 2.5 derives conservative dialect-aware correction into separate
+   corrected/final fields. A pure deterministic detector (no network, no LLM, no
+   model loading, no audio decoding) classifies the source from immutable raw
+   segment text into `EGYPTIAN`, `SAUDI`, `GULF`, `LEVANTINE`, `MSA`, or
+   `UNKNOWN_ARABIC` (`None` = no Arabic evidence). The Egyptian lexicon and its
+   optional provider apply only for confidently/explicitly EGYPTIAN sources;
+   other profiles pass through unchanged. Exact Latin/technical/number tokens
+   are preserved and `code_switch_suspected` evidence is persisted. It never
+   realigns audio or overwrites raw evidence.
 8. Stage 2.7 derives bounded contextual reconstruction through the managed local
    Ollama provider. It preserves raw text, segment timestamps, and word
    timestamps; it never creates, removes, merges, splits, or retimes segments.
+   Local and Gemini providers share one dialect-neutral, preservation-first
+   instruction plus validated profile-specific addenda, and the shared request
+   carries the target segment's inherited effective dialect profile.
 9. Timestamp-aware chunks use final operator text when present, otherwise
    corrected text; silence/quality signals are persisted separately.
 10. The source reaches `READY_FOR_ANALYSIS`.

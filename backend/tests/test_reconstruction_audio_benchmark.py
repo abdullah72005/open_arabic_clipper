@@ -368,7 +368,12 @@ class _Corrector:
     def __init__(self, events: list[str]) -> None:
         self.events = events
 
-    def correct(self, segments: list[dict[str, object]]) -> list[SegmentCorrection]:
+    def correct(
+        self,
+        segments: list[dict[str, object]],
+        *,
+        profile: object = None,
+    ) -> list[SegmentCorrection]:
         self.events.append("stage25")
         clip_index = int(str(segments[0]["text"]).split("-")[1])
         return [

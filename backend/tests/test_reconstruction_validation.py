@@ -15,6 +15,84 @@ def test_validator_rejects_mutated_latin_and_numeric_evidence() -> None:
     assert result.reason == "protected_tokens_changed"
 
 
+def test_validator_rejects_destructive_technical_token_rewrites() -> None:
+    """A candidate that fragments or changes technical tokens is rejected."""
+
+    cases = [
+        ("C++", "C#"),
+        ("foo/bar", "foo bar"),
+        ("api/v2", "api v2"),
+        ("#build", "build"),
+        ("+icon", "icon"),
+        ("https://example.com/page", "https example.com page"),
+    ]
+    for raw, destructive in cases:
+        memory = build_entity_memory([{"text": raw}])
+        candidate = ReconstructionCandidate("provider-0", destructive)
+
+        result = validate_candidate(raw, candidate, memory)
+
+        assert result.accepted is False, f"{raw!r} -> {destructive!r} must be rejected"
+        assert result.reason == "protected_tokens_changed"
+
+
+def test_validator_preserves_atomic_technical_tokens_when_unchanged() -> None:
+    """Unchanged atomic technical tokens are not themselves a validation failure."""
+
+    raw = "نستخدم C++ و foo/bar في api/v2 و #build"
+    memory = build_entity_memory([{"text": raw}])
+
+    result = validate_candidate(raw, ReconstructionCandidate("provider-0", raw), memory)
+
+    assert result.accepted is True
+
+
+def test_validator_preserves_unchanged_url_with_query_and_fragment() -> None:
+    raw = "افتح https://example.com/page?foo=bar#section الان"
+    memory = build_entity_memory([{"text": raw}])
+
+    result = validate_candidate(raw, ReconstructionCandidate("provider-0", raw), memory)
+
+    assert result.accepted is True
+
+
+def test_validator_rejects_balanced_parenthesis_url_mutation() -> None:
+    """Removing the balanced closing parenthesis of a URL is rejected."""
+
+    raw = "اقرا https://en.wikipedia.org/wiki/Function_(mathematics) الان"
+    destructive = "اقرا https://en.wikipedia.org/wiki/Function_(mathematics الان"
+    memory = build_entity_memory([{"text": raw}])
+
+    result = validate_candidate(raw, ReconstructionCandidate("provider-0", destructive), memory)
+
+    assert result.accepted is False
+    assert result.reason == "protected_tokens_changed"
+
+
+def test_validator_rejects_destructive_url_rewrites() -> None:
+    """A candidate that fragments or mutates a URL query is rejected."""
+
+    cases = [
+        ("https://example.com/page?foo=bar", "https://example.com/page foo bar"),
+        ("https://example.com/page?foo=bar", "https://example.com/page?foo=baz"),
+        (
+            "https://example.com/page?foo=bar&mode=full",
+            "https://example.com/page?mode=full&foo=bar",
+        ),
+        ("https://example.com/a%20path?q=x%2Fy", "https://example.com/a path?q=x/y"),
+        ("https://example.com/page?foo=bar#section", "https://example.com/page?foo=bar"),
+        ("https://example.com/page?foo=bar", "http://example.com/page?foo=bar"),
+    ]
+    for raw, destructive in cases:
+        memory = build_entity_memory([{"text": raw}])
+        candidate = ReconstructionCandidate("provider-0", destructive)
+
+        result = validate_candidate(raw, candidate, memory)
+
+        assert result.accepted is False, f"{raw!r} -> {destructive!r} must be rejected"
+        assert result.reason == "protected_tokens_changed"
+
+
 def test_validator_accepts_bounded_multword_candidate_with_source_evidence() -> None:
     """A supported multi-word Egyptian reconstruction remains eligible for contextual ranking."""
 

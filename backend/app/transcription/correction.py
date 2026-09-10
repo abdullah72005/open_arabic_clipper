@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
-import re
-import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Sequence
 
+from app.transcription.arabic import normalize_for_comparison as normalize_for_comparison
+from app.transcription.dialect import (
+    DIALECT_POLICY_VERSION as _DIALECT_POLICY_VERSION,
+)
+from app.transcription.dialect import ArabicDialectProfile, extract_protected_tokens
 from app.transcription.providers import (
     CorrectionProvider,
     CorrectionRequest,
@@ -17,10 +20,7 @@ from app.transcription.providers import (
     validate_provider_results,
 )
 
-_ARABIC_DIACRITICS = re.compile(r"[\u0610-\u061A\u064B-\u065F\u0670\u06D6-\u06ED]")
-_PUNCTUATION = re.compile(r"[^\w\s]", re.UNICODE)
-_WHITESPACE = re.compile(r"\s+")
-_ARABIC_COMPARISON = str.maketrans({"أ": "ا", "إ": "ا", "آ": "ا", "ى": "ي", "ة": "ه"})
+CORRECTION_POLICY_VERSION = "dialect-aware-correction-v1"
 
 
 @dataclass(frozen=True)
@@ -107,30 +107,71 @@ class ContextualCorrector:
         )
         return cls(entries, str(payload["version"]), config, provider)
 
-    def correct(self, segments: Sequence[Mapping[str, object]]) -> list[SegmentCorrection]:
-        """Return one correction per input segment while retaining input ordering."""
+    def correct(
+        self,
+        segments: Sequence[Mapping[str, object]],
+        *,
+        profile: ArabicDialectProfile | None,
+    ) -> list[SegmentCorrection]:
+        """Return one correction per input segment while retaining input ordering.
 
-        provider_results = self._provider_results(segments)
+        ``profile`` is the explicit source-level Arabic dialect profile. The
+        Egyptian lexicon and its optional provider path apply only when the
+        effective profile is confidently or explicitly EGYPTIAN; every other
+        profile (SAUDI, GULF, LEVANTINE, MSA, UNKNOWN_ARABIC, and non-Arabic)
+        passes valid text through unchanged.
+        """
+
+        provider_results = self._provider_results(segments, profile=profile)
         return [
-            self._correct_one(index, segments, provider_results.get(index))
+            self._correct_one(index, segments, provider_results.get(index), profile)
             for index in range(len(segments))
         ]
 
+    def correction_identity(self) -> dict[str, object]:
+        """Stable identity for everything that affects correction output.
+
+        The dialect-aware correction policy version, the dialect detector policy
+        version, the Egyptian lexicon version, and the output-affecting
+        thresholds/configuration all participate, so any of them invalidates
+        derived Stage 2.5 work at its correct boundary.
+        """
+
+        return {
+            "correction_policy_version": CORRECTION_POLICY_VERSION,
+            "dialect_detector_policy_version": _DIALECT_POLICY_VERSION,
+            "egyptian_lexicon_version": self._version,
+            "config": _stable_config(self._config),
+        }
+
     def _provider_results(
-        self, segments: Sequence[Mapping[str, object]]
+        self,
+        segments: Sequence[Mapping[str, object]],
+        *,
+        profile: ArabicDialectProfile | None,
     ) -> dict[int, ProviderCorrection]:
         if self._provider is None or not segments:
             return {}
-        requests = [
-            CorrectionRequest(
-                segment_index=index,
-                previous=context_window(segments, index, self._config.context_segments).previous,
-                raw_text=str(segment.get("text", "")),
-                following=context_window(segments, index, self._config.context_segments).following,
-                candidate_text=self._candidate_text(str(segment.get("text", ""))),
+        requests = []
+        for index, segment in enumerate(segments):
+            candidate = self._candidate_text(str(segment.get("text", "")), profile=profile)
+            if candidate is None:
+                continue
+            requests.append(
+                CorrectionRequest(
+                    segment_index=index,
+                    previous=context_window(
+                        segments, index, self._config.context_segments
+                    ).previous,
+                    raw_text=str(segment.get("text", "")),
+                    following=context_window(
+                        segments, index, self._config.context_segments
+                    ).following,
+                    candidate_text=candidate,
+                )
             )
-            for index, segment in enumerate(segments)
-        ]
+        if not requests:
+            return {}
         results: dict[int, ProviderCorrection] = {}
         for start in range(0, len(requests), self._config.provider_batch_size):
             batch = requests[start : start + self._config.provider_batch_size]
@@ -145,7 +186,9 @@ class ContextualCorrector:
                 continue
         return results
 
-    def _candidate_text(self, raw_text: str) -> str | None:
+    def _candidate_text(self, raw_text: str, *, profile: ArabicDialectProfile | None) -> str | None:
+        if profile is not ArabicDialectProfile.EGYPTIAN:
+            return None
         entry = self._by_confusion.get(normalize_for_comparison(raw_text))
         return entry.canonical if entry is not None else None
 
@@ -154,9 +197,14 @@ class ContextualCorrector:
         index: int,
         segments: Sequence[Mapping[str, object]],
         provider_result: ProviderCorrection | None,
+        profile: ArabicDialectProfile | None,
     ) -> SegmentCorrection:
         raw_text = str(segments[index].get("text", ""))
-        entry = self._by_confusion.get(normalize_for_comparison(raw_text))
+        entry = (
+            self._by_confusion.get(normalize_for_comparison(raw_text))
+            if profile is ArabicDialectProfile.EGYPTIAN
+            else None
+        )
         if provider_result is not None and self._provider_result_is_safe(raw_text, provider_result):
             if entry is not None and provider_result.corrected_text == entry.canonical:
                 return self._provider_correction(index, raw_text, provider_result, "llm+lexicon")
@@ -227,15 +275,15 @@ class ContextualCorrector:
         )
 
 
-def normalize_for_comparison(text: str) -> str:
-    """Normalize Arabic spelling and layout only for candidate comparison."""
+def _stable_config(config: CorrectionConfig) -> dict[str, object]:
+    """Stable output-affecting correction configuration, excluding provider plumbing."""
 
-    canonical = unicodedata.normalize("NFC", text)
-    without_diacritics = _ARABIC_DIACRITICS.sub("", canonical)
-    without_punctuation = _PUNCTUATION.sub(" ", without_diacritics)
-    return (
-        _WHITESPACE.sub(" ", without_punctuation.translate(_ARABIC_COMPARISON)).strip().casefold()
-    )
+    return {
+        "context_segments": config.context_segments,
+        "high_confidence": config.high_confidence,
+        "medium_confidence": config.medium_confidence,
+        "max_small_edit_ratio": config.max_small_edit_ratio,
+    }
 
 
 def _normalized_edit_ratio(raw_text: str, corrected_text: str) -> float:
@@ -283,4 +331,4 @@ def context_window(
 def _protected_tokens(text: str) -> tuple[str, ...]:
     """Names/numbers and English technical terms must survive automatic edits exactly."""
 
-    return tuple(re.findall(r"[A-Za-z]+|[0-9٠-٩]+", text.casefold()))
+    return extract_protected_tokens(text)

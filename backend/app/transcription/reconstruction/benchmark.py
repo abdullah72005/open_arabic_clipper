@@ -21,6 +21,7 @@ from app.core.enums import ReconstructionStatus
 from app.pipeline.fingerprints import canonical_fingerprint
 from app.services.storage import StorageCategory, StorageService, StorageValidationError
 from app.transcription.correction import SegmentCorrection, normalize_for_comparison
+from app.transcription.dialect import ArabicDialectProfile
 from app.transcription.engine import TranscriptionResult
 from app.transcription.reconstruction.capture import (
     ASRCapture,
@@ -46,7 +47,12 @@ class Transcriber(Protocol):
 class Corrector(Protocol):
     """Minimal Stage 2.5 correction boundary used by the benchmark runner."""
 
-    def correct(self, segments: list[dict[str, object]]) -> Sequence[SegmentCorrection]: ...
+    def correct(
+        self,
+        segments: list[dict[str, object]],
+        *,
+        profile: ArabicDialectProfile | None,
+    ) -> Sequence[SegmentCorrection]: ...
 
 
 class Reconstructor(Protocol):
@@ -398,7 +404,9 @@ class BenchmarkRunner:
                 (index, segment.get("start"), segment.get("end"))
                 for index, segment in enumerate(raw_segments)
             ]
-            corrections = self._corrector.correct(raw_segments)
+            corrections = self._corrector.correct(
+                raw_segments, profile=ArabicDialectProfile.EGYPTIAN
+            )
             stage25 = [
                 dict(
                     segment, raw_text=correction.raw_text, corrected_text=correction.corrected_text
