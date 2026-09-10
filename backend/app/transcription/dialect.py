@@ -197,23 +197,34 @@ def extract_protected_tokens(text: str) -> tuple[str, ...]:
     return tuple(token for token in tokens if token)
 
 
-_URL_TRAILING_PUNCTUATION = ".,;:!?)]}'\""
+_URL_TRAILING_SENTENCE_PUNCTUATION = ".,;:!?\"'"
+_URL_CLOSING_DELIMITERS = {")": "(", "]": "[", "}": "{"}
 
 
 def _strip_url_trailing_punctuation(token: str) -> str:
     """Remove sentence punctuation that merely follows a URL token.
 
-    A trailing period/comma/exclamation and similar characters after a URL are
-    transcript punctuation, not part of the URL, so they do not join the atomic
-    token. URL-internal characters (``/``, ``=``, ``&``, ``%``, ``#``, ``+``)
-    are never stripped.
+    Unambiguous sentence punctuation (``.,;:!?`` and quotes) is stripped. A
+    trailing closing delimiter (``)``, ``]``, ``}``) is stripped only when it is
+    unmatched within the URL token; a closer that balances an earlier opener is
+    preserved as URL content, so ``https://en.wikipedia.org/wiki/Function_(mathematics)``
+    keeps its final ``)``. URL-internal characters (``/``, ``=``, ``&``, ``%``,
+    ``#``, ``+``) are never stripped.
     """
 
-    return token.rstrip(_URL_TRAILING_PUNCTUATION)
+    token = token.rstrip(_URL_TRAILING_SENTENCE_PUNCTUATION)
+    while token and token[-1] in _URL_CLOSING_DELIMITERS:
+        closing = token[-1]
+        opening = _URL_CLOSING_DELIMITERS[closing]
+        if token.count(closing) > token.count(opening):
+            token = token[:-1]
+        else:
+            break
+    return token
 
 
 _PROTECTED_TOKEN = re.compile(
-    r"[A-Za-z][A-Za-z0-9+.-]*://[A-Za-z0-9._~:/?#@!$&'()*+,;=%\[\]-]+"
+    r"[A-Za-z][A-Za-z0-9+.-]*://[A-Za-z0-9._~:/?#@!$&'()*+,;=%{}\[\]-]+"
     r"|[A-Za-z0-9]+(?:(?:[-_.@/:+#])[A-Za-z0-9]+)+"
     r"|[#+][A-Za-z0-9]+"
     r"|[A-Za-z]+[+#]+"

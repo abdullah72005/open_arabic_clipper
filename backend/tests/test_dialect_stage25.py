@@ -244,6 +244,18 @@ def test_stage25_safety_gate_rejects_destructive_url_rewrites() -> None:
         )
 
 
+def test_stage25_safety_gate_rejects_balanced_parenthesis_url_mutation() -> None:
+    """Stage 2.5 provider safety rejects removing a URL's balanced closing parenthesis."""
+
+    corrector = ContextualCorrector.from_default_lexicon()
+    raw = "https://en.wikipedia.org/wiki/Function_(mathematics)"
+    destructive = "https://en.wikipedia.org/wiki/Function_(mathematics"
+
+    result = ProviderCorrection(0, destructive, changed=True, confidence=0.99, changes=[])
+
+    assert corrector._provider_result_is_safe(raw, result) is False
+
+
 def _setup_transcript(session: Any, segments: list[dict[str, object]], language: str = "ar") -> Any:
     source = SourceVideo(
         source_uri="file:///tmp/dialect.mp4", content_hash="h", rights_status="OWNED"

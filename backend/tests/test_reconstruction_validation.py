@@ -56,6 +56,19 @@ def test_validator_preserves_unchanged_url_with_query_and_fragment() -> None:
     assert result.accepted is True
 
 
+def test_validator_rejects_balanced_parenthesis_url_mutation() -> None:
+    """Removing the balanced closing parenthesis of a URL is rejected."""
+
+    raw = "اقرا https://en.wikipedia.org/wiki/Function_(mathematics) الان"
+    destructive = "اقرا https://en.wikipedia.org/wiki/Function_(mathematics الان"
+    memory = build_entity_memory([{"text": raw}])
+
+    result = validate_candidate(raw, ReconstructionCandidate("provider-0", destructive), memory)
+
+    assert result.accepted is False
+    assert result.reason == "protected_tokens_changed"
+
+
 def test_validator_rejects_destructive_url_rewrites() -> None:
     """A candidate that fragments or mutates a URL query is rejected."""
 

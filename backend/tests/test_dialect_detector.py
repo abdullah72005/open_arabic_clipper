@@ -375,6 +375,52 @@ def test_url_trailing_sentence_punctuation_is_not_part_of_the_token() -> None:
     )
 
 
+def test_balanced_url_delimiters_extract_atomically() -> None:
+    assert extract_protected_tokens(
+        "اقرا https://en.wikipedia.org/wiki/Function_(mathematics) الان"
+    ) == ("https://en.wikipedia.org/wiki/Function_(mathematics)",)
+    assert extract_protected_tokens("رابط https://example.com/a[b] الان") == (
+        "https://example.com/a[b]",
+    )
+    assert extract_protected_tokens("رابط https://example.com/a{b} الان") == (
+        "https://example.com/a{b}",
+    )
+
+
+def test_unmatched_trailing_closing_delimiter_is_sentence_punctuation() -> None:
+    assert extract_protected_tokens("انظر https://example.com/page) الان") == (
+        "https://example.com/page",
+    )
+    assert extract_protected_tokens("انظر https://example.com/page]. الان") == (
+        "https://example.com/page",
+    )
+    assert extract_protected_tokens("انظر https://example.com/page}. الان") == (
+        "https://example.com/page",
+    )
+
+
+def test_balanced_parenthesis_mutation_is_rejected() -> None:
+    raw = "https://en.wikipedia.org/wiki/Function_(mathematics)"
+    cases = [
+        "https://en.wikipedia.org/wiki/Function_(mathematics",
+        "https://en.wikipedia.org/wiki/Function_",
+        "https://en.wikipedia.org/wiki/Function(mathematics)",
+    ]
+    for candidate in cases:
+        assert extract_protected_tokens(raw) != extract_protected_tokens(candidate), (
+            f"{candidate!r} must be rejected"
+        )
+
+
+def test_extra_unmatched_trailing_close_is_sentence_punctuation() -> None:
+    """An unmatched trailing closer after a balanced URL is punctuation, not URL content."""
+
+    raw = "https://en.wikipedia.org/wiki/Function_(mathematics)"
+    with_extra = "https://en.wikipedia.org/wiki/Function_(mathematics))"
+
+    assert extract_protected_tokens(with_extra) == extract_protected_tokens(raw)
+
+
 def test_url_mutation_and_fragmentation_are_rejected() -> None:
     cases = [
         ("https://example.com/page?foo=bar", "https://example.com/page"),
