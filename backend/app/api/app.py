@@ -704,7 +704,8 @@ def _default_health(
     if reconstruction_provider is None:
         checks["reconstruction_provider"] = lambda: (
             CheckStatus.DEGRADED,
-            "reconstruction provider is disabled",
+            "local Qwen reconstruction is disabled by default; "
+            "set CLIPFACTORY_LOCAL_QWEN_ENABLED=true to enable local providers",
         )
     return HealthService(
         storage,

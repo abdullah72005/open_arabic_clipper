@@ -2,18 +2,20 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, model_validator
+from pydantic import AliasChoices, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.runtime.heavy_model_lease import HeavyModelLeaseFactory
 from app.transcription.correction import ContextualCorrector, CorrectionConfig
 from app.transcription.providers import CorrectionProvider, OpenAICompatibleCorrectionProvider
 from app.transcription.reconstruction import ContextualReconstructor
+from app.transcription.reconstruction.gemini import GeminiReconstructionProvider
 from app.transcription.reconstruction.ollama import OllamaReconstructionProvider
 from app.transcription.reconstruction.providers import (
     OpenAICompatibleReconstructionProvider,
     ReconstructionProvider,
 )
+from app.transcription.reconstruction.routing import AdaptiveRoutingConfig, RoutingMode
 from app.transcription.service import TranscriptionOptions
 
 
@@ -58,6 +60,12 @@ class Settings(BaseSettings):
     correction_provider_api_key: str | None = Field(default=None, max_length=4_096)
     correction_provider_timeout_seconds: float = Field(default=30.0, gt=0, le=300)
     reconstruction_provider: Literal["disabled", "openai_compatible", "ollama"] = "ollama"
+    # Automatic local Qwen reconstruction is disabled by default
+    # (LOCAL_QWEN_ENABLED=false). Whole-source ingestion uses INDEX priority and
+    # never loads or calls Qwen; an operator explicitly re-enables local Qwen
+    # with CLIPFACTORY_LOCAL_QWEN_ENABLED=true for targeted CANDIDATE/FINAL_CLIP
+    # refinement.
+    local_qwen_enabled: bool = False
     reconstruction_provider_base_url: str | None = Field(
         default="http://ollama:11434", max_length=2_048
     )
@@ -70,6 +78,27 @@ class Settings(BaseSettings):
     reconstruction_safety_reserve: int = Field(default=128, gt=0, le=4_096)
     reconstruction_provider_batch_windows: int = Field(default=8, gt=0, le=16)
     reconstruction_provider_batch_characters: int = Field(default=24_000, gt=0, le=48_000)
+    local_reconstruction_max_targets_per_job: int = Field(default=64, ge=0, le=100_000)
+    local_reconstruction_max_wall_seconds: float = Field(default=1_200.0, gt=0, le=86_400)
+    # Bounds for the reusable targeted-window refinement entry point. These only
+    # limit an explicitly requested window; they never re-introduce whole-source
+    # provider work.
+    reconstruction_refinement_max_targets: int = Field(default=32, ge=1, le=1_000)
+    reconstruction_refinement_max_window_seconds: float = Field(default=300.0, gt=0, le=3_600)
+    reconstruction_routing_mode: Literal["local_only", "adaptive", "gemini_only"] = "adaptive"
+    gemini_api_key: SecretStr | None = Field(
+        default=None,
+        validation_alias=AliasChoices("CLIPFACTORY_GEMINI_API_KEY", "GEMINI_API_KEY"),
+    )
+    gemini_model: str = Field(default="gemini-3.8-flash", max_length=256)
+    gemini_thinking_level: Literal["low", "medium", "high"] = "low"
+    gemini_temperature: float = Field(default=0.0, ge=0, le=2)
+    gemini_api_version: str = Field(default="v1", min_length=1, max_length=32)
+    gemini_timeout_seconds: float = Field(default=30.0, gt=0, le=300)
+    gemini_retry_attempts: int = Field(default=1, ge=0, le=3)
+    gemini_retry_backoff_seconds: float = Field(default=1.5, gt=0, le=30)
+    gemini_max_targets_per_job: int = Field(default=5, ge=0, le=100)
+    gemini_max_output_tokens: int = Field(default=1024, gt=0, le=4_096)
     heavy_model_lease_ttl_seconds: float = Field(default=300.0, gt=0)
     heavy_model_lease_renewal_interval_seconds: float = Field(default=60.0, gt=0)
     heavy_model_lease_acquisition_timeout_seconds: float = Field(default=15.0, gt=0)
@@ -142,9 +171,17 @@ class Settings(BaseSettings):
     def reconstruction_provider_instance(
         self, model: str | None = None
     ) -> ReconstructionProvider | None:
-        """Return a local Stage 2.7 provider only when explicitly configured."""
+        """Return a local Stage 2.7 provider only when explicitly configured.
+
+        Automatic local Qwen use is disabled by default: no local provider is
+        built unless the operator sets ``local_qwen_enabled`` (or explicitly
+        disables/selects a provider through ``reconstruction_provider``). This is
+        what keeps normal INDEX ingestion from loading or invoking Qwen.
+        """
 
         if self.reconstruction_provider == "disabled":
+            return None
+        if not self.local_qwen_enabled:
             return None
         resolved_model = model or self.reconstruction_provider_model
         if not self.reconstruction_provider_base_url or not resolved_model:
@@ -174,9 +211,44 @@ class Settings(BaseSettings):
         )
 
     def contextual_reconstructor(self) -> ContextualReconstructor:
-        """Build Stage 2.7 reconstruction with safe local fallback by default."""
+        """Build Stage 2.7 reconstruction with safe fallback and optional hosted Gemini."""
 
-        return ContextualReconstructor(self.reconstruction_provider_instance())
+        return ContextualReconstructor(
+            self.reconstruction_provider_instance(),
+            gemini_provider=self.gemini_provider_instance(),
+            routing=AdaptiveRoutingConfig(mode=RoutingMode(self.reconstruction_routing_mode)),
+            gemini_budget=self.gemini_max_targets_per_job,
+            batch_windows=self.reconstruction_provider_batch_windows,
+            batch_characters=self.reconstruction_provider_batch_characters,
+            local_max_targets=self.local_reconstruction_max_targets_per_job,
+            local_wall_seconds=self.local_reconstruction_max_wall_seconds,
+        )
+
+    def gemini_provider_instance(self) -> GeminiReconstructionProvider | None:
+        """Return the hosted Gemini provider only when a key is configured."""
+
+        key = self.gemini_api_key
+        if key is None or not key.get_secret_value():
+            return None
+        return GeminiReconstructionProvider(
+            api_key=key.get_secret_value(),
+            model=self.gemini_model,
+            timeout_seconds=self.gemini_timeout_seconds,
+            retry_attempts=self.gemini_retry_attempts,
+            retry_backoff_seconds=self.gemini_retry_backoff_seconds,
+            max_output_tokens=self.gemini_max_output_tokens,
+            thinking_level=self.gemini_thinking_level,
+            temperature=self.gemini_temperature,
+            api_version=self.gemini_api_version,
+        )
+
+    @property
+    def gemini_api_key_present(self) -> bool:
+        """Presence-only check that never exposes the key value."""
+
+        if self.gemini_api_key is None:
+            return False
+        return bool(self.gemini_api_key.get_secret_value())
 
     def heavy_model_lease_factory(self) -> HeavyModelLeaseFactory:
         """Build the Redis-backed lease factory that serializes heavy models."""

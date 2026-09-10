@@ -19,6 +19,129 @@ the application remains portable and config-driven.
 | Network | HTTPS checks to PyPI and npm registry succeeded |
 | Ollama | `ollama/ollama` runs under the `reconstruction` profile; `qwen3:8b` pulled with digest `500a1f067a9f…b41` |
 
+## Hosted Gemini cloud configuration (2026-09-09)
+
+Stage 2.7 supports an optional hosted Gemini reconstruction provider through the
+official Google Gen AI SDK. It is configured by environment variables only; no
+frontend settings system exists. The Gemini API key is read by application
+settings from `GEMINI_API_KEY` or `CLIPFACTORY_GEMINI_API_KEY` in the local
+`.env`, held as a Pydantic `SecretStr`, and unwrapped only when constructing the
+SDK client. It is masked in settings repr/serialization/validation errors and is
+never printed, logged, fingerprinted, returned by any API, or committed.
+
+**Cloud snippet disclosure.** The `adaptive` and `gemini_only` routing modes may
+send short transcript snippets and bounded context to Google Gemini. The
+default mode is `adaptive`; set `CLIPFACTORY_RECONSTRUCTION_ROUTING_MODE` to
+`local_only` for a fully local pipeline. Cloud-processing configuration is
+separate from rights/provenance eligibility. Free-tier quotas are shared per
+Google project, so all Gemini consumers draw from the same project allowance.
+
+Model, timeout, retry, and budget settings mirror the local provider pattern:
+
+```bash
+CLIPFACTORY_RECONSTRUCTION_ROUTING_MODE=adaptive
+CLIPFACTORY_GEMINI_MODEL=gemini-3.8-flash
+CLIPFACTORY_GEMINI_THINKING_LEVEL=low
+CLIPFACTORY_GEMINI_TEMPERATURE=0
+CLIPFACTORY_GEMINI_API_VERSION=v1
+CLIPFACTORY_GEMINI_TIMEOUT_SECONDS=30
+CLIPFACTORY_GEMINI_RETRY_ATTEMPTS=1
+CLIPFACTORY_GEMINI_RETRY_BACKOFF_SECONDS=1.5
+CLIPFACTORY_GEMINI_MAX_TARGETS_PER_JOB=5
+CLIPFACTORY_GEMINI_MAX_OUTPUT_TOKENS=1024
+```
+
+The SDK client is constructed lazily only when a generation request runs, and
+availability is configuration-level: there are no per-job `models.get` metadata
+probes, so a cache hit, an all-`NO_LLM` job, and `LOCAL_ONLY` work make zero
+Gemini network calls. Reconstruction generation is deterministic
+(`temperature=0`, explicit API version `v1`).
+
+## Bounded local reconstruction
+
+Local Qwen work is selected, ranked, batched, and hard-bounded so a multi-hour
+source can never produce unbounded inference:
+
+```bash
+CLIPFACTORY_LOCAL_QWEN_ENABLED=false
+CLIPFACTORY_LOCAL_RECONSTRUCTION_MAX_TARGETS_PER_JOB=64
+CLIPFACTORY_LOCAL_RECONSTRUCTION_MAX_WALL_SECONDS=1200
+CLIPFACTORY_RECONSTRUCTION_PROVIDER_BATCH_WINDOWS=8
+CLIPFACTORY_RECONSTRUCTION_PROVIDER_BATCH_CHARACTERS=24000
+```
+
+**Automatic local Qwen use is disabled by default** (`LOCAL_QWEN_ENABLED=false`).
+Normal whole-source ingestion runs at `INDEX` priority and never loads or calls
+Qwen. An operator explicitly re-enables local Qwen for targeted
+CANDIDATE/FINAL_CLIP refinement:
+
+```bash
+CLIPFACTORY_LOCAL_QWEN_ENABLED=true
+```
+
+When local Qwen is disabled/unavailable and `local_only` is intentionally
+selected, work defers safely (unresolved/provider-unavailable semantics) and
+never silently falls through to Gemini. The Ollama integration, local-provider
+configuration, and `local_only` routing capability are unchanged.
+
+Clean, well-covered unchanged Stage 2.5 segments route to `NO_LLM` and use
+neither LLM; local candidates are attempted strongest-first in micro-batches;
+when a ceiling is reached the remaining targets are marked unresolved/manual
+review and never auto-escalate to Gemini. Accepted per-target work survives
+cancellation and restart through checkpointed per-target fingerprints.
+
+## Transcript refinement priorities
+
+Whole-source transcripts are **indexing quality**, a shortlisted window is
+**semantic quality**, and a selected final clip is **publication/caption
+quality**:
+
+| Priority | Meaning | Provider use |
+| --- | --- | --- |
+| `INDEX` | Whole-source default | None (cheap; defers uncertainty truthfully) |
+| `CANDIDATE` | Shortlisted window | Qwen when enabled, Gemini for difficult spans (bounded) |
+| `FINAL_CLIP` | Selected clip | Quality-oriented targeted Gemini/Qwen for genuine ambiguity |
+
+Expensive provider reconstruction is deferred until a short region is close to
+publication. The reusable targeted-window entry point is bounded by:
+
+```bash
+CLIPFACTORY_RECONSTRUCTION_REFINEMENT_MAX_TARGETS=32
+CLIPFACTORY_RECONSTRUCTION_REFINEMENT_MAX_WINDOW_SECONDS=300
+```
+
+## Ollama hardware safeguards (Compose)
+
+The Ollama service pins operator-tunable safety limits sized for the documented
+~10.7 GiB WSL host:
+
+```bash
+OLLAMA_NUM_PARALLEL=1
+OLLAMA_MAX_LOADED_MODELS=1
+OLLAMA_MAX_QUEUE=4
+OLLAMA_CONTEXT_LENGTH=4096
+OLLAMA_CPUS=6
+OLLAMA_MEM_LIMIT=6g
+OLLAMA_MEMSWAP_LIMIT=8g
+```
+
+These caps primarily protect machine responsiveness; they can increase
+individual inference latency. Routing, batching, caching, and the local work
+ceilings provide the main wall-time improvement. If the ceiling prevents Qwen
+from loading or completing, the job records a truthful provider failure,
+preserves Stage 2.5 output, escalates only within the Gemini policy and budget,
+and otherwise marks the target unresolved/manual review without retrying
+indefinitely.
+
+A missing key never blocks startup or local operation. Gemini is treated as a
+scarce resource: the per-job target budget spends on the strongest eligible
+targets first, only transient failures get one bounded retry, and a 429/quota
+exhaustion stops further calls for that job. The per-job cap is not an
+account-wide billing/quota manager. A temporary provider outage does not
+invalidate accepted output: fingerprints are stable identity only and cache
+eligibility is tracked separately. See `docs/STAGE_2_7_OPERATIONS.md` for the
+full routing policy.
+
 ## Development implications
 
 The Docker services use Python 3.12 and install FFmpeg, so they are the

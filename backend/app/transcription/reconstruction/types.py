@@ -109,6 +109,15 @@ class SegmentReconstruction:
     validation_reason: str | None = None
     decision_reason: str | None = None
     explanation: str = ""
+    route: str | None = None
+    routing_evidence: tuple[str, ...] = ()
+    local_attempted: bool = False
+    local_result_state: str | None = None
+    gemini_attempted: bool = False
+    gemini_result_state: str | None = None
+    final_provider: str | None = None
+    escalation_reason: str | None = None
+    near_acceptance: bool = False
 
 
 @dataclass(frozen=True)

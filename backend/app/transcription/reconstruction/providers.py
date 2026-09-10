@@ -27,6 +27,20 @@ class ProviderResponseError(ValueError):
     """Provider output cannot safely map to requested stable segment IDs."""
 
 
+_BATCH_OUTPUT_TOKEN_CAP = 4_096
+
+
+def _batch_output_tokens(base_output_tokens: int, request_count: int) -> int:
+    """Scale the output budget to the bounded number of requested targets.
+
+    A micro-batch of ``request_count`` targets may legitimately need up to
+    ``base_output_tokens`` per target; the budget is capped so a pathological
+    batch can never request unbounded output.
+    """
+
+    return min(_BATCH_OUTPUT_TOKEN_CAP, base_output_tokens * max(1, request_count))
+
+
 class ModelNotFoundError(ProviderResponseError):
     """The configured model is absent from the provider's model listing."""
 
@@ -46,6 +60,7 @@ class ReconstructionRequest:
     routing_reasons: tuple[str, ...] = ()
     focus_spans: tuple[WordEvidence, ...] = ()
     language: str | None = None
+    dialect_profile: str | None = None
 
     def to_payload(self) -> dict[str, object]:
         return {
@@ -81,6 +96,7 @@ class ReconstructionRequest:
                 for span in self.focus_spans
             ],
             "language": self.language,
+            "dialect_profile": self.dialect_profile,
         }
 
     def estimated_tokens(
@@ -233,23 +249,28 @@ class OpenAICompatibleReconstructionProvider:
     def reconstruct_segments(
         self, requests: list[ReconstructionRequest]
     ) -> dict[int, ReconstructionCandidate]:
-        system_instruction = self._system_instruction()
-        if self._max_context_tokens is not None:
-            requests = [
-                _shrink_request_to_budget(
-                    request,
-                    self._max_context_tokens,
-                    envelope=self._envelope_estimate(system_instruction),
-                )
-                for request in requests
-            ]
-            for request in requests:
-                estimated = self._envelope_estimate(system_instruction)(request)
-                if estimated > self._max_context_tokens:
-                    raise ProviderResponseError(
-                        f"request for segment {request.segment_index} exceeds context budget "
-                        f"({estimated} > {self._max_context_tokens} tokens)"
-                    )
+        """Execute exactly one real provider request for the given targets.
+
+        This method never silently splits its input into several HTTP calls. The
+        orchestration layer plans context-safe actual request groups with
+        ``plan_aggregate_batches`` and invokes this method once per group, so
+        cancellation, local wall-time checks, and checkpoints can run between
+        every real request. As a defensive boundary, an over-budget combined set
+        that was not pre-planned raises before any HTTP dispatch instead of
+        looping.
+        """
+
+        profile = next(
+            (request.dialect_profile for request in requests if request.dialect_profile), None
+        )
+        system_instruction = self._system_instruction(profile)
+        planned = self.plan_aggregate_batches(requests)
+        if self._max_context_tokens is not None and len(planned) != 1:
+            raise ProviderResponseError(
+                "provider request exceeds context budget; orchestration must plan "
+                "context-safe batches"
+            )
+        batch = planned[0] if planned else []
         self._last_request_sizes = tuple(
             RequestSizeDiagnostics(
                 segment_index=request.segment_index,
@@ -258,38 +279,114 @@ class OpenAICompatibleReconstructionProvider:
                         "utf-8"
                     )
                 ),
-                estimated_input_tokens=self._envelope_estimate(system_instruction)(request),
+                estimated_input_tokens=self._envelope_estimate(
+                    system_instruction, self._output_tokens
+                )(request),
             )
-            for request in requests
+            for request in batch
         )
+        output_tokens = _batch_output_tokens(self._output_tokens, len(batch))
         content = self._call(
             system_instruction,
-            {"targets": [item.to_payload() for item in requests]},
+            {"targets": [item.to_payload() for item in batch]},
+            output_tokens=output_tokens,
         )
-        return _parse_reconstructions(content, requests)
+        return _parse_reconstructions(content, batch)
 
-    def _system_instruction(self) -> str:
-        instruction = _SYSTEM_INSTRUCTION
+    def plan_aggregate_batches(
+        self, requests: list[ReconstructionRequest]
+    ) -> list[list[ReconstructionRequest]]:
+        """Plan context-safe actual request groups without executing any HTTP call.
+
+        The service-layer planner bounds the number of windows and characters;
+        this is the correctness bound at the real request boundary. Every request
+        is first shrunk so its own single-target envelope fits, then requests are
+        greedily grouped (in stable order) while the exact combined envelope that
+        will be sent — system instruction, full ``{"targets": [...]}`` payload,
+        chat-framing reserve, safety reserve, and the scaled output budget for the
+        group — stays within ``max_context_tokens``. Each returned group is one
+        actual provider request that orchestration schedules, polls cancellation
+        and wall-time around, and checkpoints after. A single target that still
+        cannot fit raises before any HTTP dispatch (no recursive split/retry).
+        """
+
+        profile = next(
+            (request.dialect_profile for request in requests if request.dialect_profile), None
+        )
+        system_instruction = self._system_instruction(profile)
+        if self._max_context_tokens is None:
+            return [list(requests)]
+        single_envelope = self._envelope_estimate(system_instruction, self._output_tokens)
+        requests = [
+            _shrink_request_to_budget(
+                request,
+                self._max_context_tokens,
+                envelope=single_envelope,
+            )
+            for request in requests
+        ]
+        for request in requests:
+            estimated = single_envelope(request)
+            if estimated > self._max_context_tokens:
+                raise ProviderResponseError(
+                    f"request for segment {request.segment_index} exceeds context budget "
+                    f"({estimated} > {self._max_context_tokens} tokens)"
+                )
+        batches: list[list[ReconstructionRequest]] = []
+        current: list[ReconstructionRequest] = []
+        for request in requests:
+            if current:
+                trial = [*current, request]
+                if self._aggregate_envelope(trial, system_instruction) > self._max_context_tokens:
+                    batches.append(current)
+                    current = []
+            current.append(request)
+        if current:
+            batches.append(current)
+        return batches
+
+    def _aggregate_envelope(
+        self, requests: list[ReconstructionRequest], system_instruction: str
+    ) -> int:
+        """Conservative token estimate of the exact combined chat envelope sent."""
+
+        payload = json.dumps(
+            {"targets": [item.to_payload() for item in requests]}, ensure_ascii=False
+        )
+        return (
+            estimate_tokens(system_instruction)
+            + estimate_tokens(payload)
+            + self._chat_framing_reserve
+            + _batch_output_tokens(self._output_tokens, len(requests))
+            + self._safety_reserve
+        )
+
+    def _system_instruction(self, profile: str | None = None) -> str:
+        instruction = SYSTEM_INSTRUCTION
         if self.provider_name == "ollama" and self.model.startswith("qwen3"):
             instruction = instruction + " /no_think"
-        return instruction
+        return instruction_for_profile(instruction, profile)
 
-    def _envelope_estimate(self, system_instruction: str) -> Callable[[ReconstructionRequest], int]:
+    def _envelope_estimate(
+        self, system_instruction: str, output_tokens: int
+    ) -> Callable[[ReconstructionRequest], int]:
         def estimate(request: ReconstructionRequest) -> int:
             return request.estimated_tokens(
                 system_instruction=system_instruction,
-                output_tokens=self._output_tokens,
+                output_tokens=output_tokens,
                 chat_framing_reserve=self._chat_framing_reserve,
                 safety_reserve=self._safety_reserve,
             )
 
         return estimate
 
-    def _call(self, instruction: str, payload: dict[str, object]) -> dict[str, object]:
+    def _call(
+        self, instruction: str, payload: dict[str, object], output_tokens: int
+    ) -> dict[str, object]:
         body = {
             "model": self.model,
             "temperature": 0,
-            "max_tokens": self._output_tokens,
+            "max_tokens": output_tokens,
             "messages": [
                 {"role": "system", "content": instruction},
                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
@@ -346,7 +443,7 @@ class OpenAICompatibleReconstructionProvider:
         return parsed
 
 
-_SYSTEM_INSTRUCTION = (
+SYSTEM_INSTRUCTION = (
     "You are a conservative Arabic ASR post-processor for Egyptian Arabic speech. "
     "For the target segment, return the most plausible SPOKEN EGYPTIAN ARABIC text. "
     "Preserve Egyptian colloquial word choices, pronunciation-driven spelling, "
@@ -364,7 +461,24 @@ _SYSTEM_INSTRUCTION = (
 )
 
 _PROMPT_SCHEMA_VERSION = "stage-2-7-one-pass-v1"
-_PROMPT_HASH = hashlib.sha256(_SYSTEM_INSTRUCTION.encode("utf-8")).hexdigest()
+_PROMPT_HASH = hashlib.sha256(SYSTEM_INSTRUCTION.encode("utf-8")).hexdigest()
+
+# Backward-compatible alias for existing consumers of the shared instruction.
+_SYSTEM_INSTRUCTION = SYSTEM_INSTRUCTION
+
+DIALECT_PROFILE_ADDENDUM = (
+    'The source uses the "{profile}" dialect profile. Preserve that profile\'s '
+    "word choices and pronunciation-driven spelling exactly; do not shift "
+    "register, translate, or standardize."
+)
+
+
+def instruction_for_profile(base: str, profile: str | None) -> str:
+    """Append a narrow dialect-profile preservation addendum when supplied."""
+
+    if not profile:
+        return base
+    return base + "\n" + DIALECT_PROFILE_ADDENDUM.format(profile=profile)
 
 
 def _shrink_request_to_budget(

@@ -1,4 +1,4 @@
-from app.core.enums import ReconstructionStatus
+from app.core.enums import ReconstructionStatus, RefinementPriority
 from app.transcription.reconstruction.providers import (
     ProviderResponseError,
     ReconstructionRequest,
@@ -65,7 +65,7 @@ def test_reconstructor_applies_only_high_contextual_candidate() -> None:
     """A high-scoring candidate becomes automatic final text."""
 
     provider = OnePassProvider()
-    result = ContextualReconstructor(provider).reconstruct(
+    result = ContextualReconstructor(provider, priority=RefinementPriority.CANDIDATE).reconstruct(
         [{"start": 0.0, "end": 1.0, "text": "دخم", "corrected_text": "دخم"}],
         language="ar",
         transcription_fingerprint="asr-v1",
@@ -82,7 +82,9 @@ def test_reconstructor_applies_only_high_contextual_candidate() -> None:
 
 
 def test_operator_text_precedes_provider_candidate_and_is_manual_override() -> None:
-    result = ContextualReconstructor(OnePassProvider()).reconstruct(
+    result = ContextualReconstructor(
+        OnePassProvider(), priority=RefinementPriority.CANDIDATE
+    ).reconstruct(
         [
             {
                 "start": 0.0,
@@ -103,7 +105,9 @@ def test_operator_text_precedes_provider_candidate_and_is_manual_override() -> N
 def test_reconstructor_preserves_result_when_release_fails_after_success() -> None:
     """Cleanup failures stay out of the result path and only add bounded metadata."""
 
-    result = ContextualReconstructor(ReleaseFailingProvider()).reconstruct(
+    result = ContextualReconstructor(
+        ReleaseFailingProvider(), priority=RefinementPriority.CANDIDATE
+    ).reconstruct(
         [{"start": 0.0, "end": 1.0, "text": "دخم", "corrected_text": "دخم"}],
         language="ar",
         transcription_fingerprint="asr-v1",
@@ -122,7 +126,9 @@ def test_reconstructor_records_unload_outcome_without_corrupting_text() -> None:
         def release(self) -> UnloadOutcome:
             return UnloadOutcome(True, False, 1.0, "model still resident after unload timeout")
 
-    result = ContextualReconstructor(WarningReleaseProvider()).reconstruct(
+    result = ContextualReconstructor(
+        WarningReleaseProvider(), priority=RefinementPriority.CANDIDATE
+    ).reconstruct(
         [{"start": 0.0, "end": 1.0, "text": "دخم", "corrected_text": "دخم"}],
         language="ar",
         transcription_fingerprint="asr-v1",
@@ -138,7 +144,7 @@ def test_reconstructor_records_unload_outcome_without_corrupting_text() -> None:
 def test_reconstructor_without_provider_preserves_stage_2_5_text() -> None:
     """Disabled local models leave useful Stage 2.5 output untouched and auditable."""
 
-    result = ContextualReconstructor(None).reconstruct(
+    result = ContextualReconstructor(None, priority=RefinementPriority.CANDIDATE).reconstruct(
         [{"start": 0.0, "end": 1.0, "text": "خطي بالك", "corrected_text": "خلي بالك"}],
         language="ar",
         transcription_fingerprint="asr-v1",
@@ -169,7 +175,7 @@ def test_reconstructor_falls_back_only_for_expected_provider_failures() -> None:
             pass
 
     provider = BrokenProvider()
-    result = ContextualReconstructor(provider).reconstruct(
+    result = ContextualReconstructor(provider, priority=RefinementPriority.CANDIDATE).reconstruct(
         [{"start": 0.0, "end": 1.0, "text": "خطي بالك", "corrected_text": "خلي بالك"}],
         language="ar",
         transcription_fingerprint="asr-v1",
@@ -202,7 +208,9 @@ def test_reconstructor_surfaces_provider_unavailable_when_model_cannot_run() -> 
         def release(self) -> None:
             pass
 
-    result = ContextualReconstructor(UnavailableProvider()).reconstruct(
+    result = ContextualReconstructor(
+        UnavailableProvider(), priority=RefinementPriority.CANDIDATE
+    ).reconstruct(
         [{"start": 0.0, "end": 1.0, "text": "raw", "corrected_text": "corrected"}],
         language="ar",
         transcription_fingerprint="asr-v1",
@@ -235,7 +243,7 @@ def test_deterministic_validation_failure_is_never_applied() -> None:
     provider = OnePassProvider(
         ReconstructionCandidate("provider-0", "الرئيس 70", provider_confidence=1.0)
     )
-    result = ContextualReconstructor(provider).reconstruct(
+    result = ContextualReconstructor(provider, priority=RefinementPriority.CANDIDATE).reconstruct(
         [{"start": 0.0, "end": 1.0, "text": "الرئيس 71", "corrected_text": "الرئيس 71"}],
         language="ar",
         transcription_fingerprint="asr-v1",
@@ -255,7 +263,7 @@ def test_unchanged_candidate_text_remains_unchanged() -> None:
     provider = OnePassProvider(
         ReconstructionCandidate("provider-0", "خلي بالك", provider_confidence=0.99)
     )
-    result = ContextualReconstructor(provider).reconstruct(
+    result = ContextualReconstructor(provider, priority=RefinementPriority.CANDIDATE).reconstruct(
         [{"start": 0.0, "end": 1.0, "text": "خلي بالك", "corrected_text": "خلي بالك"}],
         language="ar",
         transcription_fingerprint="asr-v1",
@@ -330,7 +338,7 @@ def test_one_segment_failure_does_not_erase_successful_targets() -> None:
         fail_segment=1,
         failure=ProviderResponseError,
     )
-    result = ContextualReconstructor(provider).reconstruct(
+    result = ContextualReconstructor(provider, priority=RefinementPriority.CANDIDATE).reconstruct(
         [
             {"start": 0.0, "end": 1.0, "text": "دخم", "corrected_text": "دخم"},
             {"start": 1.0, "end": 2.0, "text": "خطي بالك", "corrected_text": "خلي بالك"},
@@ -359,7 +367,7 @@ def test_oserror_on_one_segment_falls_back_only_that_segment() -> None:
         fail_segment=1,
         failure=OSError,
     )
-    result = ContextualReconstructor(provider).reconstruct(
+    result = ContextualReconstructor(provider, priority=RefinementPriority.CANDIDATE).reconstruct(
         [
             {"start": 0.0, "end": 1.0, "text": "دخم", "corrected_text": "دخم"},
             {"start": 1.0, "end": 2.0, "text": "خطي بالك", "corrected_text": "خلي بالك"},
@@ -379,7 +387,7 @@ def test_reconstructor_sends_small_context_window() -> None:
     """The provider receives only local context, not the full transcript."""
 
     provider = OnePassProvider()
-    ContextualReconstructor(provider).reconstruct(
+    ContextualReconstructor(provider, priority=RefinementPriority.CANDIDATE).reconstruct(
         [
             {"start": 0.0, "end": 1.0, "text": "a", "corrected_text": "a"},
             {"start": 1.0, "end": 2.0, "text": "b", "corrected_text": "b"},

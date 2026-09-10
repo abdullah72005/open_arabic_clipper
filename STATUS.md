@@ -13,6 +13,52 @@ provider response falls back to Stage 2.5, records a truthful unavailable
 status, and the source still reaches analysis. Automatic clip selection,
 rendering, publishing, and authorization remain out of scope.
 
+## Stage 2.7 finalization: INDEX ingestion and targeted refinement (2026-09-10)
+
+Whole-source transcription is indexing, not publication. Normal whole-source
+ingestion now runs at **INDEX** priority and defers every provider
+reconstruction truthfully instead of spending Qwen/Gemini time across arbitrary
+source segments:
+
+- **Refinement priorities.** `INDEX` (whole-source default, indexing quality),
+  `CANDIDATE` (shortlisted window, semantic quality), and `FINAL_CLIP` (selected
+  clip, publication/caption quality). Priority participates in reconstruction
+  fingerprints, so an INDEX result can never satisfy a CANDIDATE/FINAL_CLIP
+  request and one window can never satisfy another.
+- **INDEX is cheap and evidence-preserving.** Normal ingestion pays for ASR +
+  Stage 2.5 + cheap uncertainty bookkeeping. It makes zero Qwen calls (Qwen is
+  not loaded) and zero Gemini calls, preserves raw ASR/Stage 2.5/timestamps/word
+  and acoustic evidence, marks deferred spans unresolved (never a provider
+  failure), and still reaches the analysis-ready success state.
+- **Local Qwen disabled by default.** `CLIPFACTORY_LOCAL_QWEN_ENABLED=false` is
+  the default; the operator re-enables local Qwen explicitly for targeted work.
+  Ollama integration, local-provider config, provider tests, and `local_only`
+  routing remain intact. Intentional `local_only` still uses Qwen (never Gemini)
+  when configured.
+- **Gemini is reserved for targeted candidate/final work.** No blanket
+  whole-source cleanup; the bounded routing/budget gates and per-job target cap
+  are unchanged.
+- **Reusable targeted refinement.** `refine_transcript_window(source_id,
+  start_time, end_time, priority)` refines only the bounded requested region,
+  reuses the Stage 2.5/2.7 provider/routing/validation/checkpoint mechanisms,
+  preserves raw ASR/timestamps and manual overrides, and returns a structured
+  outcome (refined text, confidence, status, provider/routing evidence,
+  unresolved state, target/window identity). Bounds: max window 300 s, max 32
+  targets (both configurable).
+- **Local-wall ceiling is authoritative over the Gemini backlog.** Once the
+  ceiling expires, no new local-origin escalation is enqueued and queued
+  escalations are invalidated (`local_escalations_dropped`); no Gemini call is
+  made for the backlog, safe Stage 2.5/current text is preserved, and targets are
+  marked unresolved/manual review.
+- **Uncertainty handoff.** Persisted `refinement_priority`, derived
+  `needs_refinement` and `code_switch_suspected` (evidence-based; no Stage 2.7.1
+  recovery), plus the existing status/confidence/focus-span/provider/routing
+  evidence, give future stages what they need to decide targeted refinement.
+
+Stage 2.7.1 (dialect/code-switch recovery) is not implemented by this change.
+The known regression benchmark findings below remain historical evidence and are
+not readiness proof.
+
 Stage 2.7 has not yet passed its required private, authorized unseen-audio
 benchmark. No quality, latency, RAM, VRAM, or Stage 3 readiness claim is made
 until that evaluation manifest and human review are available. The known
@@ -150,6 +196,276 @@ block infrastructure readiness. Stage 2.7.1 is not authorized yet: until the
 strict unseen-audio benchmark and a stricter 8B/ASR reliability and quality
 evaluation are available, manual correction or Stage-3 exclusion of harmful
 transcript segments remains the short practical quality path.
+
+## Hosted Gemini adaptive routing (2026-09-09)
+
+Stage 2.7 now supports an optional hosted Gemini reconstruction provider with
+deterministic routing. `qwen3.5:4b` remains the normal private quota-free path.
+Three routing modes exist: `local_only` (never calls Gemini), `adaptive`
+(default), and `gemini_only` (skips Qwen). The default is `ADAPTIVE` because a
+configured live Gemini key passed the tiny smoke test; a missing key falls back
+to local behavior exactly.
+
+Routing is a single deterministic policy (`route_adaptive`) with centralized
+constants. Targets that Stage 2.5 already trusts (`NO_LLM`) consume no provider
+calls. Mild localized uncertainty uses Qwen. Clearly difficult segments
+(contiguous very-low-probability words, large low-confidence spans, severe
+routing scores, or uncertainty overlapping a protected number/name) use one
+Gemini request directly. In ADAPTIVE mode, unresolved, malformed, failed, or
+near-accepted Qwen results escalate to one Gemini attempt. Every Gemini
+candidate passes the same shared validation and confidence/acceptance gates;
+Gemini is never automatically authoritative.
+
+Gemini is treated as scarce: `CLIPFACTORY_GEMINI_MAX_TARGETS_PER_JOB` (default
+5) caps Gemini reconstruction targets per job, accepted local results never
+call Gemini, full transcripts are never sent (only bounded windows), a 429/quota
+exhaustion stops further Gemini calls for that job, and identical completed work
+reuses its fingerprint without a duplicate Gemini call. `ADAPTIVE` and
+`GEMINI_ONLY` may send short transcript snippets and bounded context to Google
+Gemini; this is configuration, not rights/provenance policy. The cap reserves
+Gemini capacity but is not an account-wide billing/quota manager.
+
+The initial live smoke used the operator's configured `GEMINI_API_KEY` (never
+printed, logged, or committed) against `gemini-3.6-flash`, verifying
+authentication, model availability, structured-output parsing, and readable
+usage metadata. The corrective pass superseded the model with
+`gemini-3.8-flash` (see below). The operator retains the local-first default in
+`local_only` by setting `CLIPFACTORY_RECONSTRUCTION_ROUTING_MODE=local_only`.
+
+## Adaptive Gemini corrective pass (2026-09-09)
+
+> Superseded in part by the performance corrective pass below: `NO_LLM` trust no
+> longer depends on the correction method alone; clean well-covered unchanged
+> results and trusted repairs that resolved their uncertainty are the trust
+> basis.
+
+A focused corrective pass finalized the adaptive router before Sol review:
+
+- **Stage 2.5 trust routing.** `NO_LLM` now requires affirmative Stage 2.5
+  evidence (`correction_method` not `unchanged`/`pending` at
+  `correction_confidence >= 0.90`) plus clean acoustics and no protected-token
+  ambiguity. High Whisper probabilities alone can no longer suppress contextual
+  checking; a confidently wrong segment with an unchanged low-trust correction
+  stays eligible for Qwen. Isolated low-confidence words are labeled accurately.
+- **Strongest-first budget.** `CLIPFACTORY_GEMINI_MAX_TARGETS_PER_JOB` (default
+  `5`) is spent on the five strongest eligible targets by deterministic routing
+  severity, not transcript order. Direct-Gemini targets are ranked and allocated
+  first, then Qwen, then ranked local escalations; ties break by segment index.
+- **Lazy heavy-model lease.** The Ollama lease is acquired only around actual
+  local inference and local release. `NO_LLM`, `GEMINI_ONLY`, and direct-Gemini
+  work never acquire it; a direct-Gemini call runs before any optional local
+  fallback lease. Real local inference stays lease-protected.
+- **Secret handling.** The Gemini key is a Pydantic `SecretStr`, masked in repr,
+  `model_dump`, JSON, and validation errors, and unwrapped only when building the
+  SDK client.
+- **Stable fingerprints and cache eligibility.** Fingerprints cover stable
+  dependency identity only; transient availability is excluded. A temporary
+  outage never invalidates accepted output, and a first-run degraded fallback is
+  retried after provider recovery. `cache_eligible` distinguishes reusable runs.
+- **Dialect-neutral Gemini prompting.** Gemini preserves the dialect/register
+  evident in the source and context; it never defaults to Egyptian. A future
+  `dialect_profile` request hint receives a narrow profile-preservation addendum.
+- **Model and thinking.** Default is `gemini-3.8-flash` with
+  `CLIPFACTORY_GEMINI_THINKING_LEVEL=low` (bounded reasoning), passed through
+  `ThinkingConfig`, with `thoughts_token_count` retained in usage.
+- **Retry classification.** Permanent 400-class request/schema failures,
+  authentication, model-not-found, 429, malformed output, and refusal are never
+  retried; connection/timeout/eligible 5xx get at most one bounded retry.
+- **SDK cleanup.** `GeminiReconstructionProvider.release()` closes the owned SDK
+  client independently of local model release; cleanup failure is a sanitized
+  warning that never replaces a valid result.
+- **Observability.** Routes, auth-vs-rate-limit counts, final-provider (the
+  accepted text source, not a failed attempted provider), and usage metadata are
+  now accurate.
+
+Live verification: one tiny `gemini-3.8-flash` structured-output smoke at
+`thinking_level=low` succeeded (`دي موقراطية` → `ديمقراطية`; usage
+`270` prompt / `81` candidate / `75` thoughts), and a real difficult known
+Stage 2.7 phrase (`فيور 25 نوفمبر`, which `qwen3.5:4b` could not repair) routed
+`GEMINI_DIRECT` and Gemini repaired it to `في يوم 25 نوفمبر`, which passes the
+shared validation at HIGH (`phonetic 0.888`, score `0.933`). The key was never
+printed or logged. The default mode remains `ADAPTIVE`; `local_only` is the
+fully-local override.
+
+## Performance and correctness corrective pass (2026-09-09)
+
+A real three-minute source exposed a release-blocking failure: Stage 2.5 left
+all 79 segments `unchanged` (confidence `0.0`), the adaptive router treated
+every one as Qwen-eligible, orchestration made one sequential Qwen request per
+segment, and after 36–40 minutes reconstruction had not completed while Ollama
+used ~1148% CPU and the machine hit 100% CPU/RAM/disk. The corrective pass fixes
+routing, batching, ceilings, cancellation, caching, and hardware controls:
+
+- **Restored `NO_LLM` routing.** Clean, well-covered unchanged Stage 2.5
+  results now route to `NO_LLM` (no provider calls); high Whisper probabilities
+  plus adequate coverage plus zero low spans are affirmative trust. Trusted
+  Stage 2.5 repairs resolve the raw-ASR words their `changes` cover, and a clean
+  remainder is not reprocessed; independent unresolved spans still route to an
+  LLM. Missing evidence remains a conservative local check, never Gemini-direct.
+  A deterministic 79-segment clean fixture makes zero Qwen and zero Gemini calls.
+- **Bounded local micro-batching.** `reconstruction_provider_batch_windows`
+  (8) and `reconstruction_provider_batch_characters` (24 000) are now
+  functional: local targets are processed in deterministic micro-batches with
+  exact segment-ID mapping and per-candidate validation isolation.
+- **Hard local work ceilings.** `CLIPFACTORY_LOCAL_RECONSTRUCTION_MAX_TARGETS_PER_JOB`
+  (default 64, spent strongest-first) and
+  `CLIPFACTORY_LOCAL_RECONSTRUCTION_MAX_WALL_SECONDS` (default 1200) guarantee a
+  four-hour source cannot create unbounded local inference. Skipped targets are
+  marked unresolved/manual review (`local_target_budget_exhausted` /
+  `local_time_budget_exhausted`) and never auto-escalate to Gemini.
+- **Cooperative cancellation.** Cancellation is checked before and after every
+  provider batch. A cancelled job stays `CANCELLED`, is never overwritten as
+  successful, and never schedules the next stage; the current bounded request
+  is allowed to finish.
+- **Per-target reuse and checkpoints.** Each completed target persists its
+  stable dependency fingerprint and cache eligibility. A restart after
+  cancellation or a late provider failure reuses accepted targets without
+  re-calling a provider; only failed or eligible-unresolved work is retried.
+- **Corrected dependency fingerprints.** Output fingerprints now include every
+  route-relevant input (Stage 2.5 method/confidence/applied state and change
+  digest, word probabilities, acoustic evidence, language, dialect carrier,
+  bounded context) plus routing version/thresholds, local batch and ceiling
+  settings, Gemini API version and temperature. Fingerprint version is `4`.
+- **No Gemini metadata probes.** Gemini availability is configuration-level
+  with a lazily constructed SDK client; the bounded generation request is the
+  availability check. Cache hits, all-`NO_LLM`, and `LOCAL_ONLY` jobs make zero
+  Gemini network calls and ideally construct no client. Generation is
+  deterministic (`temperature=0`, explicit API version `v1`); `gemini-3.8-flash`
+  and `thinking_level=low` are unchanged.
+- **Secret and exception hygiene.** Gemini error chains are sanitized with
+  `from None`, client-close errors too; a fake-secret traceback test proves the
+  sentinel appears in neither the exception nor its formatted traceback.
+- **Provider cleanup.** Owned provider resources close exactly once on every
+  exit path (cache hit, success, cancellation, timeout, provider failure, and
+  orchestration failure); the lazy lease is held only for real local inference.
+- **Ollama hardware safeguards.** Compose pins `OLLAMA_NUM_PARALLEL=1`,
+  `OLLAMA_MAX_LOADED_MODELS=1`, a bounded queue, `OLLAMA_CONTEXT_LENGTH=4096`,
+  `OLLAMA_CPUS=6`, `OLLAMA_MEM_LIMIT=6g`, and `OLLAMA_MEMSWAP_LIMIT=8g`,
+  operator-tunable via the environment.
+- **Progress and observability.** Lightweight progress (totals, local eligible/
+  completed, Gemini eligible/completed, unresolved, phase, budget remaining,
+  cancellation requested) is persisted in `reconstruction_metadata`.
+
+Deterministic verification uses fake providers and stored transcript structures
+only. A clean 79-segment fixture makes zero provider calls; a ten-target local
+fixture with a four-target batch limit makes exactly three local calls; a
+synthetic ~6 000-segment transcript completes with at most 64 local targets (8
+batches) and zero Gemini calls; a partial-Gemini-failure restart reuses the four
+accepted targets and issues exactly one new Gemini request; cancellation between
+batches prevents later provider calls and keeps the job `CANCELLED`. Real Qwen,
+Whisper, video replay, and repeated live Gemini runs are prohibited in this
+corrective pass, so no real wall-time claim is made; the deterministic call-count
+improvements and enforced upper bounds above are the acceptance evidence.
+
+## Sol-review blocker fixes (2026-09-09)
+
+A second corrective pass fixed the four validated release blockers plus the
+cache-hit lifecycle defect without redesigning Stage 2.7:
+
+- **Aggregate local batches are context-safe.** The local provider now evaluates
+  the exact combined chat envelope that will be sent (system instruction, full
+  `{"targets": [...]}` payload, chat-framing and safety reserves, scaled output
+  budget) and greedily splits groups so no sent request ever exceeds
+  `max_context_tokens`; window/character ceilings remain secondary bounds. A
+  regression proves requests that each fit alone are split into two calls and
+  every sent envelope fits.
+- **Degraded reconstruction retries normally.** `PipelineRunner` consults an
+  optional executor `skip_is_allowed`; the reconstruction executor allows a skip
+  only when the stored run is fully cache-eligible. A degraded run (unresolved/
+  provider-failed/rate-limited/local-ceiling) re-enters the executor on a later
+  non-force request, reuses accepted per-target work with zero provider calls,
+  and retries only eligible unfinished targets.
+- **Cancellation works on every route.** One centralized poll runs before and
+  after each local batch, Gemini-only attempt, direct-Gemini attempt, and
+  escalation, plus once immediately before a successful return. Cancellation
+  landing after the final local batch is never missed, and a cancelled Gemini
+  job can no longer finish successfully or schedule the next stage.
+- **Ollama CPU default is six.** `OLLAMA_CPUS` defaults to `6` (operator
+  overridable) in Compose, `.env.example`, and documentation; memory, swap,
+  queue, loaded-model, and parallelism safeguards are unchanged.
+- **Fresh cache-hit cleanup.** The executor now releases owned provider
+  resources on every exit path, so a fresh cache-hit worker scrubs the Gemini
+  key and closes owned SDK clients without building a client or making a network
+  call; a regression proves the key is scrubbed with zero generation.
+
+Bounded verification (fake providers, stored transcripts) passes: 411 backend
+tests plus the 21 immutable-ASR capture tests; Ruff and formatting clean; scoped
+mypy shows no new errors. One tiny live Gemini structured-output smoke was
+attempted through the production settings path and failed with a sanitized
+`PROVIDER_ERROR` category (external/API-side); it was not retried and no key was
+printed, logged, or committed.
+
+## Local-batch boundary and cross-session cancellation fixes (2026-09-09)
+
+A third corrective pass fixed the two remaining P1 blockers without redesigning
+Stage 2.7:
+
+- **Every actual local request is a visible orchestration unit.** Aggregate
+  context-safe planning moved from a hidden provider loop into orchestration.
+  The provider exposes a pure `plan_aggregate_batches` helper (no HTTP) that
+  splits each window/character micro-batch into actual request units whose exact
+  combined chat envelope fits `max_context_tokens`; `reconstruct_segments`
+  executes exactly one HTTP call per unit. Orchestration polls cooperative
+  cancellation and the local wall-time budget before every actual request and
+  checkpoints after every actual request. If one actual request fails after
+  earlier ones succeeded, only its targets fail/escalate/unresolve; the earlier
+  targets' accepted candidates stay checkpointed and reusable.
+- **Cancellation status is read fresh across sessions.** `PipelineRunner` binds
+  the exact executing reconstruction job id to the executor, and
+  `_job_cancelled` reads that job's status with a fresh scalar column query
+  (bypassing the worker session's ORM identity map), so a `CANCELLED` commit
+  made by the API in a separate session is observed by the worker on its next
+  poll without a commit or refresh. Queued and active cancellation, `CANCELLED`
+  job/run persistence, and no-next-stage scheduling are preserved.
+
+Deterministic verification (fake transports, fake clocks, SQLite sessions) now
+includes: a service-level eight-target micro-batch context-split into multiple
+actual requests with every sent envelope fitting; cancellation after the first
+actual request preventing the second; the fake clock hitting the wall-time
+ceiling after the first actual request; a second actual-request failure
+preserving the first request's accepted checkpointed candidates; the provider
+refusing to hide an over-budget combined request behind a loop; and a two-session
+test where an API-session `CANCELLED` commit stops the worker before any further
+provider call with the run and job left `CANCELLED`.
+
+STAGE 2.7 MUST CONTINUE
+
+## Planning-isolation fix (2026-09-09)
+
+A final corrective pass closed the last remaining P1 blocker: a later oversized
+target (one that cannot fit `max_context_tokens` even after bounded shrinking)
+could previously abort the whole local phase during **eager** planning of all
+future micro-batches, before any valid unit ran or checkpointed. Planning is now
+per-micro-batch and lazy: each window/character micro-batch is planned
+immediately before it executes. A planner rejection is caught at the micro-batch
+boundary, only the irreducible target is isolated on its own
+(fallback/unresolved, or Gemini escalation only when policy and budget permit),
+and earlier/later valid units still run and checkpoint. Deterministic tests
+prove: a later irreducible target does not abort the earlier valid unit (its
+call happens, its result is checkpointed, only the oversized target is affected);
+an irreducible target between two valid units leaves both sides running; and in
+adaptive mode the irreducible target escalates to Gemini exactly once while the
+valid unit runs locally. Cancellation, wall-time, aggregate-envelope, per-target
+reuse, and cross-session cancellation guarantees are unchanged and green.
+
+## Wall-ceiling and Gemini 503 verification (2026-09-09)
+
+A narrow corrective pass closed a hard-ceiling bypass and sharpened Gemini
+503 observability. The local wall-time ceiling is now checked **before** each
+micro-batch is planned, not only before each actual request: once it expires,
+the batch is never planned, no target is classified unfit, no local
+attempt/failure is recorded for it, and no `local_context_unfit` Gemini
+escalation is enqueued — the existing tail handling marks remaining targets
+`local_time_budget_exhausted`. Deterministic fake-clock tests prove: a later
+irreducible target after the ceiling yields zero local failures/attempts and
+zero Gemini calls (local-only and adaptive); isolation of a middle irreducible
+target still runs both valid sides when budget is available. Gemini HTTP 503 is
+classified as the precise sanitized `SERVICE_UNAVAILABLE` category, is retried
+exactly once (initial + one bounded retry, two attempts maximum), and after
+exhaustion produces a safe fallback with `failure:SERVICE_UNAVAILABLE`
+evidence; 429/401/403/malformed-output remain single-attempt and non-retryable.
+Fake-SDK tests also prove a sentinel fake key never appears in exceptions,
+tracebacks, or metadata.
 
 STAGE 2.7 MUST CONTINUE
 

@@ -97,11 +97,56 @@ Redis with no TTL and blocks new heavy work; run
 `python -m app.cli recover-heavy-model` to clear it after confirming the model
 is no longer resident.
 
+Whole-source transcription is indexing, not publication. Normal whole-source
+ingestion runs at INDEX priority and defers all provider reconstruction
+truthfully (unresolved, never a provider failure), so it pays for ASR + Stage
+2.5 + cheap uncertainty bookkeeping only and makes zero Qwen/Gemini calls.
+Automatic local Qwen use is disabled by default
+(`CLIPFACTORY_LOCAL_QWEN_ENABLED=false`); an operator re-enables it explicitly,
+and a reusable `refine_transcript_window(source_id, start_time, end_time,
+priority)` service entry point refines only a bounded selected window at
+CANDIDATE (semantic) or FINAL_CLIP (publication/caption) quality while
+preserving raw ASR, timestamps, and manual overrides.
+
+An optional hosted Gemini provider (`gemini-3.8-flash`, low thinking, temperature
+`0`, stable v1 API by default) supports deterministic adaptive routing
+(`local_only` / `adaptive` / `gemini_only`;
+`CLIPFACTORY_RECONSTRUCTION_ROUTING_MODE`, default `adaptive`). Clean, well-covered
+unchanged Stage 2.5 segments and trusted Stage 2.5 repairs route to `NO_LLM` and
+use neither LLM; a clean transcript may make zero Qwen and zero Gemini calls.
+Normal uncertainty uses Qwen first, clearly difficult targets use one Gemini
+request directly, and Qwen failures escalate to Gemini under a finite per-job
+budget (`CLIPFACTORY_GEMINI_MAX_TARGETS_PER_JOB`, default `5`) that is spent on
+the strongest eligible targets first, not the first five. Local Qwen work is
+batched (`CLIPFACTORY_RECONSTRUCTION_PROVIDER_BATCH_WINDOWS`/`_BATCH_CHARACTERS`)
+and hard-bounded per job
+(`CLIPFACTORY_LOCAL_RECONSTRUCTION_MAX_TARGETS_PER_JOB` default `64`,
+`CLIPFACTORY_LOCAL_RECONSTRUCTION_MAX_WALL_SECONDS` default `1200`), so a
+four-hour source can never create unbounded local inference; skipped targets are
+marked unresolved/manual review and never auto-escalate to Gemini, and once the
+local wall-time ceiling expires, queued local-origin Gemini escalations are
+invalidated (no Gemini call for the backlog). Each sent
+local batch is also split at the provider boundary so its combined chat envelope
+never exceeds the configured context. `adaptive` and
+`gemini_only` may send short transcript snippets and bounded context to Google
+Gemini; set `local_only` for a fully local pipeline. The key is a secret, held
+as `SecretStr`, unwrapped only at lazy client construction, and never logged or
+committed; there are no per-job Gemini metadata probes, and a fresh cache-hit
+worker scrubs the key without any network call. A temporary Gemini
+outage never overwrites accepted output: fingerprints are stable identity only
+and cache eligibility is tracked separately. Cancelling a reconstruction job is
+cooperative and polled on every provider route: the job stays `CANCELLED`, the
+next stage is not scheduled, and already-accepted per-target work survives
+restart without re-calling a provider. A degraded (not cache-eligible)
+reconstruction is automatically retried on a later normal request without
+repeating accepted targets.
+
 Stage 2.7 cache reuse is dependency-aware: stage runs persist canonical input
-and output fingerprints, and changed upstream evidence reruns downstream work.
-Manual force requests queue the requested stage without clearing historical
-cache fields. The transcript API exposes reconstruction status and public
-derived metadata; `GET /api/sources/{id}/quality` separately reports audio and
+and output fingerprints (plus per-target fingerprints), and changed upstream
+evidence reruns downstream work. Manual force requests queue the requested stage
+without clearing historical cache fields. The transcript API exposes
+reconstruction status and public derived metadata;
+`GET /api/sources/{id}/quality` separately reports audio and
 transcript/reconstruction quality, with the aggregate conservatively taking the
 lower score. The source detail page shows provider availability, unresolved or
 manual statuses, split-quality reasons, and bounded routing focus evidence.

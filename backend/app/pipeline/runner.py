@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 
 from app.core.enums import JobKind, JobStatus, PipelineRunStatus, PipelineStage
 from app.models import PipelineRun, ProcessingJob, SourceVideo
-from app.pipeline.executor import StageExecutionResult, StageExecutor
+from app.pipeline.executor import ReconstructionCancelled, StageExecutionResult, StageExecutor
 
 
 class StageExecutionError(RuntimeError):
@@ -63,6 +63,7 @@ class PipelineRunner:
             and run.status is PipelineRunStatus.SUCCEEDED
             and input_fingerprint
             and run.input_fingerprint == input_fingerprint
+            and self._skip_is_allowed(executor, source)
         ):
             return PipelineResult(run.id, job_id, skipped=True)
 
@@ -83,6 +84,13 @@ class PipelineRunner:
             self._session.add(run)
         elif run.status in {PipelineRunStatus.FAILED, PipelineRunStatus.CANCELLED}:
             run.attempt += 1
+        if job is not None and job.status is JobStatus.CANCELLED:
+            # Cancelled before execution: never overwrite the cancelled state with
+            # a successful or running state, and never advance the source.
+            run.status = PipelineRunStatus.CANCELLED
+            run.completed_at = now
+            self._session.commit()
+            return PipelineResult(run.id, job.id, skipped=False)
         run.status = PipelineRunStatus.RUNNING
         run.error_message = None
         run.started_at = now
@@ -95,6 +103,14 @@ class PipelineRunner:
             job.started_at = now
             job.completed_at = None
         self._session.commit()
+
+        if job is not None:
+            # Bind the exact executing job so stage executors that poll
+            # cancellation (reconstruction) read this job's live status rather
+            # than "the latest job for the source".
+            setter = getattr(executor, "set_active_job", None)
+            if setter is not None:
+                setter(job.id)
 
         try:
             if "force" in inspect.signature(executor.execute).parameters:
@@ -132,6 +148,20 @@ class PipelineRunner:
             raise LookupError(f"source video {source_id} does not exist")
         return source
 
+    def _skip_is_allowed(self, executor: StageExecutor, source: SourceVideo) -> bool:
+        """Whether a matching succeeded run may be skipped.
+
+        Most stages skip whenever their input fingerprint matches. A stage may
+        opt out by exposing ``skip_is_allowed(source)``; the reconstruction
+        executor uses it so a degraded (not cache-eligible) run re-enters the
+        executor on a later normal request instead of being skipped forever.
+        """
+
+        checker = getattr(executor, "skip_is_allowed", None)
+        if checker is None:
+            return True
+        return bool(checker(source))
+
     def _latest_run(self, source_id: UUID, stage: PipelineStage) -> PipelineRun | None:
         return self._session.scalar(
             select(PipelineRun)
@@ -155,6 +185,21 @@ class PipelineRunner:
         self, run: PipelineRun, job: ProcessingJob | None, error: Exception
     ) -> None:
         completed_at = datetime.now(timezone.utc)
+        if isinstance(error, ReconstructionCancelled) or (
+            job is not None and job.status is JobStatus.CANCELLED
+        ):
+            # Cooperative cancellation: keep the job cancelled, never overwrite it
+            # as successful or failed, and never advance the source lifecycle.
+            run.status = PipelineRunStatus.CANCELLED
+            run.error_message = None
+            run.completed_at = completed_at
+            if job is not None:
+                job.status = JobStatus.CANCELLED
+                job.error_code = None
+                job.error_message = None
+                job.completed_at = completed_at
+            self._session.commit()
+            return
         message = str(error)
         run.status = PipelineRunStatus.FAILED
         run.error_message = message
