@@ -354,6 +354,47 @@ def test_slash_plus_and_hash_language_tokens_extract_atomically() -> None:
     )
 
 
+def test_url_query_fragment_and_percent_forms_extract_atomically() -> None:
+    assert extract_protected_tokens("افتح https://example.com/page?foo=bar الان") == (
+        "https://example.com/page?foo=bar",
+    )
+    assert extract_protected_tokens("رابط https://example.com/page?foo=bar&mode=full هنا") == (
+        "https://example.com/page?foo=bar&mode=full",
+    )
+    assert extract_protected_tokens("مسار https://example.com/a%20path?q=x%2Fy الان") == (
+        "https://example.com/a%20path?q=x%2Fy",
+    )
+    assert extract_protected_tokens("اقرأ https://example.com/page?foo=bar#section الان") == (
+        "https://example.com/page?foo=bar#section",
+    )
+
+
+def test_url_trailing_sentence_punctuation_is_not_part_of_the_token() -> None:
+    assert extract_protected_tokens("شاهد https://example.com/page?x=1.") == (
+        "https://example.com/page?x=1",
+    )
+
+
+def test_url_mutation_and_fragmentation_are_rejected() -> None:
+    cases = [
+        ("https://example.com/page?foo=bar", "https://example.com/page"),
+        ("https://example.com/page?foo=bar", "https://example.com/page foo bar"),
+        ("https://example.com/page?foo=bar", "https://example.com/page?foo=baz"),
+        (
+            "https://example.com/page?foo=bar&mode=full",
+            "https://example.com/page?mode=full&foo=bar",
+        ),
+        ("https://example.com/a%20path?q=x%2Fy", "https://example.com/a path?q=x/y"),
+        ("https://example.com/page?foo=bar#section", "https://example.com/page?foo=bar"),
+        ("https://example.com/page?foo=bar", "http://example.com/page?foo=bar"),
+        ("https://example.com/page?foo=bar", "https://example.com/page?foo=bar&extra=1"),
+    ]
+    for raw, candidate in cases:
+        assert extract_protected_tokens(raw) != extract_protected_tokens(candidate), (
+            f"{raw!r} -> {candidate!r} must be rejected"
+        )
+
+
 def test_destructive_technical_rewrites_are_rejected() -> None:
     cases = [
         ("C++", "C#"),

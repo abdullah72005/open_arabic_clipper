@@ -50,7 +50,8 @@ deterministic detector classifies the source from immutable raw segment text:
   zero optional Stage 2.5 provider calls.
 - **Code switching.** Latin words/names, abbreviations, technical tokens, and
   numbers are preserved exactly through Stage 2.5 and every accepted Stage 2.7
-  candidate; slash/`+`/`#`/URL technical forms are kept as exact atomic tokens.
+  candidate; slash/`+`/`#`/URL technical forms are kept as exact atomic tokens
+  (URLs include query, fragment, parameter, and percent-encoded syntax).
   `code_switch_suspected` is true only for a segment that itself contains both
   Arabic-script evidence and Latin-letter protected tokens (numbers alone and
   English-only segments are not flagged).

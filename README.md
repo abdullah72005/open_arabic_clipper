@@ -90,11 +90,12 @@ and confidence are persisted on the transcript and inherited by every segment.
 Detected Latin words, names, abbreviations, technical tokens, and numbers are
 preserved exactly (spelling, order, casing, digits) through Stage 2.5 and every
 accepted Stage 2.7 candidate; technical forms such as `C++`, `foo/bar`, `#build`,
-and `https://example.com/page` are kept as exact atomic tokens, so a candidate
-that fragments or changes them is rejected. `code_switch_suspected` is true only
-for a segment that itself contains both Arabic-script evidence and Latin-letter
-protected tokens, while numbers alone and English-only segments are not flagged.
-An optional `dialect_profile_override` may be supplied when a
+and full URLs (including query, fragment, and percent-encoded syntax, e.g.
+`https://example.com/page?foo=bar#section`) are kept as exact atomic tokens, so
+a candidate that fragments or changes them is rejected. `code_switch_suspected`
+is true only for a segment that itself contains both Arabic-script evidence and
+Latin-letter protected tokens, while numbers alone and English-only segments are
+not flagged. An optional `dialect_profile_override` may be supplied when a
 source is created through URL ingest or multipart upload and takes precedence
 over detection with confidence 1.0; it is stored on the source and included in
 normalization fingerprints so a future supported rerun invalidates derived work

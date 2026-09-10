@@ -56,7 +56,8 @@ Arabic-English code-switch preservation:
   preserved through Stage 2.5 and every accepted Stage 2.7 candidate; a
   candidate that removes, replaces, reorders, changes case, Arabicizes, or
   invents a protected token is rejected, and slash/`+`/`#`/URL technical forms
-  are kept as exact atomic tokens. `code_switch_suspected` is true only when a
+  are kept as exact atomic tokens (URLs include query, fragment, parameter, and
+  percent-encoded syntax). `code_switch_suspected` is true only when a
   segment itself contains both Arabic-script evidence and Latin-letter-bearing
   protected-token evidence (numbers alone and English-only segments are not
   flagged). Omitted-English audio recovery is

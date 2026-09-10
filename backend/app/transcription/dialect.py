@@ -184,16 +184,37 @@ def extract_protected_tokens(text: str) -> tuple[str, ...]:
     underscored, hyphenated, slash, ``+`` and ``#`` technical forms, URLs, and
     Western and Arabic-Indic numbers including simple compound numeric/date
     forms. Spelling, order, casing, and digits are exact. A technical run such
-    as ``C++``, ``foo/bar``, ``#build``, or ``https://example.com/page`` is one
-    atomic protected token, so a candidate that fragments, changes, removes, or
-    invents it is rejected.
+    as ``C++``, ``foo/bar``, ``#build``, or a full URL is one atomic protected
+    token — URLs include their query, fragment, parameter, and percent-encoded
+    syntax — so a candidate that fragments, changes, removes, or invents it is
+    rejected.
     """
 
-    return tuple(_PROTECTED_TOKEN.findall(text))
+    tokens = [
+        _strip_url_trailing_punctuation(token) if "://" in token else token
+        for token in _PROTECTED_TOKEN.findall(text)
+    ]
+    return tuple(token for token in tokens if token)
+
+
+_URL_TRAILING_PUNCTUATION = ".,;:!?)]}'\""
+
+
+def _strip_url_trailing_punctuation(token: str) -> str:
+    """Remove sentence punctuation that merely follows a URL token.
+
+    A trailing period/comma/exclamation and similar characters after a URL are
+    transcript punctuation, not part of the URL, so they do not join the atomic
+    token. URL-internal characters (``/``, ``=``, ``&``, ``%``, ``#``, ``+``)
+    are never stripped.
+    """
+
+    return token.rstrip(_URL_TRAILING_PUNCTUATION)
 
 
 _PROTECTED_TOKEN = re.compile(
-    r"[A-Za-z0-9]+(?:(?:[-_.@/:+#]|://)[A-Za-z0-9]+)+"
+    r"[A-Za-z][A-Za-z0-9+.-]*://[A-Za-z0-9._~:/?#@!$&'()*+,;=%\[\]-]+"
+    r"|[A-Za-z0-9]+(?:(?:[-_.@/:+#])[A-Za-z0-9]+)+"
     r"|[#+][A-Za-z0-9]+"
     r"|[A-Za-z]+[+#]+"
     r"|[A-Za-z]+[A-Za-z0-9]*"

@@ -222,6 +222,28 @@ def test_stage25_safety_gate_rejects_destructive_technical_rewrites() -> None:
         )
 
 
+def test_stage25_safety_gate_rejects_destructive_url_rewrites() -> None:
+    """Stage 2.5 provider safety rejects URL fragmentation and query mutation."""
+
+    corrector = ContextualCorrector.from_default_lexicon()
+    cases = [
+        ("https://example.com/page?foo=bar", "https://example.com/page foo bar"),
+        ("https://example.com/page?foo=bar", "https://example.com/page?foo=baz"),
+        (
+            "https://example.com/page?foo=bar&mode=full",
+            "https://example.com/page?mode=full&foo=bar",
+        ),
+        ("https://example.com/a%20path?q=x%2Fy", "https://example.com/a path?q=x/y"),
+        ("https://example.com/page?foo=bar#section", "https://example.com/page?foo=bar"),
+        ("https://example.com/page?foo=bar", "http://example.com/page?foo=bar"),
+    ]
+    for raw, destructive in cases:
+        result = ProviderCorrection(0, destructive, changed=True, confidence=0.99, changes=[])
+        assert corrector._provider_result_is_safe(raw, result) is False, (
+            f"{raw!r} -> {destructive!r} must be rejected"
+        )
+
+
 def _setup_transcript(session: Any, segments: list[dict[str, object]], language: str = "ar") -> Any:
     source = SourceVideo(
         source_uri="file:///tmp/dialect.mp4", content_hash="h", rights_status="OWNED"
