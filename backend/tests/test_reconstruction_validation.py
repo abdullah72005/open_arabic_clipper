@@ -15,6 +15,38 @@ def test_validator_rejects_mutated_latin_and_numeric_evidence() -> None:
     assert result.reason == "protected_tokens_changed"
 
 
+def test_validator_rejects_destructive_technical_token_rewrites() -> None:
+    """A candidate that fragments or changes technical tokens is rejected."""
+
+    cases = [
+        ("C++", "C#"),
+        ("foo/bar", "foo bar"),
+        ("api/v2", "api v2"),
+        ("#build", "build"),
+        ("+icon", "icon"),
+        ("https://example.com/page", "https example.com page"),
+    ]
+    for raw, destructive in cases:
+        memory = build_entity_memory([{"text": raw}])
+        candidate = ReconstructionCandidate("provider-0", destructive)
+
+        result = validate_candidate(raw, candidate, memory)
+
+        assert result.accepted is False, f"{raw!r} -> {destructive!r} must be rejected"
+        assert result.reason == "protected_tokens_changed"
+
+
+def test_validator_preserves_atomic_technical_tokens_when_unchanged() -> None:
+    """Unchanged atomic technical tokens are not themselves a validation failure."""
+
+    raw = "نستخدم C++ و foo/bar في api/v2 و #build"
+    memory = build_entity_memory([{"text": raw}])
+
+    result = validate_candidate(raw, ReconstructionCandidate("provider-0", raw), memory)
+
+    assert result.accepted is True
+
+
 def test_validator_accepts_bounded_multword_candidate_with_source_evidence() -> None:
     """A supported multi-word Egyptian reconstruction remains eligible for contextual ranking."""
 

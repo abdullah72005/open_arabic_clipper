@@ -25,8 +25,8 @@ from typing import Mapping, Sequence
 
 from app.transcription.arabic import normalize_for_comparison
 
-DIALECT_POLICY_VERSION = "dialect-policy-v1"
-PRESERVATION_POLICY_VERSION = "preservation-policy-v1"
+DIALECT_POLICY_VERSION = "dialect-policy-v2"
+PRESERVATION_POLICY_VERSION = "preservation-policy-v2"
 MAX_SAMPLE_SEGMENTS = 48
 
 
@@ -181,16 +181,21 @@ def extract_protected_tokens(text: str) -> tuple[str, ...]:
     """Exact ordered protected tokens from raw text.
 
     Preserves Latin words and names, abbreviations, ordinary dotted,
-    underscored, hyphenated, slash, ``+`` and ``#`` technical forms where
-    practical, and Western and Arabic-Indic numbers including simple compound
-    numeric/date forms. Spelling, order, casing, and digits are exact.
+    underscored, hyphenated, slash, ``+`` and ``#`` technical forms, URLs, and
+    Western and Arabic-Indic numbers including simple compound numeric/date
+    forms. Spelling, order, casing, and digits are exact. A technical run such
+    as ``C++``, ``foo/bar``, ``#build``, or ``https://example.com/page`` is one
+    atomic protected token, so a candidate that fragments, changes, removes, or
+    invents it is rejected.
     """
 
     return tuple(_PROTECTED_TOKEN.findall(text))
 
 
 _PROTECTED_TOKEN = re.compile(
-    r"[A-Za-z]+[A-Za-z0-9]*(?:[-_.][A-Za-z0-9]+)+"
+    r"[A-Za-z0-9]+(?:(?:[-_.@/:+#]|://)[A-Za-z0-9]+)+"
+    r"|[#+][A-Za-z0-9]+"
+    r"|[A-Za-z]+[+#]+"
     r"|[A-Za-z]+[A-Za-z0-9]*"
     r"|\d+(?:[.,:/-]\d+)*"
     r"|[٠-٩]+(?:[.,:/-][٠-٩]+)*"
@@ -213,6 +218,17 @@ def code_switch_evidence(text: str) -> CodeSwitchEvidence:
     tokens = extract_protected_tokens(text)
     latin = tuple(token for token in tokens if _has_latin_letter(token))
     return CodeSwitchEvidence(suspected=bool(latin), tokens=latin)
+
+
+def segment_code_switch_suspected(text: str) -> bool:
+    """Whether one segment is code-switch-suspected on its own evidence.
+
+    A segment is flagged only when it itself contains both Arabic-script
+    evidence and Latin-letter-bearing protected-token evidence. English-only
+    segments and numbers alone are never flagged, even inside an Arabic source.
+    """
+
+    return _has_arabic_script(text) and code_switch_evidence(text).suspected
 
 
 class DialectDetector:
@@ -258,7 +274,7 @@ class DialectDetector:
                 ),
             )
 
-        if not _arabic_applicable(sampled, language):
+        if not _arabic_applicable(segments, language):
             return DialectDetectionResult(
                 profile=None,
                 confidence=0.0,
@@ -353,7 +369,12 @@ class DialectDetector:
 
 
 def _arabic_applicable(segments: Sequence[Mapping[str, object]], language: str | None) -> bool:
-    """Arabic applicability from the reported language and/or Arabic script."""
+    """Arabic applicability from the reported language and/or Arabic script.
+
+    The Arabic-script scan covers every immutable raw segment, not only the
+    bounded marker-scoring sample, so an Arabic segment outside the sample can
+    never cause the source to be classified as non-Arabic.
+    """
 
     if language is not None and str(language).strip().lower().startswith("ar"):
         return True

@@ -123,9 +123,11 @@
   EGYPTIAN; every other profile passes valid text through unchanged. Exact
   protected tokens (Latin words/names, abbreviations, technical forms, Western
   and Arabic-Indic numbers) are preserved through Stage 2.5 and every accepted
-  Stage 2.7 candidate; `code_switch_suspected` flags Latin-bearing evidence
-  inside an Arabic source (numbers alone and English-only sources are not
-  flagged), and omitted-English audio recovery is deferred to Stage 3.5. The
+  Stage 2.7 candidate, with slash/`+`/`#`/URL technical forms kept as exact
+  atomic tokens; `code_switch_suspected` is true only for a segment that itself
+  contains both Arabic-script evidence and Latin-letter-bearing protected-token
+  evidence (numbers alone and English-only segments are not flagged), and
+  omitted-English audio recovery is deferred to Stage 3.5. The
   shared reconstruction instruction is dialect-neutral and preservation-first
   for both local and Gemini providers, with validated profile-specific addenda.
   An optional source-creation `dialect_profile_override` wins with confidence

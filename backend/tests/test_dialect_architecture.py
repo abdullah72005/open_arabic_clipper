@@ -135,7 +135,7 @@ def _segment(index: int, raw: str = "دخم", profile: str | None = None) -> dic
         segment["dialect_profile"] = profile
         segment["dialect_confidence"] = 0.95
         segment["dialect_selection"] = "detected"
-        segment["dialect_policy_version"] = "dialect-policy-v1"
+        segment["dialect_policy_version"] = "dialect-policy-v2"
     return segment
 
 

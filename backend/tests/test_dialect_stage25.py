@@ -203,6 +203,25 @@ def test_required_profile_argument_is_explicit_in_production_path() -> None:
         ContextualCorrector.from_default_lexicon().correct([{"text": "خطي بالك"}])
 
 
+def test_stage25_safety_gate_rejects_destructive_technical_rewrites() -> None:
+    """Stage 2.5 protected-token preservation rejects fragmented technical tokens."""
+
+    corrector = ContextualCorrector.from_default_lexicon()
+    cases = [
+        ("C++", "C#"),
+        ("foo/bar", "foo bar"),
+        ("api/v2", "api v2"),
+        ("#build", "build"),
+        ("+icon", "icon"),
+        ("https://example.com/page", "https example.com page"),
+    ]
+    for raw, destructive in cases:
+        result = ProviderCorrection(0, destructive, changed=True, confidence=0.99, changes=[])
+        assert corrector._provider_result_is_safe(raw, result) is False, (
+            f"{raw!r} -> {destructive!r} must be rejected"
+        )
+
+
 def _setup_transcript(session: Any, segments: list[dict[str, object]], language: str = "ar") -> Any:
     source = SourceVideo(
         source_uri="file:///tmp/dialect.mp4", content_hash="h", rights_status="OWNED"
@@ -318,6 +337,76 @@ def test_numbers_alone_do_not_flag_code_switching(sqlite_engine: Any) -> None:
         session.refresh(transcript)
         assert transcript.code_switch_suspected is False
         assert transcript.segments[0]["code_switch_tokens"] == []
+
+
+def test_long_source_arabic_outside_sample_preserves_code_switch_evidence(
+    sqlite_engine: Any,
+) -> None:
+    from sqlalchemy.orm import Session
+
+    from app.db.base import Base
+    from app.transcription.dialect import sample_segment_indexes
+
+    segments = [
+        {
+            "start": float(index),
+            "end": float(index + 1),
+            "text": f"ordinary segment {index}",
+            "raw_text": f"ordinary segment {index}",
+        }
+        for index in range(60)
+    ]
+    segments[7] = {
+        "start": 7.0,
+        "end": 8.0,
+        "text": "أنا عملت deploy للـ backend امبارح",
+        "raw_text": "أنا عملت deploy للـ backend امبارح",
+    }
+    assert 7 not in sample_segment_indexes(segments, max_samples=48)
+
+    Base.metadata.create_all(sqlite_engine)
+    with Session(sqlite_engine) as session:
+        source, transcript = _setup_transcript(session, segments, language="en")
+
+        executor = TranscriptNormalizationExecutor(session=session)
+        executor.execute(source)
+
+        session.refresh(transcript)
+        assert transcript.dialect_profile == ArabicDialectProfile.UNKNOWN_ARABIC.value
+        assert transcript.dialect_confidence == 0.0
+        assert transcript.code_switch_suspected is True
+        assert transcript.segments[7]["code_switch_suspected"] is True
+        assert transcript.segments[7]["code_switch_tokens"] == ["deploy", "backend"]
+        assert transcript.segments[0]["code_switch_suspected"] is False
+
+
+def test_segment_code_switch_requires_arabic_script_within_the_segment(
+    sqlite_engine: Any,
+) -> None:
+    from sqlalchemy.orm import Session
+
+    from app.db.base import Base
+
+    segments = _segments(
+        "أنا عملت deploy امبارح",
+        "deploy backend",
+        "فيه 71 شخص امبارح",
+        "الوضع تمام",
+    )
+    Base.metadata.create_all(sqlite_engine)
+    with Session(sqlite_engine) as session:
+        source, transcript = _setup_transcript(session, segments)
+
+        executor = TranscriptNormalizationExecutor(session=session)
+        executor.execute(source)
+
+        session.refresh(transcript)
+        assert transcript.code_switch_suspected is True
+        assert transcript.segments[0]["code_switch_suspected"] is True
+        assert transcript.segments[0]["code_switch_tokens"] == ["deploy"]
+        assert transcript.segments[1]["code_switch_suspected"] is False
+        assert transcript.segments[2]["code_switch_suspected"] is False
+        assert transcript.segments[3]["code_switch_suspected"] is False
 
 
 def test_normalization_override_propagates_and_sets_confidence_one(sqlite_engine: Any) -> None:

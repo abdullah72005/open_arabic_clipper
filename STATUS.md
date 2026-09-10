@@ -27,8 +27,10 @@ Arabic-English code-switch preservation:
   deployment-wide dialect default.
 - **Lightweight deterministic detection.** A pure detector (no network, no
   LLM, no model loading, no audio decoding) classifies the source during Stage
-  2.5 normalization from immutable raw segment text, using a bounded
-  representative sample of at most 48 segments. A known profile needs at least
+  2.5 normalization from immutable raw segment text. Marker scoring is bounded
+  to a representative sample of at most 48 segments, but Arabic applicability
+  scans every immutable raw segment, so an Arabic segment outside the sample can
+  never make the source `None`/not-applicable. A known profile needs at least
   two distinct markers, a weighted score of at least 4, a lead of at least 2
   over the runner-up, and a score of at least 1.5×max(runner_up, 1); MSA
   additionally needs strong formal evidence and no meaningful competing
@@ -53,9 +55,11 @@ Arabic-English code-switch preservation:
   compound numeric/date forms) are extracted as ordered protected tokens and
   preserved through Stage 2.5 and every accepted Stage 2.7 candidate; a
   candidate that removes, replaces, reorders, changes case, Arabicizes, or
-  invents a protected token is rejected. `code_switch_suspected` is true when an
-  Arabic source segment contains Latin-bearing evidence (numbers alone and
-  English-only sources are not flagged). Omitted-English audio recovery is
+  invents a protected token is rejected, and slash/`+`/`#`/URL technical forms
+  are kept as exact atomic tokens. `code_switch_suspected` is true only when a
+  segment itself contains both Arabic-script evidence and Latin-letter-bearing
+  protected-token evidence (numbers alone and English-only segments are not
+  flagged). Omitted-English audio recovery is
   deferred to Stage 3.5.
 - **Shared provider contract.** Both the local Qwen/OpenAI-compatible provider
   and the hosted Gemini provider receive the same dialect-neutral,

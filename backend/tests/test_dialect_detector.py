@@ -116,6 +116,50 @@ def test_arabic_english_material_remains_arabic_applicable() -> None:
     assert result.profile is not ArabicDialectProfile.MSA
 
 
+def test_arabic_outside_the_detector_sample_keeps_source_applicable() -> None:
+    segments = [
+        {
+            "start": float(i),
+            "end": float(i + 1),
+            "text": f"ordinary segment {i}",
+            "raw_text": f"ordinary segment {i}",
+        }
+        for i in range(60)
+    ]
+    segments[7] = {
+        "start": 7.0,
+        "end": 8.0,
+        "text": "أنا عملت deploy للـ backend امبارح",
+        "raw_text": "أنا عملت deploy للـ backend امبارح",
+    }
+
+    indexes = sample_segment_indexes(segments, max_samples=48)
+    assert len(indexes) == 48
+    assert 7 not in indexes
+    result = DialectDetector().detect(segments, language="en")
+
+    assert result.profile is ArabicDialectProfile.UNKNOWN_ARABIC
+    assert result.selection is DialectSelectionMethod.UNKNOWN
+    assert result.profile is not None
+
+
+def test_no_arabic_anywhere_still_resolves_to_not_applicable() -> None:
+    segments = [
+        {
+            "start": float(i),
+            "end": float(i + 1),
+            "text": f"ordinary segment {i}",
+            "raw_text": f"ordinary segment {i}",
+        }
+        for i in range(60)
+    ]
+
+    result = DialectDetector().detect(segments, language="en")
+
+    assert result.profile is None
+    assert result.selection is DialectSelectionMethod.NOT_APPLICABLE
+
+
 def test_operator_override_wins_over_detection() -> None:
     result = _detect(_segments("وش رايك نخلص الشغل الحين"), override=_SAUDI)
 
@@ -290,8 +334,8 @@ def test_arabic_indic_number_is_not_latin_evidence() -> None:
     [
         ("ملف data_v2.xlsx جاهز", ("data_v2.xlsx",)),
         ("الإصدار 1.5.0 صدر", ("1.5.0",)),
-        ("أرسلنا عبر #build و +icon", ("build", "icon")),
-        ("الرابط https://example.com/page يعمل", ("https", "example.com", "page")),
+        ("أرسلنا عبر #build و +icon", ("#build", "+icon")),
+        ("الرابط https://example.com/page يعمل", ("https://example.com/page",)),
     ],
 )
 def test_ordinary_technical_forms_are_preserved(text: str, expected: tuple[str, ...]) -> None:
@@ -299,3 +343,28 @@ def test_ordinary_technical_forms_are_preserved(text: str, expected: tuple[str, 
 
     for token in expected:
         assert token in tokens
+
+
+def test_slash_plus_and_hash_language_tokens_extract_atomically() -> None:
+    assert extract_protected_tokens("نكتب الشيفرة بلغة C++ أو C#") == ("C++", "C#")
+    assert extract_protected_tokens("المسار هو foo/bar أو api/v2") == ("foo/bar", "api/v2")
+    assert extract_protected_tokens("شغّلنا #build و +icon") == ("#build", "+icon")
+    assert extract_protected_tokens("افتح https://example.com/page الان") == (
+        "https://example.com/page",
+    )
+
+
+def test_destructive_technical_rewrites_are_rejected() -> None:
+    cases = [
+        ("C++", "C#"),
+        ("foo/bar", "foo bar"),
+        ("api/v2", "api v2"),
+        ("#build", "build"),
+        ("https://example.com/page", "https example.com page"),
+        ("C++", "C# language"),
+        ("foo/bar", "foo/bar baz"),
+    ]
+    for raw, candidate in cases:
+        assert extract_protected_tokens(raw) != extract_protected_tokens(candidate), (
+            f"{raw!r} -> {candidate!r} must be rejected"
+        )

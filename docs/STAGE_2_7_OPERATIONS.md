@@ -33,8 +33,11 @@ deterministic detector classifies the source from immutable raw segment text:
   Arabic is present but uncertain/mixed and always favors no change. Dialect is
   source evidence, not a target audience; there is no deployment-wide default.
 - **Lightweight.** No network, no LLM, no model loading, no audio decoding, no
-  per-segment classifier. Evidence comes from a bounded representative sample of
-  at most 48 segments and stores no transcript bodies.
+  per-segment classifier. Marker scoring comes from a bounded representative
+  sample of at most 48 segments and stores no transcript bodies; Arabic
+  applicability itself scans every immutable raw segment, so an Arabic segment
+  outside the sample is never lost (it resolves to `UNKNOWN_ARABIC`, not
+  `None`).
 - **Override.** An optional `dialect_profile_override` may be provided when a
   source is created through URL ingest JSON or multipart upload. It wins with
   confidence 1.0, is stored on the source, participates in normalization
@@ -47,8 +50,10 @@ deterministic detector classifies the source from immutable raw segment text:
   zero optional Stage 2.5 provider calls.
 - **Code switching.** Latin words/names, abbreviations, technical tokens, and
   numbers are preserved exactly through Stage 2.5 and every accepted Stage 2.7
-  candidate. `code_switch_suspected` is true for Latin-bearing evidence inside an
-  Arabic source (numbers alone and English-only sources are not flagged).
+  candidate; slash/`+`/`#`/URL technical forms are kept as exact atomic tokens.
+  `code_switch_suspected` is true only for a segment that itself contains both
+  Arabic-script evidence and Latin-letter protected tokens (numbers alone and
+  English-only segments are not flagged).
   Omitted-English audio recovery is deferred to Stage 3.5.
 - **Shared provider contract.** Local Qwen and hosted Gemini receive the same
   dialect-neutral, preservation-first instruction plus validated profile-specific
@@ -489,8 +494,9 @@ Behavior:
 
 Per-segment handoff signals future stages can consume: `refinement_priority`,
 `needs_refinement` (derived from status/escalation evidence), and
-`code_switch_suspected` (derived from Latin/digit word evidence; no recovery
-logic).
+`code_switch_suspected` (true only when the segment itself contains both
+Arabic-script and Latin-letter protected-token evidence; numbers alone and
+English-only segments are not flagged; no recovery logic).
 
 ## Ollama hardware safeguards (Compose)
 

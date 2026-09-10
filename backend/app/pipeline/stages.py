@@ -46,6 +46,7 @@ from app.transcription.dialect import (
     PRESERVATION_POLICY_VERSION,
     DialectDetector,
     code_switch_evidence,
+    segment_code_switch_suspected,
 )
 from app.transcription.engine import TranscriptionResult, WhisperEngine
 from app.transcription.normalization import normalize_transcript
@@ -373,7 +374,7 @@ class TranscriptNormalizationExecutor:
             )
             final_text = operator_text or correction.corrected_text
             switch = code_switch_evidence(correction.raw_text)
-            code_switch_suspected = profile is not None and switch.suspected
+            code_switch_suspected = segment_code_switch_suspected(correction.raw_text)
             normalized_segments.append(
                 {
                     **segment,

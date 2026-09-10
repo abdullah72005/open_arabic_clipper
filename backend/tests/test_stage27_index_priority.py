@@ -74,7 +74,7 @@ def _segment(
         "dialect_profile": None,
         "dialect_confidence": 0.0,
         "dialect_selection": "unknown",
-        "dialect_policy_version": "dialect-policy-v1",
+        "dialect_policy_version": "dialect-policy-v2",
         "code_switch_suspected": False,
         "code_switch_tokens": [],
     }
