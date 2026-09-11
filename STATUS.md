@@ -38,9 +38,10 @@ and defers expensive audio/transcript refinement to Stage 3.5:
   a fixed fallback only when boundaries are unavailable. Proposals are built over
   bounded atoms; a segment longer than the maximum coarse window is split at
   deterministic word/timestamp boundaries (or a proportional-character fallback
-  when only text exists), so every persisted proposal respects configured bounds.
-  Stable atom-span identity keeps multiple windows from one segment non-colliding
-  across reruns. Configurable safety caps (15 s minimum, 35–75 s preferred, 120 s
+  when only text exists), every atom is then hard-bounded so no pathological
+  single word/timestamp span survives, and source duration is the hard outer
+  bound. Stable atom-span identity keeps multiple windows from one segment
+  non-colliding across reruns. Configurable safety caps (15 s minimum, 35–75 s preferred, 120 s
   maximum, 24 proposals/hour, 240/source, 60 retained) are caps, not targets.
   Overlapping similar proposals merge; distinct ideas stay separate; zero good
   moments yields zero accepted candidates.
@@ -57,7 +58,9 @@ and defers expensive audio/transcript refinement to Stage 3.5:
   zero-adjustment provider response preserves the deterministic `clip_score`, and
   an INDEX-deferred candidate keeps the same content score as its clean
   equivalent while still routing to `CANDIDATE_NEEDS_REFINEMENT`. A filler moment
-  with perfect transcript confidence stays low quality.
+  with perfect transcript confidence stays low quality. After a long segment is
+  split, word/acoustic/low-confidence and protected/code-switch evidence is
+  filtered to each candidate's actual coarse time span.
 - **Refinement-needed behavior.** Strong non-redundant content with material
   uncertainty becomes `CANDIDATE_NEEDS_REFINEMENT` with bounded reason codes
   (`LOW_TRANSCRIPT_CONFIDENCE`, `UNRESOLVED_INDEX_TEXT`,

@@ -74,12 +74,17 @@ Proposals are generated over a flat sequence of bounded atoms. A normal segment
 is one atom; a segment longer than the maximum coarse window is split at
 deterministic word/timestamp boundaries, or, when only text is available, at a
 deterministic proportional-character fallback that preserves approximate
-text/time correspondence. This is still coarse discovery, never exact boundary
-refinement (Stage 3.5 owns final boundaries). Each atom range has a stable span
-identity; `candidate_key` combines the source UUID and the atom span, so multiple
-bounded windows from one oversized transcript segment get stable, non-colliding
-identities across reruns. Segment indexes, timestamps, and word/span evidence
-remain traceable on each persisted candidate.
+text/time correspondence. Every atom is then bounded so none exceeds the maximum
+coarse window: a pathological single word/timestamp span larger than the cap is
+split safely by time with its text distributed proportionally, and no oversized
+word atom is retained. When the source duration is known it is the hard outer
+bound, even if transcript segment/word timestamps extend beyond it. This is still
+coarse discovery, never exact boundary refinement (Stage 3.5 owns final
+boundaries). Each atom range has a stable span identity; `candidate_key` combines
+the source UUID and the atom span, so multiple bounded windows from one oversized
+transcript segment get stable, non-colliding identities across reruns. Segment
+indexes, timestamps, and word/span evidence remain traceable on each persisted
+candidate.
 
 Safety caps (configurable): minimum coarse window 15 s, preferred window
 35–75 s, maximum coarse window 120 s, at most 8 s surrounding context, at most 24
@@ -117,6 +122,9 @@ perfect transcript confidence stays low quality. Transcript confidence is derive
 separately from bounded candidate evidence (word probabilities, acoustic
 evidence, unresolved reconstruction state, low-confidence spans, manual
 overrides); `engagement_confidence` describes evidence coverage, not quality.
+After a long segment is split, word/acoustic/low-confidence and
+protected/code-switch evidence is filtered to each candidate's actual coarse
+time span, so evidence from one sub-window never contaminates another.
 
 Deterministic cue/classification/hook detection runs against an analysis-only
 normalized matching view: safe Unicode normalization, English case-folding,
