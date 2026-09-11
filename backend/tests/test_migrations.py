@@ -2,12 +2,13 @@ import importlib.util
 from pathlib import Path
 
 from alembic.config import Config
-from sqlalchemy import create_engine, inspect
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import Session
 
 from alembic import command
+from app.core.enums import JobKind, JobStatus, PipelineRunStatus, PipelineStage
 from app.core.settings import get_settings
-from app.models import SourceVideo, Transcript
+from app.models import PipelineRun, ProcessingJob, SourceVideo, Transcript
 
 
 def _load_migration() -> object:
@@ -214,3 +215,79 @@ def test_stage_3_migration_is_reversible_and_preserves_source_data() -> None:
         assert restored == 1
     finally:
         engine.dispose()
+
+
+def test_stage_3_downgrade_handles_live_stage_3_rows_and_preserves_earlier_data() -> None:
+    """Downgrade must tolerate real Stage 3 lifecycle/job/run rows."""
+
+    backend_root = Path(__file__).parents[1]
+    config = Config()
+    config.set_main_option("script_location", str(backend_root / "alembic"))
+    database_url = get_settings().database_url
+
+    command.upgrade(config, "head")
+    engine = create_engine(database_url)
+    try:
+        with Session(engine) as session:
+            source = SourceVideo(
+                source_uri="/tmp/downgrade-stage3.mp4",
+                content_hash="downgrade-stage3-hash",
+                lifecycle_state=PipelineStage.READY_FOR_REFINEMENT,
+            )
+            session.add(source)
+            session.flush()
+            session.add(
+                Transcript(
+                    source_video_id=source.id,
+                    whisper_model="large-v3-turbo",
+                    input_fingerprint="dg-fp",
+                    segments=[],
+                    word_segments=[],
+                )
+            )
+            session.add(
+                ProcessingJob(
+                    source_video_id=source.id,
+                    kind=JobKind.CANDIDATE_ANALYSIS,
+                    status=JobStatus.SUCCEEDED,
+                )
+            )
+            session.add(
+                PipelineRun(
+                    source_video_id=source.id,
+                    stage=PipelineStage.CANDIDATE_ANALYSIS,
+                    status=PipelineRunStatus.SUCCEEDED,
+                )
+            )
+            session.commit()
+            source_id = str(source.id)
+
+        command.downgrade(config, "20260910_0010")
+        tables = set(inspect(engine).get_table_names())
+        assert "candidate_analyses" not in tables
+        assert "clip_candidates" not in tables
+        with engine.connect() as connection:
+            lifecycle = connection.execute(
+                text("SELECT lifecycle_state FROM source_videos WHERE source_uri = :uri"),
+                {"uri": "/tmp/downgrade-stage3.mp4"},
+            ).scalar_one()
+            hex_id = source_id.replace("-", "")
+            transcripts = connection.execute(
+                text("SELECT count(*) FROM transcripts WHERE source_video_id = :id"),
+                {"id": hex_id},
+            ).scalar_one()
+            jobs = connection.execute(
+                text("SELECT count(*) FROM processing_jobs WHERE source_video_id = :id"),
+                {"id": hex_id},
+            ).scalar_one()
+            runs = connection.execute(
+                text("SELECT count(*) FROM pipeline_runs WHERE source_video_id = :id"),
+                {"id": hex_id},
+            ).scalar_one()
+        assert lifecycle == "READY_FOR_ANALYSIS"
+        assert transcripts == 1
+        assert jobs == 0
+        assert runs == 0
+    finally:
+        engine.dispose()
+        command.upgrade(config, "head")

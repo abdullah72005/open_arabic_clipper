@@ -196,6 +196,7 @@ class CandidateAnalysisExecutor:
             quality_input_fingerprint=quality.input_fingerprint if quality else "",
             config=self._config,
             provider_identity=self._provider_identity(),
+            semantic_provider_mode=self._mode.value,
             novelty_digest=novelty_corpus_digest([item.key for item in corpus]),
         )
 

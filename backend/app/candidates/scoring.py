@@ -7,7 +7,14 @@ from collections.abc import Mapping, Sequence
 
 from app.candidates.cues import CONTENT_CUES, FILLER_CUES, PAYOFF_CUES
 from app.candidates.policy import DEFAULT_CONFIG, Stage3Config
-from app.candidates.text import analysis_segment_text, tokenize
+from app.candidates.text import (
+    analysis_segment_text,
+    contains_any_cue,
+    contains_cue,
+    is_question,
+    matching_text,
+    tokenize,
+)
 from app.candidates.types import (
     CandidateScores,
     ContentClassification,
@@ -163,21 +170,23 @@ def compute_scores(
     duration = max(1.0, proposal.duration)
     words_per_second = word_count / duration
     density = _clamp(words_per_second / 3.0)
-    cue_hits = sum(sum(1 for cue in cues if cue in proposal.text) for cues in CONTENT_CUES.values())
+    matching = matching_text(proposal.text)
+    cue_hits = sum(
+        sum(1 for cue in cues if contains_cue(matching, cue)) for cues in CONTENT_CUES.values()
+    )
     cue_strength = _clamp(cue_hits / 4.0)
     moment_density_score = _clamp(0.7 * density + 0.3 * cue_strength)
 
     short_form_score = _length_suitability(proposal.duration)
-    ending_quality_score = _ending_quality(proposal)
-    loopability_score = _loopability(proposal)
+    ending_quality_score = _ending_quality(proposal, matching)
+    loopability_score = _loopability(proposal, matching)
 
-    filler = sum(1 for cue in FILLER_CUES if cue in proposal.text)
+    filler = sum(1 for cue in FILLER_CUES if contains_cue(matching, cue))
     filler_ratio = filler / max(1, word_count)
-    boredom_risk_score = _clamp(
-        0.5 * min(1.0, filler_ratio * 6.0)
-        + 0.3 * (1.0 - density)
-        + 0.2 * uncertainty.unresolved_ratio
-    )
+    # Content-quality only: transcript uncertainty never lowers apparent moment
+    # quality. The uncertainty term that previously inflated boredom is dropped;
+    # the filler/density terms keep their original weights.
+    boredom_risk_score = _clamp(0.5 * min(1.0, filler_ratio * 6.0) + 0.3 * (1.0 - density))
 
     boundary_confidence = _clamp(
         _BOUNDARY_QUALITY.get(proposal.boundary_reason, 0.55) - 0.25 * uncertainty.unresolved_ratio
@@ -201,16 +210,15 @@ def compute_scores(
         audio_confidence if audio_confidence is not None else _audio_confidence(segments, proposal)
     )
 
-    clip_score = _clamp(
-        0.30 * moment_density_score
-        + 0.20 * short_form_score
-        + 0.15 * density
-        + 0.12 * ending_quality_score
-        + 0.13 * (1.0 - boredom_risk_score)
-        + 0.10 * loopability_score
+    clip_score = aggregate_clip_score(
+        moment_density_score=moment_density_score,
+        short_form_score=short_form_score,
+        word_density=density,
+        ending_quality_score=ending_quality_score,
+        boredom_risk_score=boredom_risk_score,
+        loopability_score=loopability_score,
     )
 
-    del word_count
     return CandidateScores(
         clip_score=clip_score,
         short_form_score=short_form_score,
@@ -218,6 +226,7 @@ def compute_scores(
         boredom_risk_score=boredom_risk_score,
         ending_quality_score=ending_quality_score,
         loopability_score=loopability_score,
+        word_density=density,
         engagement_confidence=engagement_confidence,
         transcript_confidence=uncertainty.transcript_confidence,
         audio_confidence=resolved_audio,
@@ -240,21 +249,48 @@ def material_uncertainty(
     )
 
 
+def aggregate_clip_score(
+    *,
+    moment_density_score: float,
+    short_form_score: float,
+    word_density: float,
+    ending_quality_score: float,
+    boredom_risk_score: float,
+    loopability_score: float,
+) -> float:
+    """Single content-quality aggregate shared by deterministic and provider paths.
+
+    Only apparent content/moment quality participates. Transcript confidence,
+    unresolved/deferred INDEX status, word confidence, code-switch uncertainty,
+    audio confidence, boundary confidence, and uncertainty severity are separate
+    fields and never enter this aggregate.
+    """
+
+    return _clamp(
+        0.30 * moment_density_score
+        + 0.20 * short_form_score
+        + 0.15 * word_density
+        + 0.12 * ending_quality_score
+        + 0.13 * (1.0 - boredom_risk_score)
+        + 0.10 * loopability_score
+    )
+
+
 def recompute_clip_score(scores: CandidateScores) -> float:
     """Recompute the content-quality aggregate after validated provider adjustments.
 
-    Transcript cleanliness, transcript confidence, provider availability, and
-    audio confidence are deliberately excluded.
+    Uses exactly the same aggregate formula as deterministic scoring via
+    :func:`aggregate_clip_score`; a provider response with no accepted score
+    adjustments therefore preserves the deterministic ClipScore.
     """
 
-    density_component = scores.moment_density_score
-    return _clamp(
-        0.30 * density_component
-        + 0.20 * scores.short_form_score
-        + 0.15 * density_component
-        + 0.12 * scores.ending_quality_score
-        + 0.13 * (1.0 - scores.boredom_risk_score)
-        + 0.10 * scores.loopability_score
+    return aggregate_clip_score(
+        moment_density_score=scores.moment_density_score,
+        short_form_score=scores.short_form_score,
+        word_density=scores.word_density,
+        ending_quality_score=scores.ending_quality_score,
+        boredom_risk_score=scores.boredom_risk_score,
+        loopability_score=scores.loopability_score,
     )
 
 
@@ -268,10 +304,10 @@ def _length_suitability(duration: float) -> float:
     return _clamp(1.0 - (duration - 75.0) / 75.0)
 
 
-def _ending_quality(proposal: Proposal) -> float:
-    tail = proposal.text[-120:]
+def _ending_quality(proposal: Proposal, matching: str) -> float:
+    tail = matching[-120:]
     score = 0.5
-    if any(cue in tail for cue in PAYOFF_CUES):
+    if contains_any_cue(tail, PAYOFF_CUES):
         score += 0.3
     if proposal.text.strip().endswith((".", "!", "؟", "?", "…")):
         score += 0.15
@@ -280,13 +316,11 @@ def _ending_quality(proposal: Proposal) -> float:
     return _clamp(score)
 
 
-def _loopability(proposal: Proposal) -> float:
-    from app.candidates.text import is_question
-
+def _loopability(proposal: Proposal, matching: str) -> float:
     score = 0.4
-    if is_question(proposal.text):
+    if is_question(proposal.text) or "?" in matching or "؟" in matching:
         score += 0.3
-    if any(cue in proposal.text[:120] for cue in PAYOFF_CUES):
+    if contains_any_cue(matching[:120], PAYOFF_CUES):
         score += 0.2
     if proposal.duration <= 60:
         score += 0.1

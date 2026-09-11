@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.candidates import executor as executor_module
 from app.candidates import service as service_module
+from app.candidates.classification import classify_content
 from app.candidates.executor import CandidateAnalysisCancelled, CandidateAnalysisExecutor
 from app.candidates.hooks import generate_hooks, validate_provider_hooks
 from app.candidates.policy import DEFAULT_CONFIG, Stage3Config
@@ -28,7 +29,8 @@ from app.candidates.providers import (
     parse_semantic_entries,
 )
 from app.candidates.service import CandidateAnalysisService, derive_risks
-from app.candidates.types import HookRecord, Proposal
+from app.candidates.text import contains_cue, matching_text
+from app.candidates.types import CandidateAnalysisOutcome, HookRecord, Proposal
 from app.core.enums import (
     CandidateDisposition,
     ContentType,
@@ -253,10 +255,12 @@ class FakeProvider:
         error: SemanticProviderError | None = None,
         on_call: object = None,
         synthesize: bool = False,
+        partial: int = 0,
     ) -> None:
         self._results = dict(results or {})
         self._error = error
         self._synthesize = synthesize
+        self._partial = partial
         self.calls: list[list[str]] = []
         self.released = False
         self._on_call = on_call
@@ -271,8 +275,9 @@ class FakeProvider:
         if self._error is not None:
             self.rate_limited = self._error.category is ProviderErrorCategory.RATE_LIMITED
             raise self._error
-        if self._synthesize:
-            return {request.candidate_key: _expected(request.candidate_key) for request in requests}
+        if self._synthesize or self._partial:
+            selected = list(requests)[self._partial :]
+            return {request.candidate_key: _expected(request.candidate_key) for request in selected}
         return {
             request.candidate_key: self._results[request.candidate_key]
             for request in requests
@@ -1065,3 +1070,358 @@ def test_runner_cancelled_job_does_not_advance_source(session: Session) -> None:
     assert run is not None and run.status is PipelineRunStatus.CANCELLED
     session.refresh(source)
     assert source.lifecycle_state is PipelineStage.READY_FOR_ANALYSIS
+
+
+# finalization remediation
+
+
+class ZeroAdjustmentProvider:
+    """Peer of FakeProvider returning accepted evaluations with no score change."""
+
+    provider_name = "fake"
+    model = "fake-model-1"
+
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+        self.released = False
+
+    def evaluate(
+        self, requests: Sequence[SemanticEvaluationRequest]
+    ) -> dict[str, SemanticEvaluationResult]:
+        self.calls.append([request.candidate_key for request in requests])
+        return {
+            request.candidate_key: SemanticEvaluationResult(
+                candidate_key=request.candidate_key,
+                primary_content_type=None,
+                secondary_content_types=(),
+                score_adjustments={},
+                idea_summary="",
+                topic_summary="",
+                hooks=(),
+                confidence=0.6,
+                explanation="",
+            )
+            for request in requests
+        }
+
+    def release(self) -> None:
+        self.released = True
+
+    def runtime_identity(self) -> dict[str, object]:
+        return {"provider": "fake", "model": self.model, "digest": "digest", "temperature": 0.0}
+
+    def refresh_runtime_identity(self) -> dict[str, object]:
+        return self.runtime_identity()
+
+    def usage_summary(self) -> dict[str, int]:
+        return {}
+
+
+def _analyze(
+    segments: Sequence[Mapping[str, object]], **overrides: object
+) -> CandidateAnalysisOutcome:
+    return CandidateAnalysisService(config=_config(**overrides)).analyze(
+        source_id="source-1",
+        segments=segments,
+        duration=float(segments[-1]["end"]),  # type: ignore[arg-type]
+        language="ar",
+        dialect_profile="EGYPTIAN",
+        dialect_confidence=0.9,
+    )
+
+
+def test_index_deferred_candidate_keeps_content_score_and_refinement_status() -> None:
+    clean = _analyze(_transcript_segments(_GOOD))
+    deferred = _analyze(
+        _transcript_segments(
+            _GOOD,
+            status="LOW_CONFIDENCE_UNRESOLVED",
+            method="index_deferred",
+            needs_refinement=True,
+        )
+    )
+    clean_scores = {draft.candidate_key: draft.scores.clip_score for draft in clean.candidates}
+    assert clean_scores and deferred.candidates
+    for draft in deferred.candidates:
+        assert draft.scores.clip_score == pytest.approx(clean_scores[draft.candidate_key])
+    assert any(
+        draft.disposition is CandidateDisposition.CANDIDATE_NEEDS_REFINEMENT
+        for draft in deferred.candidates
+    )
+    assert any(
+        RefinementReason.UNRESOLVED_INDEX_TEXT in draft.refinement_reasons
+        for draft in deferred.candidates
+    )
+
+
+def test_low_transcript_confidence_preserves_content_score_and_retention() -> None:
+    clean = _analyze(_transcript_segments(_GOOD, probability=0.97))
+    low = _analyze(_transcript_segments(_GOOD, probability=0.05))
+    clean_scores = {draft.candidate_key: draft.scores.clip_score for draft in clean.candidates}
+    assert low.candidates
+    for draft in low.candidates:
+        assert draft.scores.clip_score == pytest.approx(clean_scores[draft.candidate_key])
+    assert any(draft.disposition in _RETAINED for draft in low.candidates)
+    assert any(draft.scores.transcript_confidence < 0.55 for draft in low.candidates)
+
+
+def test_provider_zero_adjustments_preserve_deterministic_clip_score() -> None:
+    segments = _transcript_segments(_GOOD)
+    deterministic = _analyze(segments)
+    provider = ZeroAdjustmentProvider()
+    enriched = CandidateAnalysisService(
+        config=_config(), provider=provider, mode=SemanticProviderMode.ADAPTIVE
+    ).analyze(
+        source_id="source-1",
+        segments=segments,
+        duration=36.0,
+        language="ar",
+        dialect_profile="EGYPTIAN",
+        dialect_confidence=0.9,
+    )
+    assert provider.calls
+    baseline = {draft.candidate_key: draft.scores.clip_score for draft in deterministic.candidates}
+    for draft in enriched.candidates:
+        assert draft.scores.clip_score == pytest.approx(baseline[draft.candidate_key])
+
+
+def test_partial_provider_output_is_retryable_and_reuses_accepted(session: Session) -> None:
+    source = _make_source(session, _transcript_segments(_GOOD))
+    first = FakeProvider(partial=1)
+    _executor(session, provider=first, mode=SemanticProviderMode.ADAPTIVE).execute(source)
+    analysis = session.scalar(
+        select(CandidateAnalysis).where(CandidateAnalysis.source_video_id == source.id)
+    )
+    assert analysis is not None
+    assert analysis.cache_eligible is False
+    assert analysis.provider_status == "PROVIDER_PARTIAL"
+    assert int(analysis.metrics.get("provider_malformed_items", 0) or 0) >= 1
+
+    rows = {
+        row.candidate_key: row
+        for row in session.scalars(
+            select(ClipCandidate).where(ClipCandidate.source_video_id == source.id)
+        )
+    }
+    accepted = {
+        key for key, row in rows.items() if (row.provider_evidence or {}).get("accepted") is True
+    }
+    requested_first = {key for call in first.calls for key in call}
+    missing = requested_first - accepted
+    assert accepted and missing
+
+    second = FakeProvider(synthesize=True)
+    _executor(session, provider=second, mode=SemanticProviderMode.ADAPTIVE).execute(
+        source, force=True
+    )
+    requested_second = {key for call in second.calls for key in call}
+    assert requested_second == missing
+    assert not (requested_second & accepted)
+    session.refresh(analysis)
+    assert analysis.cache_eligible is True
+    assert analysis.provider_status == "PROVIDER_EVALUATED"
+
+
+def test_no_provider_call_for_clearly_redundant_candidates(session: Session) -> None:
+    repeated = "الفكرة دي بتتكرر هنا بنفس الكلمات بالظبط في كل مرة."
+    segments = _transcript_segments([repeated] * 6, per_segment=30.0)
+    source = _make_source(session, segments)
+    provider = FakeProvider(synthesize=True)
+    _executor(session, provider=provider, mode=SemanticProviderMode.ADAPTIVE).execute(source)
+    rows = {
+        row.candidate_key: row
+        for row in session.scalars(
+            select(ClipCandidate).where(ClipCandidate.source_video_id == source.id)
+        )
+    }
+    assert any(
+        row.disposition is CandidateDisposition.DO_NOT_CLIP_RECENTLY_REDUNDANT
+        for row in rows.values()
+    )
+    requested = {key for call in provider.calls for key in call}
+    assert requested
+    for key in requested:
+        assert rows[key].disposition is not CandidateDisposition.DO_NOT_CLIP_RECENTLY_REDUNDANT
+
+
+def test_provider_summaries_can_drive_post_enrichment_novelty(session: Session) -> None:
+    sentences = [
+        "دراسة جديدة بتقول ان النوم الكافي بيحسن الذاكرة، دي معلومة غريبة ومفاجأة كبيرة.",
+        "البورصة ارتفعت النهاردة بسبب اخبار الشركات، دي معلومة غريبة ومفاجأة كبيرة.",
+    ]
+    segments = _transcript_segments(sentences, per_segment=55.0)
+    deterministic = _analyze(segments)
+    assert not any(
+        draft.disposition is CandidateDisposition.DO_NOT_CLIP_RECENTLY_REDUNDANT
+        for draft in deterministic.candidates
+    )
+
+    source = _make_source(session, segments)
+    provider = FakeProvider(synthesize=True)  # identical idea/topic summaries
+    _executor(session, provider=provider, mode=SemanticProviderMode.ADAPTIVE).execute(source)
+    assert provider.calls
+    rows = list(
+        session.scalars(select(ClipCandidate).where(ClipCandidate.source_video_id == source.id))
+    )
+    assert any(
+        row.disposition is CandidateDisposition.DO_NOT_CLIP_RECENTLY_REDUNDANT for row in rows
+    )
+
+
+def test_oversized_segment_is_split_into_bounded_stable_candidates(session: Session) -> None:
+    phrase = "معلومة غريبة ومفاجأة كبيرة، وفي الآخر النتيجة طلعت مفاجأة."
+    long_text = " ".join([phrase] * 12)
+    source = _make_source(
+        session,
+        _transcript_segments([long_text], per_segment=300.0),
+        duration=300.0,
+    )
+    executor = _executor(session, config=_config(max_window_seconds=90.0))
+    executor.execute(source)
+    rows = list(
+        session.scalars(select(ClipCandidate).where(ClipCandidate.source_video_id == source.id))
+    )
+    assert len(rows) >= 2
+    assert len({row.candidate_key for row in rows}) == len(rows)
+    for row in rows:
+        assert row.end_time - row.start_time <= 90.0 + 1e-6
+        assert 0.0 <= row.start_time < row.end_time <= 300.0
+    first_ids = {row.candidate_key: row.id for row in rows}
+    executor.execute(source, force=True)
+    rerun = list(
+        session.scalars(select(ClipCandidate).where(ClipCandidate.source_video_id == source.id))
+    )
+    assert {row.candidate_key for row in rerun} == set(first_ids)
+    assert {row.candidate_key: row.id for row in rerun} == first_ids
+
+
+def test_candidate_bounds_never_exceed_source_duration(session: Session) -> None:
+    phrase = "معلومة غريبة ومفاجأة كبيرة جدا، والنتيجة طلعت مفاجأة."
+    source = _make_source(
+        session,
+        _transcript_segments([" ".join([phrase] * 10)], per_segment=240.0),
+        duration=240.0,
+    )
+    _executor(session, config=_config(max_window_seconds=60.0)).execute(source)
+    rows = list(
+        session.scalars(select(ClipCandidate).where(ClipCandidate.source_video_id == source.id))
+    )
+    assert rows
+    for row in rows:
+        assert row.start_time >= 0.0
+        assert row.end_time <= 240.0
+
+
+def test_new_output_affecting_config_and_mode_change_input_fingerprint(session: Session) -> None:
+    source = _make_source(session, _transcript_segments(_GOOD))
+    baseline = _executor(session).input_fingerprint(source)
+    for override in (
+        {"novelty_corpus_limit": 123},
+        {"provider_context_characters": 99},
+        {"provenance_max_keys": 5},
+        {"provenance_max_value_length": 10},
+        {"provider_max_input_characters": 111},
+    ):
+        candidate = _executor(session, config=_config(**override)).input_fingerprint(source)
+        assert candidate != baseline, override
+    adaptive = _executor(session, mode=SemanticProviderMode.ADAPTIVE).input_fingerprint(source)
+    assert adaptive != baseline
+
+
+def test_output_fingerprint_tracks_candidate_content_changes() -> None:
+    first = _analyze(_transcript_segments(_GOOD))
+    second = _analyze(_transcript_segments(_GOOD))
+    assert first.output_fingerprint == second.output_fingerprint
+    provider = FakeProvider(synthesize=True)
+    enriched = CandidateAnalysisService(
+        config=_config(), provider=provider, mode=SemanticProviderMode.ADAPTIVE
+    ).analyze(
+        source_id="source-1",
+        segments=_transcript_segments(_GOOD),
+        duration=36.0,
+        language="ar",
+        dialect_profile="EGYPTIAN",
+        dialect_confidence=0.9,
+    )
+    assert enriched.output_fingerprint != first.output_fingerprint
+
+
+def test_english_capitalization_is_equivalent_for_deterministic_analysis() -> None:
+    upper = classify_content("How To Learn Python Fast", config=_config())
+    lower = classify_content("how to learn python fast", config=_config())
+    assert upper.primary is lower.primary
+    assert upper.primary is ContentType.EDUCATIONAL
+    assert upper.scores == lower.scores
+
+
+def test_arabic_diacritics_and_alif_variants_match_without_changing_stored_text(
+    session: Session,
+) -> None:
+    decorated = "الفَرْق بَيــن الصِيام والصَلاة واضح جدا."
+    plain = "الفرق بين الصيام والصلاة واضح جدا."
+    assert matching_text(decorated) == matching_text(plain)
+    assert contains_cue(matching_text(decorated), "الفرق بين")
+    classified = classify_content(decorated, config=_config())
+    assert classified.primary is ContentType.EDUCATIONAL
+
+    source = _make_source(session, _transcript_segments([decorated], per_segment=40.0))
+    _executor(session).execute(source)
+    candidate = session.scalar(
+        select(ClipCandidate).where(ClipCandidate.source_video_id == source.id)
+    )
+    assert candidate is not None
+    assert decorated in candidate.transcript_excerpt
+
+
+_DIALECT_FIXTURES = {
+    "egyptian": "أنا مش مصدق إزاي ده حصل، المعلومة غريبة ومفاجأة، وفي الآخر طلعت مفاجأة كبيرة.",
+    "gulf_saudi": "والله المعلومة هذي غريبة ومفاجأة، وفي الآخر طلعت النتيجة مفاجأة كبيرة.",
+    "levantine": "صراحة صار معي شي غريب ومفاجأة، وفي الآخر طلع الحل مفاجأة.",
+    "msa": "الحقيقة أن هذه المعلومة غريبة ومفاجأة، وفي الآخر كانت النتيجة مفاجأة كبيرة.",
+    "english": (
+        "The truth is this surprising fact is unbelievable, and in the end the result "
+        "turned out to be a huge surprise."
+    ),
+}
+
+
+def test_dialect_fixtures_reach_bounded_shortlist_with_no_provider_calls(
+    session: Session,
+) -> None:
+    for name, text in _DIALECT_FIXTURES.items():
+        source = _make_source(session, _transcript_segments([text], per_segment=55.0))
+        executor = _executor(session)
+        executor.execute(source)
+        rows = list(
+            session.scalars(select(ClipCandidate).where(ClipCandidate.source_video_id == source.id))
+        )
+        analysis = session.scalar(
+            select(CandidateAnalysis).where(CandidateAnalysis.source_video_id == source.id)
+        )
+        assert any(row.disposition in _RETAINED for row in rows), name
+        assert analysis is not None
+        assert analysis.metrics.get("provider_calls") == 0, name
+        assert analysis.semantic_provider_mode is SemanticProviderMode.DETERMINISTIC, name
+
+
+def test_code_switch_tokens_preserved_in_excerpt_evidence_and_hooks(session: Session) -> None:
+    text = "بنستخدم machine learning و AI في التحليل، والنتيجة كانت مفاجأة كبيرة."
+    segments = _transcript_segments([text], per_segment=40.0)
+    segments[0]["code_switch_suspected"] = True
+    segments[0]["code_switch_tokens"] = ["machine", "learning", "AI"]
+    source = _make_source(session, segments)
+    _executor(session).execute(source)
+    candidate = session.scalar(
+        select(ClipCandidate).where(ClipCandidate.source_video_id == source.id)
+    )
+    assert candidate is not None
+    assert "machine learning" in candidate.transcript_excerpt
+    assert "AI" in candidate.transcript_excerpt
+    assert candidate.code_switch_suspected is True
+    tokens = {
+        str(token).casefold() for token in candidate.evidence_snapshot.get("code_switch_tokens", [])
+    }
+    assert {"machine", "learning", "ai"} <= tokens
+    for hook in candidate.hooks:
+        if hook.get("text"):
+            assert hook["text"] in candidate.transcript_excerpt

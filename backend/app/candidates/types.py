@@ -27,6 +27,8 @@ class Proposal:
     text: str
     boundary_reason: str
     segment_indexes: tuple[int, ...]
+    span_start: int = 0
+    span_end: int = 0
 
     @property
     def duration(self) -> float:
@@ -64,6 +66,7 @@ class CandidateScores:
     boredom_risk_score: float
     ending_quality_score: float
     loopability_score: float
+    word_density: float
     engagement_confidence: float
     transcript_confidence: float
     audio_confidence: float

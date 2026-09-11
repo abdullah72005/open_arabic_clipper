@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections.abc import Mapping, Sequence
+from functools import lru_cache
 
 from app.transcription.dialect import extract_protected_tokens
 
@@ -165,12 +167,47 @@ def is_question(text: str) -> bool:
 
 
 def has_any(text: str, cues: Sequence[str]) -> bool:
-    padded = f" {text} "
-    return any(cue in padded or cue in text for cue in cues)
+    matching = matching_text(text)
+    return contains_any_cue(matching, cues)
 
 
 def normalize_arabic(text: str) -> str:
     return text.translate(_ARABIC_NORMALIZE)
+
+
+def matching_text(text: str) -> str:
+    """Analysis-only normalized matching view for deterministic cue detection.
+
+    This never replaces stored transcript text, corrected/final text, timestamps,
+    numbers, names, URLs, technical forms, protected code-switch tokens, or hook
+    display text. It normalizes Unicode safely, case-folds Latin text, removes
+    Arabic diacritics and tatweel, and conservatively unifies common alif/ya
+    variants so cue matching is robust to orthographic variation.
+    """
+
+    if not text:
+        return ""
+    normalized = unicodedata.normalize("NFKC", text)
+    normalized = _ARABIC_DIACRITICS.sub("", normalized)
+    normalized = normalize_arabic(normalized)
+    return normalized.casefold()
+
+
+@lru_cache(maxsize=8192)
+def normalized_cue(cue: str) -> str:
+    """Cache the matching view of a fixed cue string (pure function of the cue)."""
+
+    return matching_text(cue)
+
+
+def contains_cue(matching: str, cue: str) -> bool:
+    """Cue membership against a precomputed :func:`matching_text` view."""
+
+    return normalized_cue(cue) in matching
+
+
+def contains_any_cue(matching: str, cues: Sequence[str]) -> bool:
+    return any(normalized_cue(cue) in matching for cue in cues)
 
 
 def tokenize(text: str) -> list[str]:

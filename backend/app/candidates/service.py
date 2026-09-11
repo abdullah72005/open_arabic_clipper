@@ -6,6 +6,7 @@ import math
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
+from enum import Enum
 from typing import Callable
 
 from app.candidates.classification import classify_content
@@ -18,7 +19,7 @@ from app.candidates.fingerprints import (
     stage3_policy_payload,
 )
 from app.candidates.hooks import generate_hooks
-from app.candidates.novelty import NoveltyItem, score_novelty
+from app.candidates.novelty import NoveltyItem, idea_signature, score_novelty, topic_signature
 from app.candidates.policy import DEFAULT_CONFIG, Stage3Config
 from app.candidates.proposals import generate_proposals
 from app.candidates.providers import (
@@ -176,6 +177,8 @@ class CandidateAnalysisService:
             reuse=reuse or {},
         )
         self._check_cancelled()
+        drafts = self._apply_post_provider_novelty(drafts, historical_corpus)
+        self._check_cancelled()
         drafts = self._finalize(drafts)
         self._check_cancelled()
         metrics = self._metrics(proposals, drafts, provider_metrics, time.monotonic() - started)
@@ -218,6 +221,8 @@ class CandidateAnalysisService:
                 source_id=source_id,
                 start_segment_index=proposal.start_segment_index,
                 end_segment_index=proposal.end_segment_index,
+                span_start=proposal.span_start,
+                span_end=proposal.span_end,
             ),
             proposal=proposal,
             content=classification,
@@ -278,6 +283,46 @@ class CandidateAnalysisService:
             )
         return updated
 
+    def _apply_post_provider_novelty(
+        self, drafts: list[CandidateDraft], historical_corpus: Sequence[NoveltyItem]
+    ) -> list[CandidateDraft]:
+        """Two-phase novelty: deterministic first pass, then improved summaries.
+
+        Provider-enriched summaries may refine novelty/disposition for eligible
+        retained candidates. A candidate already marked clearly redundant stays
+        redundant, and provider enrichment never revives a weak candidate.
+        """
+
+        if not any(draft.provider_evidence.get("accepted") is True for draft in drafts):
+            return drafts
+        items = [
+            NoveltyItem(
+                key=draft.candidate_key,
+                source_id="",
+                idea_text=draft.idea_summary,
+                topic_text=draft.topic_summary,
+                clip_score=draft.scores.clip_score,
+            )
+            for draft in drafts
+        ]
+        results = score_novelty(items, historical_corpus, config=self._config)
+        updated: list[CandidateDraft] = []
+        for draft, novelty in zip(drafts, results):
+            if draft.disposition is CandidateDisposition.DO_NOT_CLIP_RECENTLY_REDUNDANT:
+                updated.append(draft)
+                continue
+            scores = replace(
+                draft.scores,
+                idea_novelty_score=novelty.idea_novelty_score,
+                topic_novelty_score=novelty.topic_novelty_score,
+                recent_semantic_similarity_risk=novelty.recent_semantic_similarity_risk,
+            )
+            disposition: CandidateDisposition = draft.disposition
+            if novelty.redundant and draft.scores.clip_score >= self._config.retention_threshold:
+                disposition = CandidateDisposition.DO_NOT_CLIP_RECENTLY_REDUNDANT
+            updated.append(replace(draft, scores=scores, disposition=disposition))
+        return updated
+
     # ------------------------------------------------------------------
     # provider phase
 
@@ -336,10 +381,22 @@ class CandidateAnalysisService:
                 metrics["provider_candidates_evaluated"] = _as_int(
                     metrics.get("provider_candidates_evaluated")
                 ) + len(requests)
-                malformed = len(requests) - len(results)
-                metrics["provider_malformed_items"] = (
-                    _as_int(metrics.get("provider_malformed_items")) + malformed
-                )
+                missing = [
+                    request.candidate_key
+                    for request in requests
+                    if request.candidate_key not in results
+                ]
+                if missing:
+                    # Any requested candidate lacking a valid accepted result makes
+                    # the run non-cache-eligible; a later rerun retries only the
+                    # missing evaluations whose provider input fingerprint matches,
+                    # while accepted evaluations remain reusable.
+                    metrics["provider_malformed_items"] = _as_int(
+                        metrics.get("provider_malformed_items")
+                    ) + len(missing)
+                    cache_eligible = False
+                    if status == "PROVIDER_EVALUATED":
+                        status = "PROVIDER_PARTIAL"
                 self._apply_provider_results(drafts, batch, results, requests, dialect_profile)
             except SemanticProviderError as error:
                 calls += 1
@@ -396,6 +453,7 @@ class CandidateAnalysisService:
             for index, draft in enumerate(drafts)
             if draft.scores.clip_score >= self._config.conflict_retention_threshold
             and draft.provider_evidence.get("accepted") is not True
+            and draft.disposition is not CandidateDisposition.DO_NOT_CLIP_RECENTLY_REDUNDANT
         ]
         indexed.sort(key=lambda index: (-drafts[index].scores.clip_score, index))
         return indexed
@@ -630,14 +688,51 @@ class CandidateAnalysisService:
         }
 
     def _candidate_payload(self, draft: CandidateDraft) -> dict[str, object]:
+        """Complete stable persisted-candidate representation for output identity."""
+
+        scores = draft.scores
         return {
             "candidate_key": draft.candidate_key,
             "start_segment_index": draft.proposal.start_segment_index,
             "end_segment_index": draft.proposal.end_segment_index,
+            "segment_indexes": list(draft.proposal.segment_indexes),
+            "span_start": draft.proposal.span_start,
+            "span_end": draft.proposal.span_end,
+            "start_time": round(draft.proposal.start_time, 6),
+            "end_time": round(draft.proposal.end_time, 6),
+            "boundary_reason": draft.proposal.boundary_reason,
             "disposition": draft.disposition.value,
-            "clip_score": round(draft.scores.clip_score, 6),
-            "provider_input_fingerprint": draft.provider_input_fingerprint,
+            "clip_score": round(scores.clip_score, 6),
+            "short_form_score": round(scores.short_form_score, 6),
+            "moment_density_score": round(scores.moment_density_score, 6),
+            "boredom_risk_score": round(scores.boredom_risk_score, 6),
+            "ending_quality_score": round(scores.ending_quality_score, 6),
+            "loopability_score": round(scores.loopability_score, 6),
+            "engagement_confidence": round(scores.engagement_confidence, 6),
+            "transcript_confidence": round(scores.transcript_confidence, 6),
+            "audio_confidence": round(scores.audio_confidence, 6),
+            "boundary_confidence": round(scores.boundary_confidence, 6),
+            "uncertainty_severity": round(scores.uncertainty_severity, 6),
+            "idea_novelty_score": round(scores.idea_novelty_score, 6),
+            "topic_novelty_score": round(scores.topic_novelty_score, 6),
+            "recent_semantic_similarity_risk": round(scores.recent_semantic_similarity_risk, 6),
+            "primary_content_type": draft.content.primary.value,
+            "secondary_content_types": [item.value for item in draft.content.secondary],
+            "refinement_reasons": [reason.value for reason in draft.refinement_reasons],
+            "refinement_evidence": _stable_value(draft.refinement_evidence),
+            "rights_risk": draft.rights_risk.value,
+            "originality_risk": draft.originality_risk.value,
+            "provenance_snapshot": _stable_value(draft.provenance_snapshot),
+            "dialect_profile": draft.dialect_profile,
+            "dialect_confidence": round(draft.dialect_confidence, 6),
+            "code_switch_suspected": draft.code_switch_suspected,
             "hooks": [hook.as_dict() for hook in draft.hooks],
+            "idea_summary": draft.idea_summary,
+            "topic_summary": draft.topic_summary,
+            "idea_signature": idea_signature(draft.idea_summary or draft.transcript_excerpt),
+            "topic_signature": topic_signature(draft.topic_summary or draft.transcript_excerpt),
+            "provider_evidence": _stable_value(draft.provider_evidence),
+            "provider_input_fingerprint": draft.provider_input_fingerprint,
         }
 
     def _evidence_snapshot(
@@ -651,6 +746,8 @@ class CandidateAnalysisService:
             "start_segment_index": proposal.start_segment_index,
             "end_segment_index": proposal.end_segment_index,
             "segment_count": len(proposal.segment_indexes),
+            "span_start": proposal.span_start,
+            "span_end": proposal.span_end,
             "low_confidence_spans": list(uncertainty.low_confidence_spans[:20]),
             "unresolved_segment_indexes": list(uncertainty.unresolved_segment_indexes[:50]),
             "protected_tokens": list(uncertainty.protected_tokens[:20]),
@@ -740,6 +837,18 @@ def _clamp(value: float) -> float:
     return max(0.0, min(1.0, value))
 
 
+def _stable_value(value: object) -> object:
+    """Recursively normalize a payload to JSON-stable primitives."""
+
+    if isinstance(value, Mapping):
+        return {str(key): _stable_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_stable_value(item) for item in value]
+    if isinstance(value, Enum):
+        return value.value
+    return value
+
+
 def build_input_fingerprint_payload(
     *,
     source_id: str,
@@ -765,6 +874,7 @@ def build_input_fingerprint_payload(
     quality_input_fingerprint: str,
     config: Stage3Config,
     provider_identity: Mapping[str, object],
+    semantic_provider_mode: str,
     novelty_digest: str,
 ) -> str:
     """Build the complete stable Stage 3 input dependency payload."""
@@ -819,6 +929,7 @@ def build_input_fingerprint_payload(
             "policy": stage3_policy_payload(),
             "config": stage3_config_payload(config),
             "provider_identity": dict(provider_identity),
+            "semantic_provider_mode": semantic_provider_mode,
             "novelty_digest": novelty_digest,
         }
     )

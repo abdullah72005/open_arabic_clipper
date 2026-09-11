@@ -13,7 +13,7 @@ from app.candidates.cues import (
     SEARCH_LED_CUES,
 )
 from app.candidates.policy import DEFAULT_CONFIG, Stage3Config
-from app.candidates.text import is_question
+from app.candidates.text import contains_any_cue, contains_cue, is_question, matching_text
 from app.candidates.types import HookRecord, Proposal
 from app.core.enums import ContentType, HookOrigin, HookType
 from app.transcription.dialect import extract_protected_tokens
@@ -30,20 +30,21 @@ def generate_hooks(
     """Deterministic, source-faithful hooks; never invents marketing claims."""
 
     text = proposal.text
+    matching = matching_text(text)
     preferred: list[HookType] = []
-    if is_question(text):
+    if is_question(text) or "?" in matching or "؟" in matching:
         preferred.append(HookType.QUESTION)
-    if any(cue in text for cue in CONTRAST_CUES):
+    if contains_any_cue(matching, CONTRAST_CUES):
         preferred.append(HookType.CONTRADICTION)
-    if any(cue in text for cue in CONTENT_CUES[ContentType.EMOTIONAL]):
+    if contains_any_cue(matching, CONTENT_CUES[ContentType.EMOTIONAL]):
         preferred.append(HookType.EMOTIONAL)
-    if any(cue in text for cue in PAYOFF_CUES):
+    if contains_any_cue(matching, PAYOFF_CUES):
         preferred.append(HookType.PAYOFF_FIRST)
-    if any(cue in text for cue in SEARCH_LED_CUES):
+    if contains_any_cue(matching, SEARCH_LED_CUES):
         preferred.append(HookType.SEARCH_LED)
-    if any(cue in text for cue in HOOK_DIRECTION_CUES[HookType.CURIOSITY]):
+    if contains_any_cue(matching, HOOK_DIRECTION_CUES[HookType.CURIOSITY]):
         preferred.append(HookType.CURIOSITY)
-    if any(cue in text for cue in HOOK_DIRECTION_CUES[HookType.DIRECT_CLAIM]):
+    if contains_any_cue(matching, HOOK_DIRECTION_CUES[HookType.DIRECT_CLAIM]):
         preferred.append(HookType.DIRECT_CLAIM)
     preferred.append(HookType.CONTEXTUAL)
 
@@ -115,23 +116,23 @@ def _hook_evidence(hook_type: HookType, proposal: Proposal) -> tuple[str, tuple[
                 return sentence, proposal.segment_indexes
     if hook_type is HookType.CONTRADICTION:
         for sentence in sentences:
-            if any(cue in sentence for cue in CONTRAST_CUES):
+            if contains_any_cue(matching_text(sentence), CONTRAST_CUES):
                 return sentence, proposal.segment_indexes
     if hook_type is HookType.PAYOFF_FIRST:
         for sentence in sentences:
-            if any(cue in sentence for cue in PAYOFF_CUES):
+            if contains_any_cue(matching_text(sentence), PAYOFF_CUES):
                 return sentence, proposal.segment_indexes
     if hook_type is HookType.SEARCH_LED:
         for sentence in sentences:
-            if any(cue in sentence for cue in SEARCH_LED_CUES):
+            if contains_any_cue(matching_text(sentence), SEARCH_LED_CUES):
                 return sentence, proposal.segment_indexes
     if hook_type is HookType.EMOTIONAL:
         for sentence in sentences:
-            if any(cue in sentence for cue in CONTENT_CUES[ContentType.EMOTIONAL]):
+            if contains_any_cue(matching_text(sentence), CONTENT_CUES[ContentType.EMOTIONAL]):
                 return sentence, proposal.segment_indexes
     for cue in HOOK_DIRECTION_CUES.get(hook_type, ()):  # CURIOSITY/DIRECT_CLAIM
         for sentence in sentences:
-            if cue in sentence:
+            if contains_cue(matching_text(sentence), cue):
                 return sentence, proposal.segment_indexes
     return sentences[0], proposal.segment_indexes
 

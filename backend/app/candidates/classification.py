@@ -6,6 +6,7 @@ from collections.abc import Sequence
 
 from app.candidates.cues import CONTENT_CUES, PAYOFF_CUES, STORY_BUILDUP_CUES
 from app.candidates.policy import DEFAULT_CONFIG, Stage3Config
+from app.candidates.text import contains_any_cue, contains_cue, matching_text
 from app.candidates.types import ContentClassification
 from app.core.enums import ContentType
 
@@ -22,15 +23,16 @@ def classify_content(
     """Classify candidate text. Provider values may only be declared enum members."""
 
     scores: dict[str, float] = {}
+    matching = matching_text(text)
     for content_type, cues in CONTENT_CUES.items():
-        hits = sum(1 for cue in cues if cue in text)
+        hits = sum(1 for cue in cues if contains_cue(matching, cue))
         if hits:
             scores[content_type.value] = float(hits)
-    if "?" in text or "؟" in text:
+    if "?" in matching or "؟" in matching:
         scores.setdefault(ContentType.REACTION_WORTHY.value, 0.0)
-    if any(cue in text for cue in PAYOFF_CUES):
+    if contains_any_cue(matching, PAYOFF_CUES):
         scores[ContentType.STORY.value] = scores.get(ContentType.STORY.value, 0.0) + 0.5
-    if any(cue in text for cue in STORY_BUILDUP_CUES):
+    if contains_any_cue(matching, STORY_BUILDUP_CUES):
         scores[ContentType.STORY.value] = scores.get(ContentType.STORY.value, 0.0) + 0.5
 
     deterministic_primary, secondary = _select(scores, config)

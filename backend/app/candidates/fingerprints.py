@@ -20,10 +20,25 @@ from app.candidates.policy import (
 from app.pipeline.fingerprints import canonical_fingerprint
 
 
-def candidate_key(source_id: UUID | str, start_segment_index: int, end_segment_index: int) -> str:
-    """Deterministic candidate identity from source UUID + contiguous segment range."""
+def candidate_key(
+    source_id: UUID | str,
+    start_segment_index: int,
+    end_segment_index: int,
+    span_start: int | None = None,
+    span_end: int | None = None,
+) -> str:
+    """Deterministic candidate identity from source UUID + stable coarse span.
 
-    raw = f"{source_id}:{start_segment_index}:{end_segment_index}"
+    The span identity is the contiguous atom range within the deterministic atom
+    sequence. For non-split segments atom indexes align 1:1 with segment indexes,
+    and for oversized segments each bounded sub-window gets a distinct,
+    reproducible atom range, so multiple windows from one transcript segment
+    never collide.
+    """
+
+    start_span = start_segment_index if span_start is None else span_start
+    end_span = end_segment_index if span_end is None else span_end
+    raw = f"{source_id}:a{start_span}:a{end_span}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
@@ -78,15 +93,20 @@ def stage3_config_payload(config: Stage3Config) -> dict[str, object]:
         "uncertainty_severity_threshold": config.uncertainty_severity_threshold,
         "same_source_duplicate_threshold": config.same_source_duplicate_threshold,
         "cross_source_duplicate_threshold": config.cross_source_duplicate_threshold,
+        "novelty_corpus_limit": config.novelty_corpus_limit,
         "max_secondary_content_types": config.max_secondary_content_types,
         "max_provider_candidates": config.max_provider_candidates,
         "provider_candidates_per_request": config.provider_candidates_per_request,
         "max_provider_calls_per_source": config.max_provider_calls_per_source,
         "provider_max_input_characters": config.provider_max_input_characters,
         "provider_max_output_tokens": config.provider_max_output_tokens,
+        "provider_context_characters": config.provider_context_characters,
         "provider_temperature": config.provider_temperature,
         "max_hooks_per_candidate": config.max_hooks_per_candidate,
         "max_hook_characters": config.max_hook_characters,
+        "provenance_max_keys": config.provenance_max_keys,
+        "provenance_max_key_length": config.provenance_max_key_length,
+        "provenance_max_value_length": config.provenance_max_value_length,
     }
 
 

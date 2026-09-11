@@ -261,6 +261,17 @@ def upgrade() -> None:
 def downgrade() -> None:
     op.drop_table("clip_candidates")
     op.drop_table("candidate_analyses")
+    # Remove Stage-3-only history and map live source state back to the closest
+    # valid pre-Stage-3 lifecycle before narrowing any enum/check constraint.
+    # Pre-existing Stage 1/2/2.5/2.7/2.7.1 source/transcript/audio data is kept.
+    op.execute(
+        "DELETE FROM pipeline_runs WHERE stage IN ('CANDIDATE_ANALYSIS', 'READY_FOR_REFINEMENT')"
+    )
+    op.execute("DELETE FROM processing_jobs WHERE kind = 'CANDIDATE_ANALYSIS'")
+    op.execute(
+        "UPDATE source_videos SET lifecycle_state = 'READY_FOR_ANALYSIS' "
+        "WHERE lifecycle_state IN ('CANDIDATE_ANALYSIS', 'READY_FOR_REFINEMENT')"
+    )
     with op.batch_alter_table("pipeline_runs") as batch:
         batch.alter_column(
             "stage",

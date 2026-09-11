@@ -1,4 +1,12 @@
-"""Deterministic Arabic/English cue vocabularies for Stage 3 heuristics."""
+"""Deterministic Arabic/English cue vocabularies for Stage 3 heuristics.
+
+Deliberately small and maintainable: general discourse/structural signals with
+common Egyptian, Gulf/Saudi, Levantine, MSA/Fusha, and English surface variants.
+Matching runs against the analysis-only normalized view, so orthographic
+variants (diacritics, tatweel, alif/ya forms) match without altering stored text.
+This is not a dialect classifier, and source dialect is never treated as a target
+audience.
+"""
 
 from __future__ import annotations
 
@@ -12,20 +20,25 @@ CONTENT_CUES: dict[ContentType, tuple[str, ...]] = {
         "درس",
         "تعلم",
         "طريقة عمل",
+        "المفهوم",
         "how to",
         "learn",
         "meaning",
         "explain",
+        "the difference",
     ),
     ContentType.CONTROVERSIAL_OPINION: (
         "رايي",
         "بصراحة",
+        "الصراحة",
         "اعتقد",
         "الحقيقة",
         "غلط",
         "صح",
         "جدل",
         "in my opinion",
+        "honestly",
+        "i believe",
         "controversial",
         "i think",
         "wrong",
@@ -45,8 +58,11 @@ CONTENT_CUES: dict[ContentType, tuple[str, ...]] = {
         "مرة",
         "كان في",
         "قصة",
+        "حكاية",
         "احكي",
         "حصل",
+        "صار",
+        "لما",
         "story",
         "once",
         "happened",
@@ -57,10 +73,16 @@ CONTENT_CUES: dict[ContentType, tuple[str, ...]] = {
         "اول مرة",
         "عمرك",
         "غريب",
+        "عجيب",
         "مفاجأة",
+        "فاجأني",
+        "مش متوقع",
         "fact",
         "surprisingly",
+        "surprising",
         "actually",
+        "amazing",
+        "unbelievable",
         "no way",
     ),
     ContentType.EMOTIONAL: (
@@ -70,10 +92,14 @@ CONTENT_CUES: dict[ContentType, tuple[str, ...]] = {
         "خايف",
         "زعلان",
         "قلبي",
+        "فرحان",
+        "متحمس",
         "emotional",
         "sad",
         "cried",
         "love",
+        "heartbroken",
+        "excited",
     ),
     ContentType.NEWS_CURRENT_EVENT: (
         "النهاردة",
@@ -81,6 +107,7 @@ CONTENT_CUES: dict[ContentType, tuple[str, ...]] = {
         "اعلن",
         "اليوم",
         "عاجل",
+        "الان",
         "news",
         "breaking",
         "announced",
@@ -90,6 +117,7 @@ CONTENT_CUES: dict[ContentType, tuple[str, ...]] = {
         "سؤال",
         "اجابة",
         "قال لي",
+        "سألني",
         "interview",
         "asked",
         "explained to me",
@@ -108,6 +136,8 @@ CONTENT_CUES: dict[ContentType, tuple[str, ...]] = {
         "استمر",
         "نجاح",
         "متستسلمش",
+        "لا تستسلم",
+        "بتقدر",
         "motivation",
         "never give up",
         "keep going",
@@ -117,6 +147,7 @@ CONTENT_CUES: dict[ContentType, tuple[str, ...]] = {
         "خطوة",
         "طريقة",
         "اعمل",
+        "سوي",
         "how",
         "tutorial",
         "step",
@@ -127,6 +158,7 @@ CONTENT_CUES: dict[ContentType, tuple[str, ...]] = {
         "سبب",
         "لان",
         "نتيجة",
+        "السبب",
         "analysis",
         "because",
         "reason",
@@ -135,6 +167,7 @@ CONTENT_CUES: dict[ContentType, tuple[str, ...]] = {
     ContentType.REACTION_WORTHY: (
         "مفاجأة",
         "مش معقول",
+        "لا يعقل",
         "بجد",
         "wow",
         "no way",
@@ -151,6 +184,7 @@ FILLER_CUES: tuple[str, ...] = (
     "طيب",
     "المهم",
     "عموما",
+    "زائد",
     "umm",
     "uh",
     "erm",
@@ -161,21 +195,25 @@ FILLER_CUES: tuple[str, ...] = (
 
 PAYOFF_CUES: tuple[str, ...] = (
     "في الاخر",
+    "في الآخر",
     "النتيجة",
     "طلع",
     "اكتشف",
     "الحل",
+    "بالتالي",
     "ended up",
     "turns out",
     "the result",
     "in the end",
     "discovered",
+    "the solution",
 )
 
 STORY_BUILDUP_CUES: tuple[str, ...] = (
     "في يوم",
     "وبعدين",
     "لما",
+    "كان في",
     "once",
     "then",
     "suddenly",
@@ -187,10 +225,14 @@ CONTRAST_CUES: tuple[str, ...] = (
     "لكن",
     "رغم",
     "في الحقيقة",
+    "الصراحة",
+    "مع ذلك",
     "but",
     "however",
     "although",
     "actually",
+    "even though",
+    "on the other hand",
 )
 
 NUMBER_WORDS: tuple[str, ...] = (
@@ -200,7 +242,6 @@ NUMBER_WORDS: tuple[str, ...] = (
     "مية",
     "الف",
     "مليون",
-    "واحد",
     "two",
     "three",
     "hundred",
@@ -215,11 +256,16 @@ SEARCH_LED_CUES: tuple[str, ...] = (
     "ايه هي",
     "امتي",
     "فين",
+    "كيف",
+    "ما هو",
+    "ما هي",
+    "ليش",
     "how to",
     "what is",
     "when did",
     "where is",
     "why does",
+    "why do",
 )
 
 HOOK_DIRECTION_CUES: dict[HookType, tuple[str, ...]] = {
@@ -227,13 +273,22 @@ HOOK_DIRECTION_CUES: dict[HookType, tuple[str, ...]] = {
         "مش متوقع",
         "المفاجأة",
         "مكنتش اعرف",
+        "غريب",
+        "عجيب",
         "you won't believe",
         "surprising",
         "the secret",
     ),
     HookType.CONTRADICTION: CONTRAST_CUES,
     HookType.QUESTION: ("؟", "?"),
-    HookType.DIRECT_CLAIM: ("الحقيقة", "القاعدة", "السر", "the truth", "the rule"),
+    HookType.DIRECT_CLAIM: (
+        "الحقيقة",
+        "القاعدة",
+        "السر",
+        "الصراحة",
+        "the truth",
+        "the rule",
+    ),
     HookType.EMOTIONAL: CONTENT_CUES[ContentType.EMOTIONAL],
     HookType.PAYOFF_FIRST: PAYOFF_CUES,
     HookType.CONTEXTUAL: STORY_BUILDUP_CUES,
