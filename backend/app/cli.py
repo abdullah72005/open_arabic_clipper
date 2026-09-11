@@ -9,10 +9,10 @@ from uuid import UUID
 
 import typer
 
-from app.core.enums import JobKind, PipelineStage
+from app.core.enums import CandidateDisposition, JobKind, PipelineStage
 from app.core.settings import get_settings
 from app.db.session import create_session_factory
-from app.models import ProcessingJob, SourceVideo, Transcript
+from app.models import ClipCandidate, ProcessingJob, SourceVideo, Transcript
 from app.runtime.heavy_model_lease import HeavyModelLeaseBusy, HeavyModelUnsafe
 from app.runtime.memory import MemoryReadError, capture_memory
 from app.services.health import HealthService
@@ -209,6 +209,83 @@ def retranscribe(source_id: UUID, force: bool = typer.Option(True, "--force/--no
 def reconstruct(source_id: UUID, force: bool = typer.Option(False, "--force/--no-force")) -> None:
     """Queue bounded contextual reconstruction, reusing its current fingerprint by default."""
     typer.echo(str(_queue_reconstruction(source_id, force=force)))
+
+
+def _queue_candidate_analysis(source_id: UUID, *, force: bool) -> UUID:
+    with create_session_factory()() as session:
+        if session.get(SourceVideo, source_id) is None:
+            raise typer.BadParameter("source does not exist")
+        job = ProcessingJob(source_video_id=source_id, kind=JobKind.CANDIDATE_ANALYSIS)
+        session.add(job)
+        session.commit()
+        session.refresh(job)
+        job_id = job.id
+    run_pipeline_stage.delay(
+        str(source_id), PipelineStage.CANDIDATE_ANALYSIS.value, str(job_id), force
+    )
+    return job_id
+
+
+@app.command("candidate-analysis")
+def candidate_analysis(
+    source_id: UUID, force: bool = typer.Option(False, "--force/--no-force")
+) -> None:
+    """Queue bounded Stage 3 candidate analysis for a source."""
+
+    typer.echo(str(_queue_candidate_analysis(source_id, force=force)))
+
+
+@app.command("candidates")
+def candidates(
+    source_id: UUID,
+    limit: int = typer.Option(20, min=1, max=200),
+    include_rejected: bool = typer.Option(False, "--include-rejected/--accepted-only"),
+) -> None:
+    """Print bounded current candidate summaries for local inspection."""
+
+    with create_session_factory()() as session:
+        statement = (
+            session.query(ClipCandidate)
+            .filter(ClipCandidate.source_video_id == source_id)
+            .filter(ClipCandidate.is_current.is_(True))
+            .order_by(ClipCandidate.clip_score.desc())
+        )
+        if not include_rejected:
+            statement = statement.filter(
+                ClipCandidate.disposition.in_(
+                    [
+                        CandidateDisposition.CANDIDATE,
+                        CandidateDisposition.CANDIDATE_NEEDS_REFINEMENT,
+                    ]
+                )
+            )
+        rows = statement.limit(limit).all()
+        typer.echo(
+            json.dumps(
+                [
+                    {
+                        "id": str(row.id),
+                        "candidate_key": row.candidate_key,
+                        "disposition": row.disposition.value,
+                        "start_time": row.start_time,
+                        "end_time": row.end_time,
+                        "segment_indexes": [
+                            row.start_segment_index,
+                            row.end_segment_index,
+                        ],
+                        "clip_score": row.clip_score,
+                        "transcript_confidence": row.transcript_confidence,
+                        "primary_content_type": row.primary_content_type.value,
+                        "refinement_reasons": row.refinement_reasons,
+                        "rights_risk": row.rights_risk.value,
+                        "originality_risk": row.originality_risk.value,
+                        "excerpt": row.transcript_excerpt[:200],
+                    }
+                    for row in rows
+                ],
+                ensure_ascii=False,
+            )
+        )
 
 
 @app.command()

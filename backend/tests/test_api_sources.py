@@ -12,7 +12,7 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
 from app.api.app import CeleryDispatcher, create_app
-from app.core.enums import PipelineStage, ReconstructionStatus, RightsStatus
+from app.core.enums import MediaOriginType, PipelineStage, ReconstructionStatus, RightsStatus
 from app.db.base import Base
 from app.models import SourceQualityAssessment, SourceVideo, Transcript
 from app.services.storage import StorageService
@@ -154,7 +154,13 @@ def test_upload_reads_the_request_file_in_bounded_chunks(
 
     with session_factory() as database:
         response = route.endpoint(  # type: ignore[union-attr]
-            Response(), fake_upload, RightsStatus.OWNED, None, database
+            response=Response(),
+            file=fake_upload,
+            rights_status=RightsStatus.OWNED,
+            dialect_profile_override=None,
+            media_origin=MediaOriginType.OTHER,
+            provenance_metadata=None,
+            database=database,
         )
 
     assert response.rights_status is RightsStatus.OWNED

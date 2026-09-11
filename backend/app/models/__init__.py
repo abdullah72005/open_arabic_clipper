@@ -1,5 +1,7 @@
 from app.models.audio_analysis import AudioAnalysis
 from app.models.audio_artifact import AudioArtifact
+from app.models.candidate_analysis import CandidateAnalysis
+from app.models.clip_candidate import ClipCandidate
 from app.models.pipeline_run import PipelineRun
 from app.models.processing_job import ProcessingJob
 from app.models.source_quality_assessment import SourceQualityAssessment
@@ -10,6 +12,8 @@ from app.models.transcript_chunk import TranscriptChunk
 __all__ = [
     "AudioAnalysis",
     "AudioArtifact",
+    "CandidateAnalysis",
+    "ClipCandidate",
     "PipelineRun",
     "ProcessingJob",
     "SourceQualityAssessment",

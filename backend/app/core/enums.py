@@ -26,6 +26,8 @@ class PipelineStage(str, Enum):
     CONTEXTUAL_RECONSTRUCTION = "CONTEXTUAL_RECONSTRUCTION"
     AUDIO_ANALYSIS = "AUDIO_ANALYSIS"
     READY_FOR_ANALYSIS = "READY_FOR_ANALYSIS"
+    CANDIDATE_ANALYSIS = "CANDIDATE_ANALYSIS"
+    READY_FOR_REFINEMENT = "READY_FOR_REFINEMENT"
 
 
 class JobKind(str, Enum):
@@ -35,6 +37,7 @@ class JobKind(str, Enum):
     TRANSCRIPTION = "TRANSCRIPTION"
     RECONSTRUCTION = "RECONSTRUCTION"
     PROBE = "PROBE"
+    CANDIDATE_ANALYSIS = "CANDIDATE_ANALYSIS"
 
 
 class JobStatus(str, Enum):
@@ -89,3 +92,102 @@ class RefinementPriority(str, Enum):
     INDEX = "INDEX"
     CANDIDATE = "CANDIDATE"
     FINAL_CLIP = "FINAL_CLIP"
+
+
+class MediaOriginType(str, Enum):
+    """How the source material was originally produced.
+
+    ``OTHER`` is the truthful default: it means unclassified, never an
+    operator-declared ownership statement. Media origin is independent of
+    ``RightsStatus`` and never blocks local analysis.
+    """
+
+    YOUTUBE_CREATOR_VIDEO = "YOUTUBE_CREATOR_VIDEO"
+    PODCAST_INTERVIEW = "PODCAST_INTERVIEW"
+    MOVIE_TV = "MOVIE_TV"
+    NEWS_CLIP = "NEWS_CLIP"
+    SPORTS_BROADCAST = "SPORTS_BROADCAST"
+    OTHER = "OTHER"
+
+
+class ContentType(str, Enum):
+    """Small closed content ontology for coarse candidate classification."""
+
+    EDUCATIONAL = "EDUCATIONAL"
+    CONTROVERSIAL_OPINION = "CONTROVERSIAL_OPINION"
+    FUNNY = "FUNNY"
+    STORY = "STORY"
+    SURPRISING_FACT = "SURPRISING_FACT"
+    EMOTIONAL = "EMOTIONAL"
+    NEWS_CURRENT_EVENT = "NEWS_CURRENT_EVENT"
+    INTERVIEW_INSIGHT = "INTERVIEW_INSIGHT"
+    DEBATE = "DEBATE"
+    MOTIVATIONAL = "MOTIVATIONAL"
+    TUTORIAL = "TUTORIAL"
+    ANALYSIS = "ANALYSIS"
+    REACTION_WORTHY = "REACTION_WORTHY"
+    OTHER = "OTHER"
+
+
+class CandidateDisposition(str, Enum):
+    """What Stage 3 decided about a proposal."""
+
+    CANDIDATE = "CANDIDATE"
+    CANDIDATE_NEEDS_REFINEMENT = "CANDIDATE_NEEDS_REFINEMENT"
+    DO_NOT_CLIP = "DO_NOT_CLIP"
+    DO_NOT_CLIP_RECENTLY_REDUNDANT = "DO_NOT_CLIP_RECENTLY_REDUNDANT"
+
+
+class OriginalityRisk(str, Enum):
+    """Originality/transformation risk, orthogonal to rights risk."""
+
+    NOT_INDICATED = "NOT_INDICATED"
+    UNDETERMINED = "UNDETERMINED"
+    TRANSFORMATION_REQUIRED = "TRANSFORMATION_REQUIRED"
+
+
+class RightsRisk(str, Enum):
+    """Rights/provenance risk, orthogonal to originality risk."""
+
+    LOW = "LOW"
+    UNDETERMINED = "UNDETERMINED"
+    ELEVATED = "ELEVATED"
+
+
+class HookType(str, Enum):
+    """Supported short-form hook directions."""
+
+    CURIOSITY = "CURIOSITY"
+    CONTRADICTION = "CONTRADICTION"
+    QUESTION = "QUESTION"
+    DIRECT_CLAIM = "DIRECT_CLAIM"
+    EMOTIONAL = "EMOTIONAL"
+    PAYOFF_FIRST = "PAYOFF_FIRST"
+    CONTEXTUAL = "CONTEXTUAL"
+    SEARCH_LED = "SEARCH_LED"
+
+
+class HookOrigin(str, Enum):
+    """Whether a hook was derived deterministically or by a provider."""
+
+    DETERMINISTIC = "DETERMINISTIC"
+    PROVIDER = "PROVIDER"
+
+
+class SemanticProviderMode(str, Enum):
+    """Stage 3 semantic evaluation strategy."""
+
+    DETERMINISTIC = "deterministic"
+    ADAPTIVE = "adaptive"
+    LOCAL_ONLY = "local_only"
+
+
+class RefinementReason(str, Enum):
+    """Bounded reasons a promising candidate still needs Stage 3.5 work."""
+
+    LOW_TRANSCRIPT_CONFIDENCE = "LOW_TRANSCRIPT_CONFIDENCE"
+    UNRESOLVED_INDEX_TEXT = "UNRESOLVED_INDEX_TEXT"
+    LOW_CONFIDENCE_WORD_SPAN = "LOW_CONFIDENCE_WORD_SPAN"
+    CODE_SWITCH_UNCERTAINTY = "CODE_SWITCH_UNCERTAINTY"
+    PROTECTED_ENTITY_UNCERTAINTY = "PROTECTED_ENTITY_UNCERTAINTY"
+    LOW_BOUNDARY_CONFIDENCE = "LOW_BOUNDARY_CONFIDENCE"

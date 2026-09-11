@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import shutil
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from datetime import datetime
 from pathlib import Path
 from typing import Protocol
@@ -18,10 +19,23 @@ from pydantic import BaseModel, Field
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from app.core.enums import JobKind, JobStatus, PipelineStage, ReconstructionStatus, RightsStatus
+from app.core.enums import (
+    CandidateDisposition,
+    ContentType,
+    JobKind,
+    JobStatus,
+    MediaOriginType,
+    OriginalityRisk,
+    PipelineStage,
+    ReconstructionStatus,
+    RightsRisk,
+    RightsStatus,
+)
 from app.core.settings import get_settings
 from app.db.session import create_session_factory
 from app.models import (
+    CandidateAnalysis,
+    ClipCandidate,
     ProcessingJob,
     SourceQualityAssessment,
     SourceVideo,
@@ -55,6 +69,8 @@ class SourceURLRequest(BaseModel):
     url: str = Field(min_length=1, max_length=2048)
     rights_status: RightsStatus = RightsStatus.UNKNOWN
     dialect_profile_override: ArabicDialectProfile | None = None
+    media_origin: MediaOriginType = MediaOriginType.OTHER
+    provenance_metadata: dict[str, str] = Field(default_factory=dict)
 
 
 class SourceResponse(BaseModel):
@@ -63,10 +79,70 @@ class SourceResponse(BaseModel):
     original_filename: str | None
     dialect_profile_override: ArabicDialectProfile | None
     rights_status: RightsStatus
+    media_origin: MediaOriginType
+    provenance_metadata: dict[str, object]
     lifecycle_state: PipelineStage
     created_at: datetime
 
     model_config = {"from_attributes": True}
+
+
+class ProvenanceUpdateRequest(BaseModel):
+    rights_status: RightsStatus | None = None
+    media_origin: MediaOriginType | None = None
+    provenance_metadata: dict[str, str] | None = None
+
+
+class CandidateResponse(BaseModel):
+    id: UUID
+    source_video_id: UUID
+    candidate_key: str
+    is_current: bool
+    disposition: CandidateDisposition
+    start_time: float
+    end_time: float
+    start_segment_index: int
+    end_segment_index: int
+    segment_indexes: list[int]
+    transcript_excerpt: str
+    primary_content_type: ContentType
+    secondary_content_types: list[str]
+    clip_score: float
+    short_form_score: float
+    moment_density_score: float
+    boredom_risk_score: float
+    ending_quality_score: float
+    loopability_score: float
+    engagement_confidence: float
+    transcript_confidence: float
+    audio_confidence: float
+    boundary_confidence: float
+    uncertainty_severity: float
+    idea_novelty_score: float
+    topic_novelty_score: float
+    recent_semantic_similarity_risk: float
+    refinement_reasons: list[str]
+    refinement_evidence: dict[str, object]
+    rights_risk: RightsRisk
+    originality_risk: OriginalityRisk
+    dialect_profile: str | None
+    dialect_confidence: float
+    code_switch_suspected: bool
+    hooks: list[dict[str, object]]
+    idea_summary: str
+    topic_summary: str
+    provider_evidence: dict[str, object]
+    policy_version: str
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class CandidateAnalysisResponse(BaseModel):
+    provider_status: str
+    semantic_provider_mode: str
+    cache_eligible: bool
+    metrics: dict[str, object]
 
 
 class JobResponse(BaseModel):
@@ -194,8 +270,11 @@ def create_app(
         file: UploadFile = File(...),
         rights_status: RightsStatus = Form(RightsStatus.UNKNOWN),
         dialect_profile_override: ArabicDialectProfile | None = Form(None),
+        media_origin: MediaOriginType = Form(MediaOriginType.OTHER),
+        provenance_metadata: str | None = Form(None),
         database: Session = Depends(session),
     ) -> SourceResponse:
+        provenance = _parse_provenance_form(provenance_metadata)
         filename = _safe_filename(file.filename)
         temporary_path = storage_service.resolve(StorageCategory.TEMPORARY, f"upload-{uuid4()}.tmp")
         digest = hashlib.sha256()
@@ -229,6 +308,8 @@ def create_app(
                 content_hash=digest.hexdigest(),
                 dialect_profile_override=dialect_profile_override,
                 rights_status=rights_status,
+                media_origin=media_origin,
+                provenance_metadata=provenance,
             )
             database.add(source)
             database.flush()
@@ -260,6 +341,8 @@ def create_app(
             source_uri=normalized,
             dialect_profile_override=request.dialect_profile_override,
             rights_status=request.rights_status,
+            media_origin=request.media_origin,
+            provenance_metadata=_validate_provenance_metadata(request.provenance_metadata),
         )
         database.add(source)
         database.flush()
@@ -424,6 +507,109 @@ def create_app(
         )
         return JobResponse.model_validate(job)
 
+    @app.post(
+        "/api/sources/{source_id}/candidate-analysis",
+        response_model=JobResponse,
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    def queue_candidate_analysis(
+        source_id: UUID,
+        force: bool = False,
+        database: Session = Depends(session),
+    ) -> JobResponse:
+        """Queue Stage 3 candidate analysis without touching Stage 2 caches."""
+
+        _source_or_404(database, source_id)
+        job = ProcessingJob(source_video_id=source_id, kind=JobKind.CANDIDATE_ANALYSIS)
+        database.add(job)
+        database.commit()
+        database.refresh(job)
+        run_pipeline_stage.delay(
+            str(source_id), PipelineStage.CANDIDATE_ANALYSIS.value, str(job.id), force
+        )
+        return JobResponse.model_validate(job)
+
+    @app.get(
+        "/api/sources/{source_id}/candidate-analysis",
+        response_model=CandidateAnalysisResponse,
+    )
+    def get_candidate_analysis(
+        source_id: UUID, database: Session = Depends(session)
+    ) -> CandidateAnalysisResponse:
+        _source_or_404(database, source_id)
+        analysis = database.scalar(
+            select(CandidateAnalysis).where(CandidateAnalysis.source_video_id == source_id)
+        )
+        if analysis is None:
+            raise HTTPException(status_code=404, detail="candidate analysis not found")
+        return CandidateAnalysisResponse(
+            provider_status=analysis.provider_status,
+            semantic_provider_mode=analysis.semantic_provider_mode.value,
+            cache_eligible=analysis.cache_eligible,
+            metrics=_without_secrets(analysis.metrics),
+        )
+
+    @app.get("/api/sources/{source_id}/candidates", response_model=list[CandidateResponse])
+    def list_candidates(
+        source_id: UUID,
+        offset: int = 0,
+        limit: int = 50,
+        include_rejected: bool = False,
+        database: Session = Depends(session),
+    ) -> list[CandidateResponse]:
+        """List current candidates with bounded pagination and rejected filtering."""
+
+        _source_or_404(database, source_id)
+        bounded_offset = max(offset, 0)
+        bounded_limit = min(max(limit, 1), 200)
+        statement = select(ClipCandidate).where(
+            ClipCandidate.source_video_id == source_id,
+            ClipCandidate.is_current.is_(True),
+        )
+        if not include_rejected:
+            statement = statement.where(
+                ClipCandidate.disposition.in_(
+                    [
+                        CandidateDisposition.CANDIDATE,
+                        CandidateDisposition.CANDIDATE_NEEDS_REFINEMENT,
+                    ]
+                )
+            )
+        statement = (
+            statement.order_by(ClipCandidate.clip_score.desc(), ClipCandidate.start_time.asc())
+            .offset(bounded_offset)
+            .limit(bounded_limit)
+        )
+        return [_candidate_response(candidate) for candidate in database.scalars(statement)]
+
+    @app.get("/api/candidates/{candidate_id}", response_model=CandidateResponse)
+    def get_candidate(
+        candidate_id: UUID, database: Session = Depends(session)
+    ) -> CandidateResponse:
+        candidate = database.get(ClipCandidate, candidate_id)
+        if candidate is None:
+            raise HTTPException(status_code=404, detail="candidate not found")
+        return _candidate_response(candidate)
+
+    @app.patch("/api/sources/{source_id}/provenance", response_model=SourceResponse)
+    def update_source_provenance(
+        source_id: UUID,
+        request: ProvenanceUpdateRequest,
+        database: Session = Depends(session),
+    ) -> SourceResponse:
+        """Explicitly update provenance; Stage 3 is invalidated, Stage 2 is not."""
+
+        source = _source_or_404(database, source_id)
+        if request.rights_status is not None:
+            source.rights_status = request.rights_status
+        if request.media_origin is not None:
+            source.media_origin = request.media_origin
+        if request.provenance_metadata is not None:
+            source.provenance_metadata = _validate_provenance_metadata(request.provenance_metadata)
+        database.commit()
+        database.refresh(source)
+        return SourceResponse.model_validate(source)
+
     @app.delete("/sources/{source_id}", status_code=status.HTTP_204_NO_CONTENT)
     def delete_source(source_id: UUID, database: Session = Depends(session)) -> None:
         source = _source_or_404(database, source_id)
@@ -519,6 +705,82 @@ def _safe_filename(filename: str | None) -> str:
     if candidate in {"", ".", ".."} or len(candidate) > 512:
         raise HTTPException(status_code=422, detail="invalid upload filename")
     return candidate
+
+
+PROVENANCE_MAX_KEYS = 12
+PROVENANCE_MAX_KEY_LENGTH = 64
+PROVENANCE_MAX_VALUE_LENGTH = 2048
+
+
+def _parse_provenance_form(value: str | None) -> dict[str, str]:
+    if value is None or not value.strip():
+        return {}
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as error:
+        raise HTTPException(status_code=422, detail="provenance_metadata must be JSON") from error
+    if not isinstance(parsed, dict):
+        raise HTTPException(status_code=422, detail="provenance_metadata must be an object")
+    return _validate_provenance_metadata(parsed)
+
+
+def _validate_provenance_metadata(value: Mapping[str, object]) -> dict[str, str]:
+    if len(value) > PROVENANCE_MAX_KEYS:
+        raise HTTPException(status_code=422, detail="provenance_metadata has too many keys")
+    validated: dict[str, str] = {}
+    for key, item in value.items():
+        if not isinstance(key, str) or len(key) > PROVENANCE_MAX_KEY_LENGTH:
+            raise HTTPException(status_code=422, detail="provenance_metadata key is too long")
+        text = str(item)
+        if len(text) > PROVENANCE_MAX_VALUE_LENGTH:
+            raise HTTPException(status_code=422, detail="provenance_metadata value is too long")
+        validated[key] = text
+    return validated
+
+
+def _candidate_response(candidate: ClipCandidate) -> CandidateResponse:
+    return CandidateResponse(
+        id=candidate.id,
+        source_video_id=candidate.source_video_id,
+        candidate_key=candidate.candidate_key,
+        is_current=candidate.is_current,
+        disposition=candidate.disposition,
+        start_time=candidate.start_time,
+        end_time=candidate.end_time,
+        start_segment_index=candidate.start_segment_index,
+        end_segment_index=candidate.end_segment_index,
+        segment_indexes=list(candidate.segment_indexes or []),
+        transcript_excerpt=candidate.transcript_excerpt[:4000],
+        primary_content_type=candidate.primary_content_type,
+        secondary_content_types=list(candidate.secondary_content_types or []),
+        clip_score=candidate.clip_score,
+        short_form_score=candidate.short_form_score,
+        moment_density_score=candidate.moment_density_score,
+        boredom_risk_score=candidate.boredom_risk_score,
+        ending_quality_score=candidate.ending_quality_score,
+        loopability_score=candidate.loopability_score,
+        engagement_confidence=candidate.engagement_confidence,
+        transcript_confidence=candidate.transcript_confidence,
+        audio_confidence=candidate.audio_confidence,
+        boundary_confidence=candidate.boundary_confidence,
+        uncertainty_severity=candidate.uncertainty_severity,
+        idea_novelty_score=candidate.idea_novelty_score,
+        topic_novelty_score=candidate.topic_novelty_score,
+        recent_semantic_similarity_risk=candidate.recent_semantic_similarity_risk,
+        refinement_reasons=list(candidate.refinement_reasons or []),
+        refinement_evidence=_without_secrets(dict(candidate.refinement_evidence or {})),
+        rights_risk=candidate.rights_risk,
+        originality_risk=candidate.originality_risk,
+        dialect_profile=candidate.dialect_profile,
+        dialect_confidence=candidate.dialect_confidence,
+        code_switch_suspected=candidate.code_switch_suspected,
+        hooks=list(candidate.hooks or []),
+        idea_summary=candidate.idea_summary,
+        topic_summary=candidate.topic_summary,
+        provider_evidence=_without_secrets(dict(candidate.provider_evidence or {})),
+        policy_version=candidate.policy_version,
+        created_at=candidate.created_at,
+    )
 
 
 def _new_job(source_id: UUID) -> ProcessingJob:

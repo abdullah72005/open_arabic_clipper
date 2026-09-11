@@ -7,6 +7,7 @@ from uuid import UUID
 from celery import Task  # type: ignore[import-untyped]
 from sqlalchemy.orm import Session
 
+from app.candidates.executor import CandidateAnalysisExecutor
 from app.core.enums import JobKind, JobStatus, PipelineStage
 from app.core.settings import get_settings
 from app.db.session import create_session_factory
@@ -38,6 +39,7 @@ _NEXT_STAGE: Final = {
     PipelineStage.TRANSCRIPTION: PipelineStage.TRANSCRIPT_NORMALIZATION,
     PipelineStage.TRANSCRIPT_NORMALIZATION: PipelineStage.CONTEXTUAL_RECONSTRUCTION,
     PipelineStage.CONTEXTUAL_RECONSTRUCTION: PipelineStage.AUDIO_ANALYSIS,
+    PipelineStage.AUDIO_ANALYSIS: PipelineStage.CANDIDATE_ANALYSIS,
 }
 
 
@@ -74,6 +76,13 @@ def _stage_executors(session: Session) -> dict[PipelineStage, StageExecutor]:
         ),
         PipelineStage.AUDIO_ANALYSIS: AudioAnalysisExecutor(
             session=session, storage=storage, ffmpeg_binary=settings.ffmpeg_binary
+        ),
+        PipelineStage.CANDIDATE_ANALYSIS: CandidateAnalysisExecutor(
+            session=session,
+            config=settings.stage3_config(),
+            provider=settings.candidate_semantic_provider(),
+            mode=settings.semantic_provider_mode(),
+            lease_factory=lease_factory,
         ),
     }
     return {**defaults, **_executors}

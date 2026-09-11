@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 
 from app.core.enums import JobKind, JobStatus, PipelineRunStatus, PipelineStage
 from app.models import PipelineRun, ProcessingJob, SourceVideo
-from app.pipeline.executor import ReconstructionCancelled, StageExecutionResult, StageExecutor
+from app.pipeline.executor import StageCancelled, StageExecutionResult, StageExecutor
 
 
 class StageExecutionError(RuntimeError):
@@ -185,7 +185,7 @@ class PipelineRunner:
         self, run: PipelineRun, job: ProcessingJob | None, error: Exception
     ) -> None:
         completed_at = datetime.now(timezone.utc)
-        if isinstance(error, ReconstructionCancelled) or (
+        if isinstance(error, StageCancelled) or (
             job is not None and job.status is JobStatus.CANCELLED
         ):
             # Cooperative cancellation: keep the job cancelled, never overwrite it
@@ -221,6 +221,8 @@ def _stage_for_job_kind(kind: JobKind) -> PipelineStage:
         return PipelineStage.TRANSCRIPTION
     if kind is JobKind.RECONSTRUCTION:
         return PipelineStage.CONTEXTUAL_RECONSTRUCTION
+    if kind is JobKind.CANDIDATE_ANALYSIS:
+        return PipelineStage.CANDIDATE_ANALYSIS
     raise ValueError(f"no pipeline stage is defined for job kind {kind.value}")
 
 
@@ -246,6 +248,8 @@ def _job_kind_for_stage(stage: PipelineStage) -> JobKind:
         return JobKind.TRANSCRIPTION
     if stage is PipelineStage.CONTEXTUAL_RECONSTRUCTION:
         return JobKind.RECONSTRUCTION
+    if stage is PipelineStage.CANDIDATE_ANALYSIS:
+        return JobKind.CANDIDATE_ANALYSIS
     return JobKind.INGEST
 
 
@@ -264,4 +268,6 @@ def _next_stage(stage: PipelineStage) -> PipelineStage:
         return PipelineStage.AUDIO_ANALYSIS
     if stage is PipelineStage.AUDIO_ANALYSIS:
         return PipelineStage.READY_FOR_ANALYSIS
+    if stage is PipelineStage.CANDIDATE_ANALYSIS:
+        return PipelineStage.READY_FOR_REFINEMENT
     return PipelineStage.READY_FOR_ANALYSIS

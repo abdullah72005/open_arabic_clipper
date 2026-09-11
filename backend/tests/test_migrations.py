@@ -3,9 +3,11 @@ from pathlib import Path
 
 from alembic.config import Config
 from sqlalchemy import create_engine, inspect
+from sqlalchemy.orm import Session
 
 from alembic import command
 from app.core.settings import get_settings
+from app.models import SourceVideo, Transcript
 
 
 def _load_migration() -> object:
@@ -153,5 +155,62 @@ def test_stage_2_7_truth_migration_is_reversible() -> None:
             for table in tables
         }
         assert downgraded == before
+    finally:
+        engine.dispose()
+
+
+def test_stage_3_migration_is_reversible_and_preserves_source_data() -> None:
+    backend_root = Path(__file__).parents[1]
+    config = Config()
+    config.set_main_option("script_location", str(backend_root / "alembic"))
+    database_url = get_settings().database_url
+
+    command.upgrade(config, "head")
+    engine = create_engine(database_url)
+    try:
+        with Session(engine) as session:
+            source = SourceVideo(
+                source_uri="/tmp/migration-source.mp4", content_hash="migration-hash"
+            )
+            session.add(source)
+            session.flush()
+            session.add(
+                Transcript(
+                    source_video_id=source.id,
+                    whisper_model="large-v3-turbo",
+                    input_fingerprint="fp",
+                    segments=[],
+                    word_segments=[],
+                )
+            )
+            session.commit()
+            source_id = str(source.id)
+
+        tables_at_head = set(inspect(engine).get_table_names())
+        assert "candidate_analyses" in tables_at_head
+        assert "clip_candidates" in tables_at_head
+
+        command.downgrade(config, "20260910_0010")
+        tables_after_downgrade = set(inspect(engine).get_table_names())
+        assert "candidate_analyses" not in tables_after_downgrade
+        assert "clip_candidates" not in tables_after_downgrade
+        with engine.connect() as connection:
+            from sqlalchemy import text
+
+            surviving = connection.execute(
+                text("SELECT count(*) FROM source_videos WHERE source_uri = :uri"),
+                {"uri": "/tmp/migration-source.mp4"},
+            ).scalar_one()
+        assert surviving == 1
+
+        command.upgrade(config, "head")
+        with engine.connect() as connection:
+            from sqlalchemy import text
+
+            restored = connection.execute(
+                text("SELECT count(*) FROM transcripts WHERE source_video_id = :id"),
+                {"id": source_id.replace("-", "")},
+            ).scalar_one()
+        assert restored == 1
     finally:
         engine.dispose()
