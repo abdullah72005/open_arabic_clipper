@@ -240,3 +240,44 @@ the stale lease and the marker inside one atomic script, so no acquisition can
 slip into the gap between the two operations and recovery never deletes a
 valid newly acquired lease. This behavior is covered by the heavy-model lease
 lifecycle tests.
+
+## Stage 3 candidate analysis configuration (2026-09-12)
+
+Stage 3 consumes the imperfect INDEX transcript and defaults to fully local,
+deterministic candidate analysis:
+
+```bash
+# deterministic (default) | adaptive | local_only
+CLIPFACTORY_CANDIDATE_SEMANTIC_MODE=deterministic
+CLIPFACTORY_CANDIDATE_RETENTION_THRESHOLD=0.45
+CLIPFACTORY_CANDIDATE_UNCERTAINTY_THRESHOLD=0.35
+CLIPFACTORY_CANDIDATE_MAX_RETAINED=60
+CLIPFACTORY_CANDIDATE_MAX_PROPOSALS_PER_HOUR=24
+CLIPFACTORY_CANDIDATE_MAX_PROPOSALS_PER_SOURCE=240
+CLIPFACTORY_CANDIDATE_MAX_PROVIDER_CANDIDATES=32
+CLIPFACTORY_CANDIDATE_PROVIDER_CANDIDATES_PER_REQUEST=8
+CLIPFACTORY_CANDIDATE_MAX_PROVIDER_CALLS=4
+CLIPFACTORY_CANDIDATE_PROVIDER_MAX_INPUT_CHARACTERS=6000
+CLIPFACTORY_CANDIDATE_PROVIDER_MAX_OUTPUT_TOKENS=1024
+CLIPFACTORY_CANDIDATE_NOVELTY_CORPUS_LIMIT=500
+```
+
+`deterministic` makes zero Gemini and zero Qwen calls and never loads a model.
+`adaptive` reuses the Stage 2.7 Gemini key/model configuration but only when a
+key is present, batches strongest-first, and stops remaining Gemini calls on
+`429`. `local_only` uses the configured Ollama host/model only when
+`CLIPFACTORY_LOCAL_QWEN_ENABLED=true`, never Gemini, and holds the shared
+heavy-model lease around real local inference. Missing or misconfigured
+providers degrade to deterministic output and never fail the pipeline. This is a
+separate mode from `CLIPFACTORY_RECONSTRUCTION_ROUTING_MODE`; a configured
+reconstruction key does not silently enable hosted candidate evaluation.
+
+Provenance is set at source creation (`rights_status`, `media_origin`,
+`provenance_metadata`) or through `PATCH /api/sources/{id}/provenance`. The
+`provenance_metadata` object is bounded (max 12 keys, 64-char keys, 2048-char
+string values), is never logged, and is never provider prompt content. Provenance
+changes invalidate Stage 3 only and never retranscribe the source.
+
+The host Python remains 3.10.12; use the documented Docker Python 3.12 runtime
+for Stage 3 verification (`docker compose run --rm --no-deps -v
+"$(pwd)/backend:/app" backend ...`).

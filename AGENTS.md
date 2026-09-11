@@ -3,12 +3,16 @@
 ## Product and stage
 
 - Product name: `open_arabic_clipper` (working product label: ClipFactory).
-- Current scope: Stage 2.7.1 — local-first ingest/probe, cached audio,
+- Current scope: Stage 3 — local-first ingest/probe, cached audio,
   faster-whisper transcription, conservative dialect-aware Arabic correction,
   bounded contextual reconstruction through a managed local provider, storage,
-  jobs, dashboard, and operational tooling through `READY_FOR_ANALYSIS`.
-- Explicitly out of scope until later stages: Stage 3 AI clip selection,
-  advanced rendering/reframing, social publishing, and automatic authorization.
+  jobs, dashboard, operational tooling, and deterministic-by-default candidate
+  discovery/scoring/novelty through `READY_FOR_REFINEMENT`.
+- Explicitly out of scope until later stages: Stage 3.5 targeted
+  audio/transcript and exact-boundary refinement, omitted-English recovery,
+  publication-grade transcript text, Stage 4 transformation planning,
+  advanced rendering/reframing, social publishing, review UI, analytics
+  learning, and automatic authorization.
 - Process only media the operator owns or is authorized to process. Never add
   DRM, login, paywall, CAPTCHA, or platform-protection circumvention.
 
@@ -135,6 +139,23 @@
   1.0 and participates in normalization fingerprints. Dialect is source
   evidence, not a target audience, and there is no deployment-wide dialect
   default.
+- Stage 3 adds a durable `CANDIDATE_ANALYSIS` stage between
+  `READY_FOR_ANALYSIS` and `READY_FOR_REFINEMENT`. It reuses
+  `SourceVideo.rights_status` and adds `media_origin` (default `OTHER`) plus a
+  bounded `provenance_metadata` JSON object. Candidate analysis consumes the
+  imperfect INDEX transcript, emits bounded deterministic proposals, scores
+  content quality separately from transcript confidence, classifies a closed
+  content ontology, generates at most three source-faithful hooks, deduplicates
+  same-source and a bounded recent cross-source corpus, and persists accepted and
+  rejected `clip_candidates` plus a one-to-one `candidate_analyses` summary.
+  Strong uncertain moments become `CANDIDATE_NEEDS_REFINEMENT` for Stage 3.5.
+  Stage 3 semantic mode defaults to `deterministic` (zero Gemini/Qwen); `adaptive`
+  uses Gemini selectively only with a configured key and `local_only` uses
+  Qwen/Ollama only when `CLIPFACTORY_LOCAL_QWEN_ENABLED=true`. Missing providers
+  degrade to deterministic and never fail the pipeline. Unknown/third-party
+  provenance never blocks local analysis; rights risk and
+  originality/transformation risk are separate. Recurring channel/history
+  diversity is deferred to Stage 7.
 
 ## Local development facts (not product requirements)
 
