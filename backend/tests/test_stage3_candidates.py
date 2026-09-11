@@ -20,6 +20,7 @@ from app.candidates.classification import classify_content
 from app.candidates.executor import CandidateAnalysisCancelled, CandidateAnalysisExecutor
 from app.candidates.hooks import generate_hooks, validate_provider_hooks
 from app.candidates.policy import DEFAULT_CONFIG, Stage3Config
+from app.candidates.proposals import generate_proposals
 from app.candidates.providers import (
     DeterministicSemanticProvider,
     ProviderErrorCategory,
@@ -28,6 +29,7 @@ from app.candidates.providers import (
     SemanticProviderError,
     parse_semantic_entries,
 )
+from app.candidates.scoring import compute_uncertainty
 from app.candidates.service import CandidateAnalysisService, derive_risks
 from app.candidates.text import contains_cue, matching_text
 from app.candidates.types import CandidateAnalysisOutcome, HookRecord, Proposal
@@ -1425,3 +1427,88 @@ def test_code_switch_tokens_preserved_in_excerpt_evidence_and_hooks(session: Ses
     for hook in candidate.hooks:
         if hook.get("text"):
             assert hook["text"] in candidate.transcript_excerpt
+
+
+# bound-hardening / candidate-local evidence
+
+
+def test_single_oversized_word_span_never_exceeds_window_cap() -> None:
+    segment = {
+        "start": 0.0,
+        "end": 300.0,
+        "raw_text": "كلمة",
+        "corrected_text": "كلمة",
+        "final_text": "كلمة",
+        "words": [{"word": "كلمة", "probability": 0.9, "start": 0.0, "end": 300.0}],
+    }
+    proposals = generate_proposals(
+        [segment], duration=300.0, config=_config(max_window_seconds=90.0)
+    )
+    assert proposals
+    for proposal in proposals:
+        assert proposal.duration <= 90.0 + 1e-6
+        assert 0.0 <= proposal.start_time < proposal.end_time <= 300.0
+
+
+def test_source_duration_is_hard_outer_bound_when_segments_exceed_it() -> None:
+    words = [
+        {"word": f"w{index}", "probability": 0.9, "start": index * 10.0, "end": (index + 1) * 10.0}
+        for index in range(20)
+    ]
+    segment = {
+        "start": 0.0,
+        "end": 200.0,
+        "raw_text": " ".join(word["word"] for word in words),
+        "corrected_text": " ".join(word["word"] for word in words),
+        "final_text": " ".join(word["word"] for word in words),
+        "words": words,
+    }
+    proposals = generate_proposals(
+        [segment], duration=100.0, config=_config(max_window_seconds=40.0)
+    )
+    assert proposals
+    for proposal in proposals:
+        assert proposal.end_time <= 100.0 + 1e-6
+        assert 0.0 <= proposal.start_time < proposal.end_time <= 100.0
+
+
+def test_split_segment_uncertainty_evidence_is_candidate_local() -> None:
+    words = []
+    for index in range(18):
+        words.append(
+            {
+                "word": f"w{index}",
+                "probability": 0.2 if index >= 12 else 0.95,
+                "start": index * 10.0,
+                "end": (index + 1) * 10.0,
+            }
+        )
+    text = " ".join(word["word"] for word in words)
+    segment = {
+        "start": 0.0,
+        "end": 180.0,
+        "raw_text": text,
+        "corrected_text": text,
+        "final_text": text,
+        "words": words,
+        "code_switch_suspected": True,
+        "code_switch_tokens": ["w15", "w16", "w17"],
+    }
+    proposals = generate_proposals(
+        [segment], duration=180.0, config=_config(max_window_seconds=60.0)
+    )
+    assert len(proposals) >= 3
+    ordered = sorted(proposals, key=lambda item: item.start_time)
+    early = compute_uncertainty(ordered[0], [segment], config=_config(max_window_seconds=60.0))
+    late = compute_uncertainty(ordered[-1], [segment], config=_config(max_window_seconds=60.0))
+
+    assert all(
+        span["start"] >= ordered[0].start_time - 1e-6 and span["end"] <= ordered[0].end_time + 1e-6
+        for span in early.low_confidence_spans
+    )
+    assert late.low_confidence_spans
+    assert not early.code_switch_tokens
+    assert early.code_switch_uncertainty is False
+    assert {"w15", "w16", "w17"} <= set(late.code_switch_tokens)
+    assert "w15" not in early.protected_tokens
+    assert "w15" in late.protected_tokens

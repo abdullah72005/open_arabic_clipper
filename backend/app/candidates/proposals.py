@@ -61,8 +61,9 @@ def generate_proposals(
 
     if not segments:
         return []
-    effective_duration = max(duration, segment_end(segments[-1]), 0.0)
+    effective_duration = duration if duration > 0 else max(segment_end(segments[-1]), 0.0)
     atoms = _build_atoms(segments, config, effective_duration)
+    atoms = _enforce_atom_bounds(atoms, config.max_window_seconds)
     if not atoms:
         return []
     starts = [atom.start for atom in atoms]
@@ -119,7 +120,9 @@ def _build_atoms(
         text = analysis_segment_text(segment)
         speaker = _speaker(segment)
         if end - start > config.max_window_seconds:
-            atoms.extend(_split_segment(index, start, end, text, segment, speaker, config))
+            atoms.extend(
+                _split_segment(index, start, end, text, segment, speaker, config, duration)
+            )
         else:
             atoms.append(_Atom(index, start, max(start, end), text, speaker))
     return atoms
@@ -133,8 +136,9 @@ def _split_segment(
     segment: Mapping[str, object],
     speaker: str | None,
     config: Stage3Config,
+    duration: float,
 ) -> list[_Atom]:
-    words = _word_spans(segment)
+    words = _word_spans(segment, duration)
     if words and any(token for token, _, _ in words):
         chunks = _chunk_words(words, start, end, config)
     else:
@@ -148,7 +152,7 @@ def _split_segment(
     return atoms
 
 
-def _word_spans(segment: Mapping[str, object]) -> list[tuple[str, float, float]]:
+def _word_spans(segment: Mapping[str, object], duration: float) -> list[tuple[str, float, float]]:
     raw = segment.get("words")
     if not isinstance(raw, list):
         return []
@@ -160,8 +164,54 @@ def _word_spans(segment: Mapping[str, object]) -> list[tuple[str, float, float]]
         word_end = _finite(word.get("end"))
         if word_start is None or word_end is None or word_end < word_start:
             continue
+        if duration > 0:
+            word_start = _clamp(word_start, 0.0, duration)
+            word_end = _clamp(word_end, 0.0, duration)
+        if word_end <= word_start and word_start >= duration > 0:
+            continue
         spans.append((str(word.get("word") or "").strip(), word_start, word_end))
     return spans
+
+
+def _enforce_atom_bounds(atoms: Sequence[_Atom], limit: float) -> list[_Atom]:
+    """Guarantee no atom exceeds ``limit``; split by time with proportional text.
+
+    A single pathological word/timestamp span larger than the window cap cannot be
+    retained as an atom. Its text is distributed deterministically across bounded
+    time slices so the outer bound always holds.
+    """
+
+    if limit <= 0:
+        return list(atoms)
+    bounded: list[_Atom] = []
+    for atom in atoms:
+        duration = atom.end - atom.start
+        if duration <= limit:
+            bounded.extend([atom])
+            continue
+        count = max(1, math.ceil(duration / limit))
+        total = len(atom.text)
+        for slice_index in range(count):
+            slice_start = atom.start + duration * (slice_index / count)
+            slice_end = (
+                atom.end
+                if slice_index == count - 1
+                else atom.start + duration * ((slice_index + 1) / count)
+            )
+            begin = round(total * (slice_index / count))
+            finish = (
+                total if slice_index == count - 1 else round(total * ((slice_index + 1) / count))
+            )
+            bounded.append(
+                _Atom(
+                    atom.segment_index,
+                    slice_start,
+                    slice_end,
+                    atom.text[begin:finish],
+                    atom.speaker,
+                )
+            )
+    return bounded
 
 
 def _chunk_words(

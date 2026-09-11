@@ -13,6 +13,8 @@ from app.candidates.text import (
     contains_cue,
     is_question,
     matching_text,
+    segment_end,
+    segment_start,
     tokenize,
 )
 from app.candidates.types import (
@@ -46,6 +48,18 @@ _BOUNDARY_QUALITY = {
     "single_segment": 0.35,
 }
 
+_TIME_EPS = 1e-9
+
+
+def _word_within(
+    proposal: Proposal, word_start: float, word_end: float, fully_inside: bool
+) -> bool:
+    """Whether a word's time span overlaps the candidate's coarse span."""
+
+    if word_end <= word_start:
+        return fully_inside
+    return word_end > proposal.start_time + _TIME_EPS and word_start < proposal.end_time - _TIME_EPS
+
 
 def compute_uncertainty(
     proposal: Proposal,
@@ -62,28 +76,43 @@ def compute_uncertainty(
     unresolved: list[int] = []
     overrides = 0
     code_switch_tokens: list[str] = []
-    protected_tokens: list[str] = []
     index_deferred = False
+    # Protected/code-switch evidence is derived from the candidate's own local
+    # excerpt so a split long segment cannot contaminate an unrelated sub-window.
+    local_text = proposal.text
+    local_fold = local_text.casefold()
+    protected_tokens = list(extract_protected_tokens(local_text))
 
     for index in proposal.segment_indexes:
         segment = segments[index]
-        text = analysis_segment_text(segment)
+        seg_start = segment_start(segment)
+        seg_end = segment_end(segment)
+        fully_inside = (
+            seg_start >= proposal.start_time - _TIME_EPS
+            and seg_end <= proposal.end_time + _TIME_EPS
+        )
         if segment.get("operator_text"):
             overrides += 1
-        for token in extract_protected_tokens(text):
-            protected_tokens.append(token)
         if segment.get("code_switch_suspected"):
             stored_tokens = _as_str_list(segment.get("code_switch_tokens"))
             if stored_tokens:
-                code_switch_tokens.extend(stored_tokens)
+                code_switch_tokens.extend(
+                    token
+                    for token in stored_tokens
+                    if fully_inside or token.casefold() in local_fold
+                )
             else:
-                code_switch_tokens.extend(code_switch_evidence(text).tokens)
+                code_switch_tokens.extend(code_switch_evidence(local_text).tokens)
         status = str(segment.get("reconstruction_status") or "")
         if status in _UNRESOLVED_STATUSES or segment.get("needs_refinement") is True:
             unresolved.append(index)
         if segment.get("reconstruction_method") == "index_deferred":
             index_deferred = True
         for word in _as_mapping_list(segment.get("words")):
+            word_start = _number(word.get("start"))
+            word_end = _number(word.get("end"))
+            if not _word_within(proposal, word_start, word_end, fully_inside):
+                continue
             probability = _number(word.get("probability"))
             low = probability < config.low_word_probability_threshold
             words.append((probability, low))
@@ -92,15 +121,16 @@ def compute_uncertainty(
                     {
                         "segment_index": index,
                         "word": str(word.get("word", "")),
-                        "start": _number(word.get("start")),
-                        "end": _number(word.get("end")),
+                        "start": word_start,
+                        "end": word_end,
                         "probability": probability,
                     }
                 )
-        if _number(segment.get("avg_logprob")):
-            logprobs.append(_number(segment.get("avg_logprob")))
-        if isinstance(segment.get("no_speech_prob"), int | float):
-            no_speech.append(_number(segment.get("no_speech_prob")))
+        if fully_inside:
+            if _number(segment.get("avg_logprob")):
+                logprobs.append(_number(segment.get("avg_logprob")))
+            if isinstance(segment.get("no_speech_prob"), int | float):
+                no_speech.append(_number(segment.get("no_speech_prob")))
     if overrides and not words:
         transcript_confidence = 0.9
     elif words:
