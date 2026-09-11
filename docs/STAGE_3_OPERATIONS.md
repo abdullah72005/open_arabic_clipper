@@ -70,10 +70,22 @@ speaker changes, question/answer patterns, contrast/topic transitions, story
 build-up/payoff cues, and RMS energy changes. Fixed fallback windows are used
 only when meaningful boundaries are unavailable.
 
+Proposals are generated over a flat sequence of bounded atoms. A normal segment
+is one atom; a segment longer than the maximum coarse window is split at
+deterministic word/timestamp boundaries, or, when only text is available, at a
+deterministic proportional-character fallback that preserves approximate
+text/time correspondence. This is still coarse discovery, never exact boundary
+refinement (Stage 3.5 owns final boundaries). Each atom range has a stable span
+identity; `candidate_key` combines the source UUID and the atom span, so multiple
+bounded windows from one oversized transcript segment get stable, non-colliding
+identities across reruns. Segment indexes, timestamps, and word/span evidence
+remain traceable on each persisted candidate.
+
 Safety caps (configurable): minimum coarse window 15 s, preferred window
 35–75 s, maximum coarse window 120 s, at most 8 s surrounding context, at most 24
 proposals per source hour, at most 240 proposals per source, and at most 60
-retained non-rejected candidates. These are caps, not output targets. Boundaries
+retained non-rejected candidates. These are caps, not output targets. Every
+persisted proposal/candidate satisfies the configured bounds, and boundaries
 always satisfy `0 <= start < end <= source_duration`. Highly overlapping,
 textually similar proposals are merged; distinct ideas are not merged merely
 because they share a source. Zero valid moments produces zero accepted
@@ -89,13 +101,31 @@ Persisted independent normalized scores: `clip_score`, `short_form_score`,
 `recent_semantic_similarity_risk`.
 
 `clip_score` is a content-quality aggregate of moment strength, short-form
-suitability, density, ending quality, inverse boredom, and loopability. It never
-rewards transcript cleanliness, transcript confidence, provider availability, or
-audio confidence. `engagement_confidence` describes evidence coverage, not
-quality. Transcript confidence is derived separately from bounded candidate
-evidence (word probabilities, acoustic evidence, unresolved reconstruction
-state, low-confidence spans, manual overrides). A low-quality filler moment with
-perfect transcript confidence stays low quality.
+suitability, density, ending quality, inverse boredom, and loopability. It is
+computed by one shared aggregate function used by both deterministic scoring and
+provider-enriched recomputation, so an accepted provider response with no score
+adjustments preserves the deterministic `clip_score` exactly. `clip_score` and
+the content-quality scores (`moment_density_score`, `short_form_score`,
+`ending_quality_score`, `loopability_score`, `boredom_risk_score`) never include
+transcript confidence, unresolved/deferred INDEX status, word confidence,
+code-switch uncertainty, audio confidence, boundary confidence, or uncertainty
+severity. Those remain separate fields and may only drive
+`CANDIDATE_NEEDS_REFINEMENT`, `engagement_confidence`, and evidence display. A
+strong moment with identical text/boundaries keeps the same content score whether
+its transcript is clean or INDEX-deferred. A low-quality filler moment with
+perfect transcript confidence stays low quality. Transcript confidence is derived
+separately from bounded candidate evidence (word probabilities, acoustic
+evidence, unresolved reconstruction state, low-confidence spans, manual
+overrides); `engagement_confidence` describes evidence coverage, not quality.
+
+Deterministic cue/classification/hook detection runs against an analysis-only
+normalized matching view: safe Unicode normalization, English case-folding,
+Arabic diacritic/tatweel removal, and conservative alif/ya unification. It never
+rewrites stored transcript text, corrected/final text, timestamps, numbers, names,
+URLs, technical forms, protected code-switch tokens, or hook display text, and it
+never changes dialect evidence or target-audience behavior. Cue vocabularies stay
+small and focus on general discourse/structural signals with common Egyptian,
+Gulf/Saudi, Levantine, MSA/Fusha, and English variants.
 
 ## Refinement-needed behavior
 
@@ -143,6 +173,15 @@ separate. The weaker of strongly redundant candidates is marked
 `DO_NOT_CLIP_RECENTLY_REDUNDANT`. Recurring channel-output diversity and
 publication-history dedup are deferred to Stage 7.
 
+Novelty is two-phase. Deterministic novelty is the cheap first pass and the
+initial redundancy filter; clearly redundant candidates are excluded from
+provider selection and never consume provider quota. After accepted provider
+enrichment, novelty/disposition is recomputed for eligible retained candidates
+using the improved summaries. Provider enrichment may refine novelty scores or
+mark a newly duplicate candidate redundant, but it never revives a weak candidate
+solely because it received a provider response, and an already-redundant
+candidate stays redundant.
+
 ## Semantic provider strategy
 
 Modes: `deterministic` (default; zero Gemini and zero Qwen calls), `adaptive`
@@ -160,8 +199,16 @@ after every actual request and before final success.
 Provider results are reusable: a per-candidate provider-input fingerprint covers
 bounded text/context, deterministic features, uncertainty evidence,
 dialect/code-switch evidence, provider/model/prompt/schema identity, and
-validation/scoring versions. A non-cache-eligible retry reuses matching accepted
-evaluations and calls a provider only for candidates lacking one.
+validation/scoring versions. If any requested candidate is missing a valid
+accepted result (malformed/partial provider output), the analysis is
+non-cache-eligible/retryable and reports `PROVIDER_PARTIAL`; already accepted
+evaluations are persisted on their candidate rows and a later rerun reuses them,
+calling a provider only for the missing/invalid candidates whose provider input
+fingerprint still matches. Malformed output never corrupts rows: unaccepted
+candidates keep their deterministic fallback data. Rate limits stop later calls
+safely. The semantic provider mode is part of the persistent input fingerprint, so
+switching modes invalidates Stage 3 correctly without storing secrets or
+transient availability.
 
 ## Persistence and API
 
@@ -182,8 +229,27 @@ Upsert on `candidate_key` preserves UUIDs for unchanged intervals; candidates no
 longer emitted are marked stale only after a successful finalization, and
 historical candidates are never deleted. A successful deterministic-only run
 (including an absent optional Gemini key) is cache-eligible; transient provider
-failure, malformed output, or rate exhaustion finalizes valid deterministic
-candidates with non-cache-eligible metadata so a later normal request retries.
+failure, malformed/partial output, or rate exhaustion finalizes valid
+deterministic candidates with non-cache-eligible metadata so a later normal
+request retries.
+
+The Stage 3 input fingerprint covers every output-affecting input: source
+identity/rights/provenance, transcript/audio/quality fingerprints, dialect
+evidence, all segment evidence, semantic provider mode, stable provider identity,
+novelty corpus digest, and every `Stage3Config` field that affects proposal
+generation, scoring, novelty, hooks, provider request construction, provenance
+bounds, or persistence. The output fingerprint covers the complete persisted
+current candidate representation in stable key order: bounds/spans, disposition,
+every score, classifications, hooks, uncertainty/refinement evidence,
+provenance/originality risks, dialect/code-switch handoff, idea/topic summaries
+and signatures, and provider evidence identity. Stage 3 fingerprints never
+invalidate raw ASR, Stage 2.5, Stage 2.7, or audio analysis.
+
+The downgrade path is safe after genuine Stage 3 use: it removes Stage-3-only
+candidate/analysis rows and Stage-3-only pipeline-run/job history, maps any
+`CANDIDATE_ANALYSIS`/`READY_FOR_REFINEMENT` source lifecycle back to
+`READY_FOR_ANALYSIS` before narrowing enum/check constraints, and preserves all
+pre-existing Stage 1/2/2.5/2.7/2.7.1 source, transcript, and audio data.
 
 API:
 - `POST /api/sources/{id}/candidate-analysis?force=`

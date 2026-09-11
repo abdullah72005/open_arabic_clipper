@@ -234,22 +234,29 @@ status contract and operator troubleshooting notes.
 ## Stage 3 candidate analysis
 
 Stage 3 (`CANDIDATE_ANALYSIS`) runs after `READY_FOR_ANALYSIS` and consumes the
-imperfect INDEX transcript. It generates bounded deterministic coarse proposals,
-scores content-quality separately from transcript confidence, classifies content
-types, produces at most three source-faithful hooks, deduplicates same-source and
-cross-source repeated ideas, and persists both accepted and rejected proposals.
-Strong uncertain moments survive as `CANDIDATE_NEEDS_REFINEMENT` for Stage 3.5;
-content quality below threshold is `DO_NOT_CLIP`, and redundant moments are
+imperfect INDEX transcript. It generates bounded deterministic coarse proposals
+(splitting oversized segments at word/timestamp boundaries so every candidate
+respects configured duration bounds), scores content-quality separately from
+transcript confidence, classifies content types, produces at most three
+source-faithful hooks, deduplicates same-source and cross-source repeated ideas,
+and persists both accepted and rejected proposals. Content-quality scores use one
+shared aggregate, so a zero-adjustment provider response or an INDEX-deferred
+transcript never changes a strong candidate's content score. Strong uncertain
+moments survive as `CANDIDATE_NEEDS_REFINEMENT` for Stage 3.5; content quality
+below threshold is `DO_NOT_CLIP`, and redundant moments are
 `DO_NOT_CLIP_RECENTLY_REDUNDANT`.
 
 Stage 3 semantic mode defaults to `deterministic`: zero Gemini calls and zero
 Qwen model loads. `adaptive` uses Gemini only when a key is configured, and
 `local_only` uses Qwen/Ollama only with `CLIPFACTORY_LOCAL_QWEN_ENABLED=true`.
 Missing or misconfigured providers degrade to deterministic output and never
-fail the pipeline. Unknown/third-party provenance never blocks local analysis;
-rights risk and originality/transformation risk are separate. Source dialect is
-source evidence, not target audience; code-switched text is preserved and
-omitted-English recovery is deferred to Stage 3.5.
+fail the pipeline. Clearly redundant candidates never consume provider quota; a
+malformed/partial provider response is retryable and a later rerun reuses already
+accepted evaluations while retrying only missing ones. Unknown/third-party
+provenance never blocks local analysis; rights risk and originality/transformation
+risk are separate. Source dialect is source evidence, not target audience;
+code-switched text is preserved and omitted-English recovery is deferred to Stage
+3.5.
 
 Queue and inspect candidates:
 
