@@ -201,4 +201,45 @@ describe("API client", () => {
       cache_eligible: true
     });
   });
+
+  it("queues and reloads a candidate-scoped Stage 3.5 refinement", async () => {
+    const calls: string[] = [];
+    const fetcher = async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push(String(input));
+      if (init?.method === "POST") {
+        expect(String(input)).toBe("http://api.test/api/candidates/candidate%2F1/refinements?priority=FINAL_CLIP");
+        return new Response(JSON.stringify({ refinement_id: "refinement-1", job_id: "job-1", status: "QUEUED", queued: true, cached: false, active: false }), {
+          headers: { "content-type": "application/json" }
+        });
+      }
+      return new Response(JSON.stringify([]), { headers: { "content-type": "application/json" } });
+    };
+
+    const client = createApiClient("http://api.test", fetcher);
+    await expect(client.queueCandidateRefinement("candidate/1", "FINAL_CLIP")).resolves.toMatchObject({
+      refinement_id: "refinement-1",
+      queued: true
+    });
+    await expect(client.listCandidateRefinements("candidate/1")).resolves.toEqual([]);
+    expect(calls).toContain("http://api.test/api/candidates/candidate%2F1/refinements");
+  });
+
+  it("submits manual text with only explicitly resolved ambiguity IDs", async () => {
+    const fetcher = async (input: RequestInfo | URL, init?: RequestInit) => {
+      expect(String(input)).toBe("http://api.test/api/refinements/refinement-1/manual");
+      expect(init?.method).toBe("POST");
+      expect(init?.body).toBe(JSON.stringify({ text: "النص المؤكد", resolutions: { "entity-0": "95" } }));
+      return new Response(JSON.stringify({ id: "refinement-1", final_transcript: "النص المؤكد" }), {
+        headers: { "content-type": "application/json" }
+      });
+    };
+
+    await expect(
+      createApiClient("http://api.test", fetcher).submitManualCandidateTranscript(
+        "refinement-1",
+        "النص المؤكد",
+        { "entity-0": "95" }
+      )
+    ).resolves.toMatchObject({ final_transcript: "النص المؤكد" });
+  });
 });

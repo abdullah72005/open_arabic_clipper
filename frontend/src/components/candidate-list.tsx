@@ -3,7 +3,14 @@
 import React, { useCallback, useState } from "react";
 
 import { ApiState } from "@/components/api-state";
-import { api, ApiError, type Candidate, type CandidateAnalysis } from "@/lib/api-client";
+import {
+  api,
+  ApiError,
+  type Candidate,
+  type CandidateAnalysis,
+  type CandidateRefinement,
+  type RefinementPriority
+} from "@/lib/api-client";
 
 function timestamp(value: number) {
   const minutes = Math.floor(value / 60);
@@ -34,15 +41,106 @@ function summaryLine(analysis: CandidateAnalysis): string {
   return parts.join(" · ");
 }
 
+function refinementLabel(status: string) {
+  return status.replaceAll("_", " ");
+}
+
+function recoveredTerms(refinement: CandidateRefinement) {
+  const recovered = refinement.code_switch_evidence.code_switch_recovered;
+  return Array.isArray(recovered) ? recovered.filter((term): term is string => typeof term === "string") : [];
+}
+
+function ManualRefinementReview({
+  refinement,
+  onSubmit
+}: {
+  refinement: CandidateRefinement;
+  onSubmit?: (refinementId: string, text: string, resolutions: Record<string, string>) => void;
+}) {
+  const [text, setText] = useState(refinement.manual_transcript ?? refinement.final_transcript);
+  const [resolutions, setResolutions] = useState<Record<string, string>>({});
+  return (
+    <details className="candidate-manual-review" open>
+      <summary>Manual transcript review</summary>
+      {refinement.unresolved_spans.map((span, index) => {
+        const spanId = typeof span.span_id === "string" ? span.span_id : `span-${index}`;
+        const readings = Array.isArray(span.readings) ? span.readings.filter((item): item is string => typeof item === "string") : [];
+        const reason = typeof span.reason === "string" ? span.reason.replaceAll("_", " ") : "unresolved evidence";
+        return (
+          <div key={spanId}>
+            <p><strong>{reason}</strong>{readings.length ? `: ${readings.join(", ")}` : ""}</p>
+            <input
+              aria-label={`Resolution for ${spanId}`}
+              onChange={(event) => setResolutions((current) => ({ ...current, [spanId]: event.target.value }))}
+              placeholder="Explicit resolution"
+              value={resolutions[spanId] ?? ""}
+            />
+          </div>
+        );
+      })}
+      <textarea aria-label="Manual final transcript" onChange={(event) => setText(event.target.value)} value={text} />
+      <button
+        className="button"
+        disabled={!onSubmit || !text.trim()}
+        onClick={() => onSubmit?.(refinement.id, text, resolutions)}
+        type="button"
+      >
+        Save manual transcript
+      </button>
+    </details>
+  );
+}
+
+function RefinementResult({
+  refinement,
+  onSeek,
+  onManualSubmit
+}: {
+  refinement: CandidateRefinement;
+  onSeek: (seconds: number) => void;
+  onManualSubmit?: (refinementId: string, text: string, resolutions: Record<string, string>) => void;
+}) {
+  const start = refinement.refined_start ?? refinement.coarse_start;
+  const end = refinement.refined_end ?? refinement.coarse_end;
+  const recovered = recoveredTerms(refinement);
+  return (
+    <div className="candidate-refinement" dir="auto">
+      <p>
+        <strong>{refinement.priority === "FINAL_CLIP" ? "Final-clip refinement" : "Candidate refinement"}</strong>
+        {` · ${refinementLabel(refinement.status)} · ${Math.round(refinement.confidence * 100)}% confidence`}
+      </p>
+      <button className="button" onClick={() => onSeek(start)} type="button">
+        Refined window {timestamp(start)}–{timestamp(end)}
+      </button>
+      <p>{refinement.final_transcript || refinement.automatic_transcript || "Transcript is still being prepared."}</p>
+      <p className="muted">
+        Coarse {timestamp(refinement.coarse_start)}–{timestamp(refinement.coarse_end)}
+        {refinement.dialect_profile ? ` · ${refinement.dialect_profile}` : ""}
+        {recovered.length ? ` · recovered: ${recovered.join(", ")}` : ""}
+        {refinement.unresolved_spans.length ? ` · ${refinement.unresolved_spans.length} unresolved` : ""}
+      </p>
+      {refinement.priority === "FINAL_CLIP" && refinement.status === "NEEDS_MANUAL_TRANSCRIPT_REVIEW" && (
+        <ManualRefinementReview refinement={refinement} onSubmit={onManualSubmit} />
+      )}
+    </div>
+  );
+}
+
 export function CandidateList({
   analysis,
   candidates,
+  refinements,
   onSeek,
+  onQueueRefinement,
+  onManualRefinement,
   actions
 }: {
   analysis: CandidateAnalysis | null;
   candidates: Candidate[];
+  refinements?: CandidateRefinement[];
   onSeek: (seconds: number) => void;
+  onQueueRefinement?: (candidateId: string, priority: RefinementPriority) => void;
+  onManualRefinement?: (refinementId: string, text: string, resolutions: Record<string, string>) => void;
   actions?: React.ReactNode;
 }) {
   if (analysis === null) {
@@ -62,7 +160,10 @@ export function CandidateList({
         <p className="muted">No candidates.</p>
       ) : (
         <div className="transcript-segments">
-          {candidates.map((candidate) => (
+          {candidates.map((candidate) => {
+            const candidateRefinements = (refinements ?? []).filter((item) => item.clip_candidate_id === candidate.id);
+            const refinable = candidate.disposition === "CANDIDATE" || candidate.disposition === "CANDIDATE_NEEDS_REFINEMENT";
+            return (
             <div className="transcript-segment" key={candidate.id}>
               <button onClick={() => onSeek(candidate.start_time)} type="button">
                 <time>
@@ -82,8 +183,22 @@ export function CandidateList({
               {candidate.refinement_reasons.length > 0 && (
                 <p className="muted">Needs refinement: {candidate.refinement_reasons.join(", ")}</p>
               )}
+              {refinable && (
+                <div>
+                  <button className="button" onClick={() => onQueueRefinement?.(candidate.id, "CANDIDATE")} type="button">
+                    Refine candidate
+                  </button>
+                  <button className="button" onClick={() => onQueueRefinement?.(candidate.id, "FINAL_CLIP")} type="button">
+                    Refine as final clip
+                  </button>
+                </div>
+              )}
+              {candidateRefinements.map((refinement) => (
+                <RefinementResult key={refinement.id} refinement={refinement} onManualSubmit={onManualRefinement} onSeek={onSeek} />
+              ))}
             </div>
-          ))}
+            );
+          })}
         </div>
       )}
     </section>
@@ -93,13 +208,17 @@ export function CandidateList({
 export function CandidateResults({
   sourceId,
   revision,
-  onSeek
+  onSeek,
+  onRefinementQueued
 }: {
   sourceId: string;
   revision: number;
   onSeek: (seconds: number) => void;
+  onRefinementQueued?: () => void;
 }) {
   const [includeRejected, setIncludeRejected] = useState(false);
+  const [refresh, setRefresh] = useState(0);
+  const [queueError, setQueueError] = useState("");
   const load = useCallback(
     () =>
       Promise.all([
@@ -108,26 +227,59 @@ export function CandidateResults({
           throw cause;
         }),
         api.listCandidates(sourceId, { includeRejected })
-      ]).then(([analysis, candidates]) => ({ analysis, candidates })),
+      ]).then(async ([analysis, candidates]) => ({
+        analysis,
+        candidates,
+        refinements: (await Promise.all(candidates.map((candidate) => api.listCandidateRefinements(candidate.id)))).flat()
+      })),
     [sourceId, includeRejected]
   );
+  const queueRefinement = async (candidateId: string, priority: RefinementPriority) => {
+    setQueueError("");
+    try {
+      await api.queueCandidateRefinement(candidateId, priority);
+      setRefresh((value) => value + 1);
+      onRefinementQueued?.();
+    } catch (cause) {
+      setQueueError(cause instanceof Error ? cause.message : "Could not queue refinement");
+    }
+  };
+  const submitManualRefinement = async (
+    refinementId: string,
+    text: string,
+    resolutions: Record<string, string>
+  ) => {
+    setQueueError("");
+    try {
+      await api.submitManualCandidateTranscript(refinementId, text, resolutions);
+      setRefresh((value) => value + 1);
+    } catch (cause) {
+      setQueueError(cause instanceof Error ? cause.message : "Could not save manual transcript");
+    }
+  };
   return (
-    <ApiState key={revision} load={load}>
-      {({ analysis, candidates }) => (
-        <CandidateList
-          actions={
-            <button
-              className="button"
-              onClick={() => setIncludeRejected((value) => !value)}
-              type="button"
-            >
-              {includeRejected ? "Hide rejected proposals" : "Show rejected proposals"}
-            </button>
-          }
-          analysis={analysis}
-          candidates={candidates}
-          onSeek={onSeek}
-        />
+    <ApiState key={`${revision}-${refresh}`} load={load}>
+      {({ analysis, candidates, refinements }) => (
+        <>
+          <CandidateList
+            actions={
+              <button
+                className="button"
+                onClick={() => setIncludeRejected((value) => !value)}
+                type="button"
+              >
+                {includeRejected ? "Hide rejected proposals" : "Show rejected proposals"}
+              </button>
+            }
+            analysis={analysis}
+            candidates={candidates}
+            onManualRefinement={(refinementId, text, resolutions) => void submitManualRefinement(refinementId, text, resolutions)}
+            onSeek={onSeek}
+            onQueueRefinement={(candidateId, priority) => void queueRefinement(candidateId, priority)}
+            refinements={refinements}
+          />
+          {queueError && <p className="error">Could not queue refinement: {queueError}</p>}
+        </>
       )}
     </ApiState>
   );

@@ -240,7 +240,12 @@ export default function SourceDetail() {
                     {({ transcript, quality }) => <TranscriptViewer onSeek={seekTo} onUpdated={() => setTranscriptRevision((value) => value + 1)} quality={quality} sourceId={source.id} transcript={transcript} />}
                   </ApiState>
                 )}
-                <CandidateResults onSeek={seekTo} revision={transcriptRevision} sourceId={source.id} />
+                <CandidateResults
+                  onRefinementQueued={() => setJobRevision((value) => value + 1)}
+                  onSeek={seekTo}
+                  revision={transcriptRevision}
+                  sourceId={source.id}
+                />
               </>
             );
           }}

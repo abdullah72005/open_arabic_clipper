@@ -3,7 +3,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 
 import { CandidateList } from "./candidate-list";
-import type { Candidate, CandidateAnalysis } from "@/lib/api-client";
+import type { Candidate, CandidateAnalysis, CandidateRefinement } from "@/lib/api-client";
 
 const analysis: CandidateAnalysis = {
   provider_status: "DETERMINISTIC",
@@ -47,6 +47,43 @@ const candidates: Candidate[] = [
   }
 ];
 
+const refinements: CandidateRefinement[] = [
+  {
+    id: "refinement-1",
+    source_video_id: "source-1",
+    clip_candidate_id: "candidate-2",
+    priority: "CANDIDATE",
+    status: "CANDIDATE_REFINED",
+    quality_level: "CANDIDATE",
+    coarse_start: 5,
+    coarse_end: 40,
+    context_start: 0,
+    context_end: 45,
+    refined_start: 7.2,
+    refined_end: 38.5,
+    automatic_transcript: "أنا عملت deploy للbackend امبارح",
+    manual_transcript: null,
+    final_transcript: "أنا عملت deploy للbackend امبارح",
+    word_timestamps: [],
+    confidence: 0.91,
+    dialect_profile: "EGYPTIAN",
+    dialect_confidence: 0.92,
+    code_switch_evidence: { code_switch_recovered: ["deploy", "backend"] },
+    transcript_evidence: [],
+    entity_evidence: [],
+    unresolved_spans: [],
+    provider_evidence: {},
+    routing_evidence: {},
+    input_fingerprint: "input",
+    output_fingerprint: "output",
+    cache_eligible: true,
+    metrics: {},
+    processing_duration: 2.3,
+    created_at: "2026-09-12T00:00:00Z",
+    updated_at: "2026-09-12T00:00:00Z"
+  }
+];
+
 describe("CandidateList", () => {
   it("renders compact candidates with time, score, disposition and refinement reasons", () => {
     const markup = renderToStaticMarkup(
@@ -72,5 +109,48 @@ describe("CandidateList", () => {
       <CandidateList analysis={null} candidates={[]} onSeek={() => {}} />
     );
     expect(none).toContain("No candidate analysis yet");
+  });
+
+  it("renders the automatically loaded Stage 3.5 result beside its candidate", () => {
+    const markup = renderToStaticMarkup(
+      <CandidateList
+        analysis={analysis}
+        candidates={candidates}
+        onSeek={() => {}}
+        refinements={refinements}
+      />
+    );
+
+    expect(markup).toContain("Candidate refinement");
+    expect(markup).toContain("CANDIDATE REFINED");
+    expect(markup).toContain("0:07–0:38");
+    expect(markup).toContain("أنا عملت deploy للbackend امبارح");
+    expect(markup).toContain("deploy, backend");
+  });
+
+  it("exposes unresolved evidence and a manual-review form only when final refinement needs it", () => {
+    const reviewRefinement: CandidateRefinement = {
+      ...refinements[0],
+      id: "refinement-review",
+      priority: "FINAL_CLIP",
+      status: "NEEDS_MANUAL_TRANSCRIPT_REVIEW",
+      unresolved_spans: [{ span_id: "entity-0", readings: ["25", "95"], reason: "entity_conflict" }]
+    };
+    const markup = renderToStaticMarkup(
+      <CandidateList analysis={analysis} candidates={candidates} onSeek={() => {}} refinements={[reviewRefinement]} />
+    );
+
+    expect(markup).toContain("Manual transcript review");
+    expect(markup).toContain("entity conflict");
+    expect(markup).toContain("25, 95");
+  });
+
+  it("does not offer Stage 3.5 work for a rejected Stage 3 proposal", () => {
+    const rejected: Candidate = { ...candidates[0], id: "rejected", disposition: "DO_NOT_CLIP" };
+    const markup = renderToStaticMarkup(
+      <CandidateList analysis={analysis} candidates={[rejected]} onSeek={() => {}} />
+    );
+
+    expect(markup).not.toContain("Refine candidate");
   });
 });
