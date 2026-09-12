@@ -13,6 +13,8 @@ was 16.3% slower. It is rejected; rollback-safe defaults remain CPU threads zero
 batch one, and VAD off. No batch or VAD test was justified. Full remote video is
 still acquired before analysis; audio-first/deferred-video acquisition was not
 implemented. See [benchmarks](docs/BENCHMARKS.md).
+INDEX batch size is constrained to one until a compatible batch adapter and
+semantic replay validation exist.
 
 Stage 3 candidate analysis extends the local-first ingest/transcription
 foundation through `READY_FOR_REFINEMENT`. Stage 2.7.1 reaches
