@@ -116,6 +116,8 @@ class Settings(BaseSettings):
     candidate_max_retained: int = Field(default=60, gt=0, le=240)
     candidate_max_proposals_per_hour: int = Field(default=24, gt=0, le=240)
     candidate_max_proposals_per_source: int = Field(default=240, gt=0, le=2000)
+    candidate_max_raw_proposals_per_hour: int = Field(default=96, gt=0, le=960)
+    candidate_max_raw_proposals_per_source: int = Field(default=960, gt=0, le=10_000)
     candidate_max_provider_candidates: int = Field(default=32, gt=0, le=200)
     candidate_provider_candidates_per_request: int = Field(default=8, gt=0, le=32)
     candidate_max_provider_calls: int = Field(default=4, gt=0, le=32)
@@ -277,6 +279,8 @@ class Settings(BaseSettings):
             retention_threshold=self.candidate_retention_threshold,
             uncertainty_severity_threshold=self.candidate_uncertainty_threshold,
             max_retained_candidates=self.candidate_max_retained,
+            max_raw_proposals_per_hour=self.candidate_max_raw_proposals_per_hour,
+            max_raw_proposals_per_source=self.candidate_max_raw_proposals_per_source,
             max_proposals_per_hour=self.candidate_max_proposals_per_hour,
             max_proposals_per_source=self.candidate_max_proposals_per_source,
             max_provider_candidates=self.candidate_max_provider_candidates,

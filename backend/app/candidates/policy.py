@@ -29,6 +29,11 @@ class Stage3Config:
     preferred_window_max_seconds: float = 75.0
     max_window_seconds: float = 120.0
     max_context_seconds: float = 8.0
+    # Loose raw safety cap applied to discovered proposals before full analysis.
+    # Exists only for CPU/memory protection; the tight shortlist caps below are
+    # applied after deterministic scoring/classification/novelty/refinement.
+    max_raw_proposals_per_hour: int = 96
+    max_raw_proposals_per_source: int = 960
     max_proposals_per_hour: int = 24
     max_proposals_per_source: int = 240
     max_retained_candidates: int = 60

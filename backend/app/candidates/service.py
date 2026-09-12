@@ -161,6 +161,7 @@ class CandidateAnalysisService:
             for proposal in proposals
         ]
         drafts = self._apply_novelty(drafts, historical_corpus)
+        drafts = self._shortlist(drafts)
         self._check_cancelled()
         (
             drafts,
@@ -282,6 +283,40 @@ class CandidateAnalysisService:
                 )
             )
         return updated
+
+    def _shortlist(self, drafts: list[CandidateDraft]) -> list[CandidateDraft]:
+        """Apply the tight per-hour/per-source shortlist caps after full analysis.
+
+        Candidate discovery is bounded only by the loose raw safety cap; the tight
+        caps decide the shortlist here, after deterministic scoring, classification,
+        and novelty, ranked by the real ``clip_score``. Clearly redundant candidates
+        rank last so duplicates never crowd distinct moments out of the shortlist.
+        """
+
+        if not drafts:
+            return drafts
+        hours = max(
+            1.0,
+            max((draft.proposal.end_time for draft in drafts), default=0.0) / 3600.0,
+        )
+        cap = min(
+            self._config.max_proposals_per_source,
+            int(math.ceil(hours * self._config.max_proposals_per_hour)),
+        )
+        cap = max(cap, 1)
+        if len(drafts) <= cap:
+            return drafts
+        ranked = sorted(
+            drafts,
+            key=lambda draft: (
+                draft.disposition is CandidateDisposition.DO_NOT_CLIP_RECENTLY_REDUNDANT,
+                -draft.scores.clip_score,
+                draft.proposal.start_time,
+                draft.proposal.span_start,
+            ),
+        )
+        kept = {draft.candidate_key for draft in ranked[:cap]}
+        return [draft for draft in drafts if draft.candidate_key in kept]
 
     def _apply_post_provider_novelty(
         self, drafts: list[CandidateDraft], historical_corpus: Sequence[NoveltyItem]

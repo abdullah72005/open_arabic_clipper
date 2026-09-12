@@ -41,10 +41,13 @@ and defers expensive audio/transcript refinement to Stage 3.5:
   when only text exists), every atom is then hard-bounded so no pathological
   single word/timestamp span survives, and source duration is the hard outer
   bound. Stable atom-span identity keeps multiple windows from one segment
-  non-colliding across reruns. Configurable safety caps (15 s minimum, 35–75 s preferred, 120 s
-  maximum, 24 proposals/hour, 240/source, 60 retained) are caps, not targets.
-  Overlapping similar proposals merge; distinct ideas stay separate; zero good
-  moments yields zero accepted candidates.
+  non-colliding across reruns. The funnel is broad discovery → loose configurable
+  raw safety cap (96/hour, 960/source; CPU/memory protection only) → full
+  deterministic scoring/classification/novelty/refinement → rank by `clip_score`
+  → tight shortlist caps (15 s minimum, 35–75 s preferred, 120 s
+  maximum, 24 proposals/hour, 240/source, 60 retained) → optional provider work;
+  these are caps, not targets. Overlapping similar proposals merge; distinct ideas
+  stay separate; zero good moments yields zero accepted candidates.
 - **Scoring separation.** Independent normalized scores are persisted
   (`clip_score`, `short_form_score`, `moment_density_score`,
   `boredom_risk_score`, `ending_quality_score`, `loopability_score`,
@@ -127,7 +130,7 @@ and defers expensive audio/transcript refinement to Stage 3.5:
   publication-quality text.
 
 Deterministic verification covers the focused Stage 3 candidate/API/migration
-tests plus the full existing suite: 695 backend tests pass (Docker Python 3.12).
+tests plus the full existing suite: 703 backend tests pass (Docker Python 3.12).
 Stage 3 defaults to deterministic and makes no live provider calls in the
 automated suite. See
 [docs/STAGE_3_OPERATIONS.md](docs/STAGE_3_OPERATIONS.md).

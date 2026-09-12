@@ -143,7 +143,9 @@
   `READY_FOR_ANALYSIS` and `READY_FOR_REFINEMENT`. It reuses
   `SourceVideo.rights_status` and adds `media_origin` (default `OTHER`) plus a
   bounded `provenance_metadata` JSON object. Candidate analysis consumes the
-  imperfect INDEX transcript, emits bounded deterministic proposals, scores
+  imperfect INDEX transcript, emits bounded deterministic proposals under a loose
+  raw safety cap and applies the tight per-hour/per-source shortlist caps only
+  after full deterministic scoring/novelty (ranked by `clip_score`), scores
   content quality separately from transcript confidence, classifies a closed
   content ontology, generates at most three source-faithful hooks, deduplicates
   same-source and a bounded recent cross-source corpus, and persists accepted and

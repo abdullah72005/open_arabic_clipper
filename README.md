@@ -239,7 +239,10 @@ imperfect INDEX transcript. It generates bounded deterministic coarse proposals
 respects configured duration bounds), scores content-quality separately from
 transcript confidence, classifies content types, produces at most three
 source-faithful hooks, deduplicates same-source and cross-source repeated ideas,
-and persists both accepted and rejected proposals. Content-quality scores use one
+and persists both accepted and rejected proposals. Discovery is bounded only by a
+loose raw safety cap; the tight per-hour/per-source shortlist caps are applied
+after full deterministic scoring, ranked by `clip_score`, so duplicates never
+crowd distinct moments out. Content-quality scores use one
 shared aggregate, so a zero-adjustment provider response or an INDEX-deferred
 transcript never changes a strong candidate's content score. Strong uncertain
 moments survive as `CANDIDATE_NEEDS_REFINEMENT` for Stage 3.5; content quality

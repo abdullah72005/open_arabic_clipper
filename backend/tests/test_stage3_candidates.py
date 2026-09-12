@@ -419,6 +419,116 @@ def test_many_plausible_moments_pruned_before_hosted_calls(session: Session) -> 
     assert sum(len(call) for call in provider.calls) <= 2
 
 
+def test_raw_safety_caps_are_looser_than_shortlist_caps() -> None:
+    assert DEFAULT_CONFIG.max_raw_proposals_per_hour > DEFAULT_CONFIG.max_proposals_per_hour
+    assert DEFAULT_CONFIG.max_raw_proposals_per_source > DEFAULT_CONFIG.max_proposals_per_source
+
+
+def test_generate_proposals_applies_raw_safety_cap_not_shortlist_cap() -> None:
+    segments = []
+    start = 0.0
+    for index in range(20):
+        segments.append(
+            _segment(f"معلومة رقم {index} غريبة ومفاجأة كبيرة جدا.", start, start + 24.0)
+        )
+        start += 24.0
+    config = _config(
+        min_window_seconds=20.0,
+        preferred_window_min_seconds=22.0,
+        max_raw_proposals_per_source=8,
+        max_proposals_per_source=2,
+    )
+    proposals = generate_proposals(segments, duration=start, config=config)
+    assert 2 < len(proposals) <= 8
+
+
+def test_tight_shortlist_cap_applies_after_full_analysis(session: Session) -> None:
+    segments = []
+    start = 0.0
+    for index in range(12):
+        segments.append(
+            _segment(f"معلومة رقم {index} غريبة ومفاجأة كبيرة جدا.", start, start + 24.0)
+        )
+        start += 24.0
+    source = _make_source(session, segments, duration=start)
+    executor = _executor(
+        session,
+        config=_config(
+            min_window_seconds=20.0,
+            preferred_window_min_seconds=22.0,
+            max_raw_proposals_per_source=12,
+            max_proposals_per_source=2,
+            max_retained_candidates=60,
+        ),
+    )
+    executor.execute(source)
+    analysis = session.scalar(
+        select(CandidateAnalysis).where(CandidateAnalysis.source_video_id == source.id)
+    )
+    assert analysis is not None
+    assert int(analysis.metrics.get("proposals_generated", 0) or 0) > 2
+    rows = list(
+        session.scalars(select(ClipCandidate).where(ClipCandidate.source_video_id == source.id))
+    )
+    assert len(rows) <= 2
+
+
+def test_shortlist_keeps_distinct_moments_over_redundant_duplicates(session: Session) -> None:
+    duplicate = "الفكرة دي بتتكرر هنا بنفس الكلمات بالظبط في كل مرة."
+    distinct = [
+        "دراسة جديدة بتقول ان النوم الكافي بيحسن الذاكرة بشكل كبير.",
+        "البورصة ارتفعت النهاردة بنسبة كبيرة بسبب اخبار الشركات.",
+        "في وصفة سهلة لكيك الشوكولاتة بمكونات بسيطة كتير.",
+    ]
+    segments = []
+    start = 0.0
+    for _ in range(20):
+        segments.append(_segment(duplicate, start, start + 55.0))
+        start += 55.0
+    for sentence in distinct:
+        segments.append(_segment(sentence, start, start + 22.0))
+        start += 22.0
+    source = _make_source(session, segments, duration=start)
+    executor = _executor(
+        session,
+        config=_config(
+            min_window_seconds=20.0,
+            preferred_window_min_seconds=21.0,
+            max_proposals_per_source=4,
+            max_retained_candidates=60,
+            retention_threshold=0.3,
+            conflict_retention_threshold=0.3,
+        ),
+    )
+    executor.execute(source)
+    retained = list(
+        session.scalars(
+            select(ClipCandidate).where(
+                ClipCandidate.source_video_id == source.id,
+                ClipCandidate.disposition.in_(_RETAINED),
+            )
+        )
+    )
+    assert any(
+        keyword in candidate.transcript_excerpt
+        for candidate in retained
+        for keyword in ("دراسة", "البورصة", "وصفة")
+    )
+
+
+def test_raw_safety_caps_are_configurable_from_settings() -> None:
+    from app.core.settings import Settings
+
+    settings = Settings(
+        _env_file=None,
+        candidate_max_raw_proposals_per_hour=48,
+        candidate_max_raw_proposals_per_source=480,
+    )
+    config = settings.stage3_config()
+    assert config.max_raw_proposals_per_hour == 48
+    assert config.max_raw_proposals_per_source == 480
+
+
 # ---------------------------------------------------------------------------
 # uncertainty
 
@@ -1323,6 +1433,8 @@ def test_new_output_affecting_config_and_mode_change_input_fingerprint(session: 
         {"provenance_max_keys": 5},
         {"provenance_max_value_length": 10},
         {"provider_max_input_characters": 111},
+        {"max_raw_proposals_per_source": 99},
+        {"max_raw_proposals_per_hour": 11},
     ):
         candidate = _executor(session, config=_config(**override)).input_fingerprint(source)
         assert candidate != baseline, override

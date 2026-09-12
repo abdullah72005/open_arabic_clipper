@@ -397,10 +397,17 @@ def _text_similarity(first: str, second: str) -> float:
 
 
 def _prune(proposals: list[Proposal], config: Stage3Config) -> list[Proposal]:
+    """Apply the loose raw safety cap; the tight shortlist caps run after analysis.
+
+    This bound exists only to protect CPU/memory during discovery. It never decides
+    the final shortlist: the per-hour/per-source shortlist caps are applied later,
+    after full deterministic scoring, using the real ``clip_score`` ranking.
+    """
+
     hours = max(1.0, max((proposal.end_time for proposal in proposals), default=0.0) / 3600.0)
     cap = min(
-        config.max_proposals_per_source,
-        int(math.ceil(hours * config.max_proposals_per_hour)),
+        config.max_raw_proposals_per_source,
+        int(math.ceil(hours * config.max_raw_proposals_per_hour)),
     )
     cap = max(cap, 1)
     if len(proposals) <= cap:

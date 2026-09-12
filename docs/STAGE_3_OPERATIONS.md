@@ -87,9 +87,14 @@ indexes, timestamps, and word/span evidence remain traceable on each persisted
 candidate.
 
 Safety caps (configurable): minimum coarse window 15 s, preferred window
-35–75 s, maximum coarse window 120 s, at most 8 s surrounding context, at most 24
-proposals per source hour, at most 240 proposals per source, and at most 60
-retained non-rejected candidates. These are caps, not output targets. Every
+35–75 s, maximum coarse window 120 s, at most 8 s surrounding context, and a
+loose raw safety cap of at most 96 discovered proposals per source hour / 960
+per source that exists only to protect CPU/memory during discovery. The tight
+shortlist caps (at most 24 proposals per source hour, at most 240 per source) are
+applied only after full deterministic scoring, classification, and novelty,
+ranked by the resulting `clip_score`; clearly redundant candidates rank last so
+duplicates never crowd distinct moments out of the shortlist. At most 60 retained
+non-rejected candidates are persisted. These are caps, not output targets. Every
 persisted proposal/candidate satisfies the configured bounds, and boundaries
 always satisfy `0 <= start < end <= source_duration`. Highly overlapping,
 textually similar proposals are merged; distinct ideas are not merged merely
@@ -297,6 +302,8 @@ See `.env.example`. Key variables: `CLIPFACTORY_CANDIDATE_SEMANTIC_MODE`,
 `CLIPFACTORY_CANDIDATE_RETENTION_THRESHOLD`,
 `CLIPFACTORY_CANDIDATE_UNCERTAINTY_THRESHOLD`,
 `CLIPFACTORY_CANDIDATE_MAX_RETAINED`,
+`CLIPFACTORY_CANDIDATE_MAX_RAW_PROPOSALS_PER_HOUR`,
+`CLIPFACTORY_CANDIDATE_MAX_RAW_PROPOSALS_PER_SOURCE`,
 `CLIPFACTORY_CANDIDATE_MAX_PROPOSALS_PER_HOUR`,
 `CLIPFACTORY_CANDIDATE_MAX_PROPOSALS_PER_SOURCE`,
 `CLIPFACTORY_CANDIDATE_MAX_PROVIDER_CANDIDATES`,

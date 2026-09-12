@@ -81,6 +81,8 @@ def stage3_config_payload(config: Stage3Config) -> dict[str, object]:
         "preferred_window_max_seconds": config.preferred_window_max_seconds,
         "max_window_seconds": config.max_window_seconds,
         "max_context_seconds": config.max_context_seconds,
+        "max_raw_proposals_per_hour": config.max_raw_proposals_per_hour,
+        "max_raw_proposals_per_source": config.max_raw_proposals_per_source,
         "max_proposals_per_hour": config.max_proposals_per_hour,
         "max_proposals_per_source": config.max_proposals_per_source,
         "max_retained_candidates": config.max_retained_candidates,
