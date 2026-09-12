@@ -31,6 +31,7 @@ from app.db.base import Base
 
 if TYPE_CHECKING:
     from app.models.candidate_analysis import CandidateAnalysis
+    from app.models.candidate_refinement import CandidateRefinement
     from app.models.source_video import SourceVideo
 
 _SCORE_COLUMNS = (
@@ -180,3 +181,6 @@ class ClipCandidate(Base):
 
     source_video: Mapped["SourceVideo"] = relationship(back_populates="candidates")
     candidate_analysis: Mapped["CandidateAnalysis | None"] = relationship()
+    refinements: Mapped[list["CandidateRefinement"]] = relationship(
+        back_populates="clip_candidate", cascade="all, delete-orphan"
+    )

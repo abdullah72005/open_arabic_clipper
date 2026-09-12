@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from app.models.audio_analysis import AudioAnalysis
     from app.models.audio_artifact import AudioArtifact
     from app.models.candidate_analysis import CandidateAnalysis
+    from app.models.candidate_refinement import CandidateRefinement
     from app.models.clip_candidate import ClipCandidate
     from app.models.pipeline_run import PipelineRun
     from app.models.processing_job import ProcessingJob
@@ -98,5 +99,8 @@ class SourceVideo(Base):
         back_populates="source_video", cascade="all, delete-orphan", uselist=False
     )
     candidates: Mapped[list["ClipCandidate"]] = relationship(
+        back_populates="source_video", cascade="all, delete-orphan"
+    )
+    candidate_refinements: Mapped[list["CandidateRefinement"]] = relationship(
         back_populates="source_video", cascade="all, delete-orphan"
     )

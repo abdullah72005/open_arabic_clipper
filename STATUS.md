@@ -6,8 +6,91 @@ foundation through `READY_FOR_REFINEMENT`. Stage 2.7.1 reaches
 `CANDIDATE_ANALYSIS` stage, which discovers coarse clip moments from the
 imperfect INDEX transcript and advances the source to `READY_FOR_REFINEMENT`.
 Stage 3 semantic mode defaults to deterministic (zero Gemini calls, zero Qwen
-loads). Stage 3.5 targeted audio/transcript refinement, exact clip boundaries,
-rendering, publishing, and authorization remain out of scope.
+loads). Stage 3.5 then provides explicit, candidate-scoped, audio-verified
+transcript and boundary refinement (candidate 5/5 s, final 8/8 s context, max
+150 s) through the existing job system, with optional selective Gemini
+transcription/adjudication behind a shared priority/budget gate. Rendering,
+publishing, review UI, and authorization remain out of scope, and Stage 4 is not
+implemented.
+
+## Stage 3.5 candidate-scoped refinement (2026-09-12)
+
+Stage 3.5 turns one explicitly requested Stage 3 coarse candidate into a
+trustworthy, precisely bounded, audio-verified transcript while spending
+expensive compute only on requested candidates/final clips:
+
+- **Candidate-scoped, not an automatic stage.** Work is explicit after
+  `READY_FOR_REFINEMENT` and never added to the automatic `_NEXT_STAGE` chain; a
+  source may stay `READY_FOR_REFINEMENT` while individual candidates refine
+  independently. It extends the existing Celery/`ProcessingJob` system with a
+  `CANDIDATE_REFINEMENT` job kind and a `candidate_refinements` row per
+  `(clip_candidate_id, priority)`; no new `PipelineStage`, `PipelineRun`, queue,
+  scheduler, service, or billing system. Only `CANDIDATE`/`FINAL_CLIP` are valid;
+  `INDEX` is rejected.
+- **Bounded audio only.** A StorageService-owned window service validates the
+  cached mono 16 kHz artifact against the source hash, then extracts only the
+  bounded candidate interval from the original source with a safe FFmpeg
+  argument list (candidate pre/post 5/5 s, final 8/8 s, max 150 s, path
+  `sources/{source_id}/candidate-refinements/{candidate_id}/{priority}.wav`),
+  validates duration/non-empty output/hashes, replaces atomically, and removes
+  partial temp files. Context bounds and refined bounds persist separately;
+  context audio never becomes the final clip. The whole source is never
+  retranscribed or uploaded.
+- **Targeted local Whisper backbone.** `large-v3-turbo`, word timestamps,
+  automatic language, no VAD, no condition-on-previous-text, beam 5 (candidate)
+  / 8 (final), deterministic temperature fallback; reuses `WhisperEngine`,
+  child-process isolation, peak-memory reporting, and the shared heavy-model
+  lease. Clip-relative word times convert once to source time and validate
+  within the context window. Raw ASR, timestamps, words, and Stage 2 evidence are
+  never rewritten.
+- **Omitted-English recovery from audio.** A targeted audio result may restore
+  previously omitted Latin-bearing speech (e.g. INDEX `أنا عملت امبارح` → audio
+  `أنا عملت deploy للbackend امبارح`) and persists a code-switch recovery metric
+  only when it survives validation. A text-only model/`local_only` Qwen path can
+  never add omitted English and never calls Gemini. Source dialect is preserved.
+- **Hosted providers are optional and selective.** `gemini-3.5-transcribe`
+  through the documented Interactions API in verbatim mode with word timestamps
+  (never smart mode, custom vocabulary never combined with timestamps, one
+  bounded clip per request, remote file deleted in `finally`, URI never
+  persisted, SDK client lazy and closed on exit, key never logged). Candidate
+  mode calls hosted only for material uncertainty; final mode calls whenever
+  configured unless an authoritative manual transcript already satisfies the
+  strict gate. `gemini-3.8-flash` adjudication chooses one supplied reading or
+  `UNRESOLVED` and can never rewrite the transcript. Official docs checked
+  2026-09-12; SDK `google-genai` 2.23.0.
+- **Shared Gemini priority gate.** A Redis-backed atomic fixed-window admission
+  controller (`CRITICAL`/`HIGH`/`MEDIUM`/`LOW`/`AVOID`, configurable reserves
+  that cannot exceed capacity) decides before any upload/generation; Redis
+  failure fails closed for hosted work while local continues; 429/`Retry-After`
+  establishes a bounded cooldown. Stage 3 semantic calls pass through MEDIUM;
+  Stage 2.7 maps FINAL_CLIP→CRITICAL, CANDIDATE→MEDIUM, INDEX→AVOID.
+- **Deterministic acceptance, entities, and boundaries.** Protected
+  names/numbers/dates/URLs/technical/Latin tokens, dialect preservation,
+  translation/MSA conversion, edit/insertion ratios, repetition, material
+  ASR disagreement, and entity normalization are checked. Candidate mode may
+  keep a flagged ambiguity; final meaning-critical ambiguity becomes
+  `NEEDS_MANUAL_TRANSCRIPT_REVIEW` and is never resolved arbitrarily. Boundaries
+  are refined conservatively within the radius, never default to the full
+  context window, and retain the coarse edge on weak evidence.
+- **Caching, idempotency, cancellation.** Top-level and component fingerprints
+  (audio/local/hosted/adjudication/consensus/boundary) always distinguish
+  candidate from final; components are reused only on exact dependency match;
+  degraded runs stay non-cache-eligible; manual text always wins and is never
+  cleared. The exact executing job is polled around every expensive step and
+  during Whisper; cancellation stays `CANCELLED`, preserves checkpoints,
+  deletes remote/temp files, releases leases/providers, and never produces a
+  ready state.
+- **API/CLI/handoff.** Queue/get/list one candidate refinement or a bounded
+  candidate-grade batch (score-ordered, default 5, max 10, no bulk FINAL_CLIP),
+  submit manual text/resolutions, and fetch a typed read-only Stage 4 handoff
+  (refined transcript/exact bounds + Stage 3 evidence; never mislabels
+  candidate-grade output as final-ready). Stage 4 is not implemented and
+  `FINAL_TRANSCRIPT_READY` is not publishing readiness.
+
+Deterministic verification adds Stage 3.5 tests plus the full existing suite:
+780 backend tests pass (Docker Python 3.12), coverage 87% (gate 79%). Stage 3.5
+defaults to adaptive with no live provider calls in the automated suite. See
+[docs/STAGE_3_5_OPERATIONS.md](docs/STAGE_3_5_OPERATIONS.md).
 
 ## Stage 3 candidate analysis (2026-09-12)
 

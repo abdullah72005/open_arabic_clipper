@@ -62,3 +62,31 @@ Reconstruction defaults to the managed local Ollama provider (`qwen3.5:4b`) with
 routing-driven, schema-validated two-pass candidates and per-candidate scores.
 An unavailable or misconfigured provider persists a truthful status and leaves
 Stage 2.5 final; it never blocks `READY_FOR_ANALYSIS`.
+
+## Stage 3.5 candidate-scoped refinement
+
+Stage 3.5 is explicit, candidate-scoped work after the source reaches
+`READY_FOR_REFINEMENT`. It is **not** part of the automatic `_NEXT_STAGE` chain
+and never advances every source; a source may stay `READY_FOR_REFINEMENT` while
+individual candidates refine independently. It processes **candidate audio only**
+— it never rediscovers clips, retranscribes a whole source, or uploads a whole
+source — and extends the existing Celery/`ProcessingJob` system with a
+`CANDIDATE_REFINEMENT` job kind plus a `candidate_refinements` row per
+`(clip_candidate_id, priority)`. Only `CANDIDATE` (semantic quality) and
+`FINAL_CLIP` (publication/caption quality) are valid; `INDEX` is rejected.
+
+It extracts a bounded context window (candidate 5/5 s, final 8/8 s, max 150 s)
+from the original source, runs targeted local faster-whisper as the mandatory
+backbone (word timestamps, automatic language, no VAD, no
+condition-on-previous-text, beam 5/8), converts clip-relative times to source
+time once, and validates them inside the context window. Omitted English/code
+switching is recovered only from actual targeted audio transcription; a
+text-only model or `local_only` Qwen pass can never add omitted English.
+Optional hosted `gemini-3.5-transcribe` (Interactions API, verbatim, word
+timestamps) and `gemini-3.8-flash` adjudication are selective and gated by a
+shared Redis priority/budget controller. Deterministic entity/ambiguity and
+boundary refinement produce `CANDIDATE_REFINED`, `FINAL_TRANSCRIPT_READY`,
+`NEEDS_MANUAL_TRANSCRIPT_REVIEW`, `PROVIDER_DEGRADED`, `REFINEMENT_FAILED`, or
+`CANCELLED`. `FINAL_TRANSCRIPT_READY` is transcript readiness, not publishing
+readiness. Stage 4 receives a typed read-only handoff but is not implemented. See
+`docs/STAGE_3_5_OPERATIONS.md`.

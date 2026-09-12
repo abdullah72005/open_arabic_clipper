@@ -18,9 +18,11 @@ from app.candidates.policy import (
 )
 from app.candidates.providers import (
     DeterministicSemanticProvider,
+    ProviderErrorCategory,
     SemanticEvaluationRequest,
     SemanticEvaluationResult,
     SemanticProvider,
+    SemanticProviderError,
     semantic_prompt_hash,
 )
 from app.candidates.service import (
@@ -113,6 +115,49 @@ class _LeaseBoundSemanticProvider:
         return usage() if callable(usage) else {}
 
 
+class _AdmissionBoundSemanticProvider:
+    """Route Stage 3 hosted semantic evaluation through the shared MEDIUM gate."""
+
+    def __init__(self, inner: SemanticProvider, admission: object) -> None:
+        self._inner = inner
+        self._admission = admission
+        self.provider_name = getattr(inner, "provider_name", "gemini")
+        self.model = getattr(inner, "model", None)
+        self._released = False
+
+    def evaluate(
+        self, requests: Sequence[SemanticEvaluationRequest]
+    ) -> dict[str, SemanticEvaluationResult]:
+        from app.core.enums import AdmissionPriority
+
+        try:
+            decision = self._admission.acquire(AdmissionPriority.MEDIUM)  # type: ignore[attr-defined]
+        except Exception as error:
+            raise SemanticProviderError(
+                ProviderErrorCategory.PROVIDER_ERROR, "admission gate unavailable"
+            ) from error
+        if not getattr(decision, "admitted", False):
+            raise SemanticProviderError(ProviderErrorCategory.RATE_LIMITED, "admission denied")
+        return dict(self._inner.evaluate(requests))
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        self._inner.release()
+
+    def runtime_identity(self) -> dict[str, object]:
+        return dict(self._inner.runtime_identity())
+
+    def refresh_runtime_identity(self) -> dict[str, object]:
+        return dict(self._inner.refresh_runtime_identity())
+
+    def usage_summary(self) -> dict[str, int]:
+        usage = getattr(self._inner, "usage_summary", None)
+        result = usage() if callable(usage) else {}
+        return {str(key): int(value) for key, value in dict(result).items()}
+
+
 class CandidateAnalysisExecutor:
     """Persist a bounded, atomic Stage 3 candidate-analysis result."""
 
@@ -124,12 +169,14 @@ class CandidateAnalysisExecutor:
         provider: SemanticProvider | None = None,
         mode: SemanticProviderMode = SemanticProviderMode.DETERMINISTIC,
         lease_factory: HeavyModelLeaseFactory | NoopHeavyModelLeaseFactory | None = None,
+        admission: object | None = None,
     ) -> None:
         self._session = session
         self._config = config
         self._provider = provider
         self._mode = mode
         self._lease_factory = lease_factory or NoopHeavyModelLeaseFactory()
+        self._admission = admission
         self._active_job_id: object | None = None
 
     def set_active_job(self, job_id: object | None) -> None:
@@ -264,6 +311,8 @@ class CandidateAnalysisExecutor:
             return DeterministicSemanticProvider()
         if self._mode is SemanticProviderMode.LOCAL_ONLY:
             return _LeaseBoundSemanticProvider(self._provider, self._lease_factory)
+        if self._admission is not None:
+            return _AdmissionBoundSemanticProvider(self._provider, self._admission)
         return self._provider
 
     def _release_provider(self, provider: SemanticProvider | None) -> None:

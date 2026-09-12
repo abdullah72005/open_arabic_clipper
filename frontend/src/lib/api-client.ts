@@ -170,6 +170,52 @@ export interface CandidateAnalysis {
   metrics: Record<string, unknown>;
 }
 
+export type RefinementPriority = "CANDIDATE" | "FINAL_CLIP";
+
+export interface CandidateRefinement {
+  id: string;
+  source_video_id: string;
+  clip_candidate_id: string;
+  priority: RefinementPriority;
+  status: string;
+  quality_level: string;
+  coarse_start: number;
+  coarse_end: number;
+  context_start: number;
+  context_end: number;
+  refined_start: number | null;
+  refined_end: number | null;
+  automatic_transcript: string;
+  manual_transcript: string | null;
+  final_transcript: string;
+  word_timestamps: Array<Record<string, unknown>>;
+  confidence: number;
+  dialect_profile: string | null;
+  dialect_confidence: number;
+  code_switch_evidence: Record<string, unknown>;
+  transcript_evidence: Array<Record<string, unknown>>;
+  entity_evidence: Array<Record<string, unknown>>;
+  unresolved_spans: Array<Record<string, unknown>>;
+  provider_evidence: Record<string, unknown>;
+  routing_evidence: Record<string, unknown>;
+  input_fingerprint: string;
+  output_fingerprint: string;
+  cache_eligible: boolean;
+  metrics: Record<string, unknown>;
+  processing_duration: number | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface RefinementQueueResponse {
+  refinement_id: string;
+  job_id: string | null;
+  status: string;
+  queued: boolean;
+  cached: boolean;
+  active: boolean;
+}
+
 type Fetcher = typeof fetch;
 
 export class ApiError extends Error {
@@ -208,6 +254,23 @@ export function createApiClient(baseUrl: string, fetcher: Fetcher = fetch) {
           options.includeRejected ?? false
         }`
       ),
+    listCandidateRefinements: (candidateId: string) =>
+      request<CandidateRefinement[]>(`/api/candidates/${encodeURIComponent(candidateId)}/refinements`),
+    queueCandidateRefinement: (candidateId: string, priority: RefinementPriority) =>
+      request<RefinementQueueResponse>(
+        `/api/candidates/${encodeURIComponent(candidateId)}/refinements?priority=${priority}`,
+        { method: "POST" }
+      ),
+    submitManualCandidateTranscript: (
+      refinementId: string,
+      text: string,
+      resolutions: Record<string, string>
+    ) =>
+      request<CandidateRefinement>(`/api/refinements/${encodeURIComponent(refinementId)}/manual`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ text, resolutions })
+      }),
     retranscribeTranscript: (id: string, force = true) =>
       request<Job>(`/api/sources/${encodeURIComponent(id)}/retranscribe?force=${force}`, {
         method: "POST"

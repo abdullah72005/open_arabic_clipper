@@ -292,9 +292,12 @@ unresolved/needs-refinement evidence, refinement reason codes and uncertainty
 severity, source dialect profile/confidence, candidate-local code-switch
 flags/tokens, protected name/number/date/technical-token evidence, boundary
 confidence and evidence, analysis/provider/policy fingerprints, and a provenance
-and transformation-risk snapshot. Stage 3.5 will extract candidate audio, refine
-transcription, recover omitted mixed-language speech, refine boundaries, and
-reach publication-quality text.
+and transformation-risk snapshot. Stage 3.5 extracts candidate audio, refines
+transcription, recovers omitted mixed-language speech, refines boundaries, and
+reaches publication-quality text. See
+[Stage 3.5 operations](STAGE_3_5_OPERATIONS.md) for the refinement lifecycle,
+API/CLI, fingerprints, admission gate, and the typed Stage 4 handoff (Stage 4 is
+not implemented).
 
 ## Configuration
 

@@ -38,6 +38,7 @@ class JobKind(str, Enum):
     RECONSTRUCTION = "RECONSTRUCTION"
     PROBE = "PROBE"
     CANDIDATE_ANALYSIS = "CANDIDATE_ANALYSIS"
+    CANDIDATE_REFINEMENT = "CANDIDATE_REFINEMENT"
 
 
 class JobStatus(str, Enum):
@@ -191,3 +192,51 @@ class RefinementReason(str, Enum):
     CODE_SWITCH_UNCERTAINTY = "CODE_SWITCH_UNCERTAINTY"
     PROTECTED_ENTITY_UNCERTAINTY = "PROTECTED_ENTITY_UNCERTAINTY"
     LOW_BOUNDARY_CONFIDENCE = "LOW_BOUNDARY_CONFIDENCE"
+
+
+class RefinementStatus(str, Enum):
+    """Persisted Stage 3.5 candidate-refinement lifecycle.
+
+    Readiness (``CANDIDATE_REFINED``/``FINAL_TRANSCRIPT_READY``) and provider
+    availability (``PROVIDER_DEGRADED``) are separate concepts: optional hosted
+    provider failure never makes a usable local refinement unusable.
+    """
+
+    QUEUED = "QUEUED"
+    REFINING = "REFINING"
+    CANDIDATE_REFINED = "CANDIDATE_REFINED"
+    FINAL_TRANSCRIPT_READY = "FINAL_TRANSCRIPT_READY"
+    NEEDS_MANUAL_TRANSCRIPT_REVIEW = "NEEDS_MANUAL_TRANSCRIPT_REVIEW"
+    PROVIDER_DEGRADED = "PROVIDER_DEGRADED"
+    REFINEMENT_FAILED = "REFINEMENT_FAILED"
+    CANCELLED = "CANCELLED"
+
+
+class EvidenceKind(str, Enum):
+    """Where a bounded transcript-evidence record came from."""
+
+    INDEX_RAW = "INDEX_RAW"
+    STAGE25 = "STAGE25"
+    STAGE27 = "STAGE27"
+    TARGETED_LOCAL_ASR = "TARGETED_LOCAL_ASR"
+    HOSTED_ASR = "HOSTED_ASR"
+    ADJUDICATION = "ADJUDICATION"
+    OPERATOR = "OPERATOR"
+
+
+class EvidenceState(str, Enum):
+    """Acceptance state of one bounded evidence record."""
+
+    ACCEPTED = "ACCEPTED"
+    REJECTED = "REJECTED"
+    CHECKPOINT = "CHECKPOINT"
+
+
+class AdmissionPriority(str, Enum):
+    """Shared Gemini admission priority classes."""
+
+    CRITICAL = "CRITICAL"
+    HIGH = "HIGH"
+    MEDIUM = "MEDIUM"
+    LOW = "LOW"
+    AVOID = "AVOID"
