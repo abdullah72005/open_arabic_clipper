@@ -272,10 +272,12 @@ class ProbeExecutor:
         if not source_path.is_file():
             raise StageExecutionError("source media file is unavailable for probing")
         try:
+            started_at = monotonic()
             metadata = self._probe.probe(source_path)
             return StageExecutionResult(
                 canonical_fingerprint("probe-output", "1", {"metadata": asdict(metadata)}),
                 metadata,
+                {"cache_reuse": "miss", "ffprobe_seconds": monotonic() - started_at},
             )
         except Exception as error:
             raise StageExecutionError("ffprobe failed to validate source media") from error
@@ -295,7 +297,8 @@ class AudioExtractionExecutor:
         )
 
     def execute(self, source: SourceVideo, *, force: bool = False) -> StageExecutionResult:
-        artifact = self._extractor.extract(source)
+        extraction = self._extractor.extract_with_metrics(source)
+        artifact = extraction.artifact
         return StageExecutionResult(
             canonical_fingerprint(
                 "audio-extraction-output",
@@ -306,6 +309,7 @@ class AudioExtractionExecutor:
                 },
             ),
             artifact,
+            extraction.metrics,
         )
 
 

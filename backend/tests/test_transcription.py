@@ -552,7 +552,10 @@ def test_ingest_and_probe_executors_validate_local_source(tmp_path: Path) -> Non
 
     probe = RecordingProbe()
     assert IngestExecutor().execute(source).value is source
-    assert ProbeExecutor(probe).execute(source).value is not None  # type: ignore[arg-type]
+    result = ProbeExecutor(probe).execute(source)
+    assert result.value is not None
+    assert result.metrics["cache_reuse"] == "miss"
+    assert result.metrics["ffprobe_seconds"] >= 0.0
     assert probe.paths == [source_path]
 
 

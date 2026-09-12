@@ -60,6 +60,33 @@ def test_audio_extraction_caches_a_mono_analysis_artifact(
         assert runner.calls == 1
 
 
+def test_audio_extraction_reports_validated_cache_metrics(
+    sqlite_engine: object, tmp_path: Path
+) -> None:
+    """A cache hit still measures its integrity hash and never invokes FFmpeg."""
+
+    from app.media.audio import AudioExtractionResult, AudioExtractor
+
+    Base.metadata.create_all(sqlite_engine)
+    storage = StorageService(tmp_path / "storage")
+    with Session(sqlite_engine) as session:
+        source = SourceVideo(source_uri=str(tmp_path / "source.mp4"), content_hash="source-hash")
+        Path(source.source_uri).write_bytes(b"source")
+        session.add(source)
+        session.commit()
+        runner = FakeAudioCommand()
+        extractor = AudioExtractor(storage=storage, command_runner=runner, session=session)
+
+        extractor.extract(source)
+        outcome = extractor.extract_with_metrics(source)
+
+        assert isinstance(outcome, AudioExtractionResult)
+        assert outcome.metrics["cache_reuse"] == "hit"
+        assert outcome.metrics["ffmpeg_seconds"] == 0.0
+        assert outcome.metrics["cache_validation_seconds"] >= 0.0
+        assert runner.calls == 1
+
+
 def test_audio_extraction_reports_missing_audio_stream(
     sqlite_engine: object, tmp_path: Path
 ) -> None:
