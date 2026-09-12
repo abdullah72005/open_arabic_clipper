@@ -280,6 +280,7 @@ class Settings(BaseSettings):
             batch_characters=self.reconstruction_provider_batch_characters,
             local_max_targets=self.local_reconstruction_max_targets_per_job,
             local_wall_seconds=self.local_reconstruction_max_wall_seconds,
+            admission=self.gemini_admission_controller(),
         )
 
     def gemini_provider_instance(self) -> GeminiReconstructionProvider | None:

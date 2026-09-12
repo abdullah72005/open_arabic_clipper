@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import re
 import threading
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -76,10 +77,68 @@ from app.services.storage import StorageCategory, StorageService
 from app.transcription.dialect import extract_protected_tokens
 
 _MIN_TEXT = 1e-6
+_TOKEN_BOUNDARY = r"A-Za-z0-9\u0600-\u06FF\u0660-\u0669\u06F0-\u06F9"
 
 
 class RefinementError(RuntimeError):
     """A required Stage 3.5 input or invariant failed with no safe result."""
+
+
+def _apply_entity_reading(base: str, readings: Sequence[str], selected: str) -> str | None:
+    """Substitute one adjudicated entity reading into the base transcript.
+
+    Returns the updated transcript, the unchanged base when the selected reading
+    is already present, or ``None`` when no supplied reading can be applied as a
+    bounded token substitution. The whole transcript is never replaced.
+    """
+
+    if not selected.strip():
+        return None
+    if not base.strip():
+        return None
+    pattern_selected = re.compile(
+        rf"(?<![{_TOKEN_BOUNDARY}]){re.escape(selected)}(?![{_TOKEN_BOUNDARY}])"
+    )
+    if pattern_selected.search(base):
+        return base
+    for reading in readings:
+        if reading == selected or not reading.strip():
+            continue
+        pattern = re.compile(
+            rf"(?<![{_TOKEN_BOUNDARY}]){re.escape(reading)}(?![{_TOKEN_BOUNDARY}])"
+        )
+        updated, count = pattern.subn(lambda _m: selected, base, count=1)
+        if count:
+            return updated
+    return None
+
+
+def evaluate_timing_alignment(
+    manual: str | None, automatic: str, words: Sequence[WordTimestamp]
+) -> tuple[bool, str | None]:
+    """Shared manual-vs-automatic timing-alignment gate.
+
+    Used both by execution and by the manual-review endpoint so unrelated manual
+    text can never be marked final-ready.
+    """
+
+    if not manual or not manual.strip():
+        return True, None
+    if not automatic.strip():
+        return False, "manual_transcript_without_timing_evidence"
+    if not words:
+        return False, "manual_transcript_without_word_timestamps"
+    from app.transcription.arabic import normalize_for_comparison
+
+    manual_tokens = normalize_for_comparison(manual).split()
+    automatic_tokens = normalize_for_comparison(automatic).split()
+    if not automatic_tokens:
+        return False, "manual_transcript_without_timing_evidence"
+    overlap = len(set(manual_tokens) & set(automatic_tokens))
+    ratio = overlap / max(1, len(set(manual_tokens)))
+    if ratio < 0.3:
+        return False, "manual_transcript_cannot_be_aligned_safely"
+    return True, None
 
 
 @dataclass
@@ -406,12 +465,16 @@ class CandidateRefinementService:
             if record.kind in {EvidenceKind.TARGETED_LOCAL_ASR, EvidenceKind.HOSTED_ASR}
             and record.state is EvidenceState.ACCEPTED
         ]
+        self._check_cancelled()
+        consensus_text, consensus_confidence, _ = select_consensus_text(evidence)
+        base_text = consensus_text or (local_record.transcript if local_record else "") or qwen_text
         adjudicated_text, adjudication_spans, handled_ambiguities = self._adjudicate(
             audio_path=audio_path,
             priority=priority,
             region=region,
             audio_records=audio_records,
             source_dialect=source_dialect,
+            base_text=base_text,
             ctx=ctx,
         )
         if adjudicated_text is not None:
@@ -433,9 +496,7 @@ class CandidateRefinementService:
                 )
             )
 
-        self._check_cancelled()
-        consensus_text, consensus_confidence, _ = select_consensus_text(evidence)
-        automatic = consensus_text or (local_record.transcript if local_record else "") or qwen_text
+        automatic = adjudicated_text or base_text
         manual = prior.manual_transcript if prior is not None else None
         operator_segment_text = region.operator_text
         final_text = choose_final_transcript(
@@ -558,6 +619,9 @@ class CandidateRefinementService:
             context_end=window.context_end,
             refined_start=boundary.start,
             refined_end=boundary.end,
+            audio_relative_path=window.relative_path,
+            audio_content_hash=window.content_hash,
+            audio_input_fingerprint=window.input_fingerprint,
             automatic_transcript=automatic,
             manual_transcript=manual,
             final_transcript=final_text,
@@ -1045,6 +1109,7 @@ class CandidateRefinementService:
         region: _Region,
         audio_records: Sequence[EvidenceRecord],
         source_dialect: str | None,
+        base_text: str,
         ctx: RefinementContext,
     ) -> tuple[str | None, tuple[UnresolvedSpan, ...], set[str]]:
         if self._routing_mode == "local_only" or self._adjudicator is None:
@@ -1064,7 +1129,12 @@ class CandidateRefinementService:
             ctx.bump("provider_failures")
             return None, (), set()
         ctx.bump("adjudication_calls")
-        selected: list[str] = []
+        # Adjudication never replaces a whole transcript with a bare entity:
+        # entity readings are applied as bounded substitutions into the
+        # audio-backed base transcript. Only an explicit whole-transcript
+        # disagreement may replace the base.
+        current = base_text
+        changed = False
         spans: list[UnresolvedSpan] = []
         handled: set[str] = set()
         for request in conflicts:
@@ -1091,8 +1161,35 @@ class CandidateRefinementService:
                     )
                 )
                 continue
-            selected.append(result.selected_reading)
-        return (" ".join(selected).strip() or None), tuple(spans), handled
+            selected = result.selected_reading
+            if request.ambiguity_id == "asr-disagreement":
+                # Explicit whole-transcript disagreement may replace the base.
+                if selected.strip() and selected.strip() != current:
+                    current = selected
+                    changed = True
+                continue
+            updated = _apply_entity_reading(current, request.candidate_readings, selected)
+            if updated is None:
+                spans.append(
+                    UnresolvedSpan(
+                        span_id=request.ambiguity_id,
+                        start=None,
+                        end=None,
+                        context=request.context,
+                        readings=request.candidate_readings,
+                        evidence_fingerprints=tuple(record.fingerprint for record in audio_records),
+                        providers=("gemini",),
+                        confidence=float(getattr(result, "confidence", 0.0) or 0.0),
+                        reason="adjudication_not_applicable",
+                        entity_type=None,
+                        meaning_critical=request.meaning_critical,
+                    )
+                )
+                continue
+            if updated != current:
+                current = updated
+                changed = True
+        return (current if changed else None), tuple(spans), handled
 
     def _adjudication_requests(
         self,
@@ -1321,23 +1418,7 @@ class CandidateRefinementService:
     def _timing_alignment(
         self, manual: str | None, automatic: str, words: Sequence[WordTimestamp]
     ) -> tuple[bool, str | None]:
-        if not manual or not manual.strip():
-            return True, None
-        if not automatic.strip():
-            return False, "manual_transcript_without_timing_evidence"
-        if not words:
-            return False, "manual_transcript_without_word_timestamps"
-        from app.transcription.arabic import normalize_for_comparison
-
-        manual_tokens = normalize_for_comparison(manual).split()
-        automatic_tokens = normalize_for_comparison(automatic).split()
-        if not automatic_tokens:
-            return False, "manual_transcript_without_timing_evidence"
-        overlap = len(set(manual_tokens) & set(automatic_tokens))
-        ratio = overlap / max(1, len(set(manual_tokens)))
-        if ratio < 0.3:
-            return False, "manual_transcript_cannot_be_aligned_safely"
-        return True, None
+        return evaluate_timing_alignment(manual, automatic, words)
 
     def _seed_bounds(
         self, candidate: ClipCandidate, priority: RefinementPriority

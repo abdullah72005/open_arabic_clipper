@@ -235,6 +235,9 @@ class RefinementOutcome:
     context_end: float
     refined_start: float
     refined_end: float
+    audio_relative_path: str
+    audio_content_hash: str
+    audio_input_fingerprint: str
     automatic_transcript: str
     manual_transcript: str | None
     final_transcript: str

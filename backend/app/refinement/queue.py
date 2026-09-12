@@ -16,7 +16,8 @@ from app.core.enums import (
 )
 from app.models import CandidateRefinement, ClipCandidate, ProcessingJob, SourceVideo
 from app.refinement.executor import build_candidate_refinement_executor
-from app.refinement.types import priority_is_stage35
+from app.refinement.service import evaluate_timing_alignment
+from app.refinement.types import WordTimestamp, priority_is_stage35
 from app.services.storage import StorageService
 
 _VALID_DISPOSITIONS = {
@@ -248,9 +249,22 @@ def apply_manual_transcript(
             continue
         if span.get("meaning_critical") and span.get("resolution_state") != "RESOLVED":
             pending_critical = True
+    # A final row is ready only when the manual text can be safely aligned to
+    # the existing audio-backed timing evidence; unrelated text stays in review.
+    words = [
+        WordTimestamp(
+            text=str(item.get("text", "")),
+            start=float(item.get("start", 0.0)),
+            end=float(item.get("end", 0.0)),
+        )
+        for item in (refinement.word_timestamps or [])
+        if isinstance(item, dict)
+    ]
+    aligned, _reason = evaluate_timing_alignment(
+        cleaned, refinement.automatic_transcript or "", words
+    )
     if pending_critical or (
-        refinement.priority is RefinementPriority.FINAL_CLIP
-        and not (refinement.word_timestamps or [])
+        refinement.priority is RefinementPriority.FINAL_CLIP and not (words and aligned)
     ):
         refinement.status = _review_status(refinement)
     else:

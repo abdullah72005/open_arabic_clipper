@@ -714,3 +714,55 @@ def test_executor_reuses_accepted_hosted_evidence_on_outage(
     second = _executor(session, storage, hosted_provider=failing, routing_mode="gemini_only")
     second.execute(row.id)
     assert failing.calls == 0
+
+
+# ----------------------------------------------------------------------
+# Sol review regressions
+
+
+def test_entity_adjudication_preserves_full_utterance(
+    session: Session, storage: StorageService
+) -> None:
+    candidate = _make_candidate(session, index_text="فيه 71 شخص", start=10.0, end=16.0)
+    outcome = _service(
+        session,
+        storage,
+        asr_engine=_FakeASR("فيه 70 شخص", (WordTimestamp("70", 12.0, 12.4, 0.9),)),
+        hosted_provider=_FakeHosted("فيه 70 شخص", words=(WordTimestamp("70", 2.0, 2.4, 0.9),)),
+        adjudication_provider=_FakeAdjudicator({"entity-0": "71"}),
+        admission=_FakeAdmission(),
+    ).execute(candidate, priority=RefinementPriority.FINAL_CLIP)
+
+    assert outcome.final_transcript.strip() != "71"
+    assert "شخص" in outcome.final_transcript
+    assert "71" in outcome.final_transcript
+    assert len(outcome.final_transcript.split()) > 1
+
+
+def test_whole_transcript_adjudication_may_replace(
+    session: Session, storage: StorageService
+) -> None:
+    candidate = _make_candidate(session, index_text="نص أول", start=10.0, end=16.0)
+    outcome = _service(
+        session,
+        storage,
+        asr_engine=_FakeASR("نص أول", (WordTimestamp("نص", 10.5, 10.9, 0.9),)),
+        hosted_provider=_FakeHosted("نص ثاني", words=(WordTimestamp("نص", 0.5, 0.9, 0.9),)),
+        adjudication_provider=_FakeAdjudicator({"asr-disagreement": "نص ثاني"}),
+        admission=_FakeAdmission(),
+    ).execute(candidate, priority=RefinementPriority.FINAL_CLIP)
+
+    assert outcome.final_transcript.strip() == "نص ثاني"
+
+
+def test_executor_persists_extracted_audio_metadata(
+    session: Session, storage: StorageService
+) -> None:
+    candidate = _make_candidate(session)
+    row = _refinement_row(session, candidate)
+    _executor(session, storage).execute(row.id)
+    session.refresh(row)
+    assert row.audio_relative_path
+    assert row.audio_relative_path.endswith("/CANDIDATE.wav")
+    assert row.audio_content_hash
+    assert row.audio_input_fingerprint

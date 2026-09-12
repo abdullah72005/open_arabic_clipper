@@ -209,6 +209,9 @@ class CandidateRefinementExecutor:
         refinement.context_end = outcome.context_end
         refinement.refined_start = outcome.refined_start
         refinement.refined_end = outcome.refined_end
+        refinement.audio_relative_path = outcome.audio_relative_path
+        refinement.audio_content_hash = outcome.audio_content_hash
+        refinement.audio_input_fingerprint = outcome.audio_input_fingerprint
         refinement.automatic_transcript = outcome.automatic_transcript
         if outcome.manual_transcript is not None:
             refinement.manual_transcript = outcome.manual_transcript

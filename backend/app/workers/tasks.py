@@ -84,6 +84,7 @@ def _stage_executors(session: Session) -> dict[PipelineStage, StageExecutor]:
             provider=settings.candidate_semantic_provider(),
             mode=settings.semantic_provider_mode(),
             lease_factory=lease_factory,
+            admission=settings.gemini_admission_controller(),
         ),
     }
     return {**defaults, **_executors}

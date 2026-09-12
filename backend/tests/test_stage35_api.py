@@ -322,3 +322,44 @@ def test_job_cancellation_works_for_candidate_refinement(api) -> None:
     cancelled = client.post(f"/jobs/{queued['job_id']}/cancel")
     assert cancelled.status_code == 200
     assert cancelled.json()["status"] == "CANCELLED"
+
+
+def test_manual_endpoint_rejects_unrelated_final_text(api) -> None:
+    client, factory = api
+    _source_id, candidate_id = _make_source(factory)
+    with factory() as session:
+        candidate = session.get(ClipCandidate, candidate_id)
+        assert candidate is not None
+        row = CandidateRefinement(
+            source_video_id=candidate.source_video_id,
+            clip_candidate_id=candidate.id,
+            priority=RefinementPriority.FINAL_CLIP,
+            status=RefinementStatus.NEEDS_MANUAL_TRANSCRIPT_REVIEW,
+            coarse_start=10.0,
+            coarse_end=16.0,
+            context_start=5.0,
+            context_end=21.0,
+            automatic_transcript="أنا عملت امبارح",
+            word_timestamps=[
+                {"text": "أنا", "start": 10.1, "end": 10.3},
+                {"text": "عملت", "start": 10.3, "end": 10.6},
+                {"text": "امبارح", "start": 10.6, "end": 11.0},
+            ],
+        )
+        session.add(row)
+        session.commit()
+        refinement_id = row.id
+
+    unrelated = client.post(
+        f"/api/refinements/{refinement_id}/manual",
+        json={"text": "كلام مختلف تماما وغير مرتبط", "resolutions": {}},
+    )
+    assert unrelated.status_code == 200
+    assert unrelated.json()["status"] == "NEEDS_MANUAL_TRANSCRIPT_REVIEW"
+
+    aligned = client.post(
+        f"/api/refinements/{refinement_id}/manual",
+        json={"text": "أنا عملت امبارح", "resolutions": {}},
+    )
+    assert aligned.status_code == 200
+    assert aligned.json()["status"] == "FINAL_TRANSCRIPT_READY"
