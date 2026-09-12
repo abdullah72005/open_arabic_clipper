@@ -8,9 +8,11 @@ dialect-aware Arabic correction, and records silence/quality signals through
 `READY_FOR_ANALYSIS`. Stage 3 then finds promising coarse clip moments cheaply
 from that imperfect INDEX transcript, scores content separately from transcript
 confidence, preserves strong uncertain moments as `CANDIDATE_NEEDS_REFINEMENT`
-for Stage 3.5, and advances the source to `READY_FOR_REFINEMENT`. It does not
-extract or retranscribe candidate audio, recover omitted English, select final
-boundaries, reframe, render, publish, or automatically authorize content.
+for Stage 3.5, and advances the source to `READY_FOR_REFINEMENT`. Stage 3.5 adds
+explicit, candidate-scoped, audio-verified transcript/boundary refinement with
+optional selective Gemini and a shared priority budget; it never retranscribes a
+whole source. It does not reframe, render, publish, or automatically authorize
+content; Stage 4 transformation planning is not implemented.
 
 Only process material you own or are explicitly authorized to process. URL
 ingest downloads permitted public sources directly; an optional outbound proxy
@@ -248,6 +250,33 @@ transcript never changes a strong candidate's content score. Strong uncertain
 moments survive as `CANDIDATE_NEEDS_REFINEMENT` for Stage 3.5; content quality
 below threshold is `DO_NOT_CLIP`, and redundant moments are
 `DO_NOT_CLIP_RECENTLY_REDUNDANT`.
+
+Stage 3.5 (`CANDIDATE_REFINEMENT`) then turns one explicitly requested candidate
+into a trustworthy, bounded, audio-verified transcript. It extracts only a short
+candidate context WAV (candidate 5/5 s, final 8/8 s, max 150 s) from the original
+source, runs targeted local faster-whisper as the mandatory backbone, recovers
+omitted English/code-switching only from actual audio evidence, optionally
+consults hosted `gemini-3.5-transcribe` and `gemini-3.8-flash` adjudication behind
+a shared Gemini priority/budget gate, refines boundaries conservatively, and
+reports `CANDIDATE_REFINED`, `FINAL_TRANSCRIPT_READY`,
+`NEEDS_MANUAL_TRANSCRIPT_REVIEW`, `PROVIDER_DEGRADED`, `REFINEMENT_FAILED`, or
+`CANCELLED`. It never retranscribes or uploads a whole source, is never added to
+the automatic stage chain, and `FINAL_TRANSCRIPT_READY` is not publishing
+readiness; Stage 4 is not implemented. Queue and inspect refinements:
+
+```bash
+python -m app.cli candidate-refine CANDIDATE_ID --priority CANDIDATE
+python -m app.cli candidate-refine-batch SOURCE_ID --limit 5
+python -m app.cli candidate-refinements CANDIDATE_ID
+python -m app.cli candidate-handoff CANDIDATE_ID
+```
+
+API: `POST /api/candidates/{id}/refinements`, `GET /api/refinements/{id}`, `GET
+/api/candidates/{id}/refinements`, `GET /api/candidates/{id}/stage4-handoff`,
+`POST /api/refinements/{id}/manual`, and `POST
+/api/sources/{id}/candidate-refinements/batch`. See
+[Stage 3.5 operations](docs/STAGE_3_5_OPERATIONS.md) for the full design, bounds,
+fingerprints, admission gate, and handoff.
 
 Stage 3 semantic mode defaults to `deterministic`: zero Gemini calls and zero
 Qwen model loads. `adaptive` uses Gemini only when a key is configured, and

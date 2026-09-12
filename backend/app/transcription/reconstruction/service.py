@@ -92,6 +92,7 @@ class ContextualReconstructor:
         is_cancelled: Callable[[], bool] | None = None,
         checkpoint: Callable[[dict[int, "SegmentReconstruction"], dict[str, object]], None]
         | None = None,
+        admission: object | None = None,
     ) -> None:
         self._provider = provider
         self._gemini = gemini_provider
@@ -105,6 +106,7 @@ class ContextualReconstructor:
         self._monotonic = monotonic
         self._is_cancelled = is_cancelled
         self._checkpoint = checkpoint
+        self._admission = admission
 
     def with_local_provider(
         self, provider: ReconstructionProvider | None
@@ -121,6 +123,7 @@ class ContextualReconstructor:
             local_max_targets=self._local_max_targets,
             local_wall_seconds=self._local_wall_seconds,
             priority=self._priority,
+            admission=self._admission,
             monotonic=self._monotonic,
             is_cancelled=self._is_cancelled,
             checkpoint=self._checkpoint,
@@ -139,6 +142,7 @@ class ContextualReconstructor:
             local_max_targets=self._local_max_targets,
             local_wall_seconds=self._local_wall_seconds,
             priority=priority,
+            admission=self._admission,
             monotonic=self._monotonic,
             is_cancelled=self._is_cancelled,
             checkpoint=self._checkpoint,
@@ -169,6 +173,7 @@ class ContextualReconstructor:
             local_max_targets=self._local_max_targets,
             local_wall_seconds=self._local_wall_seconds,
             priority=self._priority,
+            admission=self._admission,
             monotonic=self._monotonic,
             is_cancelled=is_cancelled or self._is_cancelled,
             checkpoint=checkpoint or self._checkpoint,
@@ -605,6 +610,30 @@ class ContextualReconstructor:
         if state.gemini_exhausted:
             return state.gemini_stop_reason or "gemini_budget_exhausted"
         return "gemini_unavailable"
+
+    def _admission_priority(self) -> str:
+        """Map this run's refinement priority to the shared Gemini admission class."""
+
+        if self._priority is RefinementPriority.FINAL_CLIP:
+            return "CRITICAL"
+        if self._priority is RefinementPriority.CANDIDATE:
+            return "MEDIUM"
+        return "AVOID"
+
+    def _gemini_admitted(self) -> bool:
+        """Consult the shared global gate before any hosted generation."""
+
+        if self._admission is None:
+            return True
+        from app.core.enums import AdmissionPriority
+
+        try:
+            decision = self._admission.acquire(  # type: ignore[attr-defined]
+                AdmissionPriority(self._admission_priority())
+            )
+        except Exception:
+            return False
+        return bool(getattr(decision, "admitted", False))
 
     def _record_gemini_unavailable(self, state: "_JobState") -> None:
         if self._gemini is not None:
@@ -1550,6 +1579,30 @@ class ContextualReconstructor:
         fallback_to_local: bool = False,
         local_seg: SegmentReconstruction | None = None,
     ) -> SegmentReconstruction:
+        if not self._gemini_admitted():
+            state.counts["gemini_admission_denied"] += 1
+            state.gemini_exhausted = True
+            state.gemini_stop_reason = "gemini_admission_denied"
+            if local_seg is not None:
+                state.counts["unresolved"] += 1
+                return replace(
+                    local_seg,
+                    gemini_attempted=False,
+                    escalation_reason=_merge_escalation(
+                        local_seg.escalation_reason, "gemini_admission_denied"
+                    ),
+                )
+            return self._fallback(
+                index,
+                segment,
+                status=ReconstructionStatus.PROVIDER_UNAVAILABLE,
+                method="gemini:admission_denied",
+                decision=decision,
+                route=route_override,
+                gemini_attempted=False,
+                final_provider=_STAGE25_METHOD,
+                escalation_reason=escalation_reason,
+            )
         state.gemini_budget_remaining -= 1
         if escalation_reason is not None:
             state.counts["gemini_escalations"] += 1
@@ -1573,6 +1626,12 @@ class ContextualReconstructor:
                 state.counts["gemini_rate_limited"] += 1
                 state.gemini_exhausted = True
                 state.gemini_stop_reason = "gemini_rate_limit_exhausted"
+                recorder = getattr(self._admission, "record_rate_limit", None)
+                if callable(recorder):
+                    try:
+                        recorder()
+                    except Exception:
+                        pass
             elif error.category is GeminiErrorCategory.AUTHENTICATION:
                 state.counts["gemini_authentication_failed"] += 1
                 state.gemini_exhausted = True
