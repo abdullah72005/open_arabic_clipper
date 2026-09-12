@@ -234,10 +234,12 @@ class IngestExecutor:
     def execute(self, source: SourceVideo, *, force: bool = False) -> StageExecutionResult:
         if not source.source_uri:
             raise StageExecutionError("source URI is missing")
+        metrics: dict[str, object] = {"cache_reuse": "not_applicable"}
         if source.source_uri.startswith(("http://", "https://")):
             acquired = self._url_adapter.acquire(source.id, source.source_uri)
             source.source_uri = str(acquired.path)
             source.original_filename = acquired.original_filename
+            metrics = dict(acquired.metrics)
         return StageExecutionResult(
             canonical_fingerprint(
                 "ingest-output",
@@ -248,6 +250,7 @@ class IngestExecutor:
                 },
             ),
             source,
+            metrics,
         )
 
 
