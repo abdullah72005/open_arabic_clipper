@@ -118,6 +118,10 @@ class TranscriptionExecutor:
             storage = self._storage or StorageService(get_settings().storage_root)
             audio_path = storage.resolve(StorageCategory.SOURCES, audio_path)
         started_at = monotonic()
+        resolver = getattr(
+            self._engine, "resolved_hardware", lambda _options: ("unknown", "unknown")
+        )
+        resolved_device, resolved_compute_type = resolver(self._options)
         self._emit_snapshot("before_load")
         cancel_event = threading.Event()
         with self._lease_factory.acquire(
@@ -149,6 +153,18 @@ class TranscriptionExecutor:
                 },
             ),
             transcript,
+            {
+                "cache_reuse": "miss",
+                "transcription_seconds": transcript.processing_duration,
+                "child_elapsed_seconds": getattr(
+                    self._engine, "last_child_elapsed_seconds", lambda: None
+                )(),
+                "child_peak_rss_bytes": self._engine.last_child_peak_rss(),
+                "requested_cpu_threads": self._options.cpu_threads,
+                "index_batch_size": self._options.index_batch_size,
+                "resolved_device": resolved_device,
+                "resolved_compute_type": resolved_compute_type,
+            },
         )
 
     def _emit_snapshot(self, label: str, child_peak_rss: int | None = None) -> None:
@@ -193,6 +209,8 @@ class TranscriptionExecutor:
             "vad_filter": self._options.vad_filter,
             "initial_prompt": self._options.initial_prompt,
             "hotwords": self._options.hotwords,
+            "cpu_threads": self._options.cpu_threads,
+            "index_batch_size": self._options.index_batch_size,
         }
         transcript.input_fingerprint = fingerprint
         transcript.raw_text = result.raw_text

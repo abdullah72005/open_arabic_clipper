@@ -64,6 +64,31 @@ def test_transcription_fingerprint_changes_for_material_settings_only() -> None:
 
     assert options.fingerprint("a" * 64) == options.fingerprint("a" * 64)
     assert options.fingerprint("a" * 64) != replace(options, beam_size=1).fingerprint("a" * 64)
+    assert options.fingerprint("a" * 64) != replace(options, index_batch_size=2).fingerprint(
+        "a" * 64
+    )
+    assert options.cpu_threads == 0
+
+
+def test_engine_passes_configured_cpu_threads_to_child_model() -> None:
+    """Thread count is execution-only but must reach child-side model construction."""
+
+    from app.transcription.engine import WhisperEngine
+
+    created: list[tuple[str, str, str, int]] = []
+
+    def model_factory(model: str, device: str, compute_type: str, cpu_threads: int) -> FakeModel:
+        created.append((model, device, compute_type, cpu_threads))
+        return FakeModel()
+
+    WhisperEngine(
+        model_factory=model_factory, cuda_available=lambda: False, runner=DirectRunner()
+    ).transcribe(
+        Path("speech.wav"),
+        TranscriptionOptions("small", "cpu", "int8", 5, cpu_threads=3),
+    )
+
+    assert created == [("small", "cpu", "int8", 3)]
 
 
 def test_transcription_options_include_forced_language_in_cache_key() -> None:
@@ -93,17 +118,17 @@ def test_engine_falls_back_to_cpu_int8_and_preserves_word_timestamps() -> None:
 
     from app.transcription.engine import WhisperEngine
 
-    created: list[tuple[str, str, str]] = []
+    created: list[tuple[str, str, str, int]] = []
 
-    def model_factory(model: str, device: str, compute_type: str) -> FakeModel:
-        created.append((model, device, compute_type))
+    def model_factory(model: str, device: str, compute_type: str, cpu_threads: int) -> FakeModel:
+        created.append((model, device, compute_type, cpu_threads))
         return FakeModel()
 
     result = WhisperEngine(
         model_factory=model_factory, cuda_available=lambda: False, runner=DirectRunner()
     ).transcribe(Path("speech.wav"), TranscriptionOptions("small", "auto", "auto", 5))
 
-    assert created == [("small", "cpu", "int8")]
+    assert created == [("small", "cpu", "int8", 0)]
     assert result.language == "ar"
     assert result.language_probability == 0.97
     assert result.segments[0]["tokens"] == [50364, 1234, 50414]
@@ -207,7 +232,9 @@ class _ChildModel:
         return rows(), _ChildInfo()
 
 
-def _child_fake_model_factory(model: str, device: str, compute_type: str) -> _ChildModel:
+def _child_fake_model_factory(
+    model: str, device: str, compute_type: str, cpu_threads: int
+) -> _ChildModel:
     return _ChildModel()
 
 

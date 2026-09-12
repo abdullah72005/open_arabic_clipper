@@ -53,6 +53,8 @@ class Settings(BaseSettings):
     whisper_temperature: tuple[float, ...] = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
     whisper_condition_on_previous_text: bool = True
     whisper_vad_filter: bool = False
+    whisper_cpu_threads: int = Field(default=0, ge=0, le=64)
+    whisper_index_batch_size: int = Field(default=1, ge=1, le=4)
     whisper_initial_prompt: str | None = Field(default=None, max_length=4_000)
     whisper_hotwords: str | None = Field(default=None, max_length=4_000)
     correction_context_segments: int = Field(default=2, ge=0, le=5)
@@ -189,6 +191,8 @@ class Settings(BaseSettings):
             vad_filter=self.whisper_vad_filter,
             initial_prompt=self.whisper_initial_prompt,
             hotwords=self.whisper_hotwords,
+            cpu_threads=self.whisper_cpu_threads,
+            index_batch_size=self.whisper_index_batch_size,
         )
 
     def correction_config(self) -> CorrectionConfig:

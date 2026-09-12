@@ -23,7 +23,7 @@ class WhisperModel(Protocol):
     def transcribe(self, path: str, **kwargs: object) -> tuple[Iterable[object], object]: ...
 
 
-ModelFactory = Callable[[str, str, str], WhisperModel]
+ModelFactory = Callable[[str, str, str, int], WhisperModel]
 CudaAvailability = Callable[[], bool]
 
 
@@ -60,6 +60,11 @@ class WhisperEngine:
         """Return the peak RSS measured inside the last spawned child, in bytes."""
 
         return self._last_outcome.child_peak_rss_bytes if self._last_outcome is not None else None
+
+    def last_child_elapsed_seconds(self) -> float | None:
+        """Return child wall time for the most recent isolated model call."""
+
+        return self._last_outcome.elapsed_seconds if self._last_outcome is not None else None
 
     def transcribe(
         self,
@@ -113,14 +118,21 @@ class WhisperEngine:
         )
 
 
-def _default_model_factory(model: str, device: str, compute_type: str) -> WhisperModel:
+def _default_model_factory(
+    model: str, device: str, compute_type: str, cpu_threads: int
+) -> WhisperModel:
     try:
         import faster_whisper  # type: ignore[import-untyped]
     except ImportError as err:
         raise RuntimeError("faster-whisper is not installed") from err
     return cast(
         WhisperModel,
-        faster_whisper.WhisperModel(model, device=device, compute_type=compute_type),
+        faster_whisper.WhisperModel(
+            model,
+            device=device,
+            compute_type=compute_type,
+            cpu_threads=cpu_threads,
+        ),
     )
 
 
@@ -140,7 +152,7 @@ def _run_transcription_child(
     garbage on both success and exceptions before it exits.
     """
 
-    model_obj = model_factory(model, device, compute_type)
+    model_obj = model_factory(model, device, compute_type, options.cpu_threads)
     try:
         segments, info = model_obj.transcribe(
             audio_path_str,
