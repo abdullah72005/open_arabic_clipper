@@ -143,7 +143,7 @@ class AudioExtractor:
         if artifact.source_content_hash != source.content_hash:
             return False
         path = self._storage.resolve(StorageCategory.SOURCES, artifact.output_path)
-        return path.is_file() and sha256_file(path) == artifact.content_hash
+        return bool(path.is_file() and sha256_file(path) == artifact.content_hash)
 
 
 def _wav_duration(path: Path) -> float:
