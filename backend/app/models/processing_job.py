@@ -26,6 +26,9 @@ class ProcessingJob(Base):
     source_video_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("source_videos.id", ondelete="CASCADE"), nullable=False, index=True
     )
+    candidate_refinement_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("candidate_refinements.id", ondelete="SET NULL"), index=True
+    )
     kind: Mapped[JobKind] = mapped_column(
         Enum(JobKind, name="job_kind", native_enum=False, create_constraint=True),
         nullable=False,

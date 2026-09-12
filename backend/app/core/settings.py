@@ -10,6 +10,7 @@ from app.candidates.local import LocalSemanticProvider
 from app.candidates.policy import Stage3Config
 from app.candidates.providers import SemanticProvider
 from app.core.enums import SemanticProviderMode
+from app.refinement.policy import AdmissionPolicy, Stage35Config
 from app.runtime.heavy_model_lease import HeavyModelLeaseFactory
 from app.transcription.correction import ContextualCorrector, CorrectionConfig
 from app.transcription.providers import CorrectionProvider, OpenAICompatibleCorrectionProvider
@@ -124,6 +125,32 @@ class Settings(BaseSettings):
     candidate_provider_max_input_characters: int = Field(default=6_000, gt=0, le=48_000)
     candidate_provider_max_output_tokens: int = Field(default=1_024, gt=0, le=4_096)
     candidate_novelty_corpus_limit: int = Field(default=500, ge=0, le=5_000)
+    # Stage 3.5 candidate-scoped refinement. Process candidate audio only; never
+    # retranscribe or upload a whole source. Routing defaults to adaptive, which
+    # uses targeted local Whisper plus selective Gemini and never silently falls
+    # back to Qwen.
+    refinement_routing_mode: Literal["adaptive", "local_only", "gemini_only"] = "adaptive"
+    refinement_candidate_pre_context_seconds: float = Field(default=5.0, ge=0, le=60)
+    refinement_candidate_post_context_seconds: float = Field(default=5.0, ge=0, le=60)
+    refinement_final_pre_context_seconds: float = Field(default=8.0, ge=0, le=60)
+    refinement_final_post_context_seconds: float = Field(default=8.0, ge=0, le=60)
+    refinement_max_window_seconds: float = Field(default=150.0, gt=0, le=600)
+    refinement_boundary_search_radius_seconds: float = Field(default=5.0, gt=0, le=30)
+    refinement_candidate_beam_size: int = Field(default=5, gt=0, le=20)
+    refinement_final_beam_size: int = Field(default=8, gt=0, le=20)
+    refinement_batch_default_limit: int = Field(default=5, gt=0, le=10)
+    refinement_batch_max_limit: int = Field(default=10, gt=0, le=20)
+    gemini_transcription_model: str = Field(default="gemini-3.5-transcribe", max_length=256)
+    gemini_transcription_api_version: str = Field(default="v1", min_length=1, max_length=32)
+    gemini_transcription_max_output_tokens: int = Field(default=2_048, gt=0, le=8_192)
+    gemini_adjudication_max_output_tokens: int = Field(default=1_024, gt=0, le=4_096)
+    gemini_admission_window_seconds: float = Field(default=60.0, gt=0, le=86_400)
+    gemini_admission_total_calls: int = Field(default=30, gt=0, le=10_000)
+    gemini_admission_critical_reserve: int = Field(default=8, ge=0, le=10_000)
+    gemini_admission_high_reserve: int = Field(default=6, ge=0, le=10_000)
+    gemini_admission_low_enabled: bool = False
+    gemini_admission_provider_cooldown_seconds: float = Field(default=60.0, ge=0, le=86_400)
+    gemini_admission_max_retry_after_seconds: float = Field(default=3_600.0, ge=0, le=86_400)
     transcription_queue_concurrency: int = Field(default=1, gt=0)
     cors_origins: list[str] = ["http://localhost:3301"]
 
@@ -134,6 +161,15 @@ class Settings(BaseSettings):
             <= 2 * self.heavy_model_lease_renewal_interval_seconds
         ):
             raise ValueError("heavy model lease TTL must exceed two renewal intervals")
+        return self
+
+    @model_validator(mode="after")  # type: ignore[untyped-decorator]
+    def _validate_admission_reserves(self) -> "Settings":
+        if (
+            self.gemini_admission_critical_reserve + self.gemini_admission_high_reserve
+            > self.gemini_admission_total_calls
+        ):
+            raise ValueError("Gemini admission reserves cannot exceed total calls")
         return self
 
     def transcription_options(self) -> TranscriptionOptions:
@@ -350,6 +386,116 @@ class Settings(BaseSettings):
             ttl_seconds=self.heavy_model_lease_ttl_seconds,
             renewal_interval_seconds=self.heavy_model_lease_renewal_interval_seconds,
             acquisition_timeout_seconds=self.heavy_model_lease_acquisition_timeout_seconds,
+        )
+
+    def stage35_config(self) -> Stage35Config:
+        """Build bounded Stage 3.5 refinement policy configuration."""
+
+        return Stage35Config(
+            candidate_pre_context_seconds=self.refinement_candidate_pre_context_seconds,
+            candidate_post_context_seconds=self.refinement_candidate_post_context_seconds,
+            final_pre_context_seconds=self.refinement_final_pre_context_seconds,
+            final_post_context_seconds=self.refinement_final_post_context_seconds,
+            max_refinement_window_seconds=self.refinement_max_window_seconds,
+            boundary_search_radius_seconds=self.refinement_boundary_search_radius_seconds,
+            candidate_beam_size=self.refinement_candidate_beam_size,
+            final_beam_size=self.refinement_final_beam_size,
+            batch_default_limit=self.refinement_batch_default_limit,
+            batch_max_limit=self.refinement_batch_max_limit,
+            hosted_max_output_tokens=self.gemini_transcription_max_output_tokens,
+            adjudication_max_output_tokens=self.gemini_adjudication_max_output_tokens,
+        )
+
+    def gemini_admission_policy(self) -> AdmissionPolicy:
+        """Build the static shared Gemini admission policy."""
+
+        return AdmissionPolicy(
+            window_seconds=self.gemini_admission_window_seconds,
+            total_calls=self.gemini_admission_total_calls,
+            critical_reserve=self.gemini_admission_critical_reserve,
+            high_reserve=self.gemini_admission_high_reserve,
+            low_enabled=self.gemini_admission_low_enabled,
+            provider_cooldown_seconds=self.gemini_admission_provider_cooldown_seconds,
+            max_retry_after_seconds=self.gemini_admission_max_retry_after_seconds,
+        )
+
+    def targeted_transcription_options(self, priority: str) -> TranscriptionOptions:
+        """Build targeted window ASR options for CANDIDATE or FINAL_CLIP work."""
+
+        beam = (
+            self.refinement_final_beam_size
+            if priority == "FINAL_CLIP"
+            else (self.refinement_candidate_beam_size)
+        )
+        return TranscriptionOptions(
+            model=self.whisper_model,
+            device=self.whisper_device,
+            compute_type=self.whisper_compute_type or "auto",
+            beam_size=beam,
+            # Automatic language detection so embedded English survives.
+            language=None,
+            word_timestamps=True,
+            cpu_compute_type=self.whisper_cpu_compute_type,
+            cuda_compute_type=self.whisper_cuda_compute_type,
+            temperature=self.whisper_temperature,
+            condition_on_previous_text=False,
+            vad_filter=False,
+            initial_prompt=None,
+            hotwords=None,
+        )
+
+    def hosted_transcription_provider(self) -> object | None:
+        """Return the optional dedicated transcription provider when a key exists."""
+
+        key = self.gemini_api_key
+        if key is None or not key.get_secret_value():
+            return None
+        from app.refinement.hosted import GeminiAudioTranscriptionProvider
+
+        return GeminiAudioTranscriptionProvider(
+            api_key=key.get_secret_value(),
+            model=self.gemini_transcription_model,
+            api_version=self.gemini_transcription_api_version,
+            timeout_seconds=self.gemini_timeout_seconds,
+            retry_attempts=self.gemini_retry_attempts,
+            retry_backoff_seconds=self.gemini_retry_backoff_seconds,
+            max_output_tokens=self.gemini_transcription_max_output_tokens,
+        )
+
+    def adjudication_provider(self) -> object | None:
+        """Return the optional Flash reasoning adjudication provider when configured."""
+
+        key = self.gemini_api_key
+        if key is None or not key.get_secret_value():
+            return None
+        from app.refinement.hosted import GeminiAdjudicationProvider
+
+        return GeminiAdjudicationProvider(
+            api_key=key.get_secret_value(),
+            model=self.gemini_model,
+            api_version=self.gemini_api_version,
+            timeout_seconds=self.gemini_timeout_seconds,
+            retry_attempts=self.gemini_retry_attempts,
+            retry_backoff_seconds=self.gemini_retry_backoff_seconds,
+            max_output_tokens=self.gemini_adjudication_max_output_tokens,
+            thinking_level=self.gemini_thinking_level,
+            temperature=self.gemini_temperature,
+        )
+
+    def gemini_admission_controller(self) -> object:
+        """Build the shared Redis-backed admission controller.
+
+        Fails closed for hosted work when Redis is unavailable; local processing
+        is unaffected because the service treats an unavailable gate as denied.
+        """
+
+        from redis import Redis
+
+        from app.refinement.admission import GeminiAdmissionController, RedisAdmissionBackend
+
+        return GeminiAdmissionController(
+            backend=RedisAdmissionBackend(Redis.from_url(self.redis_url)),
+            policy=self.gemini_admission_policy(),
         )
 
 

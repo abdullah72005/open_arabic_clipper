@@ -9,10 +9,18 @@ from uuid import UUID
 
 import typer
 
-from app.core.enums import CandidateDisposition, JobKind, PipelineStage
+from app.core.enums import CandidateDisposition, JobKind, PipelineStage, RefinementPriority
 from app.core.settings import get_settings
 from app.db.session import create_session_factory
 from app.models import ClipCandidate, ProcessingJob, SourceVideo, Transcript
+from app.refinement.handoff import build_stage4_handoff
+from app.refinement.queue import (
+    Stage35QueueError,
+    list_refinements,
+    queue_candidate_batch,
+    queue_candidate_refinement,
+    validate_candidate_for_refinement,
+)
 from app.runtime.heavy_model_lease import HeavyModelLeaseBusy, HeavyModelUnsafe
 from app.runtime.memory import MemoryReadError, capture_memory
 from app.services.health import HealthService
@@ -286,6 +294,107 @@ def candidates(
                 ensure_ascii=False,
             )
         )
+
+
+@app.command("candidate-refine")
+def candidate_refine(
+    candidate_id: UUID,
+    priority: str = typer.Option("CANDIDATE", "--priority"),
+    force: bool = typer.Option(False, "--force/--no-force"),
+) -> None:
+    """Queue one explicit candidate-scoped Stage 3.5 refinement."""
+
+    try:
+        parsed = RefinementPriority(priority.upper())
+    except ValueError as error:
+        raise typer.BadParameter("priority must be CANDIDATE or FINAL_CLIP") from error
+    with create_session_factory()() as session:
+        try:
+            candidate = validate_candidate_for_refinement(session, candidate_id)
+        except Stage35QueueError as error:
+            raise typer.BadParameter(str(error)) from error
+        outcome = queue_candidate_refinement(session, _storage(), candidate, parsed, force=force)
+    typer.echo(
+        json.dumps(
+            {
+                "refinement_id": str(outcome.refinement_id),
+                "job_id": str(outcome.job_id) if outcome.job_id else None,
+                "status": outcome.status,
+                "queued": outcome.queued,
+                "cached": outcome.cached,
+                "active": outcome.active,
+            }
+        )
+    )
+
+
+@app.command("candidate-refine-batch")
+def candidate_refine_batch(
+    source_id: UUID,
+    limit: int = typer.Option(5, min=1, max=10),
+    force: bool = typer.Option(False, "--force/--no-force"),
+) -> None:
+    """Queue a bounded, score-ordered candidate-grade refinement batch."""
+
+    with create_session_factory()() as session:
+        try:
+            outcomes = queue_candidate_batch(
+                session, _storage(), source_id, limit=limit, force=force
+            )
+        except Stage35QueueError as error:
+            raise typer.BadParameter(str(error)) from error
+    typer.echo(
+        json.dumps(
+            [
+                {
+                    "refinement_id": str(outcome.refinement_id),
+                    "job_id": str(outcome.job_id) if outcome.job_id else None,
+                    "queued": outcome.queued,
+                    "cached": outcome.cached,
+                    "active": outcome.active,
+                }
+                for outcome in outcomes
+            ]
+        )
+    )
+
+
+@app.command("candidate-refinements")
+def candidate_refinements(candidate_id: UUID) -> None:
+    """Print both quality-level refinements for a candidate."""
+
+    with create_session_factory()() as session:
+        rows = list_refinements(session, candidate_id)
+        typer.echo(
+            json.dumps(
+                [
+                    {
+                        "id": str(row.id),
+                        "priority": row.priority.value,
+                        "status": row.status.value,
+                        "quality_level": row.quality_level,
+                        "confidence": row.confidence,
+                        "refined_start": row.refined_start,
+                        "refined_end": row.refined_end,
+                        "final_transcript": row.final_transcript[:500],
+                        "cache_eligible": row.cache_eligible,
+                    }
+                    for row in rows
+                ],
+                ensure_ascii=False,
+            )
+        )
+
+
+@app.command("candidate-handoff")
+def candidate_handoff(candidate_id: UUID) -> None:
+    """Print the typed read-only Stage 4 handoff for a candidate."""
+
+    with create_session_factory()() as session:
+        handoff = build_stage4_handoff(session, candidate_id)
+        if handoff is None:
+            raise typer.BadParameter("candidate does not exist")
+    typer.echo(json.dumps(handoff, ensure_ascii=False, default=str))
 
 
 @app.command()

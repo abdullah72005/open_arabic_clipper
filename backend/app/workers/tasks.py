@@ -14,7 +14,7 @@ from app.db.session import create_session_factory
 from app.media.audio import AudioExtractor
 from app.media.ffprobe import FFprobe
 from app.models import ProcessingJob
-from app.pipeline.executor import StageExecutor
+from app.pipeline.executor import StageCancelled, StageExecutor
 from app.pipeline.runner import PipelineRunner
 from app.pipeline.stages import (
     AudioAnalysisExecutor,
@@ -25,6 +25,7 @@ from app.pipeline.stages import (
     TranscriptionExecutor,
     TranscriptNormalizationExecutor,
 )
+from app.refinement.executor import build_candidate_refinement_executor
 from app.services.storage import StorageService
 from app.transcription.engine import WhisperEngine
 from app.workers.celery_app import celery_app
@@ -135,6 +136,80 @@ def run_pipeline_stage(
         "job_id": str(result.job_id) if result.job_id else None,
         "skipped": result.skipped,
     }
+
+
+@celery_app.task(  # type: ignore[untyped-decorator]
+    bind=True, autoretry_for=(), name="clipfactory.run_candidate_refinement"
+)
+def run_candidate_refinement(
+    self: Task,
+    candidate_id: str,
+    priority: str,
+    refinement_id: str,
+    job_id: str | None = None,
+    force: bool = False,
+) -> dict[str, str | bool | None]:
+    """Run one explicit candidate-scoped Stage 3.5 refinement.
+
+    This is an extension of the existing job system, not a pipeline stage: it
+    creates no ``PipelineRun`` and never touches the whole-source stage chain.
+    """
+    from uuid import UUID as _UUID
+
+    parsed_refinement = _UUID(refinement_id)
+    parsed_job = _UUID(job_id) if job_id else None
+    session = create_session_factory()()
+    try:
+        settings = get_settings()
+        storage = StorageService(settings.storage_root)
+        if parsed_job is not None:
+            job = session.get(ProcessingJob, parsed_job)
+            if job is not None and job.status is JobStatus.CANCELLED:
+                return {"refinement_id": str(parsed_refinement), "cancelled": True}
+            if job is not None:
+                job.status = JobStatus.RUNNING
+                job.started_at = datetime.now(timezone.utc)
+                session.commit()
+        executor = build_candidate_refinement_executor(session, storage, settings)
+        executor.set_active_job(parsed_job)
+        try:
+            executor.execute(parsed_refinement, force=force)
+        except StageCancelled:
+            if parsed_job is not None:
+                cancelled_job = session.get(ProcessingJob, parsed_job)
+                if cancelled_job is not None and cancelled_job.status is not JobStatus.CANCELLED:
+                    cancelled_job.status = JobStatus.CANCELLED
+                    cancelled_job.completed_at = datetime.now(timezone.utc)
+                    session.commit()
+            return {"refinement_id": str(parsed_refinement), "cancelled": True}
+        except Exception as error:
+            if parsed_job is not None:
+                failed_job = session.get(ProcessingJob, parsed_job)
+                if failed_job is not None and failed_job.status is not JobStatus.CANCELLED:
+                    failed_job.status = JobStatus.FAILED
+                    failed_job.completed_at = datetime.now(timezone.utc)
+                    failed_job.error_message = type(error).__name__[:2048]
+                    session.commit()
+            if getattr(error, "retryable", False):
+                raise self.retry(
+                    args=[candidate_id, priority, refinement_id, job_id, force],
+                    exc=error,
+                    max_retries=MAX_RETRIES,
+                ) from error
+            raise
+        if parsed_job is not None:
+            finished_job = session.get(ProcessingJob, parsed_job)
+            if finished_job is not None and finished_job.status is not JobStatus.CANCELLED:
+                finished_job.status = JobStatus.SUCCEEDED
+                finished_job.completed_at = datetime.now(timezone.utc)
+                session.commit()
+        return {
+            "refinement_id": str(parsed_refinement),
+            "job_id": str(parsed_job) if parsed_job else None,
+            "skipped": False,
+        }
+    finally:
+        session.close()
 
 
 @celery_app.task(name="clipfactory.worker_heartbeat")  # type: ignore[untyped-decorator]

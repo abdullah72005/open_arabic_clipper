@@ -281,3 +281,47 @@ changes invalidate Stage 3 only and never retranscribe the source.
 The host Python remains 3.10.12; use the documented Docker Python 3.12 runtime
 for Stage 3 verification (`docker compose run --rm --no-deps -v
 "$(pwd)/backend:/app" backend ...`).
+
+## Stage 3.5 candidate-scoped refinement configuration (2026-09-12)
+
+Stage 3.5 processes bounded candidate audio only — never a whole source. All
+knobs are `CLIPFACTORY_`-prefixed:
+
+```bash
+# adaptive (default) | local_only | gemini_only
+CLIPFACTORY_REFINEMENT_ROUTING_MODE=adaptive
+CLIPFACTORY_REFINEMENT_CANDIDATE_PRE_CONTEXT_SECONDS=5
+CLIPFACTORY_REFINEMENT_CANDIDATE_POST_CONTEXT_SECONDS=5
+CLIPFACTORY_REFINEMENT_FINAL_PRE_CONTEXT_SECONDS=8
+CLIPFACTORY_REFINEMENT_FINAL_POST_CONTEXT_SECONDS=8
+CLIPFACTORY_REFINEMENT_MAX_WINDOW_SECONDS=150
+CLIPFACTORY_REFINEMENT_BOUNDARY_SEARCH_RADIUS_SECONDS=5
+CLIPFACTORY_REFINEMENT_CANDIDATE_BEAM_SIZE=5
+CLIPFACTORY_REFINEMENT_FINAL_BEAM_SIZE=8
+CLIPFACTORY_REFINEMENT_BATCH_DEFAULT_LIMIT=5
+CLIPFACTORY_REFINEMENT_BATCH_MAX_LIMIT=10
+CLIPFACTORY_GEMINI_TRANSCRIPTION_MODEL=gemini-3.5-transcribe
+CLIPFACTORY_GEMINI_TRANSCRIPTION_API_VERSION=v1
+CLIPFACTORY_GEMINI_TRANSCRIPTION_MAX_OUTPUT_TOKENS=2048
+CLIPFACTORY_GEMINI_ADJUDICATION_MAX_OUTPUT_TOKENS=1024
+CLIPFACTORY_GEMINI_ADMISSION_WINDOW_SECONDS=60
+CLIPFACTORY_GEMINI_ADMISSION_TOTAL_CALLS=30
+CLIPFACTORY_GEMINI_ADMISSION_CRITICAL_RESERVE=8
+CLIPFACTORY_GEMINI_ADMISSION_HIGH_RESERVE=6
+CLIPFACTORY_GEMINI_ADMISSION_LOW_ENABLED=false
+CLIPFACTORY_GEMINI_ADMISSION_PROVIDER_COOLDOWN_SECONDS=60
+CLIPFACTORY_GEMINI_ADMISSION_MAX_RETRY_AFTER_SECONDS=3600
+```
+
+`adaptive` runs targeted local Whisper first and consults hosted Gemini only for
+material uncertainty; `local_only` never calls Gemini; `gemini_only` prefers
+hosted transcription. Adaptive never silently uses Qwen. The dedicated
+transcription model uses the Interactions API in verbatim mode with word
+timestamps; custom vocabulary is never combined with timestamps in the same
+pass. Adjudication reuses `CLIPFACTORY_GEMINI_MODEL` (default
+`gemini-3.8-flash`). Admission reserves are validated against total capacity and
+cannot exceed it; Redis unavailability fails closed for hosted work while local
+processing continues. This routing mode is separate from
+`CLIPFACTORY_RECONSTRUCTION_ROUTING_MODE` and
+`CLIPFACTORY_CANDIDATE_SEMANTIC_MODE`. See
+[docs/STAGE_3_5_OPERATIONS.md](STAGE_3_5_OPERATIONS.md).

@@ -3,14 +3,14 @@
 ## Product and stage
 
 - Product name: `open_arabic_clipper` (working product label: ClipFactory).
-- Current scope: Stage 3 — local-first ingest/probe, cached audio,
+- Current scope: Stage 3.5 — local-first ingest/probe, cached audio,
   faster-whisper transcription, conservative dialect-aware Arabic correction,
   bounded contextual reconstruction through a managed local provider, storage,
-  jobs, dashboard, operational tooling, and deterministic-by-default candidate
-  discovery/scoring/novelty through `READY_FOR_REFINEMENT`.
-- Explicitly out of scope until later stages: Stage 3.5 targeted
-  audio/transcript and exact-boundary refinement, omitted-English recovery,
-  publication-grade transcript text, Stage 4 transformation planning,
+  jobs, dashboard, operational tooling, deterministic-by-default candidate
+  discovery/scoring/novelty through `READY_FOR_REFINEMENT`, and explicit,
+  candidate-scoped audio-verified transcript/boundary refinement to
+  `CANDIDATE_REFINED`/`FINAL_TRANSCRIPT_READY`.
+- Explicitly out of scope until later stages: Stage 4 transformation planning,
   advanced rendering/reframing, social publishing, review UI, analytics
   learning, and automatic authorization.
 - Process only media the operator owns or is authorized to process. Never add
@@ -158,6 +158,32 @@
   provenance never blocks local analysis; rights risk and
   originality/transformation risk are separate. Recurring channel/history
   diversity is deferred to Stage 7.
+- Stage 3.5 is explicit, candidate-scoped refinement after
+  `READY_FOR_REFINEMENT`; it is never added to the automatic `_NEXT_STAGE`
+  chain and never advances every source. It extends the existing Celery/
+  `ProcessingJob` system with a `CANDIDATE_REFINEMENT` job kind and a
+  `candidate_refinements` row per `(clip_candidate_id, priority)`; it adds no
+  `PipelineStage`, no `PipelineRun`, and no new job platform. Only `CANDIDATE`
+  and `FINAL_CLIP` are valid priorities (`INDEX` is rejected). It extracts only
+  a bounded candidate context WAV from the original source (candidate 5/5 s,
+  final 8/8 s, max 150 s), runs targeted local faster-whisper as the mandatory
+  backbone (word timestamps, automatic language, no VAD, no
+  condition-on-previous-text, beam 5/8), converts clip-relative word times to
+  source time once, and never rewrites raw ASR, timestamps, or Stage 2 evidence.
+  Stage 3.5 owns omitted-English recovery from actual audio-backed transcription;
+  a text-only model can never insert a word ASR omitted. Hosted
+  `gemini-3.5-transcribe` (Interactions API, verbatim, word timestamps) and
+  `gemini-3.8-flash` adjudication are optional, selective, admission-gated
+  (`CRITICAL`/`HIGH`/`MEDIUM`/`LOW`/`AVOID` Redis window with reserves), lazily
+  constructed, delete remote files in `finally`, and never accept malformed or
+  rewritten output. Candidate and final fingerprints always differ; component
+  checkpoints (audio/local/hosted/adjudication/consensus/boundary) are reused
+  only on exact dependency match; degraded runs stay non-cache-eligible; manual
+  text always wins and is never cleared by automated work; meaning-critical
+  unresolved final ambiguity produces `NEEDS_MANUAL_TRANSCRIPT_REVIEW`;
+  `FINAL_TRANSCRIPT_READY` is transcript readiness, not publishing readiness.
+  Qwen remains installed and disabled by default and is never used in adaptive
+  refinement. Stage 4 receives a typed read-only handoff but is not implemented.
 
 ## Local development facts (not product requirements)
 

@@ -28,6 +28,7 @@ from app.core.enums import (
     OriginalityRisk,
     PipelineStage,
     ReconstructionStatus,
+    RefinementPriority,
     RightsRisk,
     RightsStatus,
 )
@@ -35,12 +36,23 @@ from app.core.settings import get_settings
 from app.db.session import create_session_factory
 from app.models import (
     CandidateAnalysis,
+    CandidateRefinement,
     ClipCandidate,
     ProcessingJob,
     SourceQualityAssessment,
     SourceVideo,
     Transcript,
     TranscriptChunk,
+)
+from app.refinement.handoff import build_stage4_handoff
+from app.refinement.queue import (
+    Stage35QueueError,
+    apply_manual_transcript,
+    get_refinement,
+    list_refinements,
+    queue_candidate_batch,
+    queue_candidate_refinement,
+    validate_candidate_for_refinement,
 )
 from app.services.health import CheckStatus, HealthService
 from app.services.source_adapters import SourceValidationError, normalize_source_url
@@ -143,6 +155,62 @@ class CandidateAnalysisResponse(BaseModel):
     semantic_provider_mode: str
     cache_eligible: bool
     metrics: dict[str, object]
+
+
+class CandidateRefinementResponse(BaseModel):
+    id: UUID
+    source_video_id: UUID
+    clip_candidate_id: UUID
+    priority: RefinementPriority
+    status: str
+    quality_level: str
+    coarse_start: float
+    coarse_end: float
+    context_start: float
+    context_end: float
+    refined_start: float | None
+    refined_end: float | None
+    automatic_transcript: str
+    manual_transcript: str | None
+    final_transcript: str
+    word_timestamps: list[dict[str, object]]
+    confidence: float
+    dialect_profile: str | None
+    dialect_confidence: float
+    code_switch_evidence: dict[str, object]
+    transcript_evidence: list[dict[str, object]]
+    entity_evidence: list[dict[str, object]]
+    unresolved_spans: list[dict[str, object]]
+    provider_evidence: dict[str, object]
+    routing_evidence: dict[str, object]
+    input_fingerprint: str
+    output_fingerprint: str
+    cache_eligible: bool
+    metrics: dict[str, object]
+    processing_duration: float | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class RefinementQueueResponse(BaseModel):
+    refinement_id: UUID
+    job_id: UUID | None
+    status: str
+    queued: bool
+    cached: bool
+    active: bool
+
+
+class ManualTranscriptRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=20_000)
+    resolutions: dict[str, str] = Field(default_factory=dict)
+
+
+class Stage4HandoffResponse(BaseModel):
+    candidate: dict[str, object]
+    stage3: dict[str, object]
+    refinement: dict[str, object]
+    stage4_implemented: bool
 
 
 class JobResponse(BaseModel):
@@ -591,6 +659,120 @@ def create_app(
             raise HTTPException(status_code=404, detail="candidate not found")
         return _candidate_response(candidate)
 
+    @app.post(
+        "/api/candidates/{candidate_id}/refinements",
+        response_model=RefinementQueueResponse,
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    def queue_candidate_refinement_endpoint(
+        candidate_id: UUID,
+        priority: RefinementPriority = Query(...),
+        force: bool = False,
+        database: Session = Depends(session),
+    ) -> RefinementQueueResponse:
+        """Explicitly queue one candidate refinement at CANDIDATE or FINAL_CLIP."""
+
+        try:
+            candidate = validate_candidate_for_refinement(database, candidate_id)
+            outcome = queue_candidate_refinement(
+                database, storage_service, candidate, priority, force=force
+            )
+        except Stage35QueueError as error:
+            raise _stage35_http(error) from error
+        return RefinementQueueResponse(
+            refinement_id=outcome.refinement_id,
+            job_id=outcome.job_id,
+            status=outcome.status,
+            queued=outcome.queued,
+            cached=outcome.cached,
+            active=outcome.active,
+        )
+
+    @app.get(
+        "/api/refinements/{refinement_id}",
+        response_model=CandidateRefinementResponse,
+    )
+    def get_candidate_refinement(
+        refinement_id: UUID, database: Session = Depends(session)
+    ) -> CandidateRefinementResponse:
+        refinement = get_refinement(database, refinement_id)
+        if refinement is None:
+            raise HTTPException(status_code=404, detail="candidate refinement not found")
+        return _refinement_response(refinement)
+
+    @app.get(
+        "/api/candidates/{candidate_id}/refinements",
+        response_model=list[CandidateRefinementResponse],
+    )
+    def list_candidate_refinements(
+        candidate_id: UUID, database: Session = Depends(session)
+    ) -> list[CandidateRefinementResponse]:
+        if database.get(ClipCandidate, candidate_id) is None:
+            raise HTTPException(status_code=404, detail="candidate not found")
+        return [_refinement_response(row) for row in list_refinements(database, candidate_id)]
+
+    @app.get(
+        "/api/candidates/{candidate_id}/stage4-handoff",
+        response_model=Stage4HandoffResponse,
+    )
+    def get_stage4_handoff(
+        candidate_id: UUID, database: Session = Depends(session)
+    ) -> Stage4HandoffResponse:
+        handoff = build_stage4_handoff(database, candidate_id)
+        if handoff is None:
+            raise HTTPException(status_code=404, detail="candidate not found")
+        return Stage4HandoffResponse(**handoff)
+
+    @app.post(
+        "/api/refinements/{refinement_id}/manual",
+        response_model=CandidateRefinementResponse,
+    )
+    def submit_manual_transcript(
+        refinement_id: UUID,
+        request: ManualTranscriptRequest,
+        database: Session = Depends(session),
+    ) -> CandidateRefinementResponse:
+        """Submit authoritative manual text and explicitly resolve named ambiguities."""
+
+        try:
+            refinement = apply_manual_transcript(
+                database, refinement_id, request.text, request.resolutions
+            )
+        except Stage35QueueError as error:
+            raise _stage35_http(error) from error
+        return _refinement_response(refinement)
+
+    @app.post(
+        "/api/sources/{source_id}/candidate-refinements/batch",
+        response_model=list[RefinementQueueResponse],
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    def queue_candidate_refinement_batch(
+        source_id: UUID,
+        limit: int | None = None,
+        force: bool = False,
+        database: Session = Depends(session),
+    ) -> list[RefinementQueueResponse]:
+        """Queue a bounded, score-ordered candidate-grade batch (no FINAL_CLIP)."""
+
+        try:
+            outcomes = queue_candidate_batch(
+                database, storage_service, source_id, limit=limit, force=force
+            )
+        except Stage35QueueError as error:
+            raise _stage35_http(error) from error
+        return [
+            RefinementQueueResponse(
+                refinement_id=outcome.refinement_id,
+                job_id=outcome.job_id,
+                status=outcome.status,
+                queued=outcome.queued,
+                cached=outcome.cached,
+                active=outcome.active,
+            )
+            for outcome in outcomes
+        ]
+
     @app.patch("/api/sources/{source_id}/provenance", response_model=SourceResponse)
     def update_source_provenance(
         source_id: UUID,
@@ -785,6 +967,51 @@ def _candidate_response(candidate: ClipCandidate) -> CandidateResponse:
 
 def _new_job(source_id: UUID) -> ProcessingJob:
     return ProcessingJob(source_video_id=source_id, kind=JobKind.INGEST, status=JobStatus.QUEUED)
+
+
+def _stage35_http(error: Stage35QueueError) -> HTTPException:
+    detail = str(error)
+    code = 404 if "does not exist" in detail else 409
+    return HTTPException(status_code=code, detail=detail)
+
+
+def _refinement_response(row: CandidateRefinement) -> CandidateRefinementResponse:
+    return CandidateRefinementResponse(
+        id=row.id,
+        source_video_id=row.source_video_id,
+        clip_candidate_id=row.clip_candidate_id,
+        priority=row.priority,
+        status=row.status.value if hasattr(row.status, "value") else str(row.status),
+        quality_level=row.quality_level,
+        coarse_start=row.coarse_start,
+        coarse_end=row.coarse_end,
+        context_start=row.context_start,
+        context_end=row.context_end,
+        refined_start=row.refined_start,
+        refined_end=row.refined_end,
+        automatic_transcript=row.automatic_transcript,
+        manual_transcript=row.manual_transcript,
+        final_transcript=row.final_transcript,
+        word_timestamps=[dict(item) for item in (row.word_timestamps or [])],
+        confidence=row.confidence,
+        dialect_profile=row.dialect_profile,
+        dialect_confidence=row.dialect_confidence,
+        code_switch_evidence=_without_secrets(dict(row.code_switch_evidence or {})),
+        transcript_evidence=[
+            _public_metadata_value(item) for item in (row.transcript_evidence or [])
+        ],
+        entity_evidence=[_public_metadata_value(item) for item in (row.entity_evidence or [])],
+        unresolved_spans=[_public_metadata_value(item) for item in (row.unresolved_spans or [])],
+        provider_evidence=_without_secrets(dict(row.provider_evidence or {})),
+        routing_evidence=_without_secrets(dict(row.routing_evidence or {})),
+        input_fingerprint=row.input_fingerprint,
+        output_fingerprint=row.output_fingerprint,
+        cache_eligible=row.cache_eligible,
+        metrics=_without_secrets(dict(row.metrics or {})),
+        processing_duration=row.processing_duration,
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+    )
 
 
 def _source_or_404(database: Session, source_id: UUID) -> SourceVideo:
