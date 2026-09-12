@@ -289,6 +289,65 @@ def test_transcript_search_returns_timestamped_mixed_language_segment(
     assert response.json()["segments"][0]["start"] == 12.4
 
 
+def test_transcript_api_and_manual_override_preserve_mixed_bidi_logical_order(
+    client: tuple[TestClient, RecordingDispatcher],
+) -> None:
+    """The API transports canonical mixed-direction text without display formatting."""
+
+    test_client, _ = client
+    logical_text = "يعني ممكن يكون عادي بس content creator دي مش شغلانة بالنسبة للبيت"
+    source = test_client.post("/sources/upload", files={"file": ("clip.mp4", b"video")}).json()
+    factory = test_client.app.state.session_factory
+    with factory() as session:
+        session.add(
+            Transcript(
+                source_video_id=UUID(source["id"]),
+                whisper_model="small",
+                input_fingerprint="b" * 64,
+                transcription_options={},
+                raw_text=logical_text,
+                normalized_text=logical_text,
+                corrected_text=logical_text,
+                final_text=logical_text,
+                segments=[
+                    {
+                        "start": 0.0,
+                        "end": 1.0,
+                        "text": logical_text,
+                        "raw_text": logical_text,
+                        "corrected_text": logical_text,
+                        "final_text": logical_text,
+                    }
+                ],
+            )
+        )
+        session.commit()
+
+    response = test_client.get(f"/api/sources/{source['id']}/transcript")
+
+    assert response.status_code == 200
+    assert response.json()["raw_text"] == logical_text
+    assert response.json()["final_text"] == logical_text
+    assert response.json()["segments"][0]["final_text"] == logical_text
+
+    override = test_client.post(
+        f"/api/sources/{source['id']}/transcript/segments/0/override",
+        json={"text": logical_text},
+    )
+
+    assert override.status_code == 200
+    assert override.json()["operator_text"] == logical_text
+    assert override.json()["final_text"] == logical_text
+
+    with factory() as session:
+        persisted = session.scalar(
+            select(Transcript).where(Transcript.source_video_id == UUID(source["id"]))
+        )
+        assert persisted is not None
+        assert persisted.segments[0]["operator_text"] == logical_text
+        assert persisted.segments[0]["final_text"] == logical_text
+
+
 def test_operator_override_preserves_raw_correction_and_timestamp(
     client: tuple[TestClient, RecordingDispatcher],
 ) -> None:

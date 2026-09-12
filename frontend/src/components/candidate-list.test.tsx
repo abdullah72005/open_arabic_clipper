@@ -85,6 +85,24 @@ const refinements: CandidateRefinement[] = [
 ];
 
 describe("CandidateList", () => {
+  it("isolates mixed Arabic-English transcript text without changing its logical value", () => {
+    const logicalText = "أنا عملت deploy للbackend امبارح";
+    const markup = renderToStaticMarkup(
+      <CandidateList
+        analysis={analysis}
+        candidates={[{ ...candidates[0], transcript_excerpt: logicalText }]}
+        onSeek={() => {}}
+        refinements={[{ ...refinements[0], automatic_transcript: logicalText, final_transcript: logicalText }]}
+      />
+    );
+
+    expect(markup).toContain('<bdi dir="auto"');
+    expect(markup).toContain(logicalText);
+    expect(markup).not.toContain("\u2066");
+    expect(markup).not.toContain("\u2067");
+    expect(markup).not.toContain("\u2069");
+  });
+
   it("renders compact candidates with time, score, disposition and refinement reasons", () => {
     const markup = renderToStaticMarkup(
       <CandidateList analysis={analysis} candidates={candidates} onSeek={() => {}} />
@@ -141,6 +159,7 @@ describe("CandidateList", () => {
     );
 
     expect(markup).toContain("Manual transcript review");
+    expect(markup).toContain('<textarea aria-label="Manual final transcript" dir="auto">');
     expect(markup).toContain("entity conflict");
     expect(markup).toContain("25, 95");
   });

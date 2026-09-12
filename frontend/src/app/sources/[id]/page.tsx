@@ -4,6 +4,7 @@ import { useParams, useRouter } from "next/navigation";
 import { useCallback, useRef, useState } from "react";
 import { ApiState } from "@/components/api-state";
 import { CandidateResults } from "@/components/candidate-list";
+import { MixedDirectionText } from "@/components/mixed-direction-text";
 import { JobPoller } from "@/components/job-poller";
 import { JobProgress } from "@/components/job-progress";
 import { TranscriptStatus } from "@/components/transcript-status";
@@ -78,22 +79,22 @@ function TranscriptViewer({
           <div className="transcript-segment" key={`${segment.start}-${index}`}>
             <button onClick={() => onSeek(segment.start)} type="button">
               <time>{timestamp(segment.start)}</time>
-              <span>{segment.final_text ?? segment.corrected_text ?? segment.normalized_text ?? segment.text}</span>
+              <MixedDirectionText text={String(segment.final_text ?? segment.corrected_text ?? segment.normalized_text ?? segment.text ?? "")} />
             </button>
             {(segment.correction_applied
               || segment.operator_text
               || (segment.reconstruction_status ?? transcript.reconstruction_status) !== "NOT_REQUIRED") && (
               <details>
                 <summary>Correction details</summary>
-                <p><strong>Raw:</strong> {segment.raw_text ?? segment.text}</p>
-                <p><strong>Stage 2.5:</strong> {segment.corrected_text ?? segment.normalized_text ?? segment.text}</p>
+                <p><strong>Raw:</strong> <MixedDirectionText text={String(segment.raw_text ?? segment.text ?? "")} /></p>
+                <p><strong>Stage 2.5:</strong> <MixedDirectionText text={String(segment.corrected_text ?? segment.normalized_text ?? segment.text ?? "")} /></p>
                 <p className="muted">{segment.correction_method ?? "unchanged"} · {Math.round((segment.correction_confidence ?? 0) * 100)}%</p>
                 {(segment.contextual_reconstructed_text || segment.reconstruction_status) && (
                   <>
                     <p><strong>Status:</strong> {segment.reconstruction_status ?? transcript.reconstruction_status}</p>
-                    <p><strong>Stage 2.7:</strong> {segment.contextual_reconstructed_text}</p>
+                    <p><strong>Stage 2.7:</strong> <MixedDirectionText text={String(segment.contextual_reconstructed_text ?? "")} /></p>
                     {segment.reconstruction_candidate_text != null && (
-                      <p><strong>Candidate:</strong> {segment.reconstruction_candidate_text}</p>
+                      <p><strong>Candidate:</strong> <MixedDirectionText text={String(segment.reconstruction_candidate_text)} /></p>
                     )}
                     <p className="muted">
                       {segment.reconstruction_confidence_level ?? "LOW"} · {Math.round((segment.reconstruction_confidence ?? 0) * 100)}%
@@ -109,12 +110,12 @@ function TranscriptViewer({
                     ) : null}
                   </>
                 )}
-                {segment.operator_text && <p><strong>Manual:</strong> {segment.operator_text}</p>}
+                {segment.operator_text && <p><strong>Manual:</strong> <MixedDirectionText text={String(segment.operator_text)} /></p>}
               </details>
             )}
             {editingIndex === index ? (
               <div>
-                <textarea aria-label={`Transcript correction ${index + 1}`} value={draft} onChange={(event) => setDraft(event.target.value)} />
+                <textarea aria-label={`Transcript correction ${index + 1}`} dir="auto" value={draft} onChange={(event) => setDraft(event.target.value)} />
                 <button className="button" disabled={saving || !draft.trim()} onClick={() => void saveOverride(index)} type="button">Save correction</button>
                 <button className="button" disabled={saving} onClick={() => setEditingIndex(null)} type="button">Cancel</button>
               </div>

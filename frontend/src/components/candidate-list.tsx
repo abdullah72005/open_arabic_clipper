@@ -3,6 +3,7 @@
 import React, { useCallback, useState } from "react";
 
 import { ApiState } from "@/components/api-state";
+import { MixedDirectionText } from "@/components/mixed-direction-text";
 import {
   api,
   ApiError,
@@ -78,7 +79,7 @@ function ManualRefinementReview({
           </div>
         );
       })}
-      <textarea aria-label="Manual final transcript" onChange={(event) => setText(event.target.value)} value={text} />
+      <textarea aria-label="Manual final transcript" dir="auto" onChange={(event) => setText(event.target.value)} value={text} />
       <button
         className="button"
         disabled={!onSubmit || !text.trim()}
@@ -112,7 +113,7 @@ function RefinementResult({
       <button className="button" onClick={() => onSeek(start)} type="button">
         Refined window {timestamp(start)}–{timestamp(end)}
       </button>
-      <p>{refinement.final_transcript || refinement.automatic_transcript || "Transcript is still being prepared."}</p>
+      <p><MixedDirectionText text={refinement.final_transcript || refinement.automatic_transcript || "Transcript is still being prepared."} /></p>
       <p className="muted">
         Coarse {timestamp(refinement.coarse_start)}–{timestamp(refinement.coarse_end)}
         {refinement.dialect_profile ? ` · ${refinement.dialect_profile}` : ""}
@@ -169,7 +170,7 @@ export function CandidateList({
                 <time>
                   {timestamp(candidate.start_time)}–{timestamp(candidate.end_time)}
                 </time>
-                <span>{candidate.transcript_excerpt}</span>
+                <MixedDirectionText text={candidate.transcript_excerpt} />
               </button>
               <p className="muted">
                 <span className={candidate.disposition === "CANDIDATE" ? "ok" : undefined}>
