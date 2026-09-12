@@ -10,6 +10,7 @@ from sqlalchemy import (
     Enum,
     ForeignKey,
     Integer,
+    JSON,
     String,
     Text,
     UniqueConstraint,
@@ -58,6 +59,7 @@ class PipelineRun(Base):
     error_message: Mapped[str | None] = mapped_column(Text())
     input_fingerprint: Mapped[str | None] = mapped_column(String(64))
     output_fingerprint: Mapped[str | None] = mapped_column(String(64))
+    metrics: Mapped[dict[str, object]] = mapped_column(JSON(), nullable=False, default=dict)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
