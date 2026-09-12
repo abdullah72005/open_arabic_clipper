@@ -54,7 +54,9 @@ class Settings(BaseSettings):
     whisper_condition_on_previous_text: bool = True
     whisper_vad_filter: bool = False
     whisper_cpu_threads: int = Field(default=0, ge=0, le=64)
-    whisper_index_batch_size: int = Field(default=1, ge=1, le=4)
+    # Whole-source batching is intentionally unavailable until it has passed the
+    # timestamp/cancellation/semantic replay gate; accept only the safe path.
+    whisper_index_batch_size: int = Field(default=1, ge=1, le=1)
     whisper_initial_prompt: str | None = Field(default=None, max_length=4_000)
     whisper_hotwords: str | None = Field(default=None, max_length=4_000)
     correction_context_segments: int = Field(default=2, ge=0, le=5)

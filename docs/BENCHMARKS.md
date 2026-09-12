@@ -27,6 +27,11 @@ configuration remains automatic CPU threads (`0`), batch size `1`, and VAD off.
 Full remote video acquisition remains early; audio-first or deferred-video
 acquisition was not implemented.
 
+`CLIPFACTORY_WHISPER_INDEX_BATCH_SIZE` is deliberately constrained to `1` in
+this release: the installed faster-whisper batch API was inspected, but was not
+adopted because no batch run was justified after B regressed and no candidate
+replay acceptance evidence exists.
+
 This repository was benchmarked on 2026-09-04 with an operator-authorized
 51.54-second source clip. The first run downloaded the `small` model; the
 numbers below are the subsequent cached-model run, so they describe inference

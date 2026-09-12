@@ -91,6 +91,17 @@ def test_engine_passes_configured_cpu_threads_to_child_model() -> None:
     assert created == [("small", "cpu", "int8", 3)]
 
 
+def test_index_batch_size_rejects_unvalidated_batching() -> None:
+    """Stage 3.7 must not silently accept a batch path that has no replay evidence."""
+
+    from pydantic import ValidationError
+
+    from app.core.settings import Settings
+
+    with pytest.raises(ValidationError, match="whisper_index_batch_size"):
+        Settings(_env_file=None, whisper_index_batch_size=2)
+
+
 def test_transcription_options_include_forced_language_in_cache_key() -> None:
     """Forced-language output cannot reuse an auto-detected transcript."""
 
