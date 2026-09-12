@@ -5,6 +5,11 @@ from typing import Literal
 from pydantic import AliasChoices, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.candidates.gemini import GeminiSemanticProvider
+from app.candidates.local import LocalSemanticProvider
+from app.candidates.policy import Stage3Config
+from app.candidates.providers import SemanticProvider
+from app.core.enums import SemanticProviderMode
 from app.runtime.heavy_model_lease import HeavyModelLeaseFactory
 from app.transcription.correction import ContextualCorrector, CorrectionConfig
 from app.transcription.providers import CorrectionProvider, OpenAICompatibleCorrectionProvider
@@ -102,6 +107,23 @@ class Settings(BaseSettings):
     heavy_model_lease_ttl_seconds: float = Field(default=300.0, gt=0)
     heavy_model_lease_renewal_interval_seconds: float = Field(default=60.0, gt=0)
     heavy_model_lease_acquisition_timeout_seconds: float = Field(default=15.0, gt=0)
+    # Stage 3 candidate analysis. Semantic mode defaults to deterministic: a
+    # configured reconstruction Gemini key never silently turns on hosted
+    # candidate evaluation.
+    candidate_semantic_mode: Literal["deterministic", "adaptive", "local_only"] = "deterministic"
+    candidate_retention_threshold: float = Field(default=0.45, ge=0, le=1)
+    candidate_uncertainty_threshold: float = Field(default=0.35, ge=0, le=1)
+    candidate_max_retained: int = Field(default=60, gt=0, le=240)
+    candidate_max_proposals_per_hour: int = Field(default=24, gt=0, le=240)
+    candidate_max_proposals_per_source: int = Field(default=240, gt=0, le=2000)
+    candidate_max_raw_proposals_per_hour: int = Field(default=96, gt=0, le=960)
+    candidate_max_raw_proposals_per_source: int = Field(default=960, gt=0, le=10_000)
+    candidate_max_provider_candidates: int = Field(default=32, gt=0, le=200)
+    candidate_provider_candidates_per_request: int = Field(default=8, gt=0, le=32)
+    candidate_max_provider_calls: int = Field(default=4, gt=0, le=32)
+    candidate_provider_max_input_characters: int = Field(default=6_000, gt=0, le=48_000)
+    candidate_provider_max_output_tokens: int = Field(default=1_024, gt=0, le=4_096)
+    candidate_novelty_corpus_limit: int = Field(default=500, ge=0, le=5_000)
     transcription_queue_concurrency: int = Field(default=1, gt=0)
     cors_origins: list[str] = ["http://localhost:3301"]
 
@@ -249,6 +271,74 @@ class Settings(BaseSettings):
         if self.gemini_api_key is None:
             return False
         return bool(self.gemini_api_key.get_secret_value())
+
+    def stage3_config(self) -> Stage3Config:
+        """Build bounded Stage 3 policy configuration from environment knobs."""
+
+        return Stage3Config(
+            retention_threshold=self.candidate_retention_threshold,
+            uncertainty_severity_threshold=self.candidate_uncertainty_threshold,
+            max_retained_candidates=self.candidate_max_retained,
+            max_raw_proposals_per_hour=self.candidate_max_raw_proposals_per_hour,
+            max_raw_proposals_per_source=self.candidate_max_raw_proposals_per_source,
+            max_proposals_per_hour=self.candidate_max_proposals_per_hour,
+            max_proposals_per_source=self.candidate_max_proposals_per_source,
+            max_provider_candidates=self.candidate_max_provider_candidates,
+            provider_candidates_per_request=self.candidate_provider_candidates_per_request,
+            max_provider_calls_per_source=self.candidate_max_provider_calls,
+            provider_max_input_characters=self.candidate_provider_max_input_characters,
+            provider_max_output_tokens=self.candidate_provider_max_output_tokens,
+            novelty_corpus_limit=self.candidate_novelty_corpus_limit,
+        )
+
+    def semantic_provider_mode(self) -> SemanticProviderMode:
+        return SemanticProviderMode(self.candidate_semantic_mode)
+
+    def candidate_semantic_provider(self) -> SemanticProvider | None:
+        """Return the Stage 3 semantic provider for the configured mode, if any.
+
+        DETERMINISTIC never builds a provider. ADAPTIVE builds Gemini only when a
+        key is configured. LOCAL_ONLY builds the local provider only when
+        ``CLIPFACTORY_LOCAL_QWEN_ENABLED=true``.
+        """
+
+        mode = self.semantic_provider_mode()
+        if mode is SemanticProviderMode.DETERMINISTIC:
+            return None
+        if mode is SemanticProviderMode.ADAPTIVE:
+            return self.gemini_semantic_provider_instance()
+        if not self.local_qwen_enabled:
+            return None
+        return self.local_semantic_provider_instance()
+
+    def gemini_semantic_provider_instance(self) -> GeminiSemanticProvider | None:
+        key = self.gemini_api_key
+        if key is None or not key.get_secret_value():
+            return None
+        return GeminiSemanticProvider(
+            api_key=key.get_secret_value(),
+            model=self.gemini_model,
+            timeout_seconds=self.gemini_timeout_seconds,
+            retry_attempts=self.gemini_retry_attempts,
+            retry_backoff_seconds=self.gemini_retry_backoff_seconds,
+            max_output_tokens=self.candidate_provider_max_output_tokens,
+            thinking_level=self.gemini_thinking_level,
+            temperature=self.gemini_temperature,
+            api_version=self.gemini_api_version,
+        )
+
+    def local_semantic_provider_instance(self) -> LocalSemanticProvider | None:
+        if self.reconstruction_provider == "disabled" or not self.local_qwen_enabled:
+            return None
+        if not self.reconstruction_provider_base_url or not self.reconstruction_provider_model:
+            return None
+        return LocalSemanticProvider(
+            base_url=self.reconstruction_provider_base_url,
+            model=self.reconstruction_provider_model,
+            timeout_seconds=self.reconstruction_provider_timeout_seconds,
+            max_output_tokens=self.candidate_provider_max_output_tokens,
+            temperature=0.0,
+        )
 
     def heavy_model_lease_factory(self) -> HeavyModelLeaseFactory:
         """Build the Redis-backed lease factory that serializes heavy models."""

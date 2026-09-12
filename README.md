@@ -5,8 +5,12 @@ metadata, and transcribing owned or authorized media. Stage 2 extracts a cached
 mono 16 kHz WAV, runs local faster-whisper with automatic Arabic, English, and
 mixed-speech detection, preserves raw ASR evidence, applies conservative
 dialect-aware Arabic correction, and records silence/quality signals through
-`READY_FOR_ANALYSIS`. It does not
-select clips, reframe, render, publish, or automatically authorize content.
+`READY_FOR_ANALYSIS`. Stage 3 then finds promising coarse clip moments cheaply
+from that imperfect INDEX transcript, scores content separately from transcript
+confidence, preserves strong uncertain moments as `CANDIDATE_NEEDS_REFINEMENT`
+for Stage 3.5, and advances the source to `READY_FOR_REFINEMENT`. It does not
+extract or retranscribe candidate audio, recover omitted English, select final
+boundaries, reframe, render, publish, or automatically authorize content.
 
 Only process material you own or are explicitly authorized to process. URL
 ingest downloads permitted public sources directly; an optional outbound proxy
@@ -226,3 +230,46 @@ the status is `STAGE 2.7 MUST CONTINUE`.
 
 See [Stage 2.7 operations](docs/STAGE_2_7_OPERATIONS.md) for the persisted
 status contract and operator troubleshooting notes.
+
+## Stage 3 candidate analysis
+
+Stage 3 (`CANDIDATE_ANALYSIS`) runs after `READY_FOR_ANALYSIS` and consumes the
+imperfect INDEX transcript. It generates bounded deterministic coarse proposals
+(splitting oversized segments at word/timestamp boundaries so every candidate
+respects configured duration bounds), scores content-quality separately from
+transcript confidence, classifies content types, produces at most three
+source-faithful hooks, deduplicates same-source and cross-source repeated ideas,
+and persists both accepted and rejected proposals. Discovery is bounded only by a
+loose raw safety cap; the tight per-hour/per-source shortlist caps are applied
+after full deterministic scoring, ranked by `clip_score`, so duplicates never
+crowd distinct moments out. Content-quality scores use one
+shared aggregate, so a zero-adjustment provider response or an INDEX-deferred
+transcript never changes a strong candidate's content score. Strong uncertain
+moments survive as `CANDIDATE_NEEDS_REFINEMENT` for Stage 3.5; content quality
+below threshold is `DO_NOT_CLIP`, and redundant moments are
+`DO_NOT_CLIP_RECENTLY_REDUNDANT`.
+
+Stage 3 semantic mode defaults to `deterministic`: zero Gemini calls and zero
+Qwen model loads. `adaptive` uses Gemini only when a key is configured, and
+`local_only` uses Qwen/Ollama only with `CLIPFACTORY_LOCAL_QWEN_ENABLED=true`.
+Missing or misconfigured providers degrade to deterministic output and never
+fail the pipeline. Clearly redundant candidates never consume provider quota; a
+malformed/partial provider response is retryable and a later rerun reuses already
+accepted evaluations while retrying only missing ones. Unknown/third-party
+provenance never blocks local analysis; rights risk and originality/transformation
+risk are separate. Source dialect is source evidence, not target audience;
+code-switched text is preserved and omitted-English recovery is deferred to Stage
+3.5.
+
+Queue and inspect candidates:
+
+```bash
+python -m app.cli candidate-analysis SOURCE_ID [--force]
+python -m app.cli candidates SOURCE_ID [--limit 20] [--include-rejected]
+```
+
+API: `POST /api/sources/{id}/candidate-analysis`, `GET
+/api/sources/{id}/candidates`, `GET /api/candidates/{id}`, and `PATCH
+/api/sources/{id}/provenance`. See
+[Stage 3 operations](docs/STAGE_3_OPERATIONS.md) for the full design, bounds,
+fingerprints, and Stage 3.5 handoff.

@@ -1,17 +1,139 @@
 # Runtime status
 
-Stage 2.7.1 extends the local-first ingest/transcription foundation through
-`READY_FOR_ANALYSIS`. It prepares cached mono 16 kHz WAV audio, transcribes
-locally with faster-whisper, preserves raw timestamped ASR evidence, derives
-conservative dialect-aware Arabic correction into separate Stage 2.5 fields,
-then applies a bounded one-pass Stage 2.7 contextual reconstruction through the
-managed local Ollama provider without altering raw text, timestamps, word
-timestamps, or manual feedback. Final text priority is manual override, then
-HIGH-confidence Stage 2.7, then Stage 2.5, then raw ASR. The default
-reconstruction provider is local Ollama (`qwen3.5:4b`); a missing or invalid
-provider response falls back to Stage 2.5, records a truthful unavailable
-status, and the source still reaches analysis. Automatic clip selection,
+Stage 3 candidate analysis extends the local-first ingest/transcription
+foundation through `READY_FOR_REFINEMENT`. Stage 2.7.1 reaches
+`READY_FOR_ANALYSIS`; worker orchestration then runs the durable
+`CANDIDATE_ANALYSIS` stage, which discovers coarse clip moments from the
+imperfect INDEX transcript and advances the source to `READY_FOR_REFINEMENT`.
+Stage 3 semantic mode defaults to deterministic (zero Gemini calls, zero Qwen
+loads). Stage 3.5 targeted audio/transcript refinement, exact clip boundaries,
 rendering, publishing, and authorization remain out of scope.
+
+## Stage 3 candidate analysis (2026-09-12)
+
+Stage 3 discovers the best potential clip moments cheaply from an imperfect
+INDEX transcript, preserves promising moments when transcription is uncertain,
+and defers expensive audio/transcript refinement to Stage 3.5:
+
+- **Pipeline position.** `AUDIO_ANALYSIS -> READY_FOR_ANALYSIS ->
+  CANDIDATE_ANALYSIS -> READY_FOR_REFINEMENT`. `AUDIO_ANALYSIS` still records
+  `READY_FOR_ANALYSIS`; worker orchestration then queues `CANDIDATE_ANALYSIS`.
+  Failure or cancellation leaves the source at `READY_FOR_ANALYSIS`; success
+  advances it to `READY_FOR_REFINEMENT`. A dedicated job kind and retry mapping
+  were added without a new queue, scheduler, service process, or orchestration
+  subsystem. Existing sources at `READY_FOR_ANALYSIS` are analyzable through
+  `POST /api/sources/{id}/candidate-analysis` or `python -m app.cli
+  candidate-analysis`.
+- **Source provenance.** `SourceVideo.rights_status` is reused; `media_origin`
+  (default `OTHER` = unclassified) and a bounded `provenance_metadata` JSON
+  object were added. Provenance is set at creation or through an explicit
+  `PATCH /api/sources/{id}/provenance`; duplicate ingest never mutates it.
+  Provenance changes invalidate Stage 3 only. Unknown/third-party provenance
+  never blocks local analysis, and rights risk is separate from
+  originality/transformation risk.
+- **Deterministic discovery.** A pure one-pass service selects analysis text in
+  operator/final/corrected/raw priority, forms coarse windows from timestamps,
+  silence/pause midpoints, sentence punctuation, speaker changes, question/answer
+  and contrast/topic transitions, story/payoff cues, and RMS energy changes, with
+  a fixed fallback only when boundaries are unavailable. Proposals are built over
+  bounded atoms; a segment longer than the maximum coarse window is split at
+  deterministic word/timestamp boundaries (or a proportional-character fallback
+  when only text exists), every atom is then hard-bounded so no pathological
+  single word/timestamp span survives, and source duration is the hard outer
+  bound. Stable atom-span identity keeps multiple windows from one segment
+  non-colliding across reruns. The funnel is broad discovery → loose configurable
+  raw safety cap (96/hour, 960/source; CPU/memory protection only) → full
+  deterministic scoring/classification/novelty/refinement → rank by `clip_score`
+  → tight shortlist caps (15 s minimum, 35–75 s preferred, 120 s
+  maximum, 24 proposals/hour, 240/source, 60 retained) → optional provider work;
+  these are caps, not targets. Overlapping similar proposals merge; distinct ideas
+  stay separate; zero good moments yields zero accepted candidates.
+- **Scoring separation.** Independent normalized scores are persisted
+  (`clip_score`, `short_form_score`, `moment_density_score`,
+  `boredom_risk_score`, `ending_quality_score`, `loopability_score`,
+  `engagement_confidence`, `transcript_confidence`, `audio_confidence`,
+  `boundary_confidence`, `uncertainty_severity`, `idea_novelty_score`,
+  `topic_novelty_score`, `recent_semantic_similarity_risk`). Content-quality
+  scores are computed by one shared aggregate used by both deterministic and
+  provider-enriched paths; `clip_score` never includes transcript
+  cleanliness/confidence, unresolved INDEX state, word/boundary confidence,
+  code-switch uncertainty, provider availability, or audio confidence. A
+  zero-adjustment provider response preserves the deterministic `clip_score`, and
+  an INDEX-deferred candidate keeps the same content score as its clean
+  equivalent while still routing to `CANDIDATE_NEEDS_REFINEMENT`. A filler moment
+  with perfect transcript confidence stays low quality. After a long segment is
+  split, word/acoustic/low-confidence and protected/code-switch evidence is
+  filtered to each candidate's actual coarse time span.
+- **Refinement-needed behavior.** Strong non-redundant content with material
+  uncertainty becomes `CANDIDATE_NEEDS_REFINEMENT` with bounded reason codes
+  (`LOW_TRANSCRIPT_CONFIDENCE`, `UNRESOLVED_INDEX_TEXT`,
+  `LOW_CONFIDENCE_WORD_SPAN`, `CODE_SWITCH_UNCERTAINTY`,
+  `PROTECTED_ENTITY_UNCERTAINTY`, `LOW_BOUNDARY_CONFIDENCE`); code switching
+  alone never triggers refinement. Content below threshold becomes `DO_NOT_CLIP`;
+  the weaker of strongly redundant candidates becomes
+  `DO_NOT_CLIP_RECENTLY_REDUNDANT`.
+- **Content and hooks.** A closed 14-value content ontology with a deterministic
+  Arabic/English cue classifier (provider values must be declared enum members),
+  and at most three source-faithful hooks per retained proposal from eight hook
+  types. Deterministic cue/classification/hook matching runs against an
+  analysis-only normalized view (safe Unicode normalization, English
+  case-folding, Arabic diacritic/tatweel removal, conservative alif/ya unify)
+  without rewriting stored text, timestamps, numbers, names, URLs, technical
+  forms, protected tokens, or hook display text. Cue vocabularies stay small with
+  common Egyptian, Gulf/Saudi, Levantine, MSA/Fusha, and English variants.
+  Provider hooks are strictly validated; invented/changed protected tokens or
+  numbers are rejected and deterministic hooks are kept.
+- **Novelty.** Same-source overlap+similarity merges, same-source canonical
+  idea/topic signatures catch non-overlapping repeats, and a bounded recent
+  cross-source corpus (500 current non-rejected candidates) provides duplication
+  risk. Deterministic novelty is the cheap first pass and initial redundancy
+  filter; clearly redundant candidates never consume provider quota. After
+  accepted provider enrichment, novelty/disposition is recomputed for eligible
+  retained candidates using improved summaries, without reviving a weak candidate
+  or un-redundanting an already-redundant one. Provider-free mode uses stable
+  Arabic/English tokenization, stopwords, unigrams/bigrams, and TF-IDF cosine. No
+  vector database or embedding service. Recurring channel/history diversity is
+  deferred to Stage 7.
+- **Semantic providers.** A Stage 3-specific protocol/schema (not the Stage 2.7
+  reconstruction prompt). `deterministic` (default) makes zero Gemini/Qwen calls;
+  `adaptive` selectively batches strongest-first through Gemini only when a key is
+  configured and never falls back to Qwen; `local_only` uses Qwen/Ollama only when
+  `CLIPFACTORY_LOCAL_QWEN_ENABLED=true` and never Gemini. Hard caps: 32
+  provider-evaluated candidates/source, 8/request, 4 calls/source, bounded
+  input/output tokens, temperature 0. Rate limits stop later calls; malformed
+  items are isolated. Any requested candidate missing a valid accepted result
+  makes the run non-cache-eligible/retryable (`PROVIDER_PARTIAL`); accepted
+  evaluations are persisted on candidate rows and a later rerun reuses them,
+  retrying only the missing/invalid candidates whose provider-input fingerprint
+  still matches. Provider failure degrades safely and never fails the pipeline.
+- **Persistence.** `candidate_analyses` (one-to-one source summary) and
+  `clip_candidates` (deterministic `candidate_key`, current/stale marker, bounded
+  evidence, queryable scores, separate rights/originality risk, signatures,
+  provider evidence) with database constraints. The input fingerprint covers every
+  output-affecting config value plus semantic mode and stable provider identity;
+  the output fingerprint covers the complete persisted candidate representation.
+  Upsert preserves UUIDs for unchanged intervals; stale marking happens only after
+  a successful finalization; historical candidates are never deleted. The Stage 3
+  migration downgrade removes Stage-3-only rows/history and maps the source
+  lifecycle back to `READY_FOR_ANALYSIS` before narrowing constraints, preserving
+  all pre-Stage-3 data.
+- **Minimal read-only view.** The source detail page shows a "Clip candidates"
+  card (summary line plus compact rows with time-range seek, score, disposition,
+  content type, excerpt, refinement reasons, and a show-rejected toggle) backed by
+  the candidate-analysis/candidates endpoints. No candidate editing or
+  refinement UI.
+- **Stage 3.5 handoff.** Accepted/refinement-needed candidates persist the
+  segment indexes, INDEX excerpt, low-confidence spans, unresolved evidence,
+  refinement reasons/severity, dialect evidence, code-switch/protected tokens,
+  boundary confidence, fingerprints, and provenance/originality snapshot so Stage
+  3.5 can extract audio, refine transcription/boundaries, and reach
+  publication-quality text.
+
+Deterministic verification covers the focused Stage 3 candidate/API/migration
+tests plus the full existing suite: 703 backend tests pass (Docker Python 3.12).
+Stage 3 defaults to deterministic and makes no live provider calls in the
+automated suite. See
+[docs/STAGE_3_OPERATIONS.md](docs/STAGE_3_OPERATIONS.md).
 
 ## Stage 2.7.1 dialect-aware preservation (2026-09-10)
 

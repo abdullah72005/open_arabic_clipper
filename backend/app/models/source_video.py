@@ -4,16 +4,18 @@ import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from sqlalchemy import DateTime, Enum, String, Uuid, func
+from sqlalchemy import JSON, DateTime, Enum, String, Uuid, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from app.core.enums import PipelineStage, RightsStatus
+from app.core.enums import MediaOriginType, PipelineStage, RightsStatus
 from app.db.base import Base
 from app.transcription.dialect import ArabicDialectProfile
 
 if TYPE_CHECKING:
     from app.models.audio_analysis import AudioAnalysis
     from app.models.audio_artifact import AudioArtifact
+    from app.models.candidate_analysis import CandidateAnalysis
+    from app.models.clip_candidate import ClipCandidate
     from app.models.pipeline_run import PipelineRun
     from app.models.processing_job import ProcessingJob
     from app.models.source_quality_assessment import SourceQualityAssessment
@@ -42,6 +44,22 @@ class SourceVideo(Base):
         Enum(RightsStatus, name="rights_status", native_enum=False, create_constraint=True),
         nullable=False,
         default=RightsStatus.UNKNOWN,
+    )
+    media_origin: Mapped[MediaOriginType] = mapped_column(
+        Enum(
+            MediaOriginType,
+            name="media_origin_type",
+            native_enum=False,
+            create_constraint=True,
+        ),
+        nullable=False,
+        default=MediaOriginType.OTHER,
+        server_default=MediaOriginType.OTHER.value,
+    )
+    # Bounded provenance evidence (creator, license/permission reference, source
+    # platform, notes). Never logged, never used as provider prompt content.
+    provenance_metadata: Mapped[dict[str, object]] = mapped_column(
+        JSON, nullable=False, default=dict, server_default="{}"
     )
     lifecycle_state: Mapped[PipelineStage] = mapped_column(
         Enum(
@@ -75,4 +93,10 @@ class SourceVideo(Base):
     )
     quality_assessment: Mapped["SourceQualityAssessment | None"] = relationship(
         back_populates="source_video", cascade="all, delete-orphan", uselist=False
+    )
+    candidate_analysis: Mapped["CandidateAnalysis | None"] = relationship(
+        back_populates="source_video", cascade="all, delete-orphan", uselist=False
+    )
+    candidates: Mapped[list["ClipCandidate"]] = relationship(
+        back_populates="source_video", cascade="all, delete-orphan"
     )

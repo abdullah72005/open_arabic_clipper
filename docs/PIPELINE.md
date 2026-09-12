@@ -1,4 +1,4 @@
-# Stage 1, Stage 2, Stage 2.5, and Stage 2.7 pipeline
+# Stage 1, Stage 2, Stage 2.5, Stage 2.7, and Stage 3 pipeline
 
 1. An operator submits a permitted public URL or uploads a local file.
 2. The API creates a durable source and queued ingest job.
@@ -25,6 +25,23 @@
 9. Timestamp-aware chunks use final operator text when present, otherwise
    corrected text; silence/quality signals are persisted separately.
 10. The source reaches `READY_FOR_ANALYSIS`.
+11. Stage 3 candidate analysis runs from the imperfect INDEX transcript, derives
+    coarse deterministic proposals, scores content separately from transcript
+    confidence, classifies content types, generates bounded source-faithful
+    hooks, enforces same-source/cross-source novelty, and persists accepted and
+    rejected candidates. It then advances the source to `READY_FOR_REFINEMENT`.
+    Failure or cancellation leaves it at `READY_FOR_ANALYSIS`.
+
+Stage 3 consumes imperfect INDEX-quality text. Candidate quality and transcript
+confidence are separate; a strong moment with material uncertainty survives as
+`CANDIDATE_NEEDS_REFINEMENT` for Stage 3.5, which owns targeted audio/transcript
+refinement and exact boundaries. Source dialect is source evidence, not target
+audience; code-switched text is preserved and omitted-English recovery is not
+implemented in Stage 3. Unknown/third-party provenance never blocks local
+analysis. Stage 3 semantic mode defaults to deterministic; `adaptive` uses
+Gemini selectively when configured and `local_only` uses Qwen/Ollama only when
+`CLIPFACTORY_LOCAL_QWEN_ENABLED=true`. See
+`docs/STAGE_3_OPERATIONS.md` for the full design.
 
 Each stage is persisted and idempotent. Stage runs persist canonical input and
 output fingerprints; a changed upstream evidence reruns downstream derived

@@ -153,11 +153,12 @@ def test_transcription_stage_advances_to_normalization_and_uses_transcription_jo
         assert source.lifecycle_state is PipelineStage.TRANSCRIPT_NORMALIZATION
 
 
-def test_audio_analysis_is_terminal_worker_stage() -> None:
-    """The runner advances it to READY_FOR_ANALYSIS without another executor task."""
+def test_audio_analysis_queues_candidate_analysis_and_it_is_terminal() -> None:
+    """Stage 3: AUDIO_ANALYSIS queues CANDIDATE_ANALYSIS; candidate analysis is terminal."""
     from app.workers.tasks import _NEXT_STAGE
 
-    assert PipelineStage.AUDIO_ANALYSIS not in _NEXT_STAGE
+    assert _NEXT_STAGE[PipelineStage.AUDIO_ANALYSIS] is PipelineStage.CANDIDATE_ANALYSIS
+    assert PipelineStage.CANDIDATE_ANALYSIS not in _NEXT_STAGE
 
 
 def test_probe_stage_uses_probe_job_kind_and_retries_to_probe(

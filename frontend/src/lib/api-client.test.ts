@@ -148,4 +148,57 @@ describe("API client", () => {
       rights_status: "LICENSED"
     });
   });
+
+  it("loads compact Stage 3 candidates with rejected filtering", async () => {
+    const fetcher = async (input: RequestInfo | URL) => {
+      expect(String(input)).toBe(
+        "http://api.test/api/sources/source%2Fid/candidates?limit=50&include_rejected=true"
+      );
+      return new Response(
+        JSON.stringify([
+          {
+            id: "candidate-1",
+            source_video_id: "source-1",
+            candidate_key: "key-1",
+            disposition: "CANDIDATE",
+            start_time: 12,
+            end_time: 48,
+            transcript_excerpt: "معلومة غريبة",
+            primary_content_type: "SURPRISING_FACT",
+            clip_score: 0.62,
+            transcript_confidence: 0.8,
+            uncertainty_severity: 0.1,
+            refinement_reasons: [],
+            dialect_profile: "EGYPTIAN",
+            code_switch_suspected: false
+          }
+        ]),
+        { headers: { "content-type": "application/json" } }
+      );
+    };
+
+    await expect(
+      createApiClient("http://api.test", fetcher).listCandidates("source/id", { includeRejected: true })
+    ).resolves.toMatchObject([{ disposition: "CANDIDATE", clip_score: 0.62 }]);
+  });
+
+  it("loads the Stage 3 candidate-analysis summary", async () => {
+    const fetcher = async (input: RequestInfo | URL) => {
+      expect(String(input)).toBe("http://api.test/api/sources/source-1/candidate-analysis");
+      return new Response(
+        JSON.stringify({
+          provider_status: "DETERMINISTIC",
+          semantic_provider_mode: "deterministic",
+          cache_eligible: true,
+          metrics: { candidates_retained: 2 }
+        }),
+        { headers: { "content-type": "application/json" } }
+      );
+    };
+
+    await expect(createApiClient("http://api.test", fetcher).getCandidateAnalysis("source-1")).resolves.toMatchObject({
+      provider_status: "DETERMINISTIC",
+      cache_eligible: true
+    });
+  });
 });
