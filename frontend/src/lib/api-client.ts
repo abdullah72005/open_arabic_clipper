@@ -17,6 +17,8 @@ export type PipelineStage =
   | "AUDIO_ANALYSIS"
   | "READY_FOR_TRANSCRIPTION"
   | "READY_FOR_ANALYSIS"
+  | "CANDIDATE_ANALYSIS"
+  | "READY_FOR_REFINEMENT"
   | "FAILED";
 export type JobStatus = "QUEUED" | "RUNNING" | "SUCCEEDED" | "FAILED" | "CANCELLED";
 export type ProviderAvailability = "AVAILABLE" | "UNAVAILABLE" | "MISCONFIGURED";
@@ -138,6 +140,36 @@ export interface QualityResponse {
   quality: QualityMetrics | null;
 }
 
+export type CandidateDisposition =
+  | "CANDIDATE"
+  | "CANDIDATE_NEEDS_REFINEMENT"
+  | "DO_NOT_CLIP"
+  | "DO_NOT_CLIP_RECENTLY_REDUNDANT";
+
+export interface Candidate {
+  id: string;
+  source_video_id: string;
+  candidate_key: string;
+  disposition: CandidateDisposition;
+  start_time: number;
+  end_time: number;
+  transcript_excerpt: string;
+  primary_content_type: string;
+  clip_score: number;
+  transcript_confidence: number;
+  uncertainty_severity: number;
+  refinement_reasons: string[];
+  dialect_profile: string | null;
+  code_switch_suspected: boolean;
+}
+
+export interface CandidateAnalysis {
+  provider_status: string;
+  semantic_provider_mode: string;
+  cache_eligible: boolean;
+  metrics: Record<string, unknown>;
+}
+
 type Fetcher = typeof fetch;
 
 export class ApiError extends Error {
@@ -168,6 +200,14 @@ export function createApiClient(baseUrl: string, fetcher: Fetcher = fetch) {
       request<Transcript>(`/api/sources/${encodeURIComponent(id)}/transcript`),
     getQuality: (id: string) =>
       request<QualityResponse>(`/api/sources/${encodeURIComponent(id)}/quality`),
+    getCandidateAnalysis: (id: string) =>
+      request<CandidateAnalysis>(`/api/sources/${encodeURIComponent(id)}/candidate-analysis`),
+    listCandidates: (id: string, options: { includeRejected?: boolean; limit?: number } = {}) =>
+      request<Candidate[]>(
+        `/api/sources/${encodeURIComponent(id)}/candidates?limit=${options.limit ?? 50}&include_rejected=${
+          options.includeRejected ?? false
+        }`
+      ),
     retranscribeTranscript: (id: string, force = true) =>
       request<Job>(`/api/sources/${encodeURIComponent(id)}/retranscribe?force=${force}`, {
         method: "POST"

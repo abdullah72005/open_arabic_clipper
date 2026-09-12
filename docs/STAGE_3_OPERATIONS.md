@@ -271,8 +271,11 @@ CLI: `python -m app.cli candidate-analysis <source-id> [--force]` and
 
 Responses expose scores, dispositions, refinement reasons, hooks,
 provenance/originality risk, dialect/code-switch evidence, and sanitized provider
-metadata without secrets or huge transcript bodies. No Stage 3 review UI exists;
-existing frontend behavior is unchanged.
+metadata without secrets or huge transcript bodies. The source detail page shows a
+minimal read-only "Clip candidates" card (summary line, compact candidate rows
+with time-range seek, score, disposition, content type, excerpt, and refinement
+reasons, plus a show-rejected toggle) that reads the same candidate-analysis and
+candidates endpoints. There is no candidate editing or refinement UI.
 
 ## Stage 3.5 handoff
 

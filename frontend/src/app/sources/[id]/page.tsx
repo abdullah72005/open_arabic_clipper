@@ -3,6 +3,7 @@
 import { useParams, useRouter } from "next/navigation";
 import { useCallback, useRef, useState } from "react";
 import { ApiState } from "@/components/api-state";
+import { CandidateResults } from "@/components/candidate-list";
 import { JobPoller } from "@/components/job-poller";
 import { JobProgress } from "@/components/job-progress";
 import { TranscriptStatus } from "@/components/transcript-status";
@@ -239,6 +240,7 @@ export default function SourceDetail() {
                     {({ transcript, quality }) => <TranscriptViewer onSeek={seekTo} onUpdated={() => setTranscriptRevision((value) => value + 1)} quality={quality} sourceId={source.id} transcript={transcript} />}
                   </ApiState>
                 )}
+                <CandidateResults onSeek={seekTo} revision={transcriptRevision} sourceId={source.id} />
               </>
             );
           }}

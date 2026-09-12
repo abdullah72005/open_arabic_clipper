@@ -20,3 +20,6 @@ storage/quarantine/*
 !storage/quarantine/.gitkeep
 storage/benchmarks/*
 !storage/benchmarks/.gitkeep
+
+# TypeScript incremental build info
+*.tsbuildinfo

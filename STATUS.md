@@ -114,6 +114,11 @@ and defers expensive audio/transcript refinement to Stage 3.5:
   migration downgrade removes Stage-3-only rows/history and maps the source
   lifecycle back to `READY_FOR_ANALYSIS` before narrowing constraints, preserving
   all pre-Stage-3 data.
+- **Minimal read-only view.** The source detail page shows a "Clip candidates"
+  card (summary line plus compact rows with time-range seek, score, disposition,
+  content type, excerpt, refinement reasons, and a show-rejected toggle) backed by
+  the candidate-analysis/candidates endpoints. No candidate editing or
+  refinement UI.
 - **Stage 3.5 handoff.** Accepted/refinement-needed candidates persist the
   segment indexes, INDEX excerpt, low-confidence spans, unresolved evidence,
   refinement reasons/severity, dialect evidence, code-switch/protected tokens,
