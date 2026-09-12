@@ -3,16 +3,33 @@
 from __future__ import annotations
 
 import json
+import threading
 from dataclasses import asdict
 from pathlib import Path
 from uuid import UUID
 
 import typer
 
-from app.core.enums import CandidateDisposition, JobKind, PipelineStage, RefinementPriority
+from app.candidates.novelty import NoveltyItem
+from app.candidates.service import CandidateAnalysisService
+from app.core.enums import (
+    CandidateDisposition,
+    JobKind,
+    PipelineStage,
+    RefinementPriority,
+    SemanticProviderMode,
+)
 from app.core.settings import get_settings
 from app.db.session import create_session_factory
-from app.models import ClipCandidate, ProcessingJob, SourceVideo, Transcript
+from app.models import (
+    AudioAnalysis,
+    AudioArtifact,
+    CandidateAnalysis,
+    ClipCandidate,
+    ProcessingJob,
+    SourceVideo,
+    Transcript,
+)
 from app.refinement.handoff import build_stage4_handoff
 from app.refinement.queue import (
     Stage35QueueError,
@@ -25,8 +42,12 @@ from app.runtime.heavy_model_lease import HeavyModelLeaseBusy, HeavyModelUnsafe
 from app.runtime.memory import MemoryReadError, capture_memory
 from app.services.health import HealthService
 from app.services.storage import StorageCategory, StorageService
-from app.transcription.benchmark import benchmark_transcription
+from app.transcription.benchmark import benchmark_transcription, transcribe_for_benchmark
 from app.transcription.engine import WhisperEngine
+from app.transcription.performance_replay import (
+    CandidateSnapshot,
+    replay_index_candidates,
+)
 from app.transcription.reconstruction.benchmark import (
     BenchmarkRunner,
     evaluate_completion_gate,
@@ -427,6 +448,116 @@ def benchmark(audio_path: Path) -> None:
     settings = get_settings()
     report = benchmark_transcription(audio_path, WhisperEngine(), settings.transcription_options())
     typer.echo(json.dumps(report.as_dict()))
+
+
+@app.command("benchmark-index-replay")
+def benchmark_index_replay(source_id: UUID) -> None:
+    """Run INDEX ASR once and replay Stage 2.5/Stage 3 without durable writes."""
+
+    settings = get_settings()
+    with create_session_factory()() as session:
+        source = session.get(SourceVideo, source_id)
+        transcript = (
+            session.query(Transcript).filter(Transcript.source_video_id == source_id).one_or_none()
+        )
+        artifact = (
+            session.query(AudioArtifact)
+            .filter(AudioArtifact.source_video_id == source_id)
+            .one_or_none()
+        )
+        analysis = (
+            session.query(AudioAnalysis)
+            .filter(AudioAnalysis.source_video_id == source_id)
+            .one_or_none()
+        )
+        candidate_analysis = (
+            session.query(CandidateAnalysis)
+            .filter(CandidateAnalysis.source_video_id == source_id)
+            .one_or_none()
+        )
+        if source is None or transcript is None or artifact is None or analysis is None:
+            raise typer.BadParameter("source requires transcript, cached audio, and audio analysis")
+        if (
+            candidate_analysis is None
+            or candidate_analysis.semantic_provider_mode is not SemanticProviderMode.DETERMINISTIC
+        ):
+            raise typer.BadParameter("source requires deterministic Stage 3 analysis for replay")
+        baseline = [
+            CandidateSnapshot(row.candidate_key, row.disposition)
+            for row in session.query(ClipCandidate)
+            .filter(ClipCandidate.source_video_id == source_id)
+            .filter(ClipCandidate.is_current.is_(True))
+            .all()
+        ]
+        audio_path = _storage().resolve(StorageCategory.SOURCES, artifact.output_path)
+        rights_status = source.rights_status
+        media_origin = source.media_origin
+        provenance_metadata = source.provenance_metadata or {}
+        dialect_override = source.dialect_profile_override
+        silence_intervals = analysis.silence_intervals
+        audio_features = analysis.features
+        historical_corpus = [
+            NoveltyItem(
+                key=row.candidate_key,
+                source_id=str(row.source_video_id),
+                idea_text=row.idea_summary or row.transcript_excerpt,
+                topic_text=row.topic_summary or row.transcript_excerpt,
+                clip_score=row.clip_score,
+            )
+            for row in session.query(ClipCandidate)
+            .filter(
+                ClipCandidate.is_current.is_(True),
+                ClipCandidate.source_video_id != source_id,
+                ClipCandidate.disposition.in_(
+                    [
+                        CandidateDisposition.CANDIDATE,
+                        CandidateDisposition.CANDIDATE_NEEDS_REFINEMENT,
+                    ]
+                ),
+            )
+            .order_by(ClipCandidate.updated_at.desc())
+            .limit(settings.stage3_config().novelty_corpus_limit)
+            .all()
+        ]
+
+    engine = WhisperEngine()
+    cancel_event = threading.Event()
+    try:
+        with settings.heavy_model_lease_factory().acquire(
+            purpose="benchmark-asr", on_ownership_lost=cancel_event.set
+        ) as lease:
+            report, result = transcribe_for_benchmark(
+                audio_path, engine, settings.transcription_options(), cancel_event
+            )
+            if lease.ownership_lost:
+                raise HeavyModelLeaseBusy("heavy-model lease was lost during benchmark ASR")
+    except (HeavyModelLeaseBusy, HeavyModelUnsafe) as error:
+        raise typer.BadParameter(str(error)) from error
+    replay = replay_index_candidates(
+        source_id=str(source_id),
+        result=result,
+        duration=result.duration,
+        silence_intervals=silence_intervals,
+        audio_features=audio_features,
+        rights_status=rights_status,
+        media_origin=media_origin,
+        provenance_metadata=provenance_metadata,
+        dialect_override=dialect_override,
+        baseline_candidates=baseline,
+        service=CandidateAnalysisService(config=settings.stage3_config()),
+        corrector=settings.contextual_corrector(),
+        historical_corpus=historical_corpus,
+    )
+    typer.echo(
+        json.dumps(
+            {
+                "benchmark": report.as_dict(),
+                "child_peak_rss_bytes": engine.last_child_peak_rss(),
+                "replay": replay.as_dict(),
+            },
+            ensure_ascii=False,
+        )
+    )
 
 
 @app.command("benchmark-reconstruction")

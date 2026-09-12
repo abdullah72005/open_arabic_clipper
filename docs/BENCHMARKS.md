@@ -11,26 +11,30 @@ timestamps, temperature fallback `(0.0, 0.2, 0.4, 0.6, 0.8, 1.0)`,
 1,080.269895 seconds (1.625 audio-minutes per wall-minute).
 
 Variant B used the same decoding settings and cached WAV with eight CTranslate2
-CPU threads and INDEX batch size one. It completed in 1,256.133199 seconds,
-0.715777 real-time factor, and 1.397083 audio-minutes per wall-minute: 16.3%
-slower than baseline. It peaked at a live worker observation of 2.593 GiB in a
-7.752 GiB container, approximately 7.5 CPU cores, with approximately 3.7 GiB
-swap free; no Ollama model was resident. It is rejected. No batch, batch-4, or
-VAD experiment was run because the first thread-only variant was slower.
+CPU threads and INDEX batch size one. A preliminary performance-only run took
+1,256.133199 seconds. The final fidelity-correct read-only replay run took
+1,046.740927 seconds (0.596460 real-time factor and 1.676559 audio-minutes per
+wall-minute), 3.1% faster than baseline. It preserved 4,716 word timestamps,
+detected Egyptian Arabic with 0.90 confidence, and replayed all 24 retained deterministic
+Stage 3 candidates exactly (zero missing or new retained keys). The child peak
+RSS was 3,277,537,280 bytes; a live worker observation was 2.827 GiB in a
+7.752 GiB container at approximately eight CPU cores, with 135 MiB cgroup swap
+in use and no Ollama model resident. The post-child worker returned to 503.7
+MiB. B is selected. No batch, batch-4, or VAD experiment was run because the
+safe thread-only gain met the acceptance checks.
 
 The benchmark intentionally used the cached WAV and did not mutate the durable
-transcript or candidate rows. The current lightweight CLI benchmark reports
-performance only; semantic transcript, Arabic-English/code-switch, timestamp,
-and Stage 3 candidate replay comparison remain required before selecting a
-non-default execution configuration. Therefore the selected rollback-safe
-configuration remains automatic CPU threads (`0`), batch size `1`, and VAD off.
+transcript or candidate rows. `benchmark-index-replay SOURCE_ID` additionally
+replays the existing Stage 2.5 normalizer and deterministic Stage 3 service in
+memory against persisted candidate keys, without writes. Therefore the selected rollback-safe
+configuration is CPU threads `8`, batch size `1`, and VAD off; set threads to
+`0` as the portable rollback baseline.
 Full remote video acquisition remains early; audio-first or deferred-video
 acquisition was not implemented.
 
 `CLIPFACTORY_WHISPER_INDEX_BATCH_SIZE` is deliberately constrained to `1` in
 this release: the installed faster-whisper batch API was inspected, but was not
-adopted because no batch run was justified after B regressed and no candidate
-replay acceptance evidence exists.
+adopted because no batch run was justified after B met the acceptance gate.
 
 This repository was benchmarked on 2026-09-04 with an operator-authorized
 51.54-second source clip. The first run downloaded the `small` model; the

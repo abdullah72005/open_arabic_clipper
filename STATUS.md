@@ -6,10 +6,12 @@ Stage-level durable metrics now distinguish remote metadata lookup, transfer,
 artifact bytes, bounded directory-scan cost, postprocessing applicability,
 ffprobe, WAV cache validation/extraction, and transcription execution settings.
 The established 29.25-minute authorized WebM baseline remains INGEST 609.43 s,
-TRANSCRIPTION 1080.27 s, and CANDIDATE_ANALYSIS 2.35 s. One non-destructive
-thread-only cached-WAV experiment (`large-v3-turbo`, CPU int8, beam 5, automatic
-language, timestamps, VAD off, batch one, eight CPU threads) took 1256.13 s and
-was 16.3% slower. It is rejected; rollback-safe defaults remain CPU threads zero,
+TRANSCRIPTION 1080.27 s, and CANDIDATE_ANALYSIS 2.35 s. The authorized
+non-destructive replay of the thread-only cached-WAV experiment
+(`large-v3-turbo`, CPU int8, beam 5, automatic language, timestamps, VAD off,
+batch one, eight CPU threads) took 1046.74 s, 3.1% faster than baseline. It
+preserved 4,716 word timestamps and all 24 retained deterministic Stage 3
+candidates. It is selected; rollback-safe defaults remain CPU threads eight,
 batch one, and VAD off. No batch or VAD test was justified. Full remote video is
 still acquired before analysis; audio-first/deferred-video acquisition was not
 implemented. See [benchmarks](docs/BENCHMARKS.md).

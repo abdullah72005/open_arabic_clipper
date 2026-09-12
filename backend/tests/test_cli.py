@@ -1,11 +1,13 @@
 import json
 import re
 from types import SimpleNamespace
+from uuid import UUID
 
 import pytest
 from typer.testing import CliRunner
 
 from app.cli import app
+from app.core.enums import SemanticProviderMode
 from app.runtime.memory import MemoryReadError, MemorySnapshot
 from app.transcription.reconstruction.types import ProviderAvailability, ProviderHealth
 
@@ -31,9 +33,114 @@ def test_stage_2_transcript_commands_are_exposed() -> None:
     assert "retranscribe" in help_text
     assert "reconstruct" in help_text
     assert "benchmark-reconstruction" in help_text
+    assert "benchmark-index-replay" in help_text
     assert "reconstruction-health" in help_text
     assert "recover-heavy-model" in help_text
     assert "transcript" in help_text
+
+
+def test_benchmark_index_replay_emits_read_only_comparison(monkeypatch: pytest.MonkeyPatch) -> None:
+    source_id = UUID("4037a813-6fe6-4c83-96ff-e5cd4bf210ce")
+    source = SimpleNamespace(
+        rights_status="UNKNOWN",
+        media_origin="OTHER",
+        provenance_metadata={},
+        dialect_profile_override=None,
+    )
+    transcript = SimpleNamespace(duration=10.0)
+    artifact = SimpleNamespace(duration=10.0, output_path="source/audio.wav")
+    analysis = SimpleNamespace(silence_intervals=[], features=[])
+    candidate_analysis = SimpleNamespace(semantic_provider_mode=SemanticProviderMode.DETERMINISTIC)
+    candidate = SimpleNamespace(candidate_key="candidate-1", disposition="CANDIDATE")
+
+    class Query:
+        def __init__(self, value: object) -> None:
+            self.value = value
+
+        def filter(self, *_args: object) -> "Query":
+            return self
+
+        def order_by(self, *_args: object) -> "Query":
+            return self
+
+        def limit(self, *_args: object) -> "Query":
+            return self
+
+        def one_or_none(self) -> object:
+            return self.value
+
+        def all(self) -> list[object]:
+            return self.value if isinstance(self.value, list) else []
+
+    class Session:
+        def __init__(self) -> None:
+            self.values = iter(
+                [transcript, artifact, analysis, candidate_analysis, [candidate], []]
+            )
+
+        def __enter__(self) -> "Session":
+            return self
+
+        def __exit__(self, *_args: object) -> bool:
+            return False
+
+        def get(self, *_args: object) -> object:
+            return source
+
+        def query(self, *_args: object) -> Query:
+            return Query(next(self.values))
+
+    class Lease:
+        ownership_lost = False
+
+        def __enter__(self) -> "Lease":
+            return self
+
+        def __exit__(self, *_args: object) -> bool:
+            return False
+
+    class Settings:
+        def transcription_options(self) -> object:
+            return object()
+
+        def heavy_model_lease_factory(self) -> object:
+            return SimpleNamespace(acquire=lambda **_kwargs: Lease())
+
+        def stage3_config(self) -> object:
+            return SimpleNamespace(novelty_corpus_limit=1)
+
+        def contextual_corrector(self) -> object:
+            return object()
+
+    class Report:
+        def as_dict(self) -> dict[str, object]:
+            return {"wall_clock_seconds": 1.0}
+
+    monkeypatch.setattr("app.cli.get_settings", lambda: Settings())
+    monkeypatch.setattr("app.cli.create_session_factory", lambda: lambda: Session())
+    monkeypatch.setattr(
+        "app.cli._storage", lambda: SimpleNamespace(resolve=lambda *_args: "audio.wav")
+    )
+    monkeypatch.setattr(
+        "app.cli.WhisperEngine", lambda: SimpleNamespace(last_child_peak_rss=lambda: 123)
+    )
+    monkeypatch.setattr(
+        "app.cli.transcribe_for_benchmark",
+        lambda *_args: (Report(), SimpleNamespace(duration=10.0)),
+    )
+    monkeypatch.setattr(
+        "app.cli.replay_index_candidates",
+        lambda **_kwargs: SimpleNamespace(as_dict=lambda: {"retained_candidate_overlap_count": 1}),
+    )
+
+    result = CliRunner().invoke(app, ["benchmark-index-replay", str(source_id)])
+
+    assert result.exit_code == 0
+    assert json.loads(result.stdout) == {
+        "benchmark": {"wall_clock_seconds": 1.0},
+        "child_peak_rss_bytes": 123,
+        "replay": {"retained_candidate_overlap_count": 1},
+    }
 
 
 def test_recover_heavy_model_reports_clear_when_no_unsafe_state(monkeypatch) -> None:
