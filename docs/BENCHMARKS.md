@@ -1,5 +1,32 @@
 # Local transcription benchmark
 
+## Stage 3.7 representative INDEX execution experiment (2026-09-12)
+
+The authorized representative source is
+`4037a813-6fe6-4c83-96ff-e5cd4bf210ce`: 1,754.9226875 seconds of audio, managed
+WebM 588,129,680 bytes, and cached analysis WAV 56,157,604 bytes. Its durable
+baseline used `large-v3-turbo`, CPU int8, beam 5, automatic language, word
+timestamps, temperature fallback `(0.0, 0.2, 0.4, 0.6, 0.8, 1.0)`,
+`condition_on_previous_text=true`, and VAD off. Baseline transcription was
+1,080.269895 seconds (1.625 audio-minutes per wall-minute).
+
+Variant B used the same decoding settings and cached WAV with eight CTranslate2
+CPU threads and INDEX batch size one. It completed in 1,256.133199 seconds,
+0.715777 real-time factor, and 1.397083 audio-minutes per wall-minute: 16.3%
+slower than baseline. It peaked at a live worker observation of 2.593 GiB in a
+7.752 GiB container, approximately 7.5 CPU cores, with approximately 3.7 GiB
+swap free; no Ollama model was resident. It is rejected. No batch, batch-4, or
+VAD experiment was run because the first thread-only variant was slower.
+
+The benchmark intentionally used the cached WAV and did not mutate the durable
+transcript or candidate rows. The current lightweight CLI benchmark reports
+performance only; semantic transcript, Arabic-English/code-switch, timestamp,
+and Stage 3 candidate replay comparison remain required before selecting a
+non-default execution configuration. Therefore the selected rollback-safe
+configuration remains automatic CPU threads (`0`), batch size `1`, and VAD off.
+Full remote video acquisition remains early; audio-first or deferred-video
+acquisition was not implemented.
+
 This repository was benchmarked on 2026-09-04 with an operator-authorized
 51.54-second source clip. The first run downloaded the `small` model; the
 numbers below are the subsequent cached-model run, so they describe inference
