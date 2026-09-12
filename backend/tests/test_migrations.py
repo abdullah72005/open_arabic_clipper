@@ -6,9 +6,15 @@ from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import Session
 
 from alembic import command
-from app.core.enums import JobKind, JobStatus, PipelineRunStatus, PipelineStage
+from app.core.enums import (
+    JobKind,
+    JobStatus,
+    PipelineRunStatus,
+    PipelineStage,
+    SemanticProviderMode,
+)
 from app.core.settings import get_settings
-from app.models import PipelineRun, ProcessingJob, SourceVideo, Transcript
+from app.models import CandidateAnalysis, PipelineRun, ProcessingJob, SourceVideo, Transcript
 
 
 def _load_migration() -> object:
@@ -182,6 +188,14 @@ def test_stage_3_migration_is_reversible_and_preserves_source_data() -> None:
                     input_fingerprint="fp",
                     segments=[],
                     word_segments=[],
+                )
+            )
+            # Exercise the migrated enum/check constraint with the ORM's storage
+            # representation (values, not enum names).
+            session.add(
+                CandidateAnalysis(
+                    source_video_id=source.id,
+                    semantic_provider_mode=SemanticProviderMode.DETERMINISTIC,
                 )
             )
             session.commit()

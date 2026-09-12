@@ -57,6 +57,7 @@ class CandidateAnalysis(Base):
             name="semantic_provider_mode",
             native_enum=False,
             create_constraint=True,
+            values_callable=lambda enum_cls: [member.value for member in enum_cls],
         ),
         nullable=False,
         default=SemanticProviderMode.DETERMINISTIC,
