@@ -44,6 +44,29 @@ def test_remote_acquisition_records_metadata_and_download_boundaries(tmp_path: P
         "storage_write_seconds": 0.0,
         "source_hash_seconds": 0.0,
         "artifact_bytes": 4,
-        "postprocess_state": "not_requested",
+        "postprocess_state": "unknown",
         "postprocess_seconds": None,
     }
+
+
+def test_remote_acquisition_records_observed_postprocessing_time(tmp_path: Path) -> None:
+    clock_values = iter((10.0, 11.0, 12.0, 16.0))
+
+    class RecordingAdapter(YtDlpAdapter):
+        def inspect(self, url: str) -> dict[str, object]:
+            return {"filesize": 4}
+
+        def _run_download(
+            self, command: list[str], normalized_url: str, output_directory: Path
+        ) -> subprocess.CompletedProcess[str]:
+            self._postprocess_started_at = 15.0
+            (output_directory / "owned.webm").write_bytes(b"data")
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    adapter = RecordingAdapter(
+        StorageService(tmp_path / "storage"), monotonic=lambda: next(clock_values)
+    )
+    acquired = adapter.acquire(uuid4(), "https://example.com/owned")
+
+    assert acquired.metrics["postprocess_state"] == "observed"
+    assert acquired.metrics["postprocess_seconds"] == 1.0

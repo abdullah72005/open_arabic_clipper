@@ -5,10 +5,11 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 
+from app.candidates.novelty import NoveltyItem
 from app.candidates.service import CandidateAnalysisService
 from app.candidates.types import CandidateAnalysisOutcome
-from app.candidates.novelty import NoveltyItem
-from app.core.enums import CandidateDisposition, MediaOriginType, RightsStatus
+from app.core.enums import CandidateDisposition, MediaOriginType, RefinementPriority, RightsStatus
+from app.pipeline.stages import ContextualReconstructionExecutor, _segment_reconstruction_status
 from app.transcription.correction import ContextualCorrector
 from app.transcription.dialect import (
     ArabicDialectProfile,
@@ -18,6 +19,7 @@ from app.transcription.dialect import (
 )
 from app.transcription.engine import TranscriptionResult
 from app.transcription.normalization import normalize_transcript
+from app.transcription.reconstruction.service import ContextualReconstructor
 
 _RETAINED_DISPOSITIONS = {
     CandidateDisposition.CANDIDATE,
@@ -31,6 +33,9 @@ class CandidateSnapshot:
 
     candidate_key: str
     disposition: CandidateDisposition
+    refinement_reasons: tuple[str, ...] = ()
+    clip_score: float = 0.0
+    handoff_eligible: bool = False
 
 
 @dataclass(frozen=True)
@@ -48,6 +53,10 @@ class IndexReplayReport:
     retained_candidate_overlap_count: int
     missing_baseline_candidate_keys: tuple[str, ...]
     new_replay_candidate_keys: tuple[str, ...]
+    disposition_mismatches: tuple[str, ...]
+    refinement_reason_mismatches: tuple[str, ...]
+    handoff_mismatches: tuple[str, ...]
+    score_deltas: Mapping[str, float]
 
     def as_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -68,6 +77,9 @@ def replay_index_candidates(
     service: CandidateAnalysisService,
     corrector: ContextualCorrector,
     historical_corpus: Sequence[NoveltyItem],
+    reconstructor: ContextualReconstructor,
+    transcription_fingerprint: str,
+    correction_version: str,
 ) -> IndexReplayReport:
     """Replay normalization and deterministic Stage 3 without mutating durable rows."""
 
@@ -77,6 +89,28 @@ def replay_index_candidates(
         dialect_override=dialect_override,
         corrector=corrector,
     )
+    reconstruction = reconstructor.reconstruct(
+        segments,
+        language=result.language,
+        transcription_fingerprint=transcription_fingerprint,
+        correction_version=correction_version,
+    )
+    identity = reconstructor.runtime_identity()
+    segments = [
+        ContextualReconstructionExecutor._apply_segment(
+            None,
+            segment,
+            item,
+            _segment_reconstruction_status(segment, item),
+            identity,
+            segments,
+            language=result.language,
+            transcription_fingerprint=transcription_fingerprint,
+            correction_version=correction_version,
+            priority=RefinementPriority.INDEX,
+        )
+        for segment, item in zip(segments, reconstruction.segments, strict=True)
+    ]
     outcome = service.analyze(
         source_id=source_id,
         segments=segments,
@@ -144,16 +178,24 @@ def _report(
     baseline_candidates: Sequence[CandidateSnapshot],
     outcome: CandidateAnalysisOutcome,
 ) -> IndexReplayReport:
-    baseline = {
-        candidate.candidate_key
+    baseline_items = {
+        candidate.candidate_key: candidate
         for candidate in baseline_candidates
         if candidate.disposition in _RETAINED_DISPOSITIONS
     }
-    replay = {
-        candidate.candidate_key
+    replay_items = {
+        candidate.candidate_key: CandidateSnapshot(
+            candidate.candidate_key,
+            candidate.disposition,
+            tuple(reason.value for reason in candidate.refinement_reasons),
+            candidate.scores.clip_score,
+            candidate.disposition is CandidateDisposition.CANDIDATE_NEEDS_REFINEMENT,
+        )
         for candidate in outcome.candidates
         if candidate.disposition in _RETAINED_DISPOSITIONS
     }
+    baseline, replay = set(baseline_items), set(replay_items)
+    common = baseline & replay
     return IndexReplayReport(
         language=result.language,
         word_timestamp_count=len(result.word_segments),
@@ -168,4 +210,29 @@ def _report(
         retained_candidate_overlap_count=len(baseline & replay),
         missing_baseline_candidate_keys=tuple(sorted(baseline - replay)),
         new_replay_candidate_keys=tuple(sorted(replay - baseline)),
+        disposition_mismatches=tuple(
+            sorted(
+                key
+                for key in common
+                if baseline_items[key].disposition != replay_items[key].disposition
+            )
+        ),
+        refinement_reason_mismatches=tuple(
+            sorted(
+                key
+                for key in common
+                if baseline_items[key].refinement_reasons != replay_items[key].refinement_reasons
+            )
+        ),
+        handoff_mismatches=tuple(
+            sorted(
+                key
+                for key in common
+                if baseline_items[key].handoff_eligible != replay_items[key].handoff_eligible
+            )
+        ),
+        score_deltas={
+            key: replay_items[key].clip_score - baseline_items[key].clip_score
+            for key in sorted(common)
+        },
     )

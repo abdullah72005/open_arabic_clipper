@@ -155,6 +155,7 @@ class YtDlpAdapter:
         self._monotonic = monotonic
         self._last_directory_scan_seconds = 0.0
         self._last_directory_scan_count = 0
+        self._postprocess_started_at: float | None = None
 
     def inspect(self, url: str) -> Mapping[str, object]:
         """Read public metadata before downloading, using a safe argument vector."""
@@ -205,8 +206,14 @@ class YtDlpAdapter:
                 "storage_write_seconds": 0.0,
                 "source_hash_seconds": 0.0,
                 "artifact_bytes": acquired_path.stat().st_size,
-                "postprocess_state": "not_requested",
-                "postprocess_seconds": None,
+                "postprocess_state": (
+                    "observed" if self._postprocess_started_at is not None else "unknown"
+                ),
+                "postprocess_seconds": (
+                    download_started_at + download_seconds - self._postprocess_started_at
+                    if self._postprocess_started_at is not None
+                    else None
+                ),
             },
         )
 
@@ -256,6 +263,7 @@ class YtDlpAdapter:
 
         self._last_directory_scan_seconds = 0.0
         self._last_directory_scan_count = 0
+        self._postprocess_started_at = None
 
         def directory_size() -> int:
             started_at = self._monotonic()
@@ -281,7 +289,16 @@ class YtDlpAdapter:
             process.wait()
             raise SourceAcquisitionError("yt-dlp diagnostic stream is unavailable")
         diagnostic_tail = bytearray()
-        reader = threading.Thread(target=_drain_stderr, args=(stderr, diagnostic_tail), daemon=True)
+
+        def observe(chunk: bytes) -> None:
+            if self._postprocess_started_at is None and (
+                b"[Merger]" in chunk or b"[VideoRemuxer]" in chunk or b"[FFmpeg" in chunk
+            ):
+                self._postprocess_started_at = self._monotonic()
+
+        reader = threading.Thread(
+            target=_drain_stderr, args=(stderr, diagnostic_tail, observe), daemon=True
+        )
         reader.start()
 
         exceeded_limit = False
@@ -408,11 +425,15 @@ def _directory_size(directory: Path) -> int:
     return total
 
 
-def _drain_stderr(stream: BinaryIO, tail: bytearray) -> None:
+def _drain_stderr(
+    stream: BinaryIO, tail: bytearray, observe: Callable[[bytes], None] | None = None
+) -> None:
     """Drain stderr continuously while retaining only its bounded byte tail."""
 
     try:
         while chunk := stream.read(8 * 1024):
+            if observe is not None:
+                observe(chunk)
             tail.extend(chunk)
             if len(tail) > MAX_DOWNLOAD_DIAGNOSTIC_BYTES:
                 del tail[:-MAX_DOWNLOAD_DIAGNOSTIC_BYTES]

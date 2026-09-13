@@ -47,11 +47,13 @@ def test_benchmark_index_replay_emits_read_only_comparison(monkeypatch: pytest.M
         provenance_metadata={},
         dialect_profile_override=None,
     )
-    transcript = SimpleNamespace(duration=10.0)
+    transcript = SimpleNamespace(duration=10.0, input_fingerprint="input", correction_version="v1")
     artifact = SimpleNamespace(duration=10.0, output_path="source/audio.wav")
     analysis = SimpleNamespace(silence_intervals=[], features=[])
     candidate_analysis = SimpleNamespace(semantic_provider_mode=SemanticProviderMode.DETERMINISTIC)
-    candidate = SimpleNamespace(candidate_key="candidate-1", disposition="CANDIDATE")
+    candidate = SimpleNamespace(
+        candidate_key="candidate-1", disposition="CANDIDATE", refinement_reasons=[], clip_score=0.0
+    )
 
     class Query:
         def __init__(self, value: object) -> None:
@@ -110,6 +112,9 @@ def test_benchmark_index_replay_emits_read_only_comparison(monkeypatch: pytest.M
             return SimpleNamespace(novelty_corpus_limit=1)
 
         def contextual_corrector(self) -> object:
+            return object()
+
+        def contextual_reconstructor(self) -> object:
             return object()
 
     class Report:

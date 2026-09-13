@@ -69,6 +69,17 @@ class PipelineRunner:
             and run.input_fingerprint == input_fingerprint
             and self._skip_is_allowed(executor, source)
         ):
+            previous_metrics = dict(run.metrics or {})
+            run.metrics = {
+                **previous_metrics,
+                "cache_reuse": "hit",
+                "cache_hit_at": datetime.now(timezone.utc).isoformat(),
+            }
+            self._session.commit()
+            _logger.info(
+                "pipeline_stage_metrics",
+                extra={"stage": stage.value, "source_id": str(source.id), "metrics": run.metrics},
+            )
             return PipelineResult(run.id, job_id, skipped=True)
 
         job = self._load_or_create_job(source.id, stage, job_id)

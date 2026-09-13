@@ -483,7 +483,13 @@ def benchmark_index_replay(source_id: UUID) -> None:
         ):
             raise typer.BadParameter("source requires deterministic Stage 3 analysis for replay")
         baseline = [
-            CandidateSnapshot(row.candidate_key, row.disposition)
+            CandidateSnapshot(
+                row.candidate_key,
+                row.disposition,
+                tuple(row.refinement_reasons or ()),
+                row.clip_score,
+                row.disposition is CandidateDisposition.CANDIDATE_NEEDS_REFINEMENT,
+            )
             for row in session.query(ClipCandidate)
             .filter(ClipCandidate.source_video_id == source_id)
             .filter(ClipCandidate.is_current.is_(True))
@@ -496,6 +502,8 @@ def benchmark_index_replay(source_id: UUID) -> None:
         dialect_override = source.dialect_profile_override
         silence_intervals = analysis.silence_intervals
         audio_features = analysis.features
+        transcription_fingerprint = transcript.input_fingerprint
+        correction_version = transcript.correction_version
         historical_corpus = [
             NoveltyItem(
                 key=row.candidate_key,
@@ -547,6 +555,9 @@ def benchmark_index_replay(source_id: UUID) -> None:
         service=CandidateAnalysisService(config=settings.stage3_config()),
         corrector=settings.contextual_corrector(),
         historical_corpus=historical_corpus,
+        reconstructor=settings.contextual_reconstructor(),
+        transcription_fingerprint=transcription_fingerprint,
+        correction_version=correction_version,
     )
     typer.echo(
         json.dumps(

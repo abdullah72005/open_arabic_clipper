@@ -112,7 +112,9 @@ def test_fingerprint_skip_retains_prior_attempt_metrics(sqlite_engine: object) -
 
         session.refresh(run)
         assert result.skipped is True
-        assert run.metrics == {"wall_seconds": 4.0, "cache_reuse": "miss"}
+        assert run.metrics["wall_seconds"] == 4.0
+        assert run.metrics["cache_reuse"] == "hit"
+        assert isinstance(run.metrics["cache_hit_at"], str)
 
 
 def test_force_reexecutes_a_completed_stage(sqlite_engine: object) -> None:

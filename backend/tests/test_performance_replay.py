@@ -1,8 +1,9 @@
 from app.candidates.service import CandidateAnalysisService
 from app.core.enums import CandidateDisposition, MediaOriginType, RightsStatus
+from app.transcription.correction import ContextualCorrector
 from app.transcription.engine import TranscriptionResult
 from app.transcription.performance_replay import CandidateSnapshot, replay_index_candidates
-from app.transcription.correction import ContextualCorrector
+from app.transcription.reconstruction.service import ContextualReconstructor
 
 
 def test_index_replay_is_read_only_and_reports_retained_candidate_overlap() -> None:
@@ -38,6 +39,9 @@ def test_index_replay_is_read_only_and_reports_retained_candidate_overlap() -> N
         service=CandidateAnalysisService(),
         corrector=ContextualCorrector.from_default_lexicon(),
         historical_corpus=[],
+        reconstructor=ContextualReconstructor(None),
+        transcription_fingerprint="test",
+        correction_version="test",
     )
     assert report.word_timestamp_count == 1
     assert report.raw_segment_count == 1
