@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 
 from app.candidates.novelty import NoveltyItem
 from app.candidates.service import CandidateAnalysisService
@@ -36,6 +36,7 @@ class CandidateSnapshot:
     refinement_reasons: tuple[str, ...] = ()
     clip_score: float = 0.0
     handoff_eligible: bool = False
+    refinement_evidence: Mapping[str, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -57,6 +58,8 @@ class IndexReplayReport:
     refinement_reason_mismatches: tuple[str, ...]
     handoff_mismatches: tuple[str, ...]
     score_deltas: Mapping[str, float]
+    ranking_mismatches: tuple[str, ...]
+    handoff_evidence_mismatches: tuple[str, ...]
 
     def as_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -190,12 +193,19 @@ def _report(
             tuple(reason.value for reason in candidate.refinement_reasons),
             candidate.scores.clip_score,
             candidate.disposition is CandidateDisposition.CANDIDATE_NEEDS_REFINEMENT,
+            dict(candidate.refinement_evidence),
         )
         for candidate in outcome.candidates
         if candidate.disposition in _RETAINED_DISPOSITIONS
     }
     baseline, replay = set(baseline_items), set(replay_items)
     common = baseline & replay
+    baseline_order = [
+        key for key in sorted(common, key=lambda key: (-baseline_items[key].clip_score, key))
+    ]
+    replay_order = [
+        key for key in sorted(common, key=lambda key: (-replay_items[key].clip_score, key))
+    ]
     return IndexReplayReport(
         language=result.language,
         word_timestamp_count=len(result.word_segments),
@@ -235,4 +245,16 @@ def _report(
             key: replay_items[key].clip_score - baseline_items[key].clip_score
             for key in sorted(common)
         },
+        ranking_mismatches=tuple(
+            key
+            for key, baseline_key in zip(replay_order, baseline_order, strict=True)
+            if key != baseline_key
+        ),
+        handoff_evidence_mismatches=tuple(
+            sorted(
+                key
+                for key in common
+                if baseline_items[key].refinement_evidence != replay_items[key].refinement_evidence
+            )
+        ),
     )

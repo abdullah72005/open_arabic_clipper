@@ -52,7 +52,11 @@ def test_benchmark_index_replay_emits_read_only_comparison(monkeypatch: pytest.M
     analysis = SimpleNamespace(silence_intervals=[], features=[])
     candidate_analysis = SimpleNamespace(semantic_provider_mode=SemanticProviderMode.DETERMINISTIC)
     candidate = SimpleNamespace(
-        candidate_key="candidate-1", disposition="CANDIDATE", refinement_reasons=[], clip_score=0.0
+        candidate_key="candidate-1",
+        disposition="CANDIDATE",
+        refinement_reasons=[],
+        refinement_evidence={},
+        clip_score=0.0,
     )
 
     class Query:

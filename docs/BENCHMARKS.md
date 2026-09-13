@@ -13,15 +13,16 @@ timestamps, temperature fallback `(0.0, 0.2, 0.4, 0.6, 0.8, 1.0)`,
 Variant B used the same decoding settings and cached WAV with eight CTranslate2
 CPU threads and INDEX batch size one. A preliminary performance-only run took
 1,256.133199 seconds. The final fidelity-correct read-only replay run took
-1,046.740927 seconds (0.596460 real-time factor and 1.676559 audio-minutes per
-wall-minute), 3.1% faster than baseline. It preserved 4,716 word timestamps,
+1,024.903515 seconds (0.584016 real-time factor and 1.712281 audio-minutes per
+wall-minute), 5.1% faster than baseline. It preserved 4,712 word timestamps,
 detected Egyptian Arabic with 0.90 confidence, and replayed all 24 retained deterministic
 Stage 3 candidates exactly (zero missing or new retained keys). The child peak
 RSS was 3,277,537,280 bytes; a live worker observation was 2.827 GiB in a
 7.752 GiB container at approximately eight CPU cores, with 135 MiB cgroup swap
 in use and no Ollama model resident. The post-child worker returned to 503.7
-MiB. B is selected. No batch, batch-4, or VAD experiment was run because the
-safe thread-only gain met the acceptance checks.
+MiB. B is selected. Batch size 2 was rejected: the installed faster-whisper
+batch path cannot run with required VAD-off semantics (no clip timestamps); batch
+4 was therefore not justified. VAD remains off.
 
 The benchmark intentionally used the cached WAV and did not mutate the durable
 transcript or candidate rows. `benchmark-index-replay SOURCE_ID` additionally
@@ -31,6 +32,11 @@ configuration is CPU threads `8`, batch size `1`, and VAD off; set threads to
 `0` as the portable rollback baseline.
 Full remote video acquisition remains early; audio-first or deferred-video
 acquisition was not implemented.
+
+The one authorized controlled reacquisition of the representative public media
+ID reached yt-dlp metadata lookup but the platform rejected the request before
+transfer. No credential, proxy, or access-control workaround was attempted, so
+the historical 609.43-second ingest cannot yet be decomposed by an observed run.
 
 `CLIPFACTORY_WHISPER_INDEX_BATCH_SIZE` is deliberately constrained to `1` in
 this release: the installed faster-whisper batch API was inspected, but was not

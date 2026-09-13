@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 import threading
 from dataclasses import asdict
 from pathlib import Path
@@ -151,6 +153,17 @@ def recover_heavy_model() -> None:
     if not factory.unsafe_recorded():
         typer.echo(json.dumps({"status": "CLEAR", "detail": "no unsafe heavy-model state"}))
         return
+    reason = getattr(factory, "unsafe_reason", lambda: "")() or ""
+    owner = re.search(r'"owner_pid"\s*:\s*(\d+)', reason)
+    if "lease retained for benchmark-asr" in reason and owner is not None:
+        try:
+            os.kill(int(owner.group(1)), 0)
+        except ProcessLookupError:
+            factory.recover()
+            typer.echo(json.dumps({"status": "RECOVERED", "detail": "benchmark child is absent"}))
+            return
+        except PermissionError:
+            pass
     provider = settings.reconstruction_provider_instance()
     resident = provider.is_model_resident() if provider is not None else True
     if resident:
@@ -489,6 +502,7 @@ def benchmark_index_replay(source_id: UUID) -> None:
                 tuple(row.refinement_reasons or ()),
                 row.clip_score,
                 row.disposition is CandidateDisposition.CANDIDATE_NEEDS_REFINEMENT,
+                row.refinement_evidence or {},
             )
             for row in session.query(ClipCandidate)
             .filter(ClipCandidate.source_video_id == source_id)

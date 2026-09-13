@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+import threading
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from time import monotonic
-import threading
 
 from app.transcription.engine import TranscriptionResult, WhisperEngine
 from app.transcription.service import TranscriptionOptions
