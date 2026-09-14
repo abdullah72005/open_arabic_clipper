@@ -220,12 +220,20 @@ prompt, or schema invalidates correctly; unrelated rendering/publishing changes
 do not.
 
 Queue-time cache validation uses the same settings-derived Stage 4.0
-configuration, provider mode, and provider runtime identity that execution uses,
-so an adaptive or `local_only` cached analysis is reused instead of re-queued and
-never triggers a second provider call. The Stage 4.1 handoff evaluates freshness
-against that same current runtime identity, so a just-completed analysis is not
-immediately stale and a relevant policy/config/provider/model/prompt change is
-detected.
+configuration, provider mode, and **stable configured provider identity** that
+execution uses, so an adaptive or `local_only` cached analysis is reused instead
+of re-queued and never triggers a second provider call. The Stage 4.1 handoff
+evaluates freshness against that same configured identity, so a just-completed
+analysis is not immediately stale and a relevant policy/config/provider/model/
+prompt change is detected.
+
+The configured identity is derived from configuration only (no key, no client,
+no network) and is identical whether or not the provider is currently available.
+Transient Gemini/key/provider unavailability therefore does not invalidate
+accepted analysis: the cache stays a hit, no replacement job is created, and a
+force rerun reuses the accepted hosted result instead of overwriting it. A real
+model, prompt, schema, provider-mode, or policy/config change still changes the
+identity and invalidates correctly.
 
 ### Concurrency safety
 

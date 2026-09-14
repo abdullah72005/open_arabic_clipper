@@ -324,6 +324,35 @@ def test_handoff_stale_when_provider_identity_changes(
     assert second["stale"] is True
 
 
+def test_handoff_remains_current_when_provider_unavailable(
+    api: ApiFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client, factory = api
+    provider = FakeTransformationProvider(model="fake-model-v1")
+    identity = dict(provider.runtime_identity())
+    available = FakeStage40Settings(provider=provider, mode=SemanticProviderMode.ADAPTIVE)
+    install_stage40_settings(monkeypatch, available)
+    candidate_id, _ = _seed(factory)
+    with factory() as session:
+        from app.transformation.queue import get_or_create_analysis
+
+        candidate = session.get(ClipCandidate, candidate_id)
+        analysis = get_or_create_analysis(session, candidate)
+        build_transformation_executor(session, available).execute(analysis.id)
+    assert client.get(f"/api/candidates/{candidate_id}/stage4-1-handoff").json()["stale"] is False
+
+    # Same configured identity, provider now unavailable (e.g. removed key).
+    install_stage40_settings(
+        monkeypatch,
+        FakeStage40Settings(
+            provider=None, provider_identity=identity, mode=SemanticProviderMode.ADAPTIVE
+        ),
+    )
+    payload = client.get(f"/api/candidates/{candidate_id}/stage4-1-handoff").json()
+    assert payload["stale"] is False
+    assert payload["ready_for_stage4_1"] is True
+
+
 def test_handoff_no_strategy_is_valid_not_500(api: ApiFixture) -> None:
     client, factory = api
     candidate_id, _ = _seed(

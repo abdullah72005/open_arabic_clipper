@@ -451,6 +451,39 @@ class Settings(BaseSettings):
             return None
         return self.local_transformation_provider_instance()
 
+    def transformation_provider_identity(self) -> dict[str, object]:
+        """Return the stable configured provider identity, independent of availability.
+
+        Transient Gemini/key/provider availability must never invalidate accepted
+        analysis: this identity is derived from configuration only (no client, no
+        key, no network) and is identical whether or not a key is currently
+        present. A real model/prompt/schema/config change still alters it.
+        """
+
+        from app.transformation.providers import DeterministicTransformationProvider
+
+        mode = self.transformation_semantic_mode()
+        if mode is SemanticProviderMode.ADAPTIVE:
+            from app.transformation.gemini import GeminiTransformationProvider
+
+            return GeminiTransformationProvider(
+                api_key=None,
+                routine_model=self.transformation_routine_model,
+                strong_model=self.transformation_strong_model,
+                timeout_seconds=self.gemini_timeout_seconds,
+                retry_attempts=self.gemini_retry_attempts,
+                retry_backoff_seconds=self.gemini_retry_backoff_seconds,
+                max_output_tokens=self.transformation_max_output_tokens,
+                thinking_level=self.transformation_strong_thinking_level,
+                temperature=self.gemini_temperature,
+                api_version=self.gemini_api_version,
+            ).runtime_identity()
+        if mode is SemanticProviderMode.LOCAL_ONLY:
+            configured = self.local_transformation_provider_instance()
+            if configured is not None:
+                return dict(configured.runtime_identity())
+        return DeterministicTransformationProvider().runtime_identity()
+
     def gemini_transformation_provider_instance(self) -> TransformationProvider | None:
         key = self.gemini_api_key
         if key is None or not key.get_secret_value():

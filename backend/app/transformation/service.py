@@ -114,11 +114,16 @@ class TransformationEligibilityService:
         *,
         config: Stage40Config = DEFAULT_CONFIG,
         provider: TransformationProvider | None = None,
+        provider_identity: Mapping[str, object] | None = None,
         mode: SemanticProviderMode = SemanticProviderMode.DETERMINISTIC,
         is_cancelled: Callable[[], bool] | None = None,
     ) -> None:
         self._config = config
         self._provider = provider
+        # Stable configured identity, independent of transient availability.
+        self._configured_identity = (
+            dict(provider_identity) if provider_identity is not None else None
+        )
         self._mode = mode
         self._is_cancelled = is_cancelled or (lambda: False)
 
@@ -149,6 +154,28 @@ class TransformationEligibilityService:
         provider_fp = ""
 
         request = self._build_request(inputs, structure, necessity)
+        configured_identity = self._provider_identity()
+        if self._mode is not SemanticProviderMode.DETERMINISTIC and reuse is not None:
+            # Reuse accepted hosted work when the stable configured identity
+            # matches, even if the provider is temporarily unavailable now.
+            reuse_fp = provider_input_fingerprint(
+                _request_fingerprint_payload(request, configured_identity, route)
+            )
+            if reuse[0] == reuse_fp:
+                merged = self._merge_with_provider(
+                    deterministic, reuse[1].strategies, inputs, structure
+                )
+                return self._finalize(
+                    inputs,
+                    structure,
+                    necessity,
+                    merged,
+                    _STATUS_REUSED,
+                    {"reused": True},
+                    reuse_fp,
+                    input_fingerprint,
+                    cache_eligible=True,
+                )
         if self._mode is not SemanticProviderMode.DETERMINISTIC and self._provider is None:
             # Provider unavailable (e.g. missing key): deterministic results stand.
             return self._finalize(
@@ -178,30 +205,14 @@ class TransformationEligibilityService:
             )
 
         # One hosted call at most; tier chosen deterministically before the call.
+        assert self._provider is not None
         tier = getattr(self._provider, "select_tier", None)
         if callable(tier):
             tier([request])
-        provider_identity = self._provider_identity()
         provider_fp = provider_input_fingerprint(
-            _request_fingerprint_payload(request, provider_identity, route)
+            _request_fingerprint_payload(request, configured_identity, route)
         )
-        if reuse is not None and reuse[0] == provider_fp:
-            merged = self._merge_with_provider(
-                deterministic, reuse[1].strategies, inputs, structure
-            )
-            return self._finalize(
-                inputs,
-                structure,
-                necessity,
-                merged,
-                _STATUS_REUSED,
-                {"reused": True},
-                provider_fp,
-                input_fingerprint,
-                cache_eligible=True,
-            )
         provider_attempted = True
-        assert self._provider is not None
         try:
             self._check_cancelled()
             results = self._provider.discover([request])
@@ -284,6 +295,8 @@ class TransformationEligibilityService:
     # ---- provider ---------------------------------------------------------
 
     def _provider_identity(self) -> dict[str, object]:
+        if self._configured_identity is not None:
+            return dict(self._configured_identity)
         if self._provider is None:
             return DeterministicTransformationProvider().runtime_identity()
         identity = getattr(self._provider, "runtime_identity", None)

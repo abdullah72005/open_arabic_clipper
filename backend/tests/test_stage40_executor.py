@@ -46,6 +46,7 @@ from app.transformation.executor import (
     TransformationEligibilityExecutor,
     build_transformation_executor,
 )
+from app.transformation.policy import Stage40Config
 from app.transformation.providers import (
     TransformationProviderError,
     TransformationStrategyRequest,
@@ -582,6 +583,93 @@ def test_cache_misses_when_provider_identity_changes(
     install_stage40_settings(
         monkeypatch, FakeStage40Settings(provider=changed, mode=SemanticProviderMode.ADAPTIVE)
     )
+    again = queue_transformation_analysis(session, candidate)
+    assert again.cached is False
+    assert again.queued is True
+
+
+def test_adaptive_accepted_then_provider_unavailable_is_cache_hit_no_overwrite(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Transient Gemini/key unavailability must not invalidate accepted work."""
+
+    monkeypatch.setattr("app.workers.tasks.run_transformation_analysis.delay", lambda *a, **k: None)
+    provider = FakeProvider()
+    identity = provider.runtime_identity()
+    available = FakeStage40Settings(provider=provider, mode=SemanticProviderMode.ADAPTIVE)
+    install_stage40_settings(monkeypatch, available)
+    _, candidate, _ = seed(session)
+    _run_via_settings(session, available, candidate.id)
+    analysis = _analysis(session, candidate)
+    session.refresh(analysis)
+    assert analysis.cache_eligible is True
+    assert provider.calls == 1
+    accepted_output = analysis.output_fingerprint
+    accepted_evidence = dict(analysis.provider_evidence)
+    accepted_strategies = {
+        row.strategy_type: row.id
+        for row in session.scalars(
+            select(TransformationStrategyCandidate).where(
+                TransformationStrategyCandidate.analysis_id == analysis.id
+            )
+        )
+    }
+
+    # Same configured identity, but the provider is now unavailable (no key).
+    unavailable = FakeStage40Settings(
+        provider=None, provider_identity=identity, mode=SemanticProviderMode.ADAPTIVE
+    )
+    install_stage40_settings(monkeypatch, unavailable)
+    again = queue_transformation_analysis(session, candidate)
+    assert again.cached is True
+    assert again.job_id is None
+    assert again.queued is False
+    assert provider.calls == 1
+    assert (
+        session.scalar(
+            select(func.count())
+            .select_from(ProcessingJob)
+            .where(ProcessingJob.kind == JobKind.TRANSFORMATION_ELIGIBILITY)
+        )
+        == 0
+    )
+    session.refresh(analysis)
+    assert analysis.output_fingerprint == accepted_output
+    assert dict(analysis.provider_evidence) == accepted_evidence
+    assert accepted_strategies == {
+        row.strategy_type: row.id
+        for row in session.scalars(
+            select(TransformationStrategyCandidate).where(
+                TransformationStrategyCandidate.analysis_id == analysis.id
+            )
+        )
+    }
+    # A force rerun while unavailable reuses accepted hosted work, no overwrite.
+    executor = build_transformation_executor(session, unavailable)
+    executor.execute(analysis.id, force=True)
+    session.refresh(analysis)
+    assert provider.calls == 1
+    assert analysis.provider_status == "REUSED"
+    assert analysis.output_fingerprint == accepted_output
+
+
+def test_cache_misses_when_configuration_changes(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("app.workers.tasks.run_transformation_analysis.delay", lambda *a, **k: None)
+    provider = FakeProvider()
+    identity = provider.runtime_identity()
+    base = FakeStage40Settings(provider=provider, mode=SemanticProviderMode.ADAPTIVE)
+    install_stage40_settings(monkeypatch, base)
+    _, candidate, _ = seed(session)
+    _run_via_settings(session, base, candidate.id)
+    changed = FakeStage40Settings(
+        provider=provider,
+        provider_identity=identity,
+        mode=SemanticProviderMode.ADAPTIVE,
+        config=Stage40Config(provider_max_output_tokens=512),
+    )
+    install_stage40_settings(monkeypatch, changed)
     again = queue_transformation_analysis(session, candidate)
     assert again.cached is False
     assert again.queued is True

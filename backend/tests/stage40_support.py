@@ -34,11 +34,13 @@ class FakeStage40Settings:
         self,
         *,
         provider: object | None = None,
+        provider_identity: dict[str, object] | None = None,
         mode: SemanticProviderMode = SemanticProviderMode.ADAPTIVE,
         config: Stage40Config = DEFAULT_CONFIG,
         admission: object | None = None,
     ) -> None:
         self._provider = provider
+        self._provider_identity = dict(provider_identity) if provider_identity is not None else None
         self._mode = mode
         self._config = config
         self._admission = admission
@@ -51,6 +53,17 @@ class FakeStage40Settings:
 
     def transformation_provider(self) -> object | None:
         return self._provider
+
+    def transformation_provider_identity(self) -> dict[str, object]:
+        if self._provider_identity is not None:
+            return dict(self._provider_identity)
+        if self._provider is not None:
+            identity = getattr(self._provider, "runtime_identity", None)
+            if callable(identity):
+                return dict(identity())
+        from app.transformation.providers import DeterministicTransformationProvider
+
+        return DeterministicTransformationProvider().runtime_identity()
 
     def heavy_model_lease_factory(self) -> object:
         return NoopHeavyModelLeaseFactory()

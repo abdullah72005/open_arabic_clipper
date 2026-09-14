@@ -53,13 +53,15 @@ refinement and is **not** added to the automatic `_NEXT_STAGE` chain.
   not legal or monetization advice; official platform guidance was checked
   2026-09-14.
 - **Cache, freshness, concurrency.** Queue-time cache validation and Stage 4.1
-  handoff freshness use the same settings-derived config/mode/provider runtime
-  identity as execution, so adaptive/local-only cached work is reused without a
-  second provider call and a just-completed non-default-config analysis is not
-  immediately stale. Concurrent queue requests are transaction-safe (savepoint
-  uniqueness recovery plus an atomic `active_job_id IS NULL` compare-and-swap),
-  yielding one analysis and at most one active job with no escaped
-  `IntegrityError`/500.
+  handoff freshness use the same settings-derived config/mode and **stable
+  configured provider identity** as execution. That identity is derived from
+  configuration only, so transient Gemini/key/provider unavailability does not
+  invalidate accepted analysis (cache stays a hit, no replacement job, force
+  reruns reuse accepted hosted output; handoff stays current), while a real
+  model/prompt/schema/provider/config change still invalidates. Concurrent queue
+  requests are transaction-safe (savepoint uniqueness recovery plus an atomic
+  `active_job_id IS NULL` compare-and-swap), yielding one analysis and at most one
+  active job with no escaped `IntegrityError`/500.
 - **API/CLI/handoff.** Minimal endpoints queue/read one analysis and expose a
   typed read-only Stage 4.1 handoff (`stage4_1_implemented=false`) that reports
   stale instead of mixing current transcript data with old strategies.

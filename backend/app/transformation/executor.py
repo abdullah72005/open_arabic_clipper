@@ -9,7 +9,7 @@ heavy-model lease, and releases owned providers on every exit path.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from time import monotonic
 
 from sqlalchemy import select
@@ -178,6 +178,7 @@ class TransformationEligibilityExecutor:
         session: Session,
         config: Stage40Config = DEFAULT_CONFIG,
         provider: TransformationProvider | None = None,
+        provider_identity: Mapping[str, object] | None = None,
         mode: SemanticProviderMode = SemanticProviderMode.DETERMINISTIC,
         lease_factory: HeavyModelLeaseFactory | NoopHeavyModelLeaseFactory | None = None,
         admission: object | None = None,
@@ -185,6 +186,10 @@ class TransformationEligibilityExecutor:
         self._session = session
         self._config = config
         self._provider = provider
+        # Stable configured identity, independent of transient availability.
+        self._configured_identity = (
+            dict(provider_identity) if provider_identity is not None else None
+        )
         self._mode = mode
         self._lease_factory = lease_factory or NoopHeavyModelLeaseFactory()
         self._admission = admission
@@ -234,6 +239,12 @@ class TransformationEligibilityExecutor:
         return provider
 
     def _effective_provider_identity(self) -> dict[str, object]:
+        # Configured identity wins even when the provider is temporarily
+        # unavailable (missing key/outage), so accepted analysis is not
+        # invalidated by transient availability. Real model/prompt/schema
+        # changes still alter this identity and invalidate correctly.
+        if self._configured_identity is not None:
+            return dict(self._configured_identity)
         if self._provider is None or self._mode is SemanticProviderMode.DETERMINISTIC:
             return DeterministicTransformationProvider().runtime_identity()
         return dict(self._provider.runtime_identity())
@@ -268,6 +279,7 @@ class TransformationEligibilityExecutor:
         return TransformationEligibilityService(
             config=self._config,
             provider=self._effective_provider(),
+            provider_identity=self._provider_identity(),
             mode=self._mode,
             is_cancelled=self._job_cancelled,
         )
@@ -506,10 +518,13 @@ def build_transformation_executor(
 ) -> "TransformationEligibilityExecutor":
     """Build the production executor from settings, lazily and without network."""
 
+    identity_factory = getattr(settings, "transformation_provider_identity", None)
+    provider_identity = identity_factory() if callable(identity_factory) else None
     return TransformationEligibilityExecutor(
         session=session,
         config=settings.stage40_config(),  # type: ignore[attr-defined]
         provider=settings.transformation_provider(),  # type: ignore[attr-defined]
+        provider_identity=provider_identity,
         mode=settings.transformation_semantic_mode(),  # type: ignore[attr-defined]
         lease_factory=settings.heavy_model_lease_factory(),  # type: ignore[attr-defined]
         admission=settings.gemini_admission_controller(),  # type: ignore[attr-defined]
