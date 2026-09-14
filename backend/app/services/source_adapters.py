@@ -11,9 +11,9 @@ import threading
 import time
 import uuid
 from collections.abc import Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import BinaryIO, Protocol
+from typing import BinaryIO, Callable, Protocol
 from urllib.parse import SplitResult, urlsplit, urlunsplit
 
 from app.services.storage import StorageService, StorageValidationError
@@ -51,6 +51,7 @@ class AcquiredSource:
     path: Path
     original_filename: str
     source_url: str | None = None
+    metrics: Mapping[str, object] = field(default_factory=dict)
 
 
 class SourceAdapter(Protocol):
@@ -92,8 +93,11 @@ class LocalFileAdapter:
         "does not bypass access controls."
     )
 
-    def __init__(self, storage: StorageService) -> None:
+    def __init__(
+        self, storage: StorageService, *, monotonic: Callable[[], float] = time.monotonic
+    ) -> None:
         self._storage = storage
+        self._monotonic = monotonic
 
     def acquire(self, source_id: uuid.UUID | str, source: Path | str) -> AcquiredSource:
         source_path = Path(source).expanduser().resolve()
@@ -104,10 +108,25 @@ class LocalFileAdapter:
             self._storage.ensure_capacity(source_path.stat().st_size)
             filename = sanitize_filename(source_path.name)
             destination = self._storage.source_directory(source_id) / filename
+            started_at = self._monotonic()
             self._storage.atomic_write(destination, _file_chunks(source_path))
         except StorageValidationError as error:
             raise SourceValidationError(str(error)) from error
-        return AcquiredSource(path=destination, original_filename=filename)
+        return AcquiredSource(
+            path=destination,
+            original_filename=filename,
+            metrics={
+                "source_kind": "local",
+                "cache_reuse": "miss",
+                "metadata_seconds": 0.0,
+                "download_seconds": 0.0,
+                "storage_write_seconds": self._monotonic() - started_at,
+                "source_hash_seconds": 0.0,
+                "artifact_bytes": destination.stat().st_size,
+                "postprocess_state": "not_applicable",
+                "postprocess_seconds": None,
+            },
+        )
 
 
 class YtDlpAdapter:
@@ -125,6 +144,7 @@ class YtDlpAdapter:
         binary: str = "yt-dlp",
         max_download_bytes: int = DEFAULT_MAX_REMOTE_DOWNLOAD_BYTES,
         egress_proxy: str | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         if max_download_bytes <= 0:
             raise SourceValidationError("maximum remote download size must be positive")
@@ -132,6 +152,10 @@ class YtDlpAdapter:
         self._binary = binary
         self._max_download_bytes = max_download_bytes
         self._egress_proxy = egress_proxy
+        self._monotonic = monotonic
+        self._last_directory_scan_seconds = 0.0
+        self._last_directory_scan_count = 0
+        self._postprocess_started_at: float | None = None
 
     def inspect(self, url: str) -> Mapping[str, object]:
         """Read public metadata before downloading, using a safe argument vector."""
@@ -150,15 +174,19 @@ class YtDlpAdapter:
         if not isinstance(source, str):
             raise SourceValidationError("yt-dlp source must be a URL string")
         normalized_url = normalize_source_url(source)
+        metadata_started_at = self._monotonic()
         metadata = self.inspect(normalized_url)
+        metadata_seconds = self._monotonic() - metadata_started_at
         expected_bytes = _expected_bytes(metadata, self._max_download_bytes)
         self._storage.ensure_capacity(expected_bytes)
         source_directory = self._storage.source_directory(source_id)
+        download_started_at = self._monotonic()
         self._run_download(
             self._download_command(source_directory, normalized_url),
             normalized_url,
             source_directory,
         )
+        download_seconds = self._monotonic() - download_started_at
         acquired_path = _downloaded_path(source_directory)
         if not acquired_path.is_file():
             raise SourceAcquisitionError(
@@ -168,6 +196,25 @@ class YtDlpAdapter:
             path=acquired_path,
             original_filename=sanitize_filename(acquired_path.name),
             source_url=normalized_url,
+            metrics={
+                "source_kind": "remote",
+                "cache_reuse": "miss",
+                "metadata_seconds": metadata_seconds,
+                "download_seconds": download_seconds,
+                "directory_scan_seconds": self._last_directory_scan_seconds,
+                "directory_scan_count": self._last_directory_scan_count,
+                "storage_write_seconds": 0.0,
+                "source_hash_seconds": 0.0,
+                "artifact_bytes": acquired_path.stat().st_size,
+                "postprocess_state": (
+                    "observed" if self._postprocess_started_at is not None else "unknown"
+                ),
+                "postprocess_seconds": (
+                    download_started_at + download_seconds - self._postprocess_started_at
+                    if self._postprocess_started_at is not None
+                    else None
+                ),
+            },
         )
 
     def _metadata_command(self, normalized_url: str) -> list[str]:
@@ -214,6 +261,18 @@ class YtDlpAdapter:
     ) -> subprocess.CompletedProcess[str]:
         """Run yt-dlp while enforcing a bounded output directory size."""
 
+        self._last_directory_scan_seconds = 0.0
+        self._last_directory_scan_count = 0
+        self._postprocess_started_at = None
+
+        def directory_size() -> int:
+            started_at = self._monotonic()
+            try:
+                return _directory_size(output_directory)
+            finally:
+                self._last_directory_scan_seconds += self._monotonic() - started_at
+                self._last_directory_scan_count += 1
+
         _assert_public_host_resolution(urlsplit(normalized_url).hostname)
         try:
             process = subprocess.Popen(
@@ -230,12 +289,21 @@ class YtDlpAdapter:
             process.wait()
             raise SourceAcquisitionError("yt-dlp diagnostic stream is unavailable")
         diagnostic_tail = bytearray()
-        reader = threading.Thread(target=_drain_stderr, args=(stderr, diagnostic_tail), daemon=True)
+
+        def observe(chunk: bytes) -> None:
+            if self._postprocess_started_at is None and (
+                b"[Merger]" in chunk or b"[VideoRemuxer]" in chunk or b"[FFmpeg" in chunk
+            ):
+                self._postprocess_started_at = self._monotonic()
+
+        reader = threading.Thread(
+            target=_drain_stderr, args=(stderr, diagnostic_tail, observe), daemon=True
+        )
         reader.start()
 
         exceeded_limit = False
         while process.poll() is None:
-            if _directory_size(output_directory) > self._max_download_bytes:
+            if directory_size() > self._max_download_bytes:
                 process.terminate()
                 exceeded_limit = True
                 break
@@ -245,7 +313,7 @@ class YtDlpAdapter:
         reader.join()
         diagnostic_text = diagnostic_tail.decode("utf-8", errors="replace").strip()
 
-        if exceeded_limit or _directory_size(output_directory) > self._max_download_bytes:
+        if exceeded_limit or directory_size() > self._max_download_bytes:
             raise SourceAcquisitionError("yt-dlp exceeded the configured download limit")
         if returncode != 0:
             detail = f": {diagnostic_text}" if diagnostic_text else ""
@@ -357,11 +425,15 @@ def _directory_size(directory: Path) -> int:
     return total
 
 
-def _drain_stderr(stream: BinaryIO, tail: bytearray) -> None:
+def _drain_stderr(
+    stream: BinaryIO, tail: bytearray, observe: Callable[[bytes], None] | None = None
+) -> None:
     """Drain stderr continuously while retaining only its bounded byte tail."""
 
     try:
         while chunk := stream.read(8 * 1024):
+            if observe is not None:
+                observe(chunk)
             tail.extend(chunk)
             if len(tail) > MAX_DOWNLOAD_DIAGNOSTIC_BYTES:
                 del tail[:-MAX_DOWNLOAD_DIAGNOSTIC_BYTES]

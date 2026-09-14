@@ -1,6 +1,8 @@
 """Idempotent durable pipeline stage runner."""
 
 import inspect
+import json
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Mapping
@@ -12,6 +14,8 @@ from sqlalchemy.orm import Session
 from app.core.enums import JobKind, JobStatus, PipelineRunStatus, PipelineStage
 from app.models import PipelineRun, ProcessingJob, SourceVideo
 from app.pipeline.executor import StageCancelled, StageExecutionResult, StageExecutor
+
+_logger = logging.getLogger("clipfactory.pipeline")
 
 
 class StageExecutionError(RuntimeError):
@@ -65,6 +69,17 @@ class PipelineRunner:
             and run.input_fingerprint == input_fingerprint
             and self._skip_is_allowed(executor, source)
         ):
+            previous_metrics = dict(run.metrics or {})
+            run.metrics = {
+                **previous_metrics,
+                "cache_reuse": "hit",
+                "cache_hit_at": datetime.now(timezone.utc).isoformat(),
+            }
+            self._session.commit()
+            _logger.info(
+                "pipeline_stage_metrics",
+                extra={"stage": stage.value, "source_id": str(source.id), "metrics": run.metrics},
+            )
             return PipelineResult(run.id, job_id, skipped=True)
 
         job = self._load_or_create_job(source.id, stage, job_id)
@@ -117,6 +132,7 @@ class PipelineRunner:
                 result = executor.execute(source, force=force)
             else:
                 result = executor.execute(source)
+            metrics = _validated_metrics(result)
         except Exception as error:
             self._persist_failure(run, job, error)
             raise
@@ -125,11 +141,22 @@ class PipelineRunner:
         run.status = PipelineRunStatus.SUCCEEDED
         run.completed_at = completed_at
         run.output_fingerprint = _output_fingerprint(result)
+        run.metrics = metrics
         if job is not None:
             job.status = JobStatus.SUCCEEDED
             job.completed_at = completed_at
         source.lifecycle_state = _next_stage(stage)
         self._session.commit()
+        _logger.info(
+            "pipeline_stage_metrics",
+            extra={
+                "source_id": str(source.id),
+                "stage": stage.value,
+                "attempt": run.attempt,
+                "skipped": False,
+                "metrics": metrics,
+            },
+        )
         return PipelineResult(run.id, job.id if job is not None else None)
 
     def retry(self, job_id: UUID) -> PipelineResult:
@@ -224,6 +251,20 @@ def _stage_for_job_kind(kind: JobKind) -> PipelineStage:
     if kind is JobKind.CANDIDATE_ANALYSIS:
         return PipelineStage.CANDIDATE_ANALYSIS
     raise ValueError(f"no pipeline stage is defined for job kind {kind.value}")
+
+
+def _validated_metrics(result: object) -> dict[str, object]:
+    """Copy and validate the optional JSON metrics returned by a stage."""
+
+    raw_metrics = getattr(result, "metrics", {})
+    if not isinstance(raw_metrics, Mapping):
+        raise StageExecutionError("stage execution metrics must be a mapping")
+    metrics = dict(raw_metrics)
+    try:
+        json.dumps(metrics, allow_nan=False)
+    except (TypeError, ValueError) as error:
+        raise StageExecutionError("stage execution metrics must be JSON serializable") from error
+    return metrics
 
 
 def _input_fingerprint(executor: StageExecutor, source: SourceVideo) -> str:

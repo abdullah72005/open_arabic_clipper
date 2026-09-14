@@ -118,6 +118,10 @@ class TranscriptionExecutor:
             storage = self._storage or StorageService(get_settings().storage_root)
             audio_path = storage.resolve(StorageCategory.SOURCES, audio_path)
         started_at = monotonic()
+        resolver = getattr(
+            self._engine, "resolved_hardware", lambda _options: ("unknown", "unknown")
+        )
+        resolved_device, resolved_compute_type = resolver(self._options)
         self._emit_snapshot("before_load")
         cancel_event = threading.Event()
         with self._lease_factory.acquire(
@@ -149,6 +153,18 @@ class TranscriptionExecutor:
                 },
             ),
             transcript,
+            {
+                "cache_reuse": "miss",
+                "transcription_seconds": transcript.processing_duration,
+                "child_elapsed_seconds": getattr(
+                    self._engine, "last_child_elapsed_seconds", lambda: None
+                )(),
+                "child_peak_rss_bytes": self._engine.last_child_peak_rss(),
+                "requested_cpu_threads": self._options.cpu_threads,
+                "index_batch_size": self._options.index_batch_size,
+                "resolved_device": resolved_device,
+                "resolved_compute_type": resolved_compute_type,
+            },
         )
 
     def _emit_snapshot(self, label: str, child_peak_rss: int | None = None) -> None:
@@ -193,6 +209,8 @@ class TranscriptionExecutor:
             "vad_filter": self._options.vad_filter,
             "initial_prompt": self._options.initial_prompt,
             "hotwords": self._options.hotwords,
+            "cpu_threads": self._options.cpu_threads,
+            "index_batch_size": self._options.index_batch_size,
         }
         transcript.input_fingerprint = fingerprint
         transcript.raw_text = result.raw_text
@@ -234,10 +252,12 @@ class IngestExecutor:
     def execute(self, source: SourceVideo, *, force: bool = False) -> StageExecutionResult:
         if not source.source_uri:
             raise StageExecutionError("source URI is missing")
+        metrics: dict[str, object] = {"cache_reuse": "not_applicable"}
         if source.source_uri.startswith(("http://", "https://")):
             acquired = self._url_adapter.acquire(source.id, source.source_uri)
             source.source_uri = str(acquired.path)
             source.original_filename = acquired.original_filename
+            metrics = dict(acquired.metrics)
         return StageExecutionResult(
             canonical_fingerprint(
                 "ingest-output",
@@ -248,6 +268,7 @@ class IngestExecutor:
                 },
             ),
             source,
+            metrics,
         )
 
 
@@ -269,10 +290,12 @@ class ProbeExecutor:
         if not source_path.is_file():
             raise StageExecutionError("source media file is unavailable for probing")
         try:
+            started_at = monotonic()
             metadata = self._probe.probe(source_path)
             return StageExecutionResult(
                 canonical_fingerprint("probe-output", "1", {"metadata": asdict(metadata)}),
                 metadata,
+                {"cache_reuse": "miss", "ffprobe_seconds": monotonic() - started_at},
             )
         except Exception as error:
             raise StageExecutionError("ffprobe failed to validate source media") from error
@@ -292,7 +315,8 @@ class AudioExtractionExecutor:
         )
 
     def execute(self, source: SourceVideo, *, force: bool = False) -> StageExecutionResult:
-        artifact = self._extractor.extract(source)
+        extraction = self._extractor.extract_with_metrics(source)
+        artifact = extraction.artifact
         return StageExecutionResult(
             canonical_fingerprint(
                 "audio-extraction-output",
@@ -303,6 +327,7 @@ class AudioExtractionExecutor:
                 },
             ),
             artifact,
+            extraction.metrics,
         )
 
 

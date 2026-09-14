@@ -17,6 +17,7 @@ from app.core.enums import (
 from app.db.base import Base
 from app.models import PipelineRun, ProcessingJob, SourceVideo, Transcript
 from app.pipeline.authorization import AutopilotAuthorizationError, require_autopilot_authorization
+from app.pipeline.executor import StageExecutionResult
 from app.pipeline.runner import PipelineRunner
 
 
@@ -62,6 +63,58 @@ def test_completed_stage_is_skipped(sqlite_engine: object) -> None:
 
         assert result.skipped is True
         assert executor.calls == 0
+
+
+def test_successful_stage_persists_execution_metrics(sqlite_engine: object) -> None:
+    """Metrics belong to the durable successful attempt, not the executor instance."""
+
+    class MetricsExecutor(RecordingExecutor):
+        def execute(self, source: SourceVideo) -> StageExecutionResult:
+            self.calls += 1
+            return StageExecutionResult(
+                "metrics-output-v1",
+                source,
+                {"wall_seconds": 1.25, "cache_reuse": "miss"},
+            )
+
+    Base.metadata.create_all(sqlite_engine)
+    with Session(sqlite_engine) as session:
+        source = _source(session)
+
+        PipelineRunner(session, {PipelineStage.INGEST: MetricsExecutor()}).run(
+            source.id, PipelineStage.INGEST
+        )
+
+        run = session.scalar(select(PipelineRun))
+        assert run is not None
+        assert run.metrics == {"wall_seconds": 1.25, "cache_reuse": "miss"}
+
+
+def test_fingerprint_skip_retains_prior_attempt_metrics(sqlite_engine: object) -> None:
+    """A skip is not a new stage attempt and cannot erase execution evidence."""
+
+    Base.metadata.create_all(sqlite_engine)
+    with Session(sqlite_engine) as session:
+        source = _source(session)
+        run = PipelineRun(
+            source_video_id=source.id,
+            stage=PipelineStage.INGEST,
+            status=PipelineRunStatus.SUCCEEDED,
+            input_fingerprint="recording-input-v1",
+            metrics={"wall_seconds": 4.0, "cache_reuse": "miss"},
+        )
+        session.add(run)
+        session.commit()
+
+        result = PipelineRunner(session, {PipelineStage.INGEST: RecordingExecutor()}).run(
+            source.id, PipelineStage.INGEST
+        )
+
+        session.refresh(run)
+        assert result.skipped is True
+        assert run.metrics["wall_seconds"] == 4.0
+        assert run.metrics["cache_reuse"] == "hit"
+        assert isinstance(run.metrics["cache_hit_at"], str)
 
 
 def test_force_reexecutes_a_completed_stage(sqlite_engine: object) -> None:

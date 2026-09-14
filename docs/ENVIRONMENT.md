@@ -149,6 +149,25 @@ supported path on this machine. Native execution is still supported after the
 operator installs Python 3.12+ and FFmpeg/ffprobe. CPU-only operation is the
 default; later GPU acceleration is an optional enhancement.
 
+## Stage 3.7 INDEX execution controls
+
+Whole-source INDEX transcription retains the quality baseline: automatic
+language detection, word timestamps, beam 5, temperature fallback,
+`condition_on_previous_text=true`, and VAD disabled. The execution-only
+controls below are recorded in pipeline metrics and transcript options:
+
+```dotenv
+# Measured default for this Docker/WSL capacity; 0 delegates to CTranslate2.
+CLIPFACTORY_WHISPER_CPU_THREADS=8
+# Deliberately fixed to the validated non-batched path in this release.
+CLIPFACTORY_WHISPER_INDEX_BATCH_SIZE=1
+```
+
+The representative 29.25-minute CPU experiment selected eight threads after an
+authorized, non-destructive transcript and candidate comparison. Benchmark any
+other effective CPU capacity before changing either setting. Full remote video acquisition remains early; Stage 3.7 does not
+implement deferred-video or audio-first ingestion.
+
 The 7.4 GiB RAM limit makes the provisional `qwen3:8b` reconstruction model
 infeasible for the live pipeline benchmark: loading it (~5.5 GiB) alongside
 faster-whisper and the running services triggers an out-of-memory kill.

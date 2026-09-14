@@ -1,5 +1,47 @@
 # Local transcription benchmark
 
+## Stage 3.7 representative INDEX execution experiment (2026-09-12)
+
+The authorized representative source is
+`4037a813-6fe6-4c83-96ff-e5cd4bf210ce`: 1,754.9226875 seconds of audio, managed
+WebM 588,129,680 bytes, and cached analysis WAV 56,157,604 bytes. Its durable
+baseline used `large-v3-turbo`, CPU int8, beam 5, automatic language, word
+timestamps, temperature fallback `(0.0, 0.2, 0.4, 0.6, 0.8, 1.0)`,
+`condition_on_previous_text=true`, and VAD off. Baseline transcription was
+1,080.269895 seconds (1.625 audio-minutes per wall-minute).
+
+Variant B used the same decoding settings and cached WAV with eight CTranslate2
+CPU threads and INDEX batch size one. A preliminary performance-only run took
+1,256.133199 seconds. The final fidelity-correct read-only replay run took
+1,024.903515 seconds (0.584016 real-time factor and 1.712281 audio-minutes per
+wall-minute), 5.1% faster than baseline. It preserved 4,712 word timestamps,
+detected Egyptian Arabic with 0.90 confidence, and replayed all 24 retained deterministic
+Stage 3 candidates exactly (zero missing or new retained keys). The child peak
+RSS was 3,277,537,280 bytes; a live worker observation was 2.827 GiB in a
+7.752 GiB container at approximately eight CPU cores, with 135 MiB cgroup swap
+in use and no Ollama model resident. The post-child worker returned to 503.7
+MiB. B is selected. Batch size 2 was rejected: the installed faster-whisper
+batch path cannot run with required VAD-off semantics (no clip timestamps); batch
+4 was therefore not justified. VAD remains off.
+
+The benchmark intentionally used the cached WAV and did not mutate the durable
+transcript or candidate rows. `benchmark-index-replay SOURCE_ID` additionally
+replays the existing Stage 2.5 normalizer and deterministic Stage 3 service in
+memory against persisted candidate keys, without writes. Therefore the selected rollback-safe
+configuration is CPU threads `8`, batch size `1`, and VAD off; set threads to
+`0` as the portable rollback baseline.
+Full remote video acquisition remains early; audio-first or deferred-video
+acquisition was not implemented.
+
+The one authorized controlled reacquisition of the representative public media
+ID reached yt-dlp metadata lookup but the platform rejected the request before
+transfer. No credential, proxy, or access-control workaround was attempted, so
+the historical 609.43-second ingest cannot yet be decomposed by an observed run.
+
+`CLIPFACTORY_WHISPER_INDEX_BATCH_SIZE` is deliberately constrained to `1` in
+this release: the installed faster-whisper batch API was inspected, but was not
+adopted because no batch run was justified after B met the acceptance gate.
+
 This repository was benchmarked on 2026-09-04 with an operator-authorized
 51.54-second source clip. The first run downloaded the `small` model; the
 numbers below are the subsequent cached-model run, so they describe inference

@@ -5,7 +5,9 @@ from __future__ import annotations
 import subprocess
 import wave
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
+from time import monotonic
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -24,6 +26,14 @@ class MissingAudioStreamError(AudioExtractionError):
 
 
 CommandRunner = Callable[[list[str]], None]
+
+
+@dataclass(frozen=True)
+class AudioExtractionResult:
+    """One cached-WAV lookup or extraction with bounded execution metrics."""
+
+    artifact: AudioArtifact
+    metrics: dict[str, object]
 
 
 def _run_command(args: list[str]) -> None:
@@ -49,11 +59,26 @@ class AudioExtractor:
     def extract(self, source: SourceVideo) -> AudioArtifact:
         """Return a valid cached artifact or extract one through FFmpeg."""
 
+        return self.extract_with_metrics(source).artifact
+
+    def extract_with_metrics(self, source: SourceVideo) -> AudioExtractionResult:
+        """Return a valid artifact and identify whether FFmpeg work was needed."""
+
         existing = self._session.scalar(
             select(AudioArtifact).where(AudioArtifact.source_video_id == source.id)
         )
-        if existing is not None and self._is_valid(existing, source):
-            return existing
+        validation_started_at = monotonic()
+        valid = existing is not None and self._is_valid(existing, source)
+        cache_validation_seconds = monotonic() - validation_started_at
+        if valid:
+            return AudioExtractionResult(
+                existing,
+                {
+                    "cache_reuse": "hit",
+                    "cache_validation_seconds": cache_validation_seconds,
+                    "ffmpeg_seconds": 0.0,
+                },
+            )
 
         source_path = Path(source.source_uri)
         if not source_path.is_file():
@@ -78,6 +103,7 @@ class AudioExtractor:
             "pcm_s16le",
             str(output_path),
         ]
+        ffmpeg_started_at = monotonic()
         try:
             self._command_runner(args)
         except subprocess.CalledProcessError as err:
@@ -87,6 +113,7 @@ class AudioExtractor:
             raise AudioExtractionError("ffmpeg failed to extract analysis audio") from err
         except OSError as err:
             raise AudioExtractionError("ffmpeg is unavailable for audio extraction") from err
+        ffmpeg_seconds = monotonic() - ffmpeg_started_at
 
         if not output_path.is_file() or output_path.stat().st_size == 0:
             raise AudioExtractionError("ffmpeg did not produce analysis audio")
@@ -103,13 +130,20 @@ class AudioExtractor:
             self._session.add(artifact)
         self._session.commit()
         self._session.refresh(artifact)
-        return artifact
+        return AudioExtractionResult(
+            artifact,
+            {
+                "cache_reuse": "miss",
+                "cache_validation_seconds": cache_validation_seconds,
+                "ffmpeg_seconds": ffmpeg_seconds,
+            },
+        )
 
     def _is_valid(self, artifact: AudioArtifact, source: SourceVideo) -> bool:
         if artifact.source_content_hash != source.content_hash:
             return False
         path = self._storage.resolve(StorageCategory.SOURCES, artifact.output_path)
-        return path.is_file() and sha256_file(path) == artifact.content_hash
+        return bool(path.is_file() and sha256_file(path) == artifact.content_hash)
 
 
 def _wav_duration(path: Path) -> float:

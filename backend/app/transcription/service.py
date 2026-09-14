@@ -24,6 +24,8 @@ class TranscriptionOptions:
     vad_filter: bool = False
     initial_prompt: str | None = None
     hotwords: str | None = None
+    cpu_threads: int = 0
+    index_batch_size: int = 1
 
     def fingerprint(self, audio_hash: str) -> str:
         """Return the deterministic cache key for audio and output-affecting options."""
