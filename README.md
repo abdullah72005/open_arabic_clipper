@@ -11,8 +11,12 @@ confidence, preserves strong uncertain moments as `CANDIDATE_NEEDS_REFINEMENT`
 for Stage 3.5, and advances the source to `READY_FOR_REFINEMENT`. Stage 3.5 adds
 explicit, candidate-scoped, audio-verified transcript/boundary refinement with
 optional selective Gemini and a shared priority budget; it never retranscribes a
-whole source. It does not reframe, render, publish, or automatically authorize
-content; Stage 4 transformation planning is not implemented.
+whole source. Stage 4.0 then decides, per refined candidate, whether a credible
+substantive transformation path exists and emits a small bounded set of strategy
+directions for Stage 4.1, returning
+`NO_TRANSFORMATION_STRATEGY_WORTH_USING` as a normal successful outcome when none
+does. It does not reframe, render, publish, or automatically authorize content;
+Stage 4.1 transformation planning is not implemented.
 
 Only process material you own or are explicitly authorized to process. URL
 ingest downloads permitted public sources directly; an optional outbound proxy
@@ -262,7 +266,7 @@ reports `CANDIDATE_REFINED`, `FINAL_TRANSCRIPT_READY`,
 `NEEDS_MANUAL_TRANSCRIPT_REVIEW`, `PROVIDER_DEGRADED`, `REFINEMENT_FAILED`, or
 `CANCELLED`. It never retranscribes or uploads a whole source, is never added to
 the automatic stage chain, and `FINAL_TRANSCRIPT_READY` is not publishing
-readiness; Stage 4 is not implemented. Queue and inspect refinements:
+readiness; Stage 4.0 is implemented and Stage 4.1 is not. Queue and inspect refinements:
 
 ```bash
 python -m app.cli candidate-refine CANDIDATE_ID --priority CANDIDATE
@@ -277,6 +281,33 @@ API: `POST /api/candidates/{id}/refinements`, `GET /api/refinements/{id}`, `GET
 /api/sources/{id}/candidate-refinements/batch`. See
 [Stage 3.5 operations](docs/STAGE_3_5_OPERATIONS.md) for the full design, bounds,
 fingerprints, admission gate, and handoff.
+
+### Stage 4.0 transformation eligibility and strategy discovery
+
+Stage 4.0 (`TRANSFORMATION_ELIGIBILITY`) is explicit, candidate-scoped work after
+a candidate has a usable Stage 3.5 refinement. It preserves the strongest source
+moment, decides whether a credible substantive transformation path exists, and
+emits at most three recommended (and three useful rejected) bounded strategy
+directions for Stage 4.1. Deterministic hard gates reject presentation-only,
+paraphrase, generic filler, distortion, fake-hook, retention-damaging,
+context-starved, under-original, or unmarked external-fact directions before any
+ranking. It never rewrites source speech, never localizes, and never treats
+dialect as a target market. `NO_TRANSFORMATION_STRATEGY_WORTH_USING` is a
+successful completed analysis, not an error. Stage 4.0 is not added to the
+automatic stage chain and never requires final refinement. Queue and inspect:
+
+```bash
+python -m app.cli transformation-analyze CANDIDATE_ID
+python -m app.cli transformation-analysis CANDIDATE_ID
+python -m app.cli transformation-handoff CANDIDATE_ID
+```
+
+API: `POST /api/candidates/{id}/transformation-analyses`, `GET
+/api/candidates/{id}/transformation-analysis`, `GET
+/api/transformation-analyses/{id}`, and `GET
+/api/candidates/{id}/stage4-1-handoff`. See
+[Stage 4.0 operations](docs/STAGE_4_0_OPERATIONS.md) for the full design, gates,
+provider tiers, and handoff.
 
 Stage 3 semantic mode defaults to `deterministic`: zero Gemini calls and zero
 Qwen model loads. `adaptive` uses Gemini only when a key is configured, and

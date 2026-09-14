@@ -23,6 +23,8 @@ from app.transcription.reconstruction.providers import (
 )
 from app.transcription.reconstruction.routing import AdaptiveRoutingConfig, RoutingMode
 from app.transcription.service import TranscriptionOptions
+from app.transformation.policy import Stage40Config
+from app.transformation.providers import TransformationProvider
 
 
 class Settings(BaseSettings):
@@ -155,6 +157,14 @@ class Settings(BaseSettings):
     gemini_admission_low_enabled: bool = False
     gemini_admission_provider_cooldown_seconds: float = Field(default=60.0, ge=0, le=86_400)
     gemini_admission_max_retry_after_seconds: float = Field(default=3_600.0, ge=0, le=86_400)
+    # Stage 4.0 transformation eligibility. Explicit candidate-scoped work, so
+    # adaptive is the default; a missing key still degrades to deterministic.
+    # adaptive never falls back to Qwen, local_only never calls Gemini.
+    transformation_provider_mode: Literal["deterministic", "adaptive", "local_only"] = "adaptive"
+    transformation_routine_model: str = Field(default="gemini-3.5-flash-lite", max_length=256)
+    transformation_strong_model: str = Field(default="gemini-3.8-flash", max_length=256)
+    transformation_max_output_tokens: int = Field(default=2_048, gt=0, le=8_192)
+    transformation_strong_thinking_level: Literal["low", "medium", "high"] = "low"
     transcription_queue_concurrency: int = Field(default=1, gt=0)
     cors_origins: list[str] = ["http://localhost:3301"]
 
@@ -411,6 +421,68 @@ class Settings(BaseSettings):
             batch_max_limit=self.refinement_batch_max_limit,
             hosted_max_output_tokens=self.gemini_transcription_max_output_tokens,
             adjudication_max_output_tokens=self.gemini_adjudication_max_output_tokens,
+        )
+
+    def stage40_config(self) -> Stage40Config:
+        """Build bounded Stage 4.0 transformation-eligibility configuration."""
+
+        return Stage40Config(
+            provider_max_output_tokens=self.transformation_max_output_tokens,
+            provider_strong_thinking_level=self.transformation_strong_thinking_level,
+        )
+
+    def transformation_semantic_mode(self) -> SemanticProviderMode:
+        return SemanticProviderMode(self.transformation_provider_mode)
+
+    def transformation_provider(self) -> TransformationProvider | None:
+        """Return the Stage 4.0 provider for the configured mode, if any.
+
+        DETERMINISTIC never builds a provider. ADAPTIVE builds Gemini only when a
+        key is configured and never falls back to Qwen. LOCAL_ONLY builds the
+        local provider only when ``CLIPFACTORY_LOCAL_QWEN_ENABLED=true``.
+        """
+
+        mode = self.transformation_semantic_mode()
+        if mode is SemanticProviderMode.DETERMINISTIC:
+            return None
+        if mode is SemanticProviderMode.ADAPTIVE:
+            return self.gemini_transformation_provider_instance()
+        if not self.local_qwen_enabled:
+            return None
+        return self.local_transformation_provider_instance()
+
+    def gemini_transformation_provider_instance(self) -> TransformationProvider | None:
+        key = self.gemini_api_key
+        if key is None or not key.get_secret_value():
+            return None
+        from app.transformation.gemini import GeminiTransformationProvider
+
+        return GeminiTransformationProvider(
+            api_key=key.get_secret_value(),
+            routine_model=self.transformation_routine_model,
+            strong_model=self.transformation_strong_model,
+            timeout_seconds=self.gemini_timeout_seconds,
+            retry_attempts=self.gemini_retry_attempts,
+            retry_backoff_seconds=self.gemini_retry_backoff_seconds,
+            max_output_tokens=self.transformation_max_output_tokens,
+            thinking_level=self.transformation_strong_thinking_level,
+            temperature=self.gemini_temperature,
+            api_version=self.gemini_api_version,
+        )
+
+    def local_transformation_provider_instance(self) -> TransformationProvider | None:
+        if self.reconstruction_provider == "disabled" or not self.local_qwen_enabled:
+            return None
+        if not self.reconstruction_provider_base_url or not self.reconstruction_provider_model:
+            return None
+        from app.transformation.local import LocalTransformationProvider
+
+        return LocalTransformationProvider(
+            base_url=self.reconstruction_provider_base_url,
+            model=self.reconstruction_provider_model,
+            timeout_seconds=self.reconstruction_provider_timeout_seconds,
+            max_output_tokens=self.transformation_max_output_tokens,
+            temperature=0.0,
         )
 
     def gemini_admission_policy(self) -> AdmissionPolicy:

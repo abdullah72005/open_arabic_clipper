@@ -88,5 +88,33 @@ shared Redis priority/budget controller. Deterministic entity/ambiguity and
 boundary refinement produce `CANDIDATE_REFINED`, `FINAL_TRANSCRIPT_READY`,
 `NEEDS_MANUAL_TRANSCRIPT_REVIEW`, `PROVIDER_DEGRADED`, `REFINEMENT_FAILED`, or
 `CANCELLED`. `FINAL_TRANSCRIPT_READY` is transcript readiness, not publishing
-readiness. Stage 4 receives a typed read-only handoff but is not implemented. See
+readiness. Stage 4 receives a typed read-only Stage 3.5 handoff; Stage 4.0 is
+implemented and Stage 4.1 is not. See
 `docs/STAGE_3_5_OPERATIONS.md`.
+
+## Stage 4.0 transformation eligibility
+
+Stage 4.0 is explicit, candidate-scoped work after a candidate has a completed,
+audio-backed Stage 3.5 refinement. It is **not** part of the automatic
+`_NEXT_STAGE` chain and never analyzes every candidate. Queueing requires a
+current retained Stage 3 candidate plus a usable Stage 3.5 refinement; a usable
+`FINAL_CLIP` refinement is preferred when already ready, otherwise a usable
+`CANDIDATE` refinement is used, and a queued/failed/cancelled/empty final row
+never hides a usable candidate row. Final refinement is never enqueued here. If
+no Stage 3.5 refinement exists, queueing fails with a prerequisite error rather
+than analyzing the coarse INDEX transcript.
+
+Stage 4.0 assesses whether the strongest source-retention moment has a credible
+substantive transformation path, then emits a bounded set of strategy
+directions. It never rewrites source speech, never localizes, and never treats
+dialect as a target market. Deterministic gates reject directions that are
+presentation-only, paraphrase, generic filler, distorted, fake-hooked,
+retention-damaging, context-starved, under-original, or dependent on an
+unverified external fact without marking it. The result is one of
+`ELIGIBLE_FOR_TRANSFORMATION`, `ELIGIBLE_WITH_CAUTION`,
+`TRANSFORMATION_REQUIRED`, `NO_TRANSFORMATION_STRATEGY_WORTH_USING` (a successful
+completed analysis), `INSUFFICIENT_TRANSCRIPT_CONFIDENCE`, `INSUFFICIENT_CONTEXT`,
+or `UNRESOLVED_POLICY_OR_PROVENANCE_RISK`. Zero recommended directions is a valid
+success. Stage 4.1 receives a typed read-only handoff and is responsible for
+planning; Stage 4.0 produces directions, not scripts. See
+`docs/STAGE_4_0_OPERATIONS.md`.

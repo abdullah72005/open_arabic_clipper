@@ -344,3 +344,32 @@ processing continues. This routing mode is separate from
 `CLIPFACTORY_RECONSTRUCTION_ROUTING_MODE` and
 `CLIPFACTORY_CANDIDATE_SEMANTIC_MODE`. See
 [docs/STAGE_3_5_OPERATIONS.md](STAGE_3_5_OPERATIONS.md).
+
+## Stage 4.0 transformation eligibility configuration (2026-09-14)
+
+Stage 4.0 is explicit, candidate-scoped work after a usable Stage 3.5
+refinement. All knobs are `CLIPFACTORY_`-prefixed:
+
+```bash
+# adaptive (default) | deterministic | local_only
+CLIPFACTORY_TRANSFORMATION_PROVIDER_MODE=adaptive
+CLIPFACTORY_TRANSFORMATION_ROUTINE_MODEL=gemini-3.5-flash-lite
+CLIPFACTORY_TRANSFORMATION_STRONG_MODEL=gemini-3.8-flash
+CLIPFACTORY_TRANSFORMATION_MAX_OUTPUT_TOKENS=2048
+CLIPFACTORY_TRANSFORMATION_STRONG_THINKING_LEVEL=low
+```
+
+`deterministic` makes zero Gemini and zero Qwen calls and loads no model.
+`adaptive` selects exactly one hosted tier per analysis before any network call:
+`gemini-3.5-flash-lite` for routine bounded discovery, or `gemini-3.8-flash`
+(low thinking) only when a pure deterministic router flags a genuinely
+complex/high-value claim, debate, news, or transformation-required case. It
+never falls back to Qwen. `local_only` uses Qwen/Ollama only when
+`CLIPFACTORY_LOCAL_QWEN_ENABLED=true` and never calls Gemini; a missing key
+degrades to deterministic results. Every hosted request passes through the shared
+Gemini admission controller at `HIGH`; there is at most one hosted discovery call
+per analysis, temperature is 0, and output uses strict structured validation.
+This mode is separate from `CLIPFACTORY_RECONSTRUCTION_ROUTING_MODE`,
+`CLIPFACTORY_CANDIDATE_SEMANTIC_MODE`, and
+`CLIPFACTORY_REFINEMENT_ROUTING_MODE`. See
+[docs/STAGE_4_0_OPERATIONS.md](STAGE_4_0_OPERATIONS.md).

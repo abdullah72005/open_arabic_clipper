@@ -183,7 +183,8 @@
   unresolved final ambiguity produces `NEEDS_MANUAL_TRANSCRIPT_REVIEW`;
   `FINAL_TRANSCRIPT_READY` is transcript readiness, not publishing readiness.
   Qwen remains installed and disabled by default and is never used in adaptive
-  refinement. Stage 4 receives a typed read-only handoff but is not implemented.
+  refinement. Stage 4.0 transformation eligibility/strategy discovery is
+  implemented as explicit candidate-scoped work; Stage 4.1 is not.
 
 ## Local development facts (not product requirements)
 

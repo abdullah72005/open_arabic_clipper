@@ -31,6 +31,7 @@ from app.core.enums import (
     RefinementPriority,
     RightsRisk,
     RightsStatus,
+    StrategyDisposition,
 )
 from app.core.settings import get_settings
 from app.db.session import create_session_factory
@@ -61,6 +62,15 @@ from app.transcription.chunking import ChunkConfig, build_chunks
 from app.transcription.dialect import ArabicDialectProfile
 from app.transcription.normalization import normalize_transcript
 from app.transcription.reconstruction.providers import ReconstructionProvider
+from app.transformation.handoff import build_stage4_1_handoff
+from app.transformation.queue import (
+    TransformationQueueError,
+    get_analysis,
+    get_analysis_for_candidate,
+    list_strategies,
+    queue_transformation_analysis,
+    validate_candidate_for_transformation,
+)
 from app.workers.tasks import run_pipeline_stage
 
 UPLOAD_CHUNK_BYTES = 1024 * 1024
@@ -211,6 +221,91 @@ class Stage4HandoffResponse(BaseModel):
     stage3: dict[str, object]
     refinement: dict[str, object]
     stage4_implemented: bool
+
+
+class TransformationStrategyResponse(BaseModel):
+    id: str
+    strategy_key: str
+    strategy_type: str
+    disposition: str
+    is_current: bool
+    rank: int
+    intensity: str
+    direction_summary: str
+    added_value_focus: str
+    substantive_value_kind: str
+    source_moment_role: str
+    preservation_requirements: list[str]
+    retention_preservation: float
+    source_moment_damage_risk: float
+    added_value_density: float
+    originality_potential: float
+    source_dominance_risk: float
+    generic_filler_risk: float
+    redundant_commentary_risk: float
+    template_staleness_risk: float
+    external_verification_requirement: str
+    verification_requirements: list[str]
+    rejection_reasons: list[str]
+    confidence: float
+    origin: str
+    strategy_fingerprint: str
+
+
+class TransformationAnalysisResponse(BaseModel):
+    id: UUID
+    source_video_id: UUID
+    clip_candidate_id: UUID
+    refinement_id: UUID | None
+    refinement_priority: str
+    refinement_quality_level: str
+    execution_status: str
+    eligibility_outcome: str | None
+    eligibility_reasons: list[str]
+    assessments: dict[str, object]
+    source_moment: dict[str, object]
+    platform_risk: dict[str, object]
+    transformation_intensity: str | None
+    provider_mode: str
+    provider_status: str
+    provider_evidence: dict[str, object]
+    provider_input_fingerprint: str
+    input_fingerprint: str
+    output_fingerprint: str
+    cache_eligible: bool
+    metrics: dict[str, object]
+    processing_duration: float | None
+    recommended_strategies: list[TransformationStrategyResponse]
+    rejected_strategies: list[TransformationStrategyResponse]
+
+
+class TransformationQueueResponse(BaseModel):
+    analysis_id: UUID
+    job_id: UUID | None
+    status: str
+    queued: bool
+    cached: bool
+    active: bool
+
+
+class Stage41HandoffResponse(BaseModel):
+    candidate: dict[str, object]
+    stage3: dict[str, object]
+    analysis_id: str | None
+    output_fingerprint: str | None
+    eligibility_outcome: str | None
+    eligibility_reasons: list[str]
+    platform_risk: dict[str, object]
+    recommended_strategies: list[dict[str, object]]
+    rejected_strategies: list[dict[str, object]]
+    verification_requirements: list[str]
+    provider: dict[str, object]
+    cache_eligible: bool
+    current: bool
+    stale: bool
+    ready_for_stage4_1: bool
+    stage4_1_implemented: bool
+    model_config = {"extra": "allow"}
 
 
 class JobResponse(BaseModel):
@@ -773,6 +868,70 @@ def create_app(
             for outcome in outcomes
         ]
 
+    @app.post(
+        "/api/candidates/{candidate_id}/transformation-analyses",
+        response_model=TransformationQueueResponse,
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    def queue_transformation_analysis_endpoint(
+        candidate_id: UUID,
+        force: bool = False,
+        database: Session = Depends(session),
+    ) -> TransformationQueueResponse:
+        """Explicitly queue one candidate-scoped Stage 4.0 eligibility analysis."""
+
+        try:
+            candidate = validate_candidate_for_transformation(database, candidate_id)
+            outcome = queue_transformation_analysis(database, candidate, force=force)
+        except TransformationQueueError as error:
+            raise _transformation_http(error) from error
+        return TransformationQueueResponse(
+            analysis_id=outcome.analysis_id,
+            job_id=outcome.job_id,
+            status=outcome.status,
+            queued=outcome.queued,
+            cached=outcome.cached,
+            active=outcome.active,
+        )
+
+    @app.get(
+        "/api/candidates/{candidate_id}/transformation-analysis",
+        response_model=TransformationAnalysisResponse,
+    )
+    def get_candidate_transformation_analysis(
+        candidate_id: UUID, database: Session = Depends(session)
+    ) -> TransformationAnalysisResponse:
+        if database.get(ClipCandidate, candidate_id) is None:
+            raise HTTPException(status_code=404, detail="candidate not found")
+        analysis = get_analysis_for_candidate(database, candidate_id)
+        if analysis is None:
+            raise HTTPException(status_code=404, detail="transformation analysis not found")
+        return _transformation_response(database, analysis)
+
+    @app.get(
+        "/api/transformation-analyses/{analysis_id}",
+        response_model=TransformationAnalysisResponse,
+    )
+    def get_transformation_analysis(
+        analysis_id: UUID, database: Session = Depends(session)
+    ) -> TransformationAnalysisResponse:
+        analysis = get_analysis(database, analysis_id)
+        if analysis is None:
+            raise HTTPException(status_code=404, detail="transformation analysis not found")
+        return _transformation_response(database, analysis)
+
+    @app.get(
+        "/api/candidates/{candidate_id}/stage4-1-handoff",
+        response_model=Stage41HandoffResponse,
+    )
+    def get_stage4_1_handoff(
+        candidate_id: UUID, database: Session = Depends(session)
+    ) -> Stage41HandoffResponse:
+        handoff = build_stage4_1_handoff(database, candidate_id)
+        if handoff is None:
+            raise HTTPException(status_code=404, detail="candidate not found")
+        return Stage41HandoffResponse(**handoff)
+
     @app.patch("/api/sources/{source_id}/provenance", response_model=SourceResponse)
     def update_source_provenance(
         source_id: UUID,
@@ -973,6 +1132,85 @@ def _stage35_http(error: Stage35QueueError) -> HTTPException:
     detail = str(error)
     code = 404 if "does not exist" in detail else 409
     return HTTPException(status_code=code, detail=detail)
+
+
+def _transformation_http(error: TransformationQueueError) -> HTTPException:
+    detail = str(error)
+    code = 404 if "does not exist" in detail else 409
+    return HTTPException(status_code=code, detail=detail)
+
+
+def _strategy_response(row: object) -> TransformationStrategyResponse:
+    return TransformationStrategyResponse(
+        id=str(row.id),  # type: ignore[attr-defined]
+        strategy_key=row.strategy_key,  # type: ignore[attr-defined]
+        strategy_type=row.strategy_type.value,  # type: ignore[attr-defined]
+        disposition=row.disposition.value,  # type: ignore[attr-defined]
+        is_current=row.is_current,  # type: ignore[attr-defined]
+        rank=row.rank,  # type: ignore[attr-defined]
+        intensity=row.intensity.value,  # type: ignore[attr-defined]
+        direction_summary=row.direction_summary,  # type: ignore[attr-defined]
+        added_value_focus=row.added_value_focus,  # type: ignore[attr-defined]
+        substantive_value_kind=row.substantive_value_kind.value,  # type: ignore[attr-defined]
+        source_moment_role=row.source_moment_role,  # type: ignore[attr-defined]
+        preservation_requirements=list(row.preservation_requirements or []),  # type: ignore[attr-defined]
+        retention_preservation=row.retention_preservation,  # type: ignore[attr-defined]
+        source_moment_damage_risk=row.source_moment_damage_risk,  # type: ignore[attr-defined]
+        added_value_density=row.added_value_density,  # type: ignore[attr-defined]
+        originality_potential=row.originality_potential,  # type: ignore[attr-defined]
+        source_dominance_risk=row.source_dominance_risk,  # type: ignore[attr-defined]
+        generic_filler_risk=row.generic_filler_risk,  # type: ignore[attr-defined]
+        redundant_commentary_risk=row.redundant_commentary_risk,  # type: ignore[attr-defined]
+        template_staleness_risk=row.template_staleness_risk,  # type: ignore[attr-defined]
+        external_verification_requirement=row.external_verification_requirement.value,  # type: ignore[attr-defined]
+        verification_requirements=list(row.verification_requirements or []),  # type: ignore[attr-defined]
+        rejection_reasons=list(row.rejection_reasons or []),  # type: ignore[attr-defined]
+        confidence=row.confidence,  # type: ignore[attr-defined]
+        origin=row.origin.value,  # type: ignore[attr-defined]
+        strategy_fingerprint=row.strategy_fingerprint,  # type: ignore[attr-defined]
+    )
+
+
+def _transformation_response(database: Session, analysis: object) -> TransformationAnalysisResponse:
+    rows = list_strategies(database, analysis.id)  # type: ignore[attr-defined]
+    recommended = [
+        _strategy_response(row)
+        for row in rows
+        if row.is_current and row.disposition is StrategyDisposition.RECOMMENDED
+    ]
+    rejected = [
+        _strategy_response(row)
+        for row in rows
+        if row.is_current and row.disposition is not StrategyDisposition.RECOMMENDED
+    ]
+    outcome = analysis.eligibility_outcome  # type: ignore[attr-defined]
+    intensity = analysis.transformation_intensity  # type: ignore[attr-defined]
+    return TransformationAnalysisResponse(
+        id=analysis.id,  # type: ignore[attr-defined]
+        source_video_id=analysis.source_video_id,  # type: ignore[attr-defined]
+        clip_candidate_id=analysis.clip_candidate_id,  # type: ignore[attr-defined]
+        refinement_id=analysis.refinement_id,  # type: ignore[attr-defined]
+        refinement_priority=analysis.refinement_priority,  # type: ignore[attr-defined]
+        refinement_quality_level=analysis.refinement_quality_level,  # type: ignore[attr-defined]
+        execution_status=analysis.execution_status.value,  # type: ignore[attr-defined]
+        eligibility_outcome=outcome.value if outcome else None,
+        eligibility_reasons=list(analysis.eligibility_reasons or []),  # type: ignore[attr-defined]
+        assessments=_without_secrets(dict(analysis.assessments or {})),  # type: ignore[attr-defined]
+        source_moment=dict(analysis.source_moment or {}),  # type: ignore[attr-defined]
+        platform_risk=_without_secrets(dict(analysis.platform_risk or {})),  # type: ignore[attr-defined]
+        transformation_intensity=intensity.value if intensity else None,
+        provider_mode=analysis.provider_mode.value,  # type: ignore[attr-defined]
+        provider_status=analysis.provider_status,  # type: ignore[attr-defined]
+        provider_evidence=_without_secrets(dict(analysis.provider_evidence or {})),  # type: ignore[attr-defined]
+        provider_input_fingerprint=analysis.provider_input_fingerprint,  # type: ignore[attr-defined]
+        input_fingerprint=analysis.input_fingerprint,  # type: ignore[attr-defined]
+        output_fingerprint=analysis.output_fingerprint,  # type: ignore[attr-defined]
+        cache_eligible=analysis.cache_eligible,  # type: ignore[attr-defined]
+        metrics=_without_secrets(dict(analysis.metrics or {})),  # type: ignore[attr-defined]
+        processing_duration=analysis.processing_duration,  # type: ignore[attr-defined]
+        recommended_strategies=recommended,
+        rejected_strategies=rejected,
+    )
 
 
 def _refinement_response(row: CandidateRefinement) -> CandidateRefinementResponse:
