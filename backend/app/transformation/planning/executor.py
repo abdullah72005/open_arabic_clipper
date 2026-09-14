@@ -11,9 +11,10 @@ every exit path.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from datetime import datetime, timedelta, timezone
 from time import monotonic
 
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select, update
 from sqlalchemy.orm import Session
 
 from app.core.enums import (
@@ -66,6 +67,9 @@ _READY_STATUSES = {
 }
 _ACTIVE_JOB_STATUSES = {JobStatus.QUEUED, JobStatus.RUNNING}
 _DEGRADED_PROVIDER_STATUSES = {"PROVIDER_DEGRADED", "RATE_LIMITED"}
+# A run that never finalizes (worker crash) may be reclaimed after this window.
+_JOB_CLAIM_STALE_SECONDS = 3_600.0
+_CLAIMABLE_JOB_STATUSES = (JobStatus.QUEUED, JobStatus.FAILED)
 
 
 class PlanningCancelled(StageCancelled):
@@ -117,6 +121,10 @@ class _LeaseBoundPlanningProvider:
         usage = getattr(self._inner, "usage_summary", None)
         return usage() if callable(usage) else {}
 
+    def raw_call_count(self) -> int:
+        counter = getattr(self._inner, "raw_call_count", None)
+        return int(counter()) if callable(counter) else 0
+
 
 class _AdmissionBoundPlanningProvider:
     """Route Stage 4.1 hosted planning through the shared HIGH gate."""
@@ -154,6 +162,10 @@ class _AdmissionBoundPlanningProvider:
         result = usage() if callable(usage) else {}
         return {str(key): int(value) for key, value in dict(result).items()}
 
+    def raw_call_count(self) -> int:
+        counter = getattr(self._inner, "raw_call_count", None)
+        return int(counter()) if callable(counter) else 0
+
 
 class TransformationPlanningExecutor:
     """Execute one candidate-scoped Stage 4.1 planning run and persist it."""
@@ -181,6 +193,12 @@ class TransformationPlanningExecutor:
         self._lease_factory = lease_factory or NoopHeavyModelLeaseFactory()
         self._admission = admission
         self._active_job_id: object | None = None
+        # The exact effective provider wrapper that may own a heavy-model lease.
+        self._effective: PlanningProvider | None = None
+        # True when this executor atomically owns the executing job's run claim.
+        self._job_owner = False
+        # True when a duplicate/redelivered invocation was fenced out.
+        self.skipped_duplicate = False
 
     def set_active_job(self, job_id: object | None) -> None:
         self._active_job_id = job_id
@@ -201,15 +219,24 @@ class TransformationPlanningExecutor:
         return dict(self._provider.runtime_identity())
 
     def _effective_provider(self) -> PlanningProvider | None:
+        # Build once and retain the exact wrapper so its release() actually
+        # exits the shared heavy-model lease (local_only) or closes the hosted
+        # client; never discard a wrapper that may own a lease.
+        if self._effective is not None:
+            return self._effective
         if self._mode is SemanticProviderMode.DETERMINISTIC:
             return None
         if self._provider is None:
             return None
         if self._mode is SemanticProviderMode.LOCAL_ONLY:
-            return _LeaseBoundPlanningProvider(self._provider, self._lease_factory)  # type: ignore[return-value]
-        if self._admission is not None:
-            return _AdmissionBoundPlanningProvider(self._provider, self._admission)  # type: ignore[return-value]
-        return self._provider
+            self._effective = _LeaseBoundPlanningProvider(self._provider, self._lease_factory)
+        elif self._admission is not None:
+            self._effective = _AdmissionBoundPlanningProvider(  # type: ignore[assignment]
+                self._provider, self._admission
+            )
+        else:
+            self._effective = self._provider
+        return self._effective
 
     def _candidate_and_analysis(
         self, plan_set: TransformationPlanSet
@@ -308,28 +335,106 @@ class TransformationPlanningExecutor:
         plan_set.active_job_id = None
         self._session.commit()
 
+    def _claim_job(self) -> bool:
+        """Atomically claim the executing job for this run (QUEUED -> RUNNING).
+
+        A duplicate/redelivered invocation of the same ``(plan_set_id, job_id)``
+        observes a live RUNNING claim and is fenced out, so provider work runs
+        exactly once. Legitimate retries re-claim a FAILED job. A run abandoned
+        by a crashed worker is reclaimable after ``_JOB_CLAIM_STALE_SECONDS``.
+        """
+
+        if self._active_job_id is None:
+            self._job_owner = True
+            return True
+        now = datetime.now(timezone.utc)
+        stale_before = now - timedelta(seconds=_JOB_CLAIM_STALE_SECONDS)
+        result = self._session.execute(
+            update(ProcessingJob)
+            .where(
+                ProcessingJob.id == self._active_job_id,
+                or_(
+                    ProcessingJob.status.in_(_CLAIMABLE_JOB_STATUSES),
+                    and_(
+                        ProcessingJob.status == JobStatus.RUNNING,
+                        ProcessingJob.started_at.is_not(None),
+                        ProcessingJob.started_at < stale_before,
+                    ),
+                ),
+            )
+            .values(status=JobStatus.RUNNING, started_at=now)
+            .execution_options(synchronize_session=False)
+        )
+        claimed = int(result.rowcount) == 1
+        self._session.commit()
+        self._job_owner = claimed
+        return claimed
+
+    def _finish_job(self, status: JobStatus) -> None:
+        """Finalize the claimed job only while this run still owns it."""
+
+        if self._active_job_id is None or not self._job_owner:
+            return
+        self._session.execute(
+            update(ProcessingJob)
+            .where(
+                ProcessingJob.id == self._active_job_id,
+                ProcessingJob.status == JobStatus.RUNNING,
+            )
+            .values(
+                status=status,
+                completed_at=datetime.now(timezone.utc),
+            )
+            .execution_options(synchronize_session=False)
+        )
+        self._session.commit()
+
     def execute(self, plan_set_id: object, *, force: bool = False) -> StageExecutionResult:
+        self.skipped_duplicate = False
         plan_set = self._session.get(TransformationPlanSet, plan_set_id)
         if plan_set is None:
             raise PlanningInputError("transformation plan set is missing")
         if self._job_cancelled():
             self._mark_cancelled(plan_set)
+            self._finish_job(JobStatus.CANCELLED)
             raise PlanningCancelled("Stage 4.1 planning cancelled before start")
         try:
             _candidate, _analysis, refinement, inputs, fingerprint = self._resolve(plan_set)
         except PlanningInputError:
             self._mark_failed(plan_set)
+            self._finish_job(JobStatus.FAILED)
             raise
-        if self.is_cache_hit(plan_set, force=force):
-            self._release_owned_providers()
+        if not self._claim_job():
+            # Another delivery already owns this exact job; do no provider work.
+            self.skipped_duplicate = True
             return StageExecutionResult(plan_set.output_fingerprint, plan_set)
-        if self._claimed_by_other_job(plan_set):
+        try:
+            if self.is_cache_hit(plan_set, force=force):
+                self._finish_job(JobStatus.SUCCEEDED)
+                return StageExecutionResult(plan_set.output_fingerprint, plan_set)
+            if self._claimed_by_other_job(plan_set):
+                self._finish_job(JobStatus.SUCCEEDED)
+                return StageExecutionResult(plan_set.output_fingerprint, plan_set)
+            self._claim(plan_set)
+            started = monotonic()
+            outcome = self._run_service(plan_set, inputs, fingerprint)
+            if self._job_cancelled():
+                self._mark_cancelled(plan_set)
+                self._finish_job(JobStatus.CANCELLED)
+                raise PlanningCancelled("Stage 4.1 planning cancelled before persistence")
+            result = self._persist(plan_set, refinement, inputs, outcome, monotonic() - started)
+            self._finish_job(JobStatus.SUCCEEDED)
+            return result
+        finally:
             self._release_owned_providers()
-            return StageExecutionResult(plan_set.output_fingerprint, plan_set)
-        self._claim(plan_set)
 
+    def _run_service(
+        self,
+        plan_set: TransformationPlanSet,
+        inputs: PlanningInputs,
+        fingerprint: str,
+    ) -> PlanningOutcome:
         checkpoints = self._checkpoints(plan_set)
-        started = monotonic()
         service = PlanningService(
             config=self._config,
             provider=self._effective_provider(),
@@ -338,23 +443,19 @@ class TransformationPlanningExecutor:
             is_cancelled=self._job_cancelled,
         )
         try:
-            outcome = service.plan(
+            return service.plan(
                 inputs,
                 input_fingerprint=fingerprint,
                 checkpoints=checkpoints,
             )
         except StageCancelled:
             self._mark_cancelled(plan_set)
+            self._finish_job(JobStatus.CANCELLED)
             raise
         except Exception:
             self._mark_failed(plan_set)
+            self._finish_job(JobStatus.FAILED)
             raise
-        finally:
-            self._release_owned_providers()
-        if self._job_cancelled():
-            self._mark_cancelled(plan_set)
-            raise PlanningCancelled("Stage 4.1 planning cancelled before persistence")
-        return self._persist(plan_set, refinement, inputs, outcome, monotonic() - started)
 
     def _checkpoints(self, plan_set: TransformationPlanSet) -> dict[str, dict[str, object]]:
         checkpoints: dict[str, dict[str, object]] = {}
@@ -483,8 +584,15 @@ class TransformationPlanningExecutor:
                 row.is_current = False
 
     def _release_owned_providers(self) -> None:
-        provider = self._provider
-        release = getattr(provider, "release", None)
+        # Release the exact effective wrapper so a lease-bound local wrapper
+        # exits its HeavyModelLease and stops its renewer; never release only
+        # the inner provider. The wrapper is idempotent and releases the inner.
+        effective = self._effective
+        self._effective = None
+        target = effective if effective is not None else self._provider
+        if target is None:
+            return
+        release = getattr(target, "release", None)
         if callable(release):
             try:
                 release()

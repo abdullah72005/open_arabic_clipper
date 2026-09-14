@@ -28,11 +28,15 @@ from app.transformation.planning.fingerprints import (
     plan_fingerprint,
 )
 from app.transformation.planning.policy import (
+    COSMETIC_EVASION_MARKERS,
     DISTORTION_MARKERS,
     FAKE_HOOK_MARKERS,
     GENERIC_VALUE_MARKERS,
     PARAPHRASE_SCAFFOLD_MARKERS,
+    PLATFORM_EVASION_MARKERS,
     PRESENTATION_ONLY_TERMS,
+    RENDERING_INSTRUCTION_MARKERS,
+    TTS_SELECTION_MARKERS,
     VERIFIED_CLAIM_MARKERS,
     Stage41Config,
     additive_value_kinds,
@@ -65,11 +69,19 @@ REJECT_UNSUPPORTED_FACT = "UNSUPPORTED_FACT"
 REJECT_VALUE_KIND_MISMATCH = "VALUE_KIND_INCONSISTENT_WITH_STRATEGY"
 REJECT_NON_CHRONOLOGICAL = "NON_CHRONOLOGICAL_SOURCE"
 REJECT_DUPLICATE_EXCERPT = "DUPLICATE_EXCERPT"
+REJECT_OVERLAPPING_EXCERPT = "OVERLAPPING_EXCERPT"
+REJECT_SHORT_EXCERPT = "SOURCE_EXCERPT_TOO_SHORT"
 REJECT_VERIFICATION_MISSING = "VERIFICATION_DEPENDENCY_MISSING"
 REJECT_VERIFICATION_UNLINKED = "VERIFICATION_DEPENDENCY_UNLINKED"
+REJECT_VERIFICATION_BLOCK_REFERENCE = "VERIFICATION_BLOCK_REFERENCE_INVALID"
 REJECT_NARRATION_ESSENTIAL = "NARRATION_MUST_BE_ESSENTIAL"
 REJECT_NARRATION_UNSPECIFIED = "NARRATION_REQUIREMENT_INCOMPLETE"
+REJECT_NARRATION_CONTRADICTION = "NARRATION_CONTRADICTION"
 REJECT_NO_VALUE = "NO_SUBSTANTIVE_VALUE"
+REJECT_TTS_SELECTION = "TTS_SELECTION_FORBIDDEN"
+REJECT_RENDERING_INSTRUCTION = "RENDERING_INSTRUCTION_FORBIDDEN"
+REJECT_EVASION = "PLATFORM_EVASION_FORBIDDEN"
+REJECT_COSMETIC_CLAIM = "COSMETIC_CLAIM_FORBIDDEN"
 
 _VERIFICATION_BLOCK_TYPES = {PlanBlockType.FACT_VERIFICATION_PLACEHOLDER}
 _SUBSTANTIVE_TYPES = {PlanBlockType.ORIGINAL_VALUE, PlanBlockType.TEXTUAL_ANNOTATION}
@@ -173,6 +185,57 @@ def _is_generic(text: str) -> bool:
     return False
 
 
+def boundary_violation(text: str) -> str | None:
+    """Hard Stage 4.1 boundary over one provider-controlled free-text field.
+
+    Bounded, explicit phrase markers only, so legitimate semantic wording such
+    as "explain the model" is never blocked.
+    """
+
+    if not text or not text.strip():
+        return None
+    if _has_marker(text, TTS_SELECTION_MARKERS):
+        return REJECT_TTS_SELECTION
+    if _has_marker(text, RENDERING_INSTRUCTION_MARKERS):
+        return REJECT_RENDERING_INSTRUCTION
+    if _has_marker(text, PLATFORM_EVASION_MARKERS):
+        return REJECT_EVASION
+    if _has_marker(text, COSMETIC_EVASION_MARKERS):
+        return REJECT_COSMETIC_CLAIM
+    return None
+
+
+def _block_boundary_texts(block: PlanBlock) -> list[str]:
+    return [
+        block.purpose or "",
+        block.semantic_intent or "",
+        block.why_unavailable or "",
+        block.draft_line or "",
+        block.continuity_rationale or "",
+        block.verification_rationale or "",
+        block.intended_use or "",
+        " ".join(block.preservation_constraints),
+        " ".join(block.grounding_refs),
+    ]
+
+
+def _plan_boundary_violation(
+    blocks: Sequence[PlanBlock], plan: PlanProviderPlan, narration: NarrationRequirement
+) -> str | None:
+    texts: list[str] = list(plan.preservation_constraints)
+    for block in blocks:
+        texts.extend(_block_boundary_texts(block))
+    if narration.language:
+        texts.append(narration.language)
+    if narration.register:
+        texts.append(narration.register)
+    for text in texts:
+        violation = boundary_violation(text)
+        if violation is not None:
+            return violation
+    return None
+
+
 def resolve_source_span(
     block: PlanProviderBlock,
     inputs: PlanningInputs,
@@ -224,6 +287,8 @@ def _resolve_block(
             return None, error or REJECT_INVALID_SPAN
         role = raw.source_role or SourceExcerptRole.SUPPORT
         duration = max(0.0, span.end - span.start)
+        if duration < config.min_source_excerpt_seconds:
+            return None, REJECT_SHORT_EXCERPT
         return (
             PlanBlock(
                 index=index,
@@ -447,28 +512,51 @@ def validate_provider_plan(
     ):
         return ValidationResult(plan=None, reasons=(REJECT_INVALID_SPAN,))
 
+    narration, narration_error = _resolve_narration(provider_plan, inputs)
+    if narration_error is not None:
+        return ValidationResult(plan=None, reasons=(narration_error,))
+
+    boundary = _plan_boundary_violation(blocks, provider_plan, narration)
+    if boundary is not None:
+        return ValidationResult(plan=None, reasons=(boundary,))
+
+    # True elapsed block duration before the hero, including any preceding
+    # source SUPPORT excerpt. Authored-material cap is retained as an additional
+    # protection.
+    elapsed_before = sum(b.estimated_duration for b in blocks[:hero_index])
     authored_before = sum(b.estimated_duration for b in blocks[:hero_index] if not b.is_source)
     strict = is_strict_hero_window(
         inputs.source_moment_structure,
         inputs.duration,
         float(inputs.stage3_risk.get("moment_density_score", 0.0) or 0.0),
     )
-    cap = (
+    authored_cap = (
         config.strict_authored_before_hero_seconds
         if strict
         else config.max_authored_before_hero_seconds
     )
-    if authored_before > cap:
+    elapsed_cap = (
+        config.strict_elapsed_before_hero_seconds
+        if strict
+        else config.max_elapsed_before_hero_seconds
+    )
+    authored_breach = authored_before > authored_cap
+    elapsed_breach = elapsed_before > elapsed_cap
+    if authored_breach or elapsed_breach:
+        worst = max(
+            authored_before if authored_breach else 0.0,
+            elapsed_before if elapsed_breach else 0.0,
+        )
         return ValidationResult(
             plan=None,
-            reasons=(REJECT_LONG_PREAMBLE if authored_before >= 10.0 else REJECT_LATE_HERO,),
+            reasons=(REJECT_LONG_PREAMBLE if worst >= 10.0 else REJECT_LATE_HERO,),
         )
 
-    derived = _durations(blocks, provider_plan.narration)
+    derived = _durations(blocks, narration)
     if float(derived["total_seconds"]) > config.max_plan_duration_seconds:
         return ValidationResult(plan=None, reasons=(REJECT_TOO_LONG,))
 
-    # Chronology and duplicate excerpts.
+    # Chronology, exact duplicates, and partial overlap.
     previous_start: float | None = None
     seen_spans: set[tuple[float, float]] = set()
     for block in source_blocks:
@@ -480,10 +568,15 @@ def validate_provider_plan(
         if previous_start is not None and block.source_start < previous_start - 0.5:
             return ValidationResult(plan=None, reasons=(REJECT_NON_CHRONOLOGICAL,))
         previous_start = block.source_start
-
-    narration, narration_error = _resolve_narration(provider_plan, inputs)
-    if narration_error is not None:
-        return ValidationResult(plan=None, reasons=(narration_error,))
+    for left_index, left in enumerate(source_blocks):
+        assert left.source_start is not None and left.source_end is not None
+        for right in source_blocks[left_index + 1 :]:
+            assert right.source_start is not None and right.source_end is not None
+            if (
+                left.source_start < right.source_end - 0.05
+                and right.source_start < left.source_end - 0.05
+            ):
+                return ValidationResult(plan=None, reasons=(REJECT_OVERLAPPING_EXCERPT,))
 
     substantive = [b for b in blocks if b.is_substantive]
     for block in substantive:
@@ -493,6 +586,18 @@ def validate_provider_plan(
 
     if not substantive and not _verification_blocks(blocks):
         return ValidationResult(plan=None, reasons=(REJECT_NO_VALUE,))
+
+    narration_delivery_blocks = [
+        b
+        for b in substantive
+        if b.delivery_intent is not None and b.delivery_intent.value == "NARRATION"
+    ]
+    if narration.is_none and narration_delivery_blocks:
+        return ValidationResult(plan=None, reasons=(REJECT_NARRATION_CONTRADICTION,))
+    if not inputs.planning_context.narration_allowed and (
+        narration_delivery_blocks or narration.essential or narration.need is NarrationNeed.REQUIRED
+    ):
+        return ValidationResult(plan=None, reasons=(REJECT_NARRATION_CONTRADICTION,))
 
     non_narration_substantive = [
         b
@@ -507,18 +612,40 @@ def validate_provider_plan(
     ):
         return ValidationResult(plan=None, reasons=(REJECT_NARRATION_ESSENTIAL,))
 
+    # Genuine verification linkage: placeholders reference real dependent
+    # substantive block indexes whose dependency_ids carry the claim id, and
+    # every dependency reference must resolve to a real placeholder claim.
     verification_blocks = _verification_blocks(blocks)
     requires_verification = external == "REQUIRES_EXTERNAL_FACT_VERIFICATION"
+    if any(not placeholder.claim_dependency for placeholder in verification_blocks):
+        return ValidationResult(plan=None, reasons=(REJECT_VERIFICATION_MISSING,))
     if requires_verification and not verification_blocks:
         return ValidationResult(plan=None, reasons=(REJECT_VERIFICATION_MISSING,))
-    if verification_blocks and requires_verification:
-        linked = False
-        for placeholder in verification_blocks:
-            if placeholder.dependent_block_ids or any(
-                placeholder.claim_dependency in block.dependency_ids for block in substantive
-            ):
-                linked = True
-        if not linked:
+    claims = {
+        placeholder.claim_dependency
+        for placeholder in verification_blocks
+        if placeholder.claim_dependency
+    }
+    for block in substantive:
+        for dependency in block.dependency_ids:
+            if dependency not in claims:
+                return ValidationResult(plan=None, reasons=(REJECT_VERIFICATION_UNLINKED,))
+    for dependency in narration.verification_dependency_ids:
+        if dependency not in claims:
+            return ValidationResult(plan=None, reasons=(REJECT_VERIFICATION_UNLINKED,))
+    for placeholder in verification_blocks:
+        block_link = False
+        for index in placeholder.dependent_block_ids:
+            if index < 0 or index >= len(blocks) or index == placeholder.index:
+                return ValidationResult(plan=None, reasons=(REJECT_VERIFICATION_BLOCK_REFERENCE,))
+            dependent = blocks[index]
+            if not dependent.is_substantive:
+                return ValidationResult(plan=None, reasons=(REJECT_VERIFICATION_BLOCK_REFERENCE,))
+            if placeholder.claim_dependency not in dependent.dependency_ids:
+                return ValidationResult(plan=None, reasons=(REJECT_VERIFICATION_UNLINKED,))
+            block_link = True
+        narration_link = placeholder.claim_dependency in narration.verification_dependency_ids
+        if not (block_link or narration_link):
             return ValidationResult(plan=None, reasons=(REJECT_VERIFICATION_UNLINKED,))
 
     status = (
@@ -538,7 +665,7 @@ def validate_provider_plan(
             }
         )
 
-    hero_appearance = sum(b.estimated_duration for b in blocks[:hero_index])
+    hero_appearance = elapsed_before
     structure = _structure_signature(strategy_type, blocks)
     plan = ValidatedPlan(
         strategy_id=str(strategy.get("id", "")),
@@ -579,6 +706,7 @@ def validate_provider_plan(
             "payoff_index": inputs.source_moment.get("payoff_index"),
             "hero_appearance_time": round(hero_appearance, 3),
             "authored_before_hero_seconds": round(authored_before, 3),
+            "elapsed_before_hero_seconds": round(elapsed_before, 3),
         },
         degraded_rules=_degraded_rules(strategy_type),
         stage40_risk={

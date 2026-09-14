@@ -164,7 +164,7 @@ class PlanBlock:
     verification_rationale: str | None = None
     intended_use: str | None = None
     must_verify_before_execution: bool = False
-    dependent_block_ids: tuple[str, ...] = ()
+    dependent_block_ids: tuple[int, ...] = ()
 
     def as_dict(self) -> dict[str, object]:
         payload: dict[str, object] = {
@@ -261,7 +261,7 @@ class PlanProviderBlock:
     verification_rationale: str | None = None
     intended_use: str | None = None
     must_verify_before_execution: bool = False
-    dependent_block_ids: tuple[str, ...] = ()
+    dependent_block_ids: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)

@@ -24,8 +24,20 @@ def test_no_tts_or_rendering_modules_added() -> None:
     planning_root = Path(__file__).parents[1] / "app" / "transformation" / "planning"
     sources = "\n".join(path.read_text() for path in planning_root.glob("*.py"))
     lowered = sources.casefold()
-    for forbidden in ("ffmpeg", "tts_provider", "voice_id", "text_to_speech", "render("):
+    # No TTS generation or media/rendering implementation may live in Stage 4.1.
+    for forbidden in (
+        "import ffmpeg",
+        "subprocess",
+        "generate_speech",
+        "synthesize_speech",
+        "text_to_speech(",
+        "def render",
+        "ffmpeg_operation",
+    ):
         assert forbidden not in lowered
+    # The boundary markers exist only to reject such provider output.
+    assert "tts_selection_markers" in lowered
+    assert "rendering_instruction_markers" in lowered
 
 
 def test_no_stage_4_2_or_4_3_implemented() -> None:
@@ -47,9 +59,12 @@ def test_no_automatic_next_stage_entry() -> None:
 def test_no_platform_evasion_tactics() -> None:
     planning_root = Path(__file__).parents[1] / "app" / "transformation" / "planning"
     sources = "\n".join(path.read_text().casefold() for path in planning_root.glob("*.py"))
-    # The planning instruction must explicitly prohibit platform-evasion work.
+    # The planning instruction must explicitly prohibit platform-evasion work
+    # and the deterministic boundary must reject evasion markers.
     assert "platform-detection evasion" in sources
-    for forbidden in ("evade detection", "bypass detection", "anti-detection"):
+    assert "platform_evasion_markers" in sources
+    assert "reject_evasion" in sources
+    for forbidden in ("anti-detection", "evasion_strategy", "def evade"):
         assert forbidden not in sources
 
 

@@ -33,6 +33,44 @@ from app.transformation.planning.types import (
 from app.transformation.policy import DEFAULT_CONFIG as STAGE40_CONFIG
 
 
+class FakeHeavyModelLease:
+    """Tracks entry/exit and refuses a second concurrent acquisition."""
+
+    def __init__(self, factory: "FakeHeavyModelLeaseFactory") -> None:
+        self._factory = factory
+        self.active = False
+        self.ownership_lost = False
+
+    def __enter__(self) -> "FakeHeavyModelLease":
+        if self._factory.held:
+            self._factory.blocked += 1
+            raise RuntimeError("heavy-model lease already held")
+        self._factory.held = True
+        self.active = True
+        self._factory.entered += 1
+        return self
+
+    def __exit__(self, *exc: object) -> bool:
+        if self.active:
+            self.active = False
+            self._factory.held = False
+            self._factory.exited += 1
+        return False
+
+
+class FakeHeavyModelLeaseFactory:
+    def __init__(self) -> None:
+        self.held = False
+        self.acquired = 0
+        self.entered = 0
+        self.exited = 0
+        self.blocked = 0
+
+    def acquire(self, purpose: str = "ollama") -> FakeHeavyModelLease:
+        self.acquired += 1
+        return FakeHeavyModelLease(self)
+
+
 class FakeStage41Settings:
     """Minimal duck-typed settings for Stage 4.1 executor/queue/handoff."""
 
@@ -44,12 +82,14 @@ class FakeStage41Settings:
         mode: SemanticProviderMode = SemanticProviderMode.ADAPTIVE,
         config: Stage41Config = DEFAULT_CONFIG,
         admission: object | None = None,
+        lease_factory: object | None = None,
     ) -> None:
         self._provider = provider
         self._provider_identity = dict(provider_identity) if provider_identity is not None else None
         self._mode = mode
         self._config = config
         self._admission = admission
+        self._lease_factory = lease_factory
 
     def stage41_config(self) -> Stage41Config:
         return self._config
@@ -87,7 +127,7 @@ class FakeStage41Settings:
         return DeterministicPlanningProvider().runtime_identity()
 
     def heavy_model_lease_factory(self) -> object:
-        return NoopHeavyModelLeaseFactory()
+        return self._lease_factory or NoopHeavyModelLeaseFactory()
 
     def gemini_admission_controller(self) -> object | None:
         return self._admission
@@ -135,6 +175,9 @@ class FakePlanningProvider:
     def release(self) -> None:
         self.released += 1
         return None
+
+    def raw_call_count(self) -> int:
+        return self.calls
 
     def runtime_identity(self) -> dict[str, object]:
         return {"provider": "fake", "model": self.model}
@@ -442,6 +485,7 @@ def run_planning(
         provider_identity=settings.transformation_planning_provider_identity(),
         mode=mode,
         config=DEFAULT_CONFIG,
+        lease_factory=settings.heavy_model_lease_factory(),  # type: ignore[arg-type]
     )
     executor.execute(plan_set.id)
     session.refresh(plan_set)
@@ -458,6 +502,8 @@ def install_stage41_settings(monkeypatch: Any, settings: FakeStage41Settings) ->
 
 
 __all__ = [
+    "FakeHeavyModelLease",
+    "FakeHeavyModelLeaseFactory",
     "FakePlanningProvider",
     "FakeStage41Settings",
     "ContentType",

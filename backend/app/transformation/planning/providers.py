@@ -64,9 +64,16 @@ PLANNING_SYSTEM_INSTRUCTION = (
     "approval, and no platform-detection evasion. "
     "If a plan depends on an external fact, emit a FACT_VERIFICATION_PLACEHOLDER "
     "that names what must be verified and marks must_verify_before_execution=true; "
-    "do not supply the supposed fact and do not research it. "
+    "do not supply the supposed fact and do not research it. Dependent content must "
+    "reference the requirement: list the integer block indexes of the dependent "
+    "substantive blocks in dependent_block_ids, and list the placeholder's "
+    "claim_dependency value in those blocks' dependency_ids (or in the narration "
+    "verification_dependency_ids when narration delivers the dependent content). "
     "Narration is optional: use NONE unless narration is genuinely necessary. "
     "Never cause a plan to be required solely because narration was removed. "
+    "Do not select a TTS provider, TTS model, or voice; do not give frame-level "
+    "rendering instructions; do not propose mirroring, pitch shifting, speed "
+    "tricks, watermark removal, or any platform-detection evasion. "
     "If a strategy cannot produce a valid substantive plan, set no_valid_plan=true "
     "with a short bounded reason instead of emitting filler."
 )
@@ -115,7 +122,10 @@ PLANNING_OUTPUT_SCHEMA: dict[str, object] = {
                                 "verification_rationale": {"type": "string"},
                                 "intended_use": {"type": "string"},
                                 "must_verify_before_execution": {"type": "boolean"},
-                                "dependent_block_ids": {"type": "array"},
+                                "dependent_block_ids": {
+                                    "type": "array",
+                                    "items": {"type": "integer"},
+                                },
                             },
                             "required": ["block_type"],
                         },
@@ -366,6 +376,28 @@ def _float(value: object) -> float:
     return max(0.0, number)
 
 
+def _bounded_int_list(value: object, limit: int = _BOUNDED_LIST) -> tuple[int, ...]:
+    """Parse dependent block references into validated integer block indexes."""
+
+    if not isinstance(value, list):
+        return ()
+    items: list[int] = []
+    for item in value:
+        if isinstance(item, bool):
+            continue
+        candidate: int | None = None
+        if isinstance(item, int):
+            candidate = int(item)
+        elif isinstance(item, str) and item.strip().lstrip("-").isdigit():
+            candidate = int(item.strip())
+        if candidate is None or candidate in items:
+            continue
+        items.append(candidate)
+        if len(items) >= limit:
+            break
+    return tuple(items)
+
+
 def _int_or_none(value: object) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int):
         return None
@@ -399,7 +431,7 @@ def _parse_block(entry: Mapping[str, object]) -> PlanProviderBlock | None:
         or None,
         intended_use=_bounded_text(entry.get("intended_use"), _BOUNDED_FIELD) or None,
         must_verify_before_execution=bool(entry.get("must_verify_before_execution", False)),
-        dependent_block_ids=_bounded_list(entry.get("dependent_block_ids")),
+        dependent_block_ids=_bounded_int_list(entry.get("dependent_block_ids")),
     )
 
 

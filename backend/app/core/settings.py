@@ -484,12 +484,12 @@ class Settings(BaseSettings):
                 routine_model=self.transformation_planning_routine_model,
                 strong_model=self.transformation_planning_strong_model,
                 timeout_seconds=self.gemini_timeout_seconds,
-                retry_attempts=self.gemini_retry_attempts,
-                retry_backoff_seconds=self.gemini_retry_backoff_seconds,
+                retry_attempts=0,
                 max_output_tokens=self.transformation_planning_max_output_tokens,
                 thinking_level=self.transformation_planning_strong_thinking_level,
                 temperature=self.gemini_temperature,
                 api_version=self.gemini_api_version,
+                max_raw_calls=self.stage41_config().max_hosted_raw_calls,
             ).runtime_identity()
         if mode is _Mode.LOCAL_ONLY:
             configured = self.local_transformation_planning_provider_instance()
@@ -508,12 +508,12 @@ class Settings(BaseSettings):
             routine_model=self.transformation_planning_routine_model,
             strong_model=self.transformation_planning_strong_model,
             timeout_seconds=self.gemini_timeout_seconds,
-            retry_attempts=self.gemini_retry_attempts,
-            retry_backoff_seconds=self.gemini_retry_backoff_seconds,
+            retry_attempts=0,
             max_output_tokens=self.transformation_planning_max_output_tokens,
             thinking_level=self.transformation_planning_strong_thinking_level,
             temperature=self.gemini_temperature,
             api_version=self.gemini_api_version,
+            max_raw_calls=self.stage41_config().max_hosted_raw_calls,
         )
 
     def local_transformation_planning_provider_instance(self) -> object | None:

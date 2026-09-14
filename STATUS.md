@@ -35,13 +35,33 @@ refinement, and is **never** added to the automatic `_NEXT_STAGE` chain.
 - **Deterministic first.** Deterministic logic owns readiness, bounds, routing,
   source-span resolution (indexed Stage 3.5 word references or a safe
   full-window sentinel; provider timestamps/quotes are never trusted), hero
-  placement (block 0/1 with a 3 s authored-before-hero cap, 1.5 s for short,
-  dense, joke, or payoff-first moments), duration arithmetic, substantive-value/
-  paraphrase/cosmetic rejection, narration/TTS separation, verification
-  dependency enforcement, material distinction, persistence eligibility, and
-  fingerprint/cache composition. Every valid plan has exactly one hero source
-  excerpt and at least one source excerpt; blocks are capped at eight and plans
-  at three.
+  placement, duration arithmetic, substantive-value/paraphrase/cosmetic
+  rejection, narration/TTS separation, verification dependency enforcement,
+  material distinction, persistence eligibility, and fingerprint/cache
+  composition. Every valid plan has exactly one hero source excerpt and at least
+  one source excerpt; blocks are capped at eight and plans at three. The hero
+  must actually appear early: the cap uses **true elapsed block duration** before
+  the hero (including any preceding source `SUPPORT` excerpt) at 3 s, strictly
+  1.5 s for short, dense, joke, or payoff-first moments, and the authored-material
+  cap is retained as an additional protection. Every source excerpt must meet
+  `min_source_excerpt_seconds` (0.4 s), and partially overlapping source spans are
+  rejected, not only exact duplicates; chronology and non-overlap are preserved.
+  `hero_appearance_time` and the persisted elapsed/authored evidence remain
+  accurate and auditable.
+- **Hard TTS/rendering/evasion boundary.** Every provider-controlled free-text
+  field that can persist into a plan (purpose, semantic intent, why-unavailable,
+  draft line, continuity rationale, preservation constraints, verification text,
+  grounding refs, narration language/register) is checked against bounded,
+  explicit policy markers. TTS provider/model/voice selection, speaker identity,
+  frame-level rendering instructions, cosmetic-only transformation claims, and
+  platform/detection-evasion tactics (mirroring, pitch shifting, speed tricks,
+  watermark removal/obfuscation) are rejected. Legitimate narration semantics
+  (purpose, language, register, duration, placement, dependency) are preserved,
+  and ordinary semantic words such as "model" are not blocked.
+- **Narration contract.** A plan whose substantive block requires narration
+  delivery while `NarrationNeed.NONE` is recorded is rejected, and a
+  narration-disallowed context cannot accept an essential narration-only
+  contribution. Valid `NONE` plans with no narration-delivery block remain valid.
 - **Providers are optional.** `deterministic` makes zero Gemini/Qwen calls
   (conservative grounded fallback only for `SOURCE_LED_MINIMAL`/
   `SOURCE_AS_EVIDENCE`); `adaptive` (default) batches per tier, at most one
@@ -49,10 +69,14 @@ refinement, and is **never** added to the automatic `_NEXT_STAGE` chain.
   admission gate (`gemini-3.5-flash-lite` routine, `gemini-3.8-flash`
   low-thinking for genuinely complex strategies), temperature 0, strict
   structured output, and never falls back to Qwen; `local_only` uses Qwen only
-  when `CLIPFACTORY_LOCAL_QWEN_ENABLED=true`. Missing key/outage/429/quota/
-  safety refusal/malformed output never fails the source: accepted per-strategy
-  checkpoints survive, only unfinished work stays non-cache-eligible, and a
-  later normal request retries it. Planning mode is separately configurable
+  when `CLIPFACTORY_LOCAL_QWEN_ENABLED=true`. The two-call ceiling is a hard
+  **raw** `generate_content` budget: there is no per-tier retry inside it, the
+  provider refuses a third raw call, and persisted metrics report actual raw
+  hosted calls, not only tier invocations. Missing key/outage/429/quota/safety
+  refusal/malformed output never fails the source: accepted per-strategy
+  checkpoints survive (including across repeated forced reruns), only unfinished
+  work stays non-cache-eligible, and a later normal request retries it. Planning
+  mode is separately configurable
   (`CLIPFACTORY_TRANSFORMATION_PLANNING_MODE`) and decoupled from Stage 4.0 mode.
 - **Narration and TTS.** Narration is an abstract semantic requirement (need,
   purpose, language, register, duration, placement, dependencies) and never
@@ -65,18 +89,31 @@ refinement, and is **never** added to the automatic `_NEXT_STAGE` chain.
   or relabel the dialect. No channel/account/target-market persistence model was
   added.
 - **Verification.** A strategy marked `REQUIRES_EXTERNAL_FACT_VERIFICATION`
-  must yield a structured placeholder that names the claim and blocks dependent
-  blocks; no fact is fabricated and there is no browsing/research subsystem.
+  must yield a structured placeholder that names the claim and links to real
+  dependent content. Linkage is deterministic and persisted: a placeholder lists
+  the integer block indexes of dependent substantive blocks, those blocks carry
+  the placeholder's claim id in `dependency_ids`, and narration depends on a
+  claim through `verification_dependency_ids`. Bogus, missing, nonexistent, or
+  unlinked references are rejected; `must_verify_before_execution=true` is
+  preserved. No fact is fabricated and there is no browsing/research subsystem.
+- **Durable execution.** A duplicate/redelivered Celery invocation of the same
+  `(plan_set_id, job_id)` is fenced by an atomic `QUEUED -> RUNNING`
+  `ProcessingJob` claim, so provider work runs exactly once; legitimate retries
+  re-claim a `FAILED` job and a run abandoned by a crashed worker is reclaimable
+  after a bounded staleness window. The local-only executor retains and releases
+  the exact lease-bound provider wrapper, so the shared heavy-model lease always
+  exits on success, provider failure, cancellation, cache hit, and exception.
 - **API/CLI/handoff.** Minimal endpoints queue/read one plan set and expose a
   typed read-only Stage 4.2 handoff (`stage4_2_implemented=false`,
   `stage4_3_implemented=false`) with exact ordered blocks, hero span, narration
   semantics, verification dependencies, and Stage 4.0 risk.
 
-Deterministic verification: 63 focused Stage 4.1 tests plus the full backend
-suite (937 passed) in Docker Python 3.12 with the repository compose/.env files
-mounted (86% coverage, above the 79% gate), with no live provider calls in the
-automated suite. See
-[docs/STAGE_4_1_OPERATIONS.md](docs/STAGE_4_1_OPERATIONS.md).
+Deterministic verification: 87 focused Stage 4.1 tests (63 original + 24
+review-remediation) plus the full backend suite in Docker Python 3.12 with the
+repository compose/.env files mounted, with no live provider calls in the
+automated suite. Planning policy/schema/validation versions advanced to
+`stage4.1-v2`/`stage4.1-schema-v2`/`stage4.1-validation-v2` so prior plans
+invalidate. See [docs/STAGE_4_1_OPERATIONS.md](docs/STAGE_4_1_OPERATIONS.md).
 
 ## Stage 4.0 transformation eligibility and strategy discovery (2026-09-14)
 

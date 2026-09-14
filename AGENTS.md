@@ -195,36 +195,49 @@
   no `_NEXT_STAGE` entry, and never touches the source lifecycle, and it neither
   selects/approves a plan nor renders or synthesizes speech. Deterministic logic
   owns readiness, bounds, routing, source-span resolution from indexed Stage 3.5
-  word evidence (never provider timestamps/quotes), hero placement (block 0/1,
-  bounded already-authored material before the hero), duration arithmetic,
-  substantive-value/paraphrase/cosmetic validation, narration/TTS separation,
-  verification-dependency enforcement, material distinction, and fingerprint/
-  cache composition. Plan blocks use a closed set (`SOURCE_EXCERPT`,
+  word evidence (never provider timestamps/quotes), hero placement (block 0/1
+  with the cap on true elapsed block duration before the hero — including any
+  preceding source `SUPPORT` excerpt — plus the retained authored-material cap),
+  minimum source-excerpt duration, partial-overlap rejection, duration
+  arithmetic, substantive-value/paraphrase/cosmetic validation, narration/TTS
+  separation, narration-contract consistency, verification-dependency
+  enforcement, the TTS/rendering/evasion boundary over all provider-controlled
+  free-text fields, material distinction, and fingerprint/cache composition.
+  Plan blocks use a closed set (`SOURCE_EXCERPT`,
   `ORIGINAL_VALUE`, `TRANSITION`, `TEXTUAL_ANNOTATION`,
-  `FACT_VERIFICATION_PLACEHOLDER`) stored as validated JSON; narration is an
-  abstract semantic requirement (`NONE`/`OPTIONAL`/`RECOMMENDED`/`REQUIRED` with
+  `FACT_VERIFICATION_PLACEHOLDER`) stored as validated JSON; verification
+  placeholders link to real dependent substantive block indexes by claim id;
+  narration is an abstract semantic requirement
+  (`NONE`/`OPTIONAL`/`RECOMMENDED`/`REQUIRED` with
   purpose/language/register/duration/placement/dependencies) and never names a
   TTS provider, model, or voice — channel configuration will decide the
   persistent narrator and Stage 6 generates speech. An optional provider reuses
   the repository's google-genai structured adapter (`gemini-3.5-flash-lite`
   routine, `gemini-3.8-flash` strong low-thinking for genuinely complex
   strategies, `v1`, temperature 0, batched at most one call per tier and two per
-  plan-set run through the shared `HIGH` admission gate), or explicit
-  `local_only` Qwen only when `CLIPFACTORY_LOCAL_QWEN_ENABLED=true`; adaptive
+  plan-set run through the shared `HIGH` admission gate). The two-call ceiling is
+  a hard raw `generate_content` budget with no per-tier retry, and metrics report
+  actual raw hosted calls. Explicit `local_only` Qwen is used only when
+  `CLIPFACTORY_LOCAL_QWEN_ENABLED=true` and adaptive
   never silently falls back to Qwen. Provider mode is separately configurable
   (`CLIPFACTORY_TRANSFORMATION_PLANNING_MODE`, default `adaptive`) and decoupled
   from Stage 4.0 mode. Missing key/outage/429/quota/safety refusal/malformed
-  output never fails the source: per-strategy accepted checkpoints survive, a
+  output never fails the source: per-strategy accepted checkpoints survive
+  (including repeated forced reruns), a
   deferred/no-plan/provider-unavailable outcome is recorded truthfully as a
   successful semantic result, only unfinished work stays non-cache-eligible, and
-  a later normal request retries it. Plan-set input fingerprints exclude the
+  a later normal request retries it. Duplicate/redelivered Celery invocations of
+  the same `(plan_set, job)` are fenced by an atomic `QUEUED -> RUNNING` job
+  claim, and the `local_only` executor always releases its lease-bound provider
+  wrapper. Plan-set input fingerprints exclude the
   Gemini key, transient admission state, TTS provider/model/voice/fallback, and
   rendering settings; target-market/language/register semantic context and any
   relevant Stage 4.0 change invalidate correctly, while voice/provider/model-only
   changes do not. New persistence is `transformation_plan_sets` (one durable
   envelope per candidate) and `transformation_plans` (one stable row per
   `(plan_set, strategy_candidate)`), plus a `TRANSFORMATION_PLANNING` job kind
-  and a nullable `processing_jobs.transformation_plan_set_id` FK. A read-only
+  and a nullable `processing_jobs.transformation_plan_set_id` FK. Planning
+  policy/schema/validation versions are `stage4.1-v2`. A read-only
   Stage 4.2 handoff exposes exact ordered blocks, hero span, narration semantics,
   verification dependencies, and Stage 4.0 risk with `stage4_2_implemented`
   and `stage4_3_implemented` set to `false`. Stage 4.2 governor and Stage 4.3

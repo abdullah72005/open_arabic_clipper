@@ -322,14 +322,20 @@ normally at most one per current recommended strategy, and never manufactures
 alternatives or selects/approves a winner. Every valid plan has exactly one hero
 source excerpt placed as block 0 or 1, deterministically resolved source
 timestamps and text from Stage 3.5 evidence (the provider never supplies either),
-and deterministic source/original/narration duration arithmetic. Original-value
+and deterministic source/original/narration duration arithmetic. The hero must
+appear early by true elapsed duration (including any preceding source support
+excerpt), every source excerpt must meet a minimum duration, and partially
+overlapping excerpts are rejected. Original-value
 blocks must state what the viewer learns beyond the excerpt; presentation-only
 edits, paraphrase, fake hooks, distortion, unsupported facts, and value kinds
-inconsistent with the Stage 4.0 strategy are rejected before persistence.
+inconsistent with the Stage 4.0 strategy are rejected before persistence, as are
+TTS/voice selection, rendering instructions, and platform-evasion tactics in any
+provider-controlled field.
 Narration is described as an abstract semantic requirement only (need, purpose,
 language, register, duration, placement, dependencies) and never selects a TTS
 provider, model, or voice. External facts become verification placeholders that
-block dependent blocks, never fabricated content. Stage 4.1 is not added to the
+link to real dependent blocks by index and block execution until verified; no
+fact is fabricated. Stage 4.1 is not added to the
 automatic stage chain, adds no `PipelineStage`/`PipelineRun`/`_NEXT_STAGE` entry,
 and never touches the source lifecycle.
 

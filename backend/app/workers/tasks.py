@@ -317,26 +317,19 @@ def run_transformation_planning(
             job = session.get(ProcessingJob, parsed_job)
             if job is not None and job.status is JobStatus.CANCELLED:
                 return {"plan_set_id": str(parsed_plan_set), "cancelled": True}
-            if job is not None:
-                job.status = JobStatus.RUNNING
-                job.started_at = datetime.now(timezone.utc)
-                session.commit()
         executor = build_transformation_planning_executor(session, settings)
         executor.set_active_job(parsed_job)
         try:
+            # The executor owns the durable QUEUED -> RUNNING claim and job
+            # finalization, so a duplicate/redelivered invocation of this same
+            # job performs no provider work and does not overwrite job state.
             executor.execute(parsed_plan_set, force=force)
         except StageCancelled:
-            if parsed_job is not None:
-                cancelled_job = session.get(ProcessingJob, parsed_job)
-                if cancelled_job is not None and cancelled_job.status is not JobStatus.CANCELLED:
-                    cancelled_job.status = JobStatus.CANCELLED
-                    cancelled_job.completed_at = datetime.now(timezone.utc)
-                    session.commit()
             return {"plan_set_id": str(parsed_plan_set), "cancelled": True}
         except Exception as error:
-            if parsed_job is not None:
+            if parsed_job is not None and not getattr(executor, "skipped_duplicate", False):
                 failed_job = session.get(ProcessingJob, parsed_job)
-                if failed_job is not None and failed_job.status is not JobStatus.CANCELLED:
+                if failed_job is not None and failed_job.status is JobStatus.RUNNING:
                     failed_job.status = JobStatus.FAILED
                     failed_job.completed_at = datetime.now(timezone.utc)
                     failed_job.error_message = type(error).__name__[:2048]
@@ -348,16 +341,10 @@ def run_transformation_planning(
                     max_retries=MAX_RETRIES,
                 ) from error
             raise
-        if parsed_job is not None:
-            finished_job = session.get(ProcessingJob, parsed_job)
-            if finished_job is not None and finished_job.status is not JobStatus.CANCELLED:
-                finished_job.status = JobStatus.SUCCEEDED
-                finished_job.completed_at = datetime.now(timezone.utc)
-                session.commit()
         return {
             "plan_set_id": str(parsed_plan_set),
             "job_id": str(parsed_job) if parsed_job else None,
-            "skipped": False,
+            "skipped": bool(getattr(executor, "skipped_duplicate", False)),
         }
     finally:
         session.close()

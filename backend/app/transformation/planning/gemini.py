@@ -84,7 +84,7 @@ class _GeminiBlock(BaseModel):
     verification_rationale: str | None = None
     intended_use: str | None = None
     must_verify_before_execution: bool = False
-    dependent_block_ids: list[str] = Field(default_factory=list)
+    dependent_block_ids: list[int] = Field(default_factory=list)
 
 
 class _GeminiPlan(BaseModel):
@@ -113,12 +113,13 @@ class GeminiPlanningProvider:
         routine_model: str = GEMINI_ROUTINE_MODEL,
         strong_model: str = GEMINI_STRONG_MODEL,
         timeout_seconds: float = 45.0,
-        retry_attempts: int = 1,
+        retry_attempts: int = 0,
         retry_backoff_seconds: float = 1.5,
         max_output_tokens: int = 4_096,
         thinking_level: str | None = "low",
         temperature: float = 0.0,
         api_version: str = GEMINI_API_VERSION,
+        max_raw_calls: int = 2,
         owns_client: bool = True,
         client_factory: Callable[[], object] | None = None,
         sleep: Callable[[float], None] = time.sleep,
@@ -127,8 +128,11 @@ class GeminiPlanningProvider:
         self.strong_model = strong_model
         self.model = routine_model
         self._timeout = max(0.1, float(timeout_seconds))
+        # Stage 4.1 keeps no per-tier retry inside its two-call ceiling.
         self._retry_attempts = max(0, int(retry_attempts))
         self._retry_backoff = max(0.0, float(retry_backoff_seconds))
+        self._max_raw_calls = max(1, int(max_raw_calls))
+        self._raw_calls = 0
         self._output_tokens = max(1, int(max_output_tokens))
         self._thinking_level = thinking_level
         self._temperature = max(0.0, float(temperature))
@@ -209,6 +213,11 @@ class GeminiPlanningProvider:
     def usage_summary(self) -> dict[str, int]:
         return dict(self._usage)
 
+    def raw_call_count(self) -> int:
+        """Actual raw hosted generate_content calls made by this provider."""
+
+        return self._raw_calls
+
     def plan(
         self, requests: Sequence[PlanningRequest], tier: str = _ROUTINE
     ) -> dict[str, PlanProviderResult]:
@@ -216,26 +225,25 @@ class GeminiPlanningProvider:
             raise PlanningProviderError(ProviderErrorCategory.MISSING_KEY.value)
         if not requests:
             return {}
+        if self._raw_calls >= self._max_raw_calls:
+            raise PlanningProviderError(
+                ProviderErrorCategory.PROVIDER_ERROR.value,
+                "hosted planning raw-call budget exhausted",
+            )
         self.model = self.strong_model if tier == _STRONG else self.routine_model
         thinking: str | None = self._thinking_level if tier == _STRONG else None
         client = self._client_instance()
         if client is None:
             raise PlanningProviderError(ProviderErrorCategory.MISSING_KEY.value)
-        attempts = 1 + self._retry_attempts
-        last_error: PlanningProviderError | None = None
-        for attempt in range(attempts):
-            try:
-                return self._call_once(client, requests, thinking)
-            except PlanningProviderError as error:
-                if error.category == ProviderErrorCategory.RATE_LIMITED.value:
-                    self.rate_limited = True
-                    raise
-                if ProviderErrorCategory(error.category) in _RETRYABLE and attempt < attempts - 1:
-                    last_error = error
-                    self._sleep(self._retry_backoff)
-                    continue
-                raise
-        raise last_error or PlanningProviderError(ProviderErrorCategory.PROVIDER_ERROR.value)
+        # Exactly one raw call per tier. Stage 4.1 deliberately performs no
+        # per-tier retry so a retryable failure cannot silently exceed the
+        # hard two-call hosted budget for one plan-set run.
+        try:
+            return self._call_once(client, requests, thinking)
+        except PlanningProviderError as error:
+            if error.category == ProviderErrorCategory.RATE_LIMITED.value:
+                self.rate_limited = True
+            raise
 
     def _call_once(
         self,
@@ -254,6 +262,7 @@ class GeminiPlanningProvider:
         if thinking is not None:
             config.thinking_config = types.ThinkingConfig(thinking_level=thinking)
         try:
+            self._raw_calls += 1
             response = client.models.generate_content(  # type: ignore[attr-defined]
                 model=self.model,
                 contents=json.dumps(payload, ensure_ascii=False),

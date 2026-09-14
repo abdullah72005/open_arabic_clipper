@@ -19,9 +19,12 @@ from app.core.enums import (
     TransformationStrategyType,
 )
 
-POLICY_VERSION = "stage4.1-v1"
-SCHEMA_VERSION = "stage4.1-schema-v1"
-VALIDATION_VERSION = "stage4.1-validation-v1"
+# v2 hardening: real verification-block linkage, hero elapsed-time cap,
+# minimum excerpt duration, narration-contract checks, overlapping-span
+# rejection, and the TTS/rendering/evasion boundary.
+POLICY_VERSION = "stage4.1-v2"
+SCHEMA_VERSION = "stage4.1-schema-v2"
+VALIDATION_VERSION = "stage4.1-validation-v2"
 INPUT_FINGERPRINT_VERSION = "1"
 OUTPUT_FINGERPRINT_VERSION = "1"
 PLAN_FINGERPRINT_VERSION = "1"
@@ -229,6 +232,92 @@ VERIFIED_CLAIM_MARKERS: tuple[str, ...] = (
     "تم التحقق",
     "مؤكد أن",
 )
+
+# Hard Stage 4.1 boundary markers. These are intentionally explicit, bounded
+# phrases (not bare words) so legitimate semantic use such as "model" in
+# "explain the model" is never blocked. Applied to every provider-controlled
+# free-text field that can persist into a plan.
+TTS_SELECTION_MARKERS: tuple[str, ...] = (
+    "tts",
+    "text-to-speech",
+    "text to speech",
+    "speech synthesis",
+    "speech-synthesis",
+    "synthesize speech",
+    "synthesise speech",
+    "voiceover",
+    "voice over",
+    "voice-over",
+    "voice id",
+    "voice_id",
+    "voice model",
+    "voice provider",
+    "narrator voice",
+    "speaker voice",
+    "voice clone",
+    "voice cloning",
+    "elevenlabs",
+    "amazon polly",
+    "azure speech",
+    "google tts",
+    "gemini tts",
+    "male voice",
+    "female voice",
+)
+RENDERING_INSTRUCTION_MARKERS: tuple[str, ...] = (
+    "ffmpeg",
+    "timeline",
+    "shot list",
+    "storyboard",
+    "keyframe",
+    "key frame",
+    "frame rate",
+    "render at",
+    "render the clip",
+    "render the video",
+    "render this clip",
+    "cut to",
+    "fade in",
+    "fade out",
+    "green screen",
+    "b-roll",
+    "broll",
+    "voiceover:",
+)
+# Presentation-only transformation claims that masquerade as originality.
+COSMETIC_EVASION_MARKERS: tuple[str, ...] = (
+    "mirror the video",
+    "mirroring the video",
+    "mirror image",
+    "horizontal flip",
+    "flip the video",
+    "pitch shift",
+    "pitch-shift",
+    "change the pitch",
+    "speed up the",
+    "slow down the video",
+    "sped up",
+    "remove watermark",
+    "watermark removal",
+    "obfuscate",
+    "strip metadata",
+)
+# Platform-detection evasion tactics.
+PLATFORM_EVASION_MARKERS: tuple[str, ...] = (
+    "evade detection",
+    "evading detection",
+    "bypass detection",
+    "avoid detection",
+    "platform detection",
+    "content id evasion",
+    "avoid copyright detection",
+    "copyright evasion",
+    "fingerprint evasion",
+    "dodge the algorithm",
+    "trick the algorithm",
+    "avoid the algorithm",
+    "monetization loophole",
+)
 # Presentation/repost-only "value" that can never establish originality.
 PRESENTATION_ONLY_CHANGES: frozenset[str] = frozenset(
     {
@@ -260,12 +349,19 @@ class Stage41Config:
     max_blocks_per_plan: int = 8
     max_authored_before_hero_seconds: float = 3.0
     strict_authored_before_hero_seconds: float = 1.5
+    # True elapsed block duration before the hero (includes any preceding
+    # source SUPPORT excerpts). The authored-material cap above remains an
+    # additional protection.
+    max_elapsed_before_hero_seconds: float = 3.0
+    strict_elapsed_before_hero_seconds: float = 1.5
     short_moment_seconds: float = 20.0
     high_moment_density_floor: float = 0.5
     min_source_excerpt_seconds: float = 0.4
     max_plan_duration_seconds: float = 180.0
     min_substantive_intent_characters: int = 12
     containment_reject_ratio: float = 0.80
+    # Raw hosted generate_content ceiling for one plan-set run.
+    max_hosted_raw_calls: int = 2
 
     # Bounded provider input/output.
     provider_max_input_characters: int = 12_000
@@ -344,12 +440,15 @@ def stage41_config_payload(config: Stage41Config) -> dict[str, object]:
         "max_blocks_per_plan": config.max_blocks_per_plan,
         "max_authored_before_hero_seconds": config.max_authored_before_hero_seconds,
         "strict_authored_before_hero_seconds": config.strict_authored_before_hero_seconds,
+        "max_elapsed_before_hero_seconds": config.max_elapsed_before_hero_seconds,
+        "strict_elapsed_before_hero_seconds": config.strict_elapsed_before_hero_seconds,
         "short_moment_seconds": config.short_moment_seconds,
         "high_moment_density_floor": config.high_moment_density_floor,
         "min_source_excerpt_seconds": config.min_source_excerpt_seconds,
         "max_plan_duration_seconds": config.max_plan_duration_seconds,
         "min_substantive_intent_characters": config.min_substantive_intent_characters,
         "containment_reject_ratio": config.containment_reject_ratio,
+        "max_hosted_raw_calls": config.max_hosted_raw_calls,
         "provider_max_input_characters": config.provider_max_input_characters,
         "provider_max_words": config.provider_max_words,
         "provider_max_output_tokens": config.provider_max_output_tokens,

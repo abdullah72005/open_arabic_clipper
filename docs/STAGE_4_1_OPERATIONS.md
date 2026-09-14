@@ -122,7 +122,11 @@ fields required for its type.
   credit.
 - `FACT_VERIFICATION_PLACEHOLDER`: asserts no external fact; names the claim/
   dependency, why it is needed, and its intended use;
-  `must_verify_before_execution=true`; identifies dependent original blocks.
+  `must_verify_before_execution=true`; links to real dependent content by the
+  integer block indexes of dependent substantive blocks. Those blocks carry the
+  placeholder's `claim_dependency` value in `dependency_ids`, or the narration
+  references it through `verification_dependency_ids`. Bogus, nonexistent, or
+  unlinked references are rejected.
 
 One giant script, finished voiceover, shot list, frame timeline, FFmpeg
 operation, or publication-ready copy is never persisted.
@@ -140,16 +144,23 @@ timestamps and excerpt text are resolved and persisted deterministically.
   present; invalid indices or out-of-window spans reject only that provider item.
 - When word timing coverage is insufficient, only a safe full-window excerpt is
   allowed.
+- Every source excerpt must meet `min_source_excerpt_seconds` (0.4 s); a
+  near-zero-duration token excerpt, including the hero, is rejected.
 - Plan-local excerpts never mutate Stage 3.5 bounds or transcripts.
-- Overlapping duplicate excerpts are rejected; chronological source order is
-  preserved; the source hook/payoff is preserved and mid-thought cuts avoided.
-- Authored material before the hero is capped at 3 s, with a stricter 1.5 s cap
-  for short, dense, joke, or payoff-first moments; a 10–20 s preamble is
-  rejected.
+- Partially overlapping source spans are rejected, not only exact duplicates;
+  chronological, distinct, non-overlapping excerpts are preserved.
+- The hero must actually appear early: the cap uses **true elapsed block
+  duration** before the hero — including any preceding source `SUPPORT` excerpt
+  — at 3 s, with a stricter 1.5 s cap for short, dense, joke, or payoff-first
+  moments. A long source-support preamble followed by the hero at block 1 is
+  rejected. The authored-material cap is retained as an additional protection,
+  and a 10–20 s preamble is rejected.
 - Blocks per plan are capped at eight and plans at three. Duration/config limits
   are versioned and fingerprinted.
-- Hero appearance time, source/original/narration duration totals, and ratios
-  are computed deterministically; provider arithmetic is never trusted.
+- Hero appearance time (the true elapsed duration before the hero), source/
+  original/narration duration totals, and ratios are computed deterministically
+  and persisted with elapsed/authored evidence for audit; provider arithmetic is
+  never trusted.
 
 Valid structures include source-first, a very short original frame followed by
 source, source/counterpoint/source/synthesis, and mostly uninterrupted source
@@ -178,6 +189,21 @@ make an otherwise repost-like plan valid. Deeper plan-quality judgment is
 deferred to Stage 4.2; no embeddings, extra model, or subjective optimization
 loop is used.
 
+### Hard TTS/rendering/evasion boundary
+
+Every provider-controlled free-text field that can persist into a plan is also
+checked against bounded, explicit policy markers: purpose, semantic intent,
+why-unavailable, draft line, continuity rationale, preservation constraints,
+verification rationale, intended use, grounding refs, and narration language/
+register. Rejected output includes TTS provider/model/voice selection, speaker
+identity, frame-level rendering instructions (`ffmpeg`, timeline, shot list,
+storyboard, keyframe, render instructions), cosmetic-only transformation claims
+(mirroring, pitch shifting, speed tricks, watermark removal/obfuscation), and
+platform-detection/copyright-evasion tactics. Markers are explicit phrases, so
+ordinary semantic wording such as "model" in "explain the model" is never
+blocked. Legitimate narration semantics (purpose, language, register, duration,
+placement, verification dependency) are preserved.
+
 ## Narration abstraction (future TTS contract)
 
 Narration is an abstract semantic requirement only. Need states: `NONE`,
@@ -193,6 +219,9 @@ dependency IDs.
 - If removing an optional narrated block would remove the plan's only
   substantive contribution, that narration cannot be labeled optional: the plan
   must mark it essential/required or be rejected.
+- A substantive block that requires narration delivery while `NarrationNeed.NONE`
+  is recorded is rejected, and a narration-disallowed context cannot accept an
+  essential narration-only contribution.
 - Narration cannot replace or dialect-shift quoted source speech; no speech is
   synthesized.
 
@@ -231,12 +260,16 @@ not.
 
 A strategy marked `REQUIRES_EXTERNAL_FACT_VERIFICATION` must yield at least one
 concrete dependency. The planning provider creates a structured placeholder that
-names the claim/dependency and why it is needed; dependent original blocks
-reference it; the plan status becomes verification-required; the dependency
-blocks execution until verified. No placeholder text may imply verification
-already happened. There is no external browse/search/research subsystem, no
-Gemini search grounding, and no automatic web request. External facts are never
-supplied by the provider.
+names the claim/dependency and why it is needed. Linkage is deterministic and
+persisted: the placeholder lists the integer block indexes of dependent
+substantive blocks, those blocks carry the placeholder's `claim_dependency` value
+in `dependency_ids`, and narration may depend on a claim through
+`verification_dependency_ids`. Bogus, missing, nonexistent, or unlinked
+references are rejected; the plan status becomes verification-required; the
+dependency blocks execution until verified. `must_verify_before_execution=true`
+is preserved. No placeholder text may imply verification already happened. There
+is no external browse/search/research subsystem, no Gemini search grounding, and
+no automatic web request. External facts are never supplied by the provider.
 
 ## Gemini behavior
 
@@ -263,7 +296,11 @@ Requests are batched only within one candidate: pending strategy requests are
 grouped by routine versus strong, at most one call per tier and at most two
 hosted calls per plan-set run, never across unrelated candidates; at most the
 three approved current strategies are included. Each strategy item is parsed
-independently, so one malformed item never invalidates accepted siblings.
+independently, so one malformed item never invalidates accepted siblings. The
+two-call ceiling is a hard **raw** `generate_content` budget: Stage 4.1 performs
+no per-tier retry inside it, the provider refuses a third raw call, and persisted
+metrics report actual raw hosted calls (`hosted_raw_calls`) in addition to outer
+tier invocations (`routine_calls`/`strong_calls`).
 
 Provider output must identify the exact requested Stage 4.0 strategy ID/key.
 Unknown, rejected, stale, duplicate, or omitted strategy identities are invalid
@@ -297,10 +334,27 @@ schema (never the Stage 4.0 directions-only output).
 Accepted cached plan results remain accepted and are never overwritten by a
 transient failure. A missing key, 429, timeout, outage, quota denial, safety
 refusal, or malformed output never fails the source: remaining work is recorded
-as deferred/unavailable, accepted per-strategy checkpoints survive, only
-unfinished work stays non-cache-eligible, and a later normal request retries only
-unfinished strategy work. Deferred and no-valid-plan outcomes are successful
-semantic outcomes.
+as deferred/unavailable, accepted per-strategy checkpoints survive (and are
+re-persisted on every run, including repeated forced reruns), only unfinished
+work stays non-cache-eligible, and a later normal request retries only unfinished
+strategy work. Deferred and no-valid-plan outcomes are successful semantic
+outcomes.
+
+## Durable execution, lease release, and cancellation
+
+A duplicate/redelivered Celery invocation of the same `(plan_set_id, job_id)` is
+fenced by an atomic `QUEUED -> RUNNING` `ProcessingJob` claim performed inside the
+executor, so provider work runs exactly once; the loser records
+`skipped_duplicate` and performs no provider work. Legitimate retries re-claim a
+`FAILED` job, and a run abandoned by a crashed worker is reclaimable after a
+bounded staleness window. The plan-set `active_job_id` compare-and-swap remains
+as an additional guard.
+
+The `local_only` executor retains the exact lease-bound provider wrapper and
+releases it on every exit path (success, provider failure, cancellation, cache
+hit, and exception), so the shared heavy-model lease always exits and its renewer
+stops; a subsequent lease is never blocked. Hosted clients are closed and keys
+scrubbed on the same paths.
 
 ## Fingerprints, cache, and concurrency
 
@@ -415,7 +469,12 @@ ruff format app tests alembic && ruff check app tests alembic
 
 All Stage 4.1 tests are deterministic and hermetic: providers are mocked and no
 test makes a live Gemini, Qwen, web, TTS, or rendering call even when a key is
-present. Known limitation: the repository's strict `mypy` configuration already
-reports the same class of `no-any-return`/`untyped-decorator` findings in the
-frozen Stage 4.0 provider modules and the FastAPI app; Stage 4.1 matches that
+present. The hardening pass advanced planning versions to
+`stage4.1-v2` / `stage4.1-schema-v2` / `stage4.1-validation-v2` (real
+verification-block linkage, hero elapsed-time cap, minimum excerpt duration,
+narration-contract checks, overlapping-span rejection, and the
+TTS/rendering/evasion boundary), so prior plans invalidate through the input
+fingerprint. Known limitation: the repository's strict `mypy` configuration
+already reports the same class of `no-any-return`/`untyped-decorator` findings in
+the frozen Stage 4.0 provider modules and the FastAPI app; Stage 4.1 matches that
 existing convention rather than introducing a new lint regime.

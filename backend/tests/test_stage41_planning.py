@@ -209,7 +209,7 @@ def test_counterpoint_external_fact_creates_verification_dependency(
                 verification_rationale="The opposing figure must be verified",
                 intended_use="Balance the claim",
                 must_verify_before_execution=True,
-                dependent_block_ids=("1",),
+                dependent_block_ids=(1,),
             ),
         ),
     )

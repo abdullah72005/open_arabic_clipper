@@ -383,9 +383,23 @@ class PlanningService:
             status=attempt_status,
             reasons=(provider_plan.no_valid_reason,) if provider_plan.no_valid_plan else (),
             provider_input_fingerprint=provider_input_fp,
-            checkpoint=checkpoint if not reused else None,
+            # Always persist the checkpoint, including on reuse, so an accepted
+            # provider result stays durable across repeated forced reruns and
+            # does not require another hosted call.
+            checkpoint=checkpoint,
         )
         return plan, attempt
+
+    def _raw_hosted_calls(self) -> int:
+        """Actual raw hosted calls reported by the provider (not tier invocations)."""
+
+        counter = getattr(self._provider, "raw_call_count", None)
+        if callable(counter):
+            try:
+                return int(counter())
+            except Exception:
+                return self._provider_calls
+        return self._provider_calls
 
     def _validate(
         self,
@@ -475,6 +489,7 @@ class PlanningService:
             "gemini_calls": self._provider_calls,
             "routine_calls": self._routine_calls,
             "strong_calls": self._strong_calls,
+            "hosted_raw_calls": self._raw_hosted_calls(),
             "cache_hits": sum(1 for attempt in attempts if attempt.status == _ATTEMPT_REUSED),
             "checkpoint_reuses": sum(
                 1 for attempt in attempts if attempt.status == _ATTEMPT_REUSED
