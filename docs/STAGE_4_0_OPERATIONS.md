@@ -86,6 +86,23 @@ new value; their names alone are never enough. Directions are not scripts and
 contain no completed narration, hook text, edit timeline, shot list, TTS text, or
 rendering instruction.
 
+### Substantive value must be grounded
+
+A deterministic recommendation requires a concrete, candidate-specific value-add
+basis supported by available evidence: a specific missing contextual gap,
+inference, explanation target, comparison basis, counterpoint,
+verification/correction requirement, synthesis, authored thesis, useful takeaway,
+or source-as-evidence framing. Static strategy scores, Stage 3 quality, transcript
+length, hook presence, or generic template wording never establish value on their
+own. When no such evidence exists, Stage 4.0 returns
+`NO_TRANSFORMATION_STRATEGY_WORTH_USING` (or, for a serious complex case, defers
+to selective provider discovery); it never invents facts or requires external
+research. Value-focus text quotes or names the concrete evidence rather than
+emitting a generic phrase, e.g. `Advance the stated thesis: "<candidate claim>"`.
+The same grounding check applies to provider directions: an ungrounded or
+generic focus is rejected.
+
+
 ## Retention preservation
 
 Every recommended direction keeps the strongest source moment as the hero. The
@@ -201,6 +218,26 @@ the same provider-input fingerprint. A changed transcript, refined boundary,
 Stage 3 evidence, deterministic/transformation policy, selected provider/model,
 prompt, or schema invalidates correctly; unrelated rendering/publishing changes
 do not.
+
+Queue-time cache validation uses the same settings-derived Stage 4.0
+configuration, provider mode, and provider runtime identity that execution uses,
+so an adaptive or `local_only` cached analysis is reused instead of re-queued and
+never triggers a second provider call. The Stage 4.1 handoff evaluates freshness
+against that same current runtime identity, so a just-completed analysis is not
+immediately stale and a relevant policy/config/provider/model/prompt change is
+detected.
+
+### Concurrency safety
+
+Concurrent queue requests for one candidate are transaction-safe. Analysis
+creation recovers from a `clip_candidate_id` uniqueness race inside a savepoint,
+and active-job claiming is a single conditional
+`UPDATE ... SET active_job_id = :job WHERE id = :id AND active_job_id IS NULL`
+compare-and-swap that both PostgreSQL and SQLite evaluate atomically (a losing
+writer re-evaluates the predicate after the winner commits and observes zero
+rows). Simultaneous requests therefore yield one analysis and at most one active
+Stage 4.0 job, reuse the active job instead of duplicating it, and never surface
+a uniqueness `IntegrityError` or 500 during normal concurrent queueing.
 
 ## Cancellation and resource safety
 

@@ -21,15 +21,23 @@ refinement and is **not** added to the automatic `_NEXT_STAGE` chain.
 - **Deterministic first.** Hard gates own transcript/context sufficiency,
   transformation necessity, source-moment structure, content-to-strategy
   suitability, presentation-only zero credit, anti-slop validation, retention,
-  originality, filler, and final eligibility. There is no single "transformation
-  score"; ranking uses ordered transparent criteria after hard filtering.
+  originality, filler, and final eligibility. A deterministic recommendation also
+  requires a concrete, candidate-specific value-add basis supported by available
+  evidence (a specific context gap, inference, explanation target, comparison,
+  counterpoint, verification, synthesis, thesis, takeaway, or source-as-evidence
+  framing); static scores, quality, length, hooks, or generic templates never
+  establish value on their own, and absent evidence yields
+  `NO_TRANSFORMATION_STRATEGY_WORTH_USING` or defers to selective provider
+  discovery. There is no single "transformation score"; ranking uses ordered
+  transparent criteria after hard filtering.
   `NO_TRANSFORMATION_STRATEGY_WORTH_USING` is a successful, cache-eligible
   completed result that may contain zero recommended strategies.
 - **Bounded strategy directions.** At most three recommended and three useful
   rejected directions from the closed 15-value set, each carrying independent
   assessments, preservation requirements, verification flags, and a stable
   strategy fingerprint. Directions are not scripts and contain no narration,
-  timeline, TTS, or rendering fields.
+  timeline, TTS, or rendering fields. Value-focus text quotes or names concrete
+  candidate evidence, and ungrounded provider directions are rejected.
 - **Providers are optional.** `deterministic` makes zero Gemini/Qwen calls;
   `adaptive` (default) selects one hosted tier per analysis
   (`gemini-3.5-flash-lite` routine, `gemini-3.8-flash` low-thinking for
@@ -44,13 +52,22 @@ refinement and is **not** added to the automatic `_NEXT_STAGE` chain.
   for explicit stored conflicts. The platform-risk snapshot is decision support,
   not legal or monetization advice; official platform guidance was checked
   2026-09-14.
+- **Cache, freshness, concurrency.** Queue-time cache validation and Stage 4.1
+  handoff freshness use the same settings-derived config/mode/provider runtime
+  identity as execution, so adaptive/local-only cached work is reused without a
+  second provider call and a just-completed non-default-config analysis is not
+  immediately stale. Concurrent queue requests are transaction-safe (savepoint
+  uniqueness recovery plus an atomic `active_job_id IS NULL` compare-and-swap),
+  yielding one analysis and at most one active job with no escaped
+  `IntegrityError`/500.
 - **API/CLI/handoff.** Minimal endpoints queue/read one analysis and expose a
   typed read-only Stage 4.1 handoff (`stage4_1_implemented=false`) that reports
   stale instead of mixing current transcript data with old strategies.
 
-Deterministic verification: 62 focused Stage 4.0 tests plus the full backend
-suite (861 tests in Docker Python 3.12 with the repository compose/.env files
-mounted) pass with no live provider calls in the automated suite. See
+Deterministic verification: 72 focused Stage 4.0 tests (passing both with and
+without a Gemini key present) plus the full backend suite in Docker Python 3.12
+with the repository compose/.env files mounted, with no live provider calls in
+the automated suite. See
 [docs/STAGE_4_0_OPERATIONS.md](docs/STAGE_4_0_OPERATIONS.md).
 
 ## Stage 3.7 performance instrumentation (2026-09-12)

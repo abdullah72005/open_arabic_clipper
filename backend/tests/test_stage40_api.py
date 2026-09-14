@@ -10,7 +10,12 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import Session, sessionmaker
+from stage40_support import (
+    FakeStage40Settings,
+    FakeTransformationProvider,
+    install_stage40_settings,
+)
 
 from app.api.app import create_app
 from app.core.enums import (
@@ -23,6 +28,7 @@ from app.core.enums import (
     RefinementStatus,
     RightsRisk,
     RightsStatus,
+    SemanticProviderMode,
 )
 from app.core.settings import get_settings
 from app.db.base import Base
@@ -33,14 +39,17 @@ from app.models import (
     Transcript,
 )
 from app.services.storage import StorageService
-from app.transformation.executor import TransformationEligibilityExecutor
-from app.transformation.policy import DEFAULT_CONFIG
+from app.transformation.executor import build_transformation_executor
+from app.transformation.policy import Stage40Config
 from app.workers.tasks import _NEXT_STAGE
 
 STRONG_TRANSCRIPT = (
     "The guest argues that remote work collapsed productivity because managers lost the "
     "ability to mentor junior staff and the data shows promotion rates fell sharply."
 )
+
+
+ApiFixture = tuple[TestClient, sessionmaker[Session]]
 
 
 class RecordingDispatcher:
@@ -52,10 +61,10 @@ class RecordingDispatcher:
 
 
 @pytest.fixture
-def dispatched(monkeypatch: pytest.MonkeyPatch) -> list[tuple]:
-    calls: list[tuple] = []
+def dispatched(monkeypatch: pytest.MonkeyPatch) -> list[tuple[object, ...]]:
+    calls: list[tuple[object, ...]] = []
 
-    def _delay(*args, **kwargs):
+    def _delay(*args: object, **kwargs: object) -> None:
         calls.append((args, kwargs))
 
     monkeypatch.setattr("app.workers.tasks.run_transformation_analysis.delay", _delay)
@@ -64,11 +73,15 @@ def dispatched(monkeypatch: pytest.MonkeyPatch) -> list[tuple]:
 
 @pytest.fixture
 def api(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dispatched
-) -> Iterator[tuple[TestClient, sessionmaker]]:
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    dispatched: list[tuple[object, ...]],
+) -> Iterator[ApiFixture]:
     monkeypatch.delenv("CLIPFACTORY_GEMINI_API_KEY", raising=False)
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     get_settings.cache_clear()
+    settings = FakeStage40Settings(mode=SemanticProviderMode.DETERMINISTIC)
+    install_stage40_settings(monkeypatch, settings)
     engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'api40.sqlite3'}")
     Base.metadata.create_all(engine)
     factory = sessionmaker(bind=engine, expire_on_commit=False)
@@ -77,12 +90,12 @@ def api(
     app.state.session_factory = factory
     app.state.storage = storage
     with TestClient(app) as client:
-        client.session_factory = factory  # type: ignore[attr-defined]
+        client.session_factory = factory
         yield client, factory
 
 
 def _seed(
-    factory: sessionmaker,
+    factory: sessionmaker[Session],
     *,
     transcript: str = STRONG_TRANSCRIPT,
     content_type: ContentType = ContentType.INTERVIEW_INSIGHT,
@@ -174,31 +187,37 @@ def _seed(
         return candidate.id, source.id
 
 
-def _run(factory: sessionmaker, candidate_id: uuid.UUID) -> None:
+def _run(
+    factory: sessionmaker[Session],
+    candidate_id: uuid.UUID,
+    config: Stage40Config | None = None,
+) -> None:
     with factory() as session:
         from app.transformation.queue import get_or_create_analysis
 
         candidate = session.get(ClipCandidate, candidate_id)
         analysis = get_or_create_analysis(session, candidate)
-        TransformationEligibilityExecutor(session=session, config=DEFAULT_CONFIG).execute(
-            analysis.id
+        settings = FakeStage40Settings(
+            mode=SemanticProviderMode.DETERMINISTIC,
+            config=config or Stage40Config(),
         )
+        build_transformation_executor(session, settings).execute(analysis.id)
 
 
-def test_queue_requires_refinement_prerequisite(api) -> None:
+def test_queue_requires_refinement_prerequisite(api: ApiFixture) -> None:
     client, factory = api
     candidate_id, _ = _seed(factory, with_refinement=False)
     response = client.post(f"/api/candidates/{candidate_id}/transformation-analyses")
     assert response.status_code == 409
 
 
-def test_queue_missing_candidate_is_404(api) -> None:
+def test_queue_missing_candidate_is_404(api: ApiFixture) -> None:
     client, _ = api
     response = client.post(f"/api/candidates/{uuid.uuid4()}/transformation-analyses")
     assert response.status_code == 404
 
 
-def test_queue_and_fetch_analysis(api, dispatched) -> None:
+def test_queue_and_fetch_analysis(api: ApiFixture, dispatched: list[tuple[object, ...]]) -> None:
     client, factory = api
     candidate_id, _ = _seed(factory)
     response = client.post(f"/api/candidates/{candidate_id}/transformation-analyses")
@@ -217,14 +236,14 @@ def test_queue_and_fetch_analysis(api, dispatched) -> None:
     assert by_id.status_code == 200
 
 
-def test_analysis_not_found_before_running(api) -> None:
+def test_analysis_not_found_before_running(api: ApiFixture) -> None:
     client, factory = api
     candidate_id, _ = _seed(factory)
     response = client.get(f"/api/candidates/{candidate_id}/transformation-analysis")
     assert response.status_code == 404
 
 
-def test_handoff_is_ready_when_current(api) -> None:
+def test_handoff_is_ready_when_current(api: ApiFixture) -> None:
     client, factory = api
     candidate_id, _ = _seed(factory)
     _run(factory, candidate_id)
@@ -238,7 +257,7 @@ def test_handoff_is_ready_when_current(api) -> None:
     assert payload["recommended_strategies"]
 
 
-def test_handoff_reports_stale_when_upstream_changes(api) -> None:
+def test_handoff_reports_stale_when_upstream_changes(api: ApiFixture) -> None:
     client, factory = api
     candidate_id, _ = _seed(factory)
     _run(factory, candidate_id)
@@ -253,7 +272,59 @@ def test_handoff_reports_stale_when_upstream_changes(api) -> None:
     assert payload["ready_for_stage4_1"] is False
 
 
-def test_handoff_no_strategy_is_valid_not_500(api) -> None:
+def test_handoff_current_with_non_default_config_and_stale_on_change(
+    api: ApiFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client, factory = api
+    config = Stage40Config(provider_max_output_tokens=1024)
+    install_stage40_settings(
+        monkeypatch, FakeStage40Settings(mode=SemanticProviderMode.DETERMINISTIC, config=config)
+    )
+    candidate_id, _ = _seed(factory)
+    _run(factory, candidate_id, config=config)
+    first = client.get(f"/api/candidates/{candidate_id}/stage4-1-handoff").json()
+    assert first["stale"] is False
+    assert first["ready_for_stage4_1"] is True
+
+    # A relevant config change must invalidate freshness.
+    install_stage40_settings(
+        monkeypatch,
+        FakeStage40Settings(
+            mode=SemanticProviderMode.DETERMINISTIC,
+            config=Stage40Config(provider_max_output_tokens=512),
+        ),
+    )
+    second = client.get(f"/api/candidates/{candidate_id}/stage4-1-handoff").json()
+    assert second["stale"] is True
+    assert second["ready_for_stage4_1"] is False
+
+
+def test_handoff_stale_when_provider_identity_changes(
+    api: ApiFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client, factory = api
+    provider = FakeTransformationProvider(model="fake-model-v1")
+    settings = FakeStage40Settings(provider=provider, mode=SemanticProviderMode.ADAPTIVE)
+    install_stage40_settings(monkeypatch, settings)
+    candidate_id, _ = _seed(factory)
+    with factory() as session:
+        from app.transformation.queue import get_or_create_analysis
+
+        candidate = session.get(ClipCandidate, candidate_id)
+        analysis = get_or_create_analysis(session, candidate)
+        build_transformation_executor(session, settings).execute(analysis.id)
+    first = client.get(f"/api/candidates/{candidate_id}/stage4-1-handoff").json()
+    assert first["stale"] is False
+
+    changed = FakeTransformationProvider(model="fake-model-v2")
+    install_stage40_settings(
+        monkeypatch, FakeStage40Settings(provider=changed, mode=SemanticProviderMode.ADAPTIVE)
+    )
+    second = client.get(f"/api/candidates/{candidate_id}/stage4-1-handoff").json()
+    assert second["stale"] is True
+
+
+def test_handoff_no_strategy_is_valid_not_500(api: ApiFixture) -> None:
     client, factory = api
     candidate_id, _ = _seed(
         factory,
@@ -270,7 +341,9 @@ def test_handoff_no_strategy_is_valid_not_500(api) -> None:
     assert payload["ready_for_stage4_1"] is False
 
 
-def test_cli_transformation_commands(api, monkeypatch, capsys) -> None:
+def test_cli_transformation_commands(
+    api: ApiFixture, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
     client, factory = api
     candidate_id, _ = _seed(factory)
     _run(factory, candidate_id)

@@ -230,8 +230,8 @@ STRATEGY_VALUE_KINDS: dict[TransformationStrategyType, tuple[str, ...]] = {
     TransformationStrategyType.ANALYSIS: ("AUTHORED_THESIS", "EXPLANATION", "SYNTHESIS"),
     TransformationStrategyType.SUMMARY: ("SYNTHESIS", "USEFUL_TAKEAWAY"),
     TransformationStrategyType.COMPARISON: ("COMPARISON", "SYNTHESIS"),
-    TransformationStrategyType.COUNTERPOINT: ("COUNTERPOINT", "AUTHORED_THESIS"),
-    TransformationStrategyType.REACTION_FRAMING: ("AUTHORED_THESIS", "SYNTHESIS"),
+    TransformationStrategyType.COUNTERPOINT: ("COUNTERPOINT",),
+    TransformationStrategyType.REACTION_FRAMING: ("AUTHORED_THESIS",),
     TransformationStrategyType.QUESTION_EXPLANATION_TAKEAWAY: (
         "EXPLANATION",
         "USEFUL_TAKEAWAY",

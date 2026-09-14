@@ -14,22 +14,13 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.core.enums import StrategyDisposition
+from app.core.settings import get_settings
 from app.models import CandidateRefinement, ClipCandidate
-from app.transformation.eligibility import derive_source_moment, transformation_necessity
-from app.transformation.fingerprints import (
-    build_input_fingerprint_payload,
-    transformation_input_fingerprint,
-)
-from app.transformation.inputs import (
-    build_transformation_inputs,
-    resolve_effective_refinement,
-)
-from app.transformation.policy import DEFAULT_CONFIG
+from app.transformation.executor import build_transformation_executor
 from app.transformation.queue import (
     get_analysis_for_candidate,
     list_strategies,
 )
-from app.transformation.service import compute_provider_route
 
 
 def _as_uuid(value: uuid.UUID | str) -> uuid.UUID:
@@ -223,35 +214,22 @@ def _strategy_dict(row: Any) -> dict[str, object]:
 
 
 def _staleness(session: Session, candidate: ClipCandidate, analysis: Any) -> tuple[bool, bool]:
-    refinement = resolve_stored_refinement(session, analysis)
-    if refinement is None:
+    """Compare the stored input fingerprint to the current runtime identity.
+
+    Freshness uses the same settings-derived Stage 4.0 config, provider mode, and
+    provider runtime identity that execution uses, so a just-completed analysis
+    is not immediately stale and a relevant policy/config/provider/model/prompt
+    change is detected. Unrelated rendering/publishing settings are absent from
+    the fingerprint entirely.
+    """
+
+    if not analysis.input_fingerprint:
         return False, False
     try:
-        inputs = build_transformation_inputs(session, candidate, refinement, DEFAULT_CONFIG)
+        executor = build_transformation_executor(session, get_settings())
+        current = executor.input_fingerprint(candidate)
     except Exception:
         return False, False
-    structure = derive_source_moment(inputs, DEFAULT_CONFIG)
-    necessity = transformation_necessity(inputs)
-    route = compute_provider_route(inputs, structure, necessity)
-    payload = build_input_fingerprint_payload(
-        inputs=inputs,
-        config=DEFAULT_CONFIG,
-        provider_identity=dict(analysis.provider_identity or {}),
-        provider_mode=analysis.provider_mode.value,
-        provider_route=route,
-    )
-    current = transformation_input_fingerprint(payload)
-    if analysis.input_fingerprint and current != analysis.input_fingerprint:
-        return True, False
-    return False, bool(analysis.input_fingerprint)
-
-
-def resolve_stored_refinement(session: Session, analysis: Any) -> CandidateRefinement | None:
-    if analysis.refinement_id:
-        row = session.get(CandidateRefinement, analysis.refinement_id)
-        if row is not None:
-            return row
-    candidate = session.get(ClipCandidate, analysis.clip_candidate_id)
-    if candidate is None:
-        return None
-    return resolve_effective_refinement(session, candidate)
+    if not current:
+        return False, False
+    return (current != analysis.input_fingerprint), True

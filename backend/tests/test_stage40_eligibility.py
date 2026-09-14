@@ -191,8 +191,11 @@ def test_setup_before_short_payoff_is_rejected_for_damage() -> None:
         coarse_end=10.0,
         refined_end=9.5,
         moment_density_score=0.9,
-        transcript="He jumped from the roof into the pool and everyone screamed and laughed.",
-        idea_summary="roof jump into pool",
+        transcript=(
+            "He jumped from the roof into the pool because his friends dared him and "
+            "everyone screamed and laughed loudly."
+        ),
+        idea_summary="Friends dared him to jump and he did",
         hooks=({"type": "PAYOFF_FIRST"},),
     )
     outcome = evaluate(short)
@@ -202,7 +205,7 @@ def test_setup_before_short_payoff_is_rejected_for_damage() -> None:
     assert any("HOOK_PAYOFF_DAMAGE" in item.rejection_reasons for item in rejected)
 
 
-def test_least_intrusive_sufficient_intensity_is_preferred_for_funny() -> None:
+def test_funny_without_grounded_value_has_no_strategy() -> None:
     funny = make_inputs(
         content_type=ContentType.FUNNY,
         transcript="He walked straight into the glass door while everyone watched and laughed.",
@@ -210,6 +213,25 @@ def test_least_intrusive_sufficient_intensity_is_preferred_for_funny() -> None:
         hooks=({"type": "PAYOFF_FIRST"},),
     )
     outcome = evaluate(funny)
+    assert (
+        outcome.eligibility_outcome
+        is TransformationEligibilityOutcome.NO_TRANSFORMATION_STRATEGY_WORTH_USING
+    )
+    assert outcome.recommended == ()
+
+
+def test_funny_with_grounded_inference_prefers_minimal_and_preserves_retention() -> None:
+    grounded = make_inputs(
+        content_type=ContentType.FUNNY,
+        transcript=(
+            "The pigeon stole his sandwich because he left it on the bench and then "
+            "everyone laughed."
+        ),
+        idea_summary="Pigeon stole the sandwich when he looked away",
+        hooks=({"type": "PAYOFF_FIRST"},),
+    )
+    outcome = evaluate(grounded)
+    assert outcome.recommended
     assert outcome.recommended[0].intensity is TransformationIntensity.MINIMAL
     assert outcome.recommended[0].assessments.retention_preservation >= 0.8
 
@@ -221,7 +243,7 @@ def test_interview_suitability_includes_evidence_analysis_counterpoint() -> None
     assert TransformationStrategyType.ANALYSIS in types
 
 
-def test_educational_prefers_explanation_and_comparison() -> None:
+def test_educational_prefers_explanation_and_takeaway() -> None:
     educational = make_inputs(
         content_type=ContentType.EDUCATIONAL,
         transcript="Hold the stone at 20 degrees and push the blade away five times per side.",
@@ -231,7 +253,7 @@ def test_educational_prefers_explanation_and_comparison() -> None:
     outcome = evaluate(educational)
     types = {item.strategy_type for item in outcome.recommended}
     assert TransformationStrategyType.EXPLANATORY in types
-    assert TransformationStrategyType.COMPARISON in types
+    assert TransformationStrategyType.HOOK_PLUS_TAKEAWAY in types
 
 
 def test_news_marks_external_verification_requirement() -> None:
@@ -387,6 +409,50 @@ def test_multiple_candidates_do_not_receive_identical_templates() -> None:
     first_focus = {item.added_value_focus for item in first.recommended}
     second_focus = {item.added_value_focus for item in second.recommended}
     assert first_focus != second_focus
+
+
+def test_high_quality_moment_without_evidenced_value_has_no_strategy() -> None:
+    """High Stage 3 scores alone never establish substantive original value."""
+
+    high_quality = make_inputs(
+        content_type=ContentType.REACTION_WORTHY,
+        transcript="The car flipped three times and landed on its wheels and he walked out.",
+        idea_summary="car flips and driver walks out",
+        hooks=({"type": "PAYOFF_FIRST"},),
+        clip_score=0.95,
+        short_form_score=0.9,
+        moment_density_score=0.85,
+        ending_quality_score=0.9,
+        loopability_score=0.8,
+    )
+    outcome = evaluate(high_quality)
+    assert (
+        outcome.eligibility_outcome
+        is TransformationEligibilityOutcome.NO_TRANSFORMATION_STRATEGY_WORTH_USING
+    )
+    assert outcome.recommended == ()
+    assert any("NO_EVIDENCED_VALUE_BASIS" in item.rejection_reasons for item in outcome.rejected)
+
+
+def test_high_quality_moment_with_grounded_inference_is_eligible() -> None:
+    grounded = make_inputs(
+        content_type=ContentType.OTHER,
+        transcript="The new tariff policy caused prices to spike because supply collapsed.",
+        idea_summary="tariff policy caused price spike",
+        topic_summary="tariff policy economics",
+        hooks=(),
+        clip_score=0.95,
+        short_form_score=0.9,
+        moment_density_score=0.85,
+        ending_quality_score=0.9,
+        loopability_score=0.8,
+    )
+    outcome = evaluate(grounded)
+    assert (
+        outcome.eligibility_outcome is TransformationEligibilityOutcome.ELIGIBLE_FOR_TRANSFORMATION
+    )
+    assert outcome.recommended
+    assert all(item.added_value_focus for item in outcome.recommended)
 
 
 def test_dialect_remains_source_evidence_not_target_market() -> None:

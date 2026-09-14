@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 from collections.abc import Iterator, Sequence
+from pathlib import Path
 
 import pytest
 from sqlalchemy import Engine, func, select
 from sqlalchemy.orm import Session
+from stage40_support import (
+    FakeStage40Settings,
+    install_stage40_settings,
+)
 
 from app.core.enums import (
     CandidateDisposition,
@@ -39,6 +44,7 @@ from app.models import (
 from app.transformation.executor import (
     TransformationCancelled,
     TransformationEligibilityExecutor,
+    build_transformation_executor,
 )
 from app.transformation.providers import (
     TransformationProviderError,
@@ -46,6 +52,7 @@ from app.transformation.providers import (
 )
 from app.transformation.queue import (
     TransformationQueueError,
+    TransformationQueueOutcome,
     queue_transformation_analysis,
     validate_candidate_for_transformation,
 )
@@ -202,8 +209,10 @@ class FakeProvider:
 
 
 def _executor(
-    session: Session, provider: FakeProvider | None = None, mode=SemanticProviderMode.DETERMINISTIC
-):
+    session: Session,
+    provider: FakeProvider | None = None,
+    mode: SemanticProviderMode = SemanticProviderMode.DETERMINISTIC,
+) -> TransformationEligibilityExecutor:
     return TransformationEligibilityExecutor(session=session, provider=provider, mode=mode)
 
 
@@ -443,12 +452,15 @@ def test_unrelated_rendering_settings_are_not_in_fingerprint(session: Session) -
 def test_concurrent_active_queue_does_not_duplicate(
     session: Session, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    calls: list[tuple] = []
+    calls: list[tuple[object, ...]] = []
 
     def _delay(*args: object, **_kwargs: object) -> None:
         calls.append(args)
 
     monkeypatch.setattr("app.workers.tasks.run_transformation_analysis.delay", _delay)
+    install_stage40_settings(
+        monkeypatch, FakeStage40Settings(mode=SemanticProviderMode.DETERMINISTIC)
+    )
     _, candidate, _ = seed(session)
     first = queue_transformation_analysis(session, candidate)
     second = queue_transformation_analysis(session, candidate)
@@ -468,18 +480,176 @@ def test_concurrent_active_queue_does_not_duplicate(
 
 def test_queue_cache_hit_after_execution(session: Session, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("app.workers.tasks.run_transformation_analysis.delay", lambda *a, **k: None)
+    settings = FakeStage40Settings(mode=SemanticProviderMode.DETERMINISTIC)
+    install_stage40_settings(monkeypatch, settings)
     _, candidate, _ = seed(session)
     outcome = queue_transformation_analysis(session, candidate)
     queued_job = session.get(ProcessingJob, outcome.job_id)
     queued_job.status = JobStatus.SUCCEEDED
     session.commit()
     analysis = _analysis(session, candidate)
-    _executor(session).execute(outcome.analysis_id)
+    build_transformation_executor(session, settings).execute(outcome.analysis_id)
     again = queue_transformation_analysis(session, candidate)
     assert again.cached is True
     assert again.job_id is None
     session.refresh(analysis)
     assert analysis.cache_eligible is True
+
+
+def _run_via_settings(
+    session: Session, settings: FakeStage40Settings, candidate_id: object
+) -> None:
+    from app.transformation.queue import get_or_create_analysis
+
+    candidate = session.get(ClipCandidate, candidate_id)
+    analysis = get_or_create_analysis(session, candidate)
+    build_transformation_executor(session, settings).execute(analysis.id)
+
+
+def test_adaptive_cache_hit_reuses_output_without_second_provider_call(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("app.workers.tasks.run_transformation_analysis.delay", lambda *a, **k: None)
+    provider = FakeProvider()
+    settings = FakeStage40Settings(provider=provider, mode=SemanticProviderMode.ADAPTIVE)
+    install_stage40_settings(monkeypatch, settings)
+    _, candidate, _ = seed(session)
+    _run_via_settings(session, settings, candidate.id)
+    analysis = _analysis(session, candidate)
+    session.refresh(analysis)
+    assert analysis.cache_eligible is True
+    assert provider.calls == 1
+    again = queue_transformation_analysis(session, candidate)
+    assert again.cached is True
+    assert again.job_id is None
+    assert provider.calls == 1
+    assert (
+        session.scalar(
+            select(func.count())
+            .select_from(ProcessingJob)
+            .where(ProcessingJob.kind == JobKind.TRANSFORMATION_ELIGIBILITY)
+        )
+        == 0
+    )
+
+
+def test_local_only_cache_hit_reuses_output_without_second_provider_call(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("app.workers.tasks.run_transformation_analysis.delay", lambda *a, **k: None)
+    provider = FakeProvider()
+    settings = FakeStage40Settings(provider=provider, mode=SemanticProviderMode.LOCAL_ONLY)
+    install_stage40_settings(monkeypatch, settings)
+    _, candidate, _ = seed(session)
+    _run_via_settings(session, settings, candidate.id)
+    analysis = _analysis(session, candidate)
+    session.refresh(analysis)
+    assert analysis.cache_eligible is True
+    assert provider.calls == 1
+    again = queue_transformation_analysis(session, candidate)
+    assert again.cached is True
+    assert provider.calls == 1
+
+
+def test_deterministic_cache_hit_reuses_output(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("app.workers.tasks.run_transformation_analysis.delay", lambda *a, **k: None)
+    settings = FakeStage40Settings(mode=SemanticProviderMode.DETERMINISTIC)
+    install_stage40_settings(monkeypatch, settings)
+    _, candidate, _ = seed(session)
+    _run_via_settings(session, settings, candidate.id)
+    analysis = _analysis(session, candidate)
+    session.refresh(analysis)
+    assert analysis.cache_eligible is True
+    again = queue_transformation_analysis(session, candidate)
+    assert again.cached is True
+    assert again.job_id is None
+
+
+def test_cache_misses_when_provider_identity_changes(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("app.workers.tasks.run_transformation_analysis.delay", lambda *a, **k: None)
+    provider = FakeProvider()
+    settings = FakeStage40Settings(provider=provider, mode=SemanticProviderMode.ADAPTIVE)
+    install_stage40_settings(monkeypatch, settings)
+    _, candidate, _ = seed(session)
+    _run_via_settings(session, settings, candidate.id)
+    # A changed provider runtime identity must invalidate the cache.
+    changed = FakeProvider()
+    changed.model = "fake-model-v2"
+    install_stage40_settings(
+        monkeypatch, FakeStage40Settings(provider=changed, mode=SemanticProviderMode.ADAPTIVE)
+    )
+    again = queue_transformation_analysis(session, candidate)
+    assert again.cached is False
+    assert again.queued is True
+
+
+def test_concurrent_two_session_queue_creates_one_analysis_and_one_job(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import threading
+
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    engine = create_engine(
+        f"sqlite+pysqlite:///{tmp_path / 'concurrent40.sqlite3'}",
+        connect_args={"check_same_thread": False, "timeout": 30},
+    )
+    factory = sessionmaker(bind=engine, expire_on_commit=False)
+    Base.metadata.create_all(engine)
+    with factory() as setup:
+        _, candidate, _ = seed(setup)
+        candidate_id = candidate.id
+
+    calls: list[tuple[object, ...]] = []
+    monkeypatch.setattr(
+        "app.workers.tasks.run_transformation_analysis.delay",
+        lambda *a, **k: calls.append(a),
+    )
+    install_stage40_settings(
+        monkeypatch, FakeStage40Settings(mode=SemanticProviderMode.DETERMINISTIC)
+    )
+    barrier = threading.Barrier(2)
+    outcomes: list[TransformationQueueOutcome] = []
+    errors: list[BaseException] = []
+
+    def worker() -> None:
+        with factory() as worker_session:
+            candidate = worker_session.get(ClipCandidate, candidate_id)
+            try:
+                barrier.wait(timeout=30)
+                outcomes.append(queue_transformation_analysis(worker_session, candidate))
+            except BaseException as error:  # noqa: BLE001 - captured for assertion
+                errors.append(error)
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=60)
+
+    assert errors == []
+    assert len(outcomes) == 2
+    analysis_ids = {outcome.analysis_id for outcome in outcomes}
+    assert len(analysis_ids) == 1
+    with factory() as verify:
+        from app.models import TransformationEligibilityAnalysis
+
+        analyses = verify.scalars(select(TransformationEligibilityAnalysis)).all()
+        assert len(analyses) == 1
+        active_jobs = verify.scalars(
+            select(ProcessingJob).where(
+                ProcessingJob.kind == JobKind.TRANSFORMATION_ELIGIBILITY,
+                ProcessingJob.status.in_({JobStatus.QUEUED, JobStatus.RUNNING}),
+            )
+        ).all()
+        assert len(active_jobs) == 1
+        assert len(calls) == 1
+    engine.dispose()
 
 
 def test_accepted_hosted_output_survives_later_outage(session: Session) -> None:
@@ -506,7 +676,9 @@ def test_deterministic_results_survive_bad_provider_direction(session: Session) 
     )
 
     class BadProvider(FakeProvider):
-        def discover(self, requests):  # type: ignore[override]
+        def discover(
+            self, requests: Sequence[TransformationStrategyRequest]
+        ) -> dict[str, TransformationProviderResult]:
             self.calls += 1
             strategy = TransformationProviderStrategy(
                 strategy_type=TransformationStrategyType.SUMMARY,

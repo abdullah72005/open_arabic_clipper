@@ -12,6 +12,7 @@ unverified external fact without marking it. There is no single
 from __future__ import annotations
 
 from app.core.enums import (
+    ContentType,
     ExternalFactRequirement,
     SourceMomentStructure,
     StrategyDisposition,
@@ -54,6 +55,120 @@ REJECT_EXTERNAL_FACT = "UNVERIFIED_EXTERNAL_FACT"
 REJECT_SCRIPT_SHAPED = "SCRIPT_OR_TIMELINE_SHAPED"
 REJECT_LOW_VALUE_DENSITY = "LOW_ADDED_VALUE_DENSITY"
 REJECT_TEMPLATE_STALENESS = "TEMPLATE_STALENESS"
+REJECT_NO_EVIDENCED_VALUE = "NO_EVIDENCED_VALUE_BASIS"
+
+# Concreteness cues for grounded value-add detection. These only help locate an
+# existing candidate-specific opportunity; they never establish value by
+# themselves, and an absent opportunity yields no recommended strategy.
+_CAUSAL_CUES = (
+    "because",
+    "since",
+    "due to",
+    "led to",
+    "leads to",
+    "caused",
+    "therefore",
+    "thus",
+    "hence",
+    "نتيجة",
+    "بسبب",
+    "لأن",
+    "عشان",
+    "علشان",
+    "أدى",
+    "يؤدي",
+)
+_CONTRAST_CUES = (
+    " but ",
+    " however",
+    " although",
+    " despite",
+    " whereas",
+    " unless",
+    "لكن",
+    "رغم",
+    "بينما",
+    "إلا أن",
+)
+_COMPARISON_CUES = (
+    " than ",
+    " compared",
+    " versus",
+    " vs ",
+    " more than",
+    " less than",
+    "better than",
+    "worse than",
+    "أكثر",
+    "أقل",
+    "أحسن",
+    "أفضل",
+    "مقارنة",
+)
+_EXPLANATION_CUES = ("how ", "why ", "method", "step", "طريقة", "شرح", "خطوة", "سبب")
+_INSTRUCTION_CUES = (
+    "hold ",
+    "push ",
+    "inspect",
+    "use ",
+    "avoid",
+    "keep ",
+    "اضغط",
+    "امسك",
+    "استخدم",
+    "حافظ",
+)
+_STANCE_CUES = (
+    " is ",
+    " are ",
+    " was ",
+    " were ",
+    " means",
+    " causes",
+    " caused",
+    " hurts",
+    " helps",
+    " should",
+    " must",
+    " argues",
+    " believes",
+    " important",
+    " better",
+    " worse",
+    "يعني",
+    "لازم",
+    "يجب",
+    "أهم",
+    "أفضل",
+    "أخطر",
+)
+_MONTHS = (
+    "january",
+    "february",
+    "march",
+    "april",
+    "may",
+    "june",
+    "july",
+    "august",
+    "september",
+    "october",
+    "november",
+    "december",
+    "يناير",
+    "فبراير",
+    "مارس",
+    "أبريل",
+    "مايو",
+    "يونيو",
+    "يوليو",
+    "أغسطس",
+    "سبتمبر",
+    "أكتوبر",
+    "نوفمبر",
+    "ديسمبر",
+)
+
 
 _INTENSITY: dict[TransformationStrategyType, TransformationIntensity] = {
     TransformationStrategyType.SOURCE_LED_MINIMAL: TransformationIntensity.MINIMAL,
@@ -96,7 +211,7 @@ _BASE_ADDED_VALUE: dict[TransformationStrategyType, float] = {
     TransformationStrategyType.SUMMARY: 0.36,
 }
 _BASE_ORIGINALITY: dict[TransformationStrategyType, float] = {
-    TransformationStrategyType.SOURCE_LED_MINIMAL: 0.30,
+    TransformationStrategyType.SOURCE_LED_MINIMAL: 0.46,
     TransformationStrategyType.CONTEXT_HOOK: 0.55,
     TransformationStrategyType.HOOK_PLUS_TAKEAWAY: 0.58,
     TransformationStrategyType.EXPLANATORY: 0.62,
@@ -236,31 +351,252 @@ def _value_kind(strategy: TransformationStrategyType) -> SubstantiveValueKind:
     return _VALUE_KIND_FOR.get(kinds[0], SubstantiveValueKind.SYNTHESIS)
 
 
-def _excerpt(inputs: TransformationInputs, limit: int = 120) -> str:
-    lead = (inputs.idea_summary or inputs.topic_summary).strip()
-    transcript = inputs.transcript.strip()
-    combined = f"{lead} {transcript}".strip()
-    return combined[:limit].rstrip()
+def _bounded(phrase: str, limit: int = 100) -> str:
+    return " ".join(phrase.split())[:limit].strip()
 
 
-def _added_value_focus(
-    strategy: TransformationStrategyType, kind: SubstantiveValueKind, inputs: TransformationInputs
-) -> str:
-    excerpt = _excerpt(inputs)
-    templates = {
-        SubstantiveValueKind.MISSING_CONTEXT: "Supply the context a viewer needs: {e}",
-        SubstantiveValueKind.INFERENCE: "State the original inference here: {e}",
-        SubstantiveValueKind.EXPLANATION: "Explain the reasoning behind the claim: {e}",
-        SubstantiveValueKind.COMPARISON: "Compare this case to a concrete alternative: {e}",
-        SubstantiveValueKind.COUNTERPOINT: "Add a specific counterpoint: {e}",
-        SubstantiveValueKind.VERIFICATION_CORRECTION: "Verify or correct a checkable detail: {e}",
-        SubstantiveValueKind.SYNTHESIS: "Draw the synthesis the source leaves implicit: {e}",
-        SubstantiveValueKind.AUTHORED_THESIS: "Advance an authored thesis: {e}",
-        SubstantiveValueKind.USEFUL_TAKEAWAY: "Give one actionable takeaway: {e}",
-        SubstantiveValueKind.SOURCE_AS_EVIDENCE: "Use this moment as evidence: {e}",
+def _has_cue(text: str, cues: tuple[str, ...]) -> bool:
+    lowered = f" {text.casefold()} "
+    return any(cue in lowered for cue in cues)
+
+
+def _clauses(text: str) -> list[str]:
+    import re
+
+    parts = re.split(r"[.!?؟\n]+", text)
+    return [part.strip() for part in parts if len(part.strip()) >= 12]
+
+
+def _clause_with(text: str, cues: tuple[str, ...]) -> str | None:
+    for clause in _clauses(text):
+        if _has_cue(clause, cues):
+            return clause
+    return None
+
+
+def _claim_phrase(text: str, idea: str) -> str | None:
+    if idea and _has_cue(idea, _STANCE_CUES):
+        return idea
+    for clause in _clauses(text):
+        if _has_cue(clause, _STANCE_CUES):
+            return clause
+    return None
+
+
+def _entity_terms(inputs: TransformationInputs) -> list[str]:
+    import re
+
+    stopwords = {
+        "the",
+        "this",
+        "that",
+        "these",
+        "those",
+        "and",
+        "but",
+        "however",
+        "there",
+        "then",
+        "when",
+        "with",
+        "from",
+        "they",
+        "them",
+        "she",
+        "his",
+        "her",
+        "its",
     }
-    template = templates.get(kind, templates[SubstantiveValueKind.SYNTHESIS])
-    return template.format(e=excerpt)
+    terms: list[str] = []
+    for item in inputs.entity_evidence:
+        if not isinstance(item, dict):
+            continue
+        value = item.get("text") or item.get("normalized")
+        if isinstance(value, str) and value.strip() and value.strip() not in terms:
+            terms.append(value.strip())
+    for token in re.findall(r"\b[A-Z][A-Za-z]{2,}\b", inputs.transcript):
+        if token.casefold() in stopwords or token in terms:
+            continue
+        terms.append(token)
+    return terms
+
+
+def _numeric_terms(text: str) -> list[str]:
+    import re
+
+    found = re.findall(r"\d[\d.,%:/-]*", text)
+    lowered = text.casefold()
+    found.extend(month for month in _MONTHS if month in lowered)
+    return list(dict.fromkeys(found))
+
+
+def _topic_is_broader(topic: str, text: str) -> bool:
+    if not topic.strip():
+        return False
+    lowered = text.casefold()
+    tokens = [token for token in topic.casefold().split() if len(token) >= 4]
+    if not tokens:
+        return topic.casefold() not in lowered
+    return any(token not in lowered for token in tokens)
+
+
+def _appears_once(term: str, text: str) -> bool:
+    return text.casefold().count(term.casefold()) == 1
+
+
+def collect_value_evidence(
+    inputs: TransformationInputs,
+) -> dict[SubstantiveValueKind, str]:
+    """Concrete candidate-specific value-add opportunities supported by evidence.
+
+    Each entry is a bounded focus phrase that quotes or names concrete evidence
+    from the candidate. Static strategy scores, content type, transcript length,
+    hooks, or generic wording never produce an entry here on their own.
+    """
+
+    evidence: dict[SubstantiveValueKind, str] = {}
+    text = inputs.transcript.strip()
+    idea = inputs.idea_summary.strip()
+    topic = inputs.topic_summary.strip()
+    entities = _entity_terms(inputs)
+    numbers = _numeric_terms(text)
+    claim = _claim_phrase(text, idea)
+    causal = _clause_with(text, _CAUSAL_CUES)
+    contrast = _clause_with(text, _CONTRAST_CUES)
+    comparison = _clause_with(text, _COMPARISON_CUES)
+    instruction = _clause_with(text, _INSTRUCTION_CUES)
+
+    if claim:
+        evidence[SubstantiveValueKind.AUTHORED_THESIS] = (
+            f'Advance the stated thesis: "{_bounded(claim)}"'
+        )
+    if causal:
+        evidence[SubstantiveValueKind.INFERENCE] = f'State the inference from: "{_bounded(causal)}"'
+    if inputs.content_type in {
+        ContentType.EDUCATIONAL,
+        ContentType.TUTORIAL,
+        ContentType.ANALYSIS,
+    } or (_has_cue(text, _EXPLANATION_CUES)):
+        target = causal or instruction or claim or idea or text
+        evidence[SubstantiveValueKind.EXPLANATION] = (
+            f'Explain the mechanism behind: "{_bounded(target)}"'
+        )
+    if comparison:
+        evidence[SubstantiveValueKind.COMPARISON] = (
+            f'Compare the alternatives in: "{_bounded(comparison)}"'
+        )
+    elif len(entities) >= 2:
+        evidence[SubstantiveValueKind.COMPARISON] = (
+            f'Compare "{_bounded(entities[0], 40)}" with "{_bounded(entities[1], 40)}"'
+        )
+    if contrast:
+        evidence[SubstantiveValueKind.COUNTERPOINT] = (
+            f'Add the missing counterpoint in: "{_bounded(contrast)}"'
+        )
+    elif (
+        inputs.content_type
+        in {
+            ContentType.CONTROVERSIAL_OPINION,
+            ContentType.DEBATE,
+        }
+        and claim
+    ):
+        evidence[SubstantiveValueKind.COUNTERPOINT] = (
+            f'Add a specific counterpoint to: "{_bounded(claim)}"'
+        )
+    if numbers:
+        evidence[SubstantiveValueKind.VERIFICATION_CORRECTION] = (
+            f'Verify the checkable detail: "{_bounded(numbers[0], 40)}"'
+        )
+    elif entities:
+        evidence[SubstantiveValueKind.VERIFICATION_CORRECTION] = (
+            f'Verify the referenced entity: "{_bounded(entities[0], 40)}"'
+        )
+    clauses = _clauses(text)
+    if len(clauses) >= 2:
+        evidence[SubstantiveValueKind.SYNTHESIS] = (
+            f'Synthesize "{_bounded(clauses[0], 60)}" and "{_bounded(clauses[1], 60)}"'
+        )
+    if inputs.content_type in {
+        ContentType.TUTORIAL,
+        ContentType.EDUCATIONAL,
+        ContentType.MOTIVATIONAL,
+    } or _has_cue(text, _INSTRUCTION_CUES):
+        takeaway = instruction or claim or idea
+        if takeaway:
+            evidence[SubstantiveValueKind.USEFUL_TAKEAWAY] = (
+                f'Turn "{_bounded(takeaway)}" into one takeaway'
+            )
+    if topic and _topic_is_broader(topic, text) and (claim or idea):
+        evidence[SubstantiveValueKind.SOURCE_AS_EVIDENCE] = (
+            f'Use this moment as evidence for: "{_bounded(topic)}"'
+        )
+    if inputs.content_type is ContentType.NEWS_CURRENT_EVENT:
+        anchor = claim or idea or text
+        evidence[SubstantiveValueKind.MISSING_CONTEXT] = (
+            f'Supply the missing context for: "{_bounded(anchor)}"'
+        )
+    elif inputs.content_type is ContentType.DEBATE and claim:
+        evidence[SubstantiveValueKind.MISSING_CONTEXT] = (
+            f'Supply the missing context for: "{_bounded(claim)}"'
+        )
+    elif entities and _appears_once(entities[0], text):
+        evidence[SubstantiveValueKind.MISSING_CONTEXT] = (
+            f'Explain the unexplained reference to "{_bounded(entities[0], 40)}"'
+        )
+    return evidence
+
+
+def _focus_is_grounded(focus: str, inputs: TransformationInputs) -> bool:
+    """A focus must name concrete candidate evidence, not a generic template."""
+
+    if not focus.strip():
+        return False
+    haystack = " ".join(
+        [inputs.transcript, inputs.idea_summary, inputs.topic_summary, *_entity_terms(inputs)]
+    ).casefold()
+    tokens = {
+        token for token in _word_tokens(focus) if len(token) >= 4 and token not in _FOCUS_STOPWORDS
+    }
+    return any(token in haystack for token in tokens)
+
+
+_FOCUS_STOPWORDS = frozenset(
+    {
+        "advance",
+        "stated",
+        "thesis",
+        "explain",
+        "mechanism",
+        "inference",
+        "compare",
+        "alternatives",
+        "counterpoint",
+        "verify",
+        "checkable",
+        "detail",
+        "synthesize",
+        "takeaway",
+        "evidence",
+        "supply",
+        "missing",
+        "context",
+        "reference",
+        "unexplained",
+        "specific",
+        "moment",
+        "source",
+        "behind",
+        "one",
+        "into",
+    }
+)
+
+
+def _word_tokens(text: str) -> list[str]:
+    import re
+
+    return re.findall(r"\w+", text.casefold())
 
 
 def _direction_summary(strategy: TransformationStrategyType, inputs: TransformationInputs) -> str:
@@ -383,6 +719,8 @@ def apply_hard_gates(
         reasons.append(REJECT_DISTORTION)
     if is_paraphrase(combined):
         reasons.append(REJECT_PARAPHRASE)
+    if not _focus_is_grounded(draft.added_value_focus, inputs):
+        reasons.append(REJECT_NO_EVIDENCED_VALUE)
     if draft.strategy_type in NAME_ONLY_STRATEGIES and _substance(inputs) < 0.35:
         reasons.append(REJECT_NO_SUBSTANTIVE_VALUE)
     if draft.assessments.added_value_density < config.min_added_value_density:
@@ -456,9 +794,17 @@ def _candidate_drafts(
     inputs: TransformationInputs, config: Stage40Config, structure: SourceMomentStructure
 ) -> list[StrategyDraft]:
     suitability = CONTENT_SUITABILITY.get(inputs.content_type, ())
+    evidence = collect_value_evidence(inputs)
     drafts: list[StrategyDraft] = []
     for strategy in suitability:
         kind = _value_kind(strategy)
+        focus = ""
+        for candidate_name in STRATEGY_VALUE_KINDS.get(strategy, ()):
+            candidate_kind = _VALUE_KIND_FOR.get(candidate_name)
+            if candidate_kind is not None and candidate_kind in evidence:
+                kind = candidate_kind
+                focus = evidence[candidate_kind]
+                break
         requirement, details = _external_requirement(strategy, structure)
         base = StrategyDraft(
             strategy_type=strategy,
@@ -466,7 +812,7 @@ def _candidate_drafts(
             rank=0,
             intensity=_INTENSITY[strategy],
             direction_summary=_direction_summary(strategy, inputs),
-            added_value_focus=_added_value_focus(strategy, kind, inputs),
+            added_value_focus=focus,
             substantive_value_kind=kind,
             source_moment_role="HERO",
             preservation_requirements=_preservation_requirements(strategy, inputs, config),

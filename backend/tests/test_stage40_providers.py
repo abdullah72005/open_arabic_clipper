@@ -18,7 +18,7 @@ from app.core.enums import (
     SubstantiveValueKind,
     TransformationStrategyType,
 )
-from app.core.settings import Settings
+from app.core.settings import Settings, get_settings
 from app.transformation.gemini import GeminiTransformationProvider
 from app.transformation.local import LocalTransformationProvider
 from app.transformation.providers import (
@@ -221,17 +221,49 @@ def test_local_provider_parses_without_network() -> None:
     assert results["c1"].strategies
 
 
-def test_qwen_disabled_by_default_and_adaptive_never_uses_it() -> None:
-    settings = Settings(CLIPFACTORY_GEMINI_API_KEY=None)
-    assert settings.local_qwen_enabled is False
-    assert settings.transformation_semantic_mode().value == "adaptive"
+def test_qwen_disabled_by_default_and_adaptive_never_uses_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.transformation.local import LocalTransformationProvider
+
+    def _settings() -> Settings:
+        get_settings.cache_clear()
+        return get_settings()
+
+    def _clear_keys() -> None:
+        monkeypatch.delenv("CLIPFACTORY_GEMINI_API_KEY", raising=False)
+        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+
+    monkeypatch.delenv("CLIPFACTORY_TRANSFORMATION_PROVIDER_MODE", raising=False)
+    monkeypatch.delenv("CLIPFACTORY_LOCAL_QWEN_ENABLED", raising=False)
+    monkeypatch.delenv("CLIPFACTORY_RECONSTRUCTION_PROVIDER", raising=False)
+    _clear_keys()
+    get_settings.cache_clear()
+    default = _settings()
+    assert default.local_qwen_enabled is False
+    assert default.transformation_semantic_mode().value == "adaptive"
     # adaptive with no key builds no provider at all and never Qwen.
-    assert settings.transformation_provider() is None
-    local_only = Settings(
-        CLIPFACTORY_TRANSFORMATION_PROVIDER_MODE="local_only",
-        CLIPFACTORY_LOCAL_QWEN_ENABLED=False,
-    )
+    assert default.transformation_provider() is None
+
+    # adaptive with a Gemini key uses Gemini and never falls back to Qwen.
+    monkeypatch.setenv("CLIPFACTORY_GEMINI_API_KEY", "hermetic-test-key")
+    adaptive = _settings()
+    provider = adaptive.transformation_provider()
+    assert provider is not None
+    assert getattr(provider, "provider_name", None) == "gemini"
+
+    # local_only with Qwen disabled returns no provider even if a Gemini key exists.
+    monkeypatch.setenv("CLIPFACTORY_TRANSFORMATION_PROVIDER_MODE", "local_only")
+    local_only = _settings()
     assert local_only.transformation_provider() is None
+
+    # explicit local_only with Qwen enabled preserves the supported local path.
+    monkeypatch.setenv("CLIPFACTORY_LOCAL_QWEN_ENABLED", "true")
+    local_enabled = _settings()
+    local_provider = local_enabled.transformation_provider()
+    assert isinstance(local_provider, LocalTransformationProvider)
+    assert local_provider.provider_name == "ollama"
+    get_settings.cache_clear()
 
 
 def test_gemini_key_is_secret_and_presence_only() -> None:
