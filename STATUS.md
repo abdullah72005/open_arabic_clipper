@@ -1,5 +1,77 @@
 # Runtime status
 
+## Stage 4.0 transformation eligibility and strategy discovery (2026-09-14)
+
+Stage 4.0 decides, per refined Stage 3 candidate, whether a credible substantive
+transformation path exists and emits a small bounded set of strategy directions
+for Stage 4.1. It is explicit, candidate-scoped work after a usable Stage 3.5
+refinement and is **not** added to the automatic `_NEXT_STAGE` chain.
+
+- **No lifecycle change.** It extends the existing Celery/`ProcessingJob`
+  platform with a `TRANSFORMATION_ELIGIBILITY` job kind and a nullable
+  `processing_jobs.transformation_analysis_id` FK. It adds no `PipelineStage`,
+  no `PipelineRun`, and never advances the source lifecycle; Stage 4.1 is not
+  implemented.
+- **Input resolution.** Queueing requires a current retained candidate and a
+  usable, audio-backed Stage 3.5 refinement. A usable `FINAL_CLIP` row is
+  preferred when already ready, otherwise a usable `CANDIDATE` row is used; a
+  queued/failed/cancelled/empty final row never hides a usable candidate row and
+  final refinement is never enqueued automatically. No Stage 3.5 refinement
+  means a prerequisite error, never analysis of the coarse INDEX transcript.
+- **Deterministic first.** Hard gates own transcript/context sufficiency,
+  transformation necessity, source-moment structure, content-to-strategy
+  suitability, presentation-only zero credit, anti-slop validation, retention,
+  originality, filler, and final eligibility. A deterministic recommendation also
+  requires a concrete, candidate-specific value-add basis supported by available
+  evidence (a specific context gap, inference, explanation target, comparison,
+  counterpoint, verification, synthesis, thesis, takeaway, or source-as-evidence
+  framing); static scores, quality, length, hooks, or generic templates never
+  establish value on their own, and absent evidence yields
+  `NO_TRANSFORMATION_STRATEGY_WORTH_USING` or defers to selective provider
+  discovery. There is no single "transformation score"; ranking uses ordered
+  transparent criteria after hard filtering.
+  `NO_TRANSFORMATION_STRATEGY_WORTH_USING` is a successful, cache-eligible
+  completed result that may contain zero recommended strategies.
+- **Bounded strategy directions.** At most three recommended and three useful
+  rejected directions from the closed 15-value set, each carrying independent
+  assessments, preservation requirements, verification flags, and a stable
+  strategy fingerprint. Directions are not scripts and contain no narration,
+  timeline, TTS, or rendering fields. Value-focus text quotes or names concrete
+  candidate evidence, and ungrounded provider directions are rejected.
+- **Providers are optional.** `deterministic` makes zero Gemini/Qwen calls;
+  `adaptive` (default) selects one hosted tier per analysis
+  (`gemini-3.5-flash-lite` routine, `gemini-3.8-flash` low-thinking for
+  complex/transformation-required cases) through the shared HIGH admission gate,
+  at most one hosted call, never a Qwen fallback; `local_only` uses Qwen only
+  when `CLIPFACTORY_LOCAL_QWEN_ENABLED=true`. A missing key/outage/429/malformed
+  output preserves deterministic results, never fails the analysis, and keeps
+  the run non-cache-eligible only while selected hosted work is unfinished.
+- **Rights vs originality stay separate.** Unknown/third-party provenance remains
+  analyzable and usually raises transformation necessity
+  (`TRANSFORMATION_REQUIRED`); `UNRESOLVED_POLICY_OR_PROVENANCE_RISK` is reserved
+  for explicit stored conflicts. The platform-risk snapshot is decision support,
+  not legal or monetization advice; official platform guidance was checked
+  2026-09-14.
+- **Cache, freshness, concurrency.** Queue-time cache validation and Stage 4.1
+  handoff freshness use the same settings-derived config/mode and **stable
+  configured provider identity** as execution. That identity is derived from
+  configuration only, so transient Gemini/key/provider unavailability does not
+  invalidate accepted analysis (cache stays a hit, no replacement job, force
+  reruns reuse accepted hosted output; handoff stays current), while a real
+  model/prompt/schema/provider/config change still invalidates. Concurrent queue
+  requests are transaction-safe (savepoint uniqueness recovery plus an atomic
+  `active_job_id IS NULL` compare-and-swap), yielding one analysis and at most one
+  active job with no escaped `IntegrityError`/500.
+- **API/CLI/handoff.** Minimal endpoints queue/read one analysis and expose a
+  typed read-only Stage 4.1 handoff (`stage4_1_implemented=false`) that reports
+  stale instead of mixing current transcript data with old strategies.
+
+Deterministic verification: 72 focused Stage 4.0 tests (passing both with and
+without a Gemini key present) plus the full backend suite in Docker Python 3.12
+with the repository compose/.env files mounted, with no live provider calls in
+the automated suite. See
+[docs/STAGE_4_0_OPERATIONS.md](docs/STAGE_4_0_OPERATIONS.md).
+
 ## Stage 3.7 performance instrumentation (2026-09-12)
 
 Stage-level durable metrics now distinguish remote metadata lookup, transfer,
@@ -28,8 +100,8 @@ loads). Stage 3.5 then provides explicit, candidate-scoped, audio-verified
 transcript and boundary refinement (candidate 5/5 s, final 8/8 s context, max
 150 s) through the existing job system, with optional selective Gemini
 transcription/adjudication behind a shared priority/budget gate. Rendering,
-publishing, review UI, and authorization remain out of scope, and Stage 4 is not
-implemented.
+publishing, review UI, and authorization remain out of scope; Stage 4.0 is
+implemented (explicit, candidate-scoped) and Stage 4.1 is not.
 
 ## Stage 3.5 candidate-scoped refinement (2026-09-12)
 
@@ -102,7 +174,7 @@ expensive compute only on requested candidates/final clips:
   candidate-grade batch (score-ordered, default 5, max 10, no bulk FINAL_CLIP),
   submit manual text/resolutions, and fetch a typed read-only Stage 4 handoff
   (refined transcript/exact bounds + Stage 3 evidence; never mislabels
-  candidate-grade output as final-ready). Stage 4 is not implemented and
+  candidate-grade output as final-ready). Stage 4.0 is implemented and Stage 4.1 is not, and
   `FINAL_TRANSCRIPT_READY` is not publishing readiness.
 
 Deterministic verification adds Stage 3.5 tests plus the full existing suite:

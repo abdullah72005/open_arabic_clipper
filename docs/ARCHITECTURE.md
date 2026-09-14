@@ -25,3 +25,30 @@ Stage 2.7 reconstruction marker without changing Stage 2.7 behavior.
 `candidate_analyses` and `clip_candidates` persist the result, and small API/CLI
 surfaces expose provenance, queueing, and bounded inspection. There is no
 separate queue, service process, orchestration subsystem, or analytics engine.
+
+## Stage 4.0 transformation eligibility
+
+Stage 4.0 lives in `app/transformation/` and is explicit, candidate-scoped work
+after a candidate has a usable Stage 3.5 refinement. It decides whether a
+credible substantive transformation path exists, produces at most three
+recommended (and three useful rejected) strategy directions for Stage 4.1, and
+returns `NO_TRANSFORMATION_STRATEGY_WORTH_USING` as a normal successful outcome
+when no natural strategy clears the hard gates. It extends the existing
+Celery/`ProcessingJob` platform with a `TRANSFORMATION_ELIGIBILITY` job kind and
+a nullable `processing_jobs.transformation_analysis_id` FK. It adds **no**
+`PipelineStage`, **no** `PipelineRun`, **no** `_NEXT_STAGE` entry, and no source
+lifecycle change. `transformation_eligibility_analyses` (one current row per
+candidate) and `transformation_strategy_candidates` (one current row per
+`(analysis, strategy_type)`) persist the bounded result.
+
+Deterministic logic owns prerequisites, transcript/context sufficiency,
+transformation necessity, source-moment structure, content-to-strategy
+suitability, presentation-only zero credit, hard gates, validation, final
+eligibility, safe fallback, and deterministic ranking. An optional Stage
+4-specific provider (hosted Gemini routine/strong tiers or an explicit
+`local_only` Qwen) may only assess candidates that survived those gates, runs at
+most one hosted call per analysis through the shared HIGH admission gate, and
+never overrides a hard blocker. Rights/provenance risk and
+originality/transformation risk stay separate; the platform-risk snapshot is
+decision support, never a legal or monetization guarantee. Stage 4.1 receives a
+typed read-only handoff only.

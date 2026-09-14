@@ -9,6 +9,10 @@ from app.models.source_quality_assessment import SourceQualityAssessment
 from app.models.source_video import SourceVideo
 from app.models.transcript import Transcript
 from app.models.transcript_chunk import TranscriptChunk
+from app.models.transformation_eligibility import (
+    TransformationEligibilityAnalysis,
+    TransformationStrategyCandidate,
+)
 
 __all__ = [
     "AudioAnalysis",
@@ -22,4 +26,6 @@ __all__ = [
     "SourceVideo",
     "Transcript",
     "TranscriptChunk",
+    "TransformationEligibilityAnalysis",
+    "TransformationStrategyCandidate",
 ]

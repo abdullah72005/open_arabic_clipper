@@ -213,6 +213,81 @@ def run_candidate_refinement(
         session.close()
 
 
+@celery_app.task(  # type: ignore[untyped-decorator]
+    bind=True, autoretry_for=(), name="clipfactory.run_transformation_analysis"
+)
+def run_transformation_analysis(
+    self: Task,
+    analysis_id: str,
+    job_id: str | None = None,
+    force: bool = False,
+) -> dict[str, str | bool | None]:
+    """Run one explicit candidate-scoped Stage 4.0 transformation analysis.
+
+    This extends the existing job system, not the pipeline: it creates no
+    ``PipelineRun``, schedules no next stage, and never touches the whole-source
+    stage chain.
+    """
+
+    from uuid import UUID as _UUID
+
+    from app.transformation.executor import build_transformation_executor
+
+    parsed_analysis = _UUID(analysis_id)
+    parsed_job = _UUID(job_id) if job_id else None
+    session = create_session_factory()()
+    try:
+        settings = get_settings()
+        if parsed_job is not None:
+            job = session.get(ProcessingJob, parsed_job)
+            if job is not None and job.status is JobStatus.CANCELLED:
+                return {"analysis_id": str(parsed_analysis), "cancelled": True}
+            if job is not None:
+                job.status = JobStatus.RUNNING
+                job.started_at = datetime.now(timezone.utc)
+                session.commit()
+        executor = build_transformation_executor(session, settings)
+        executor.set_active_job(parsed_job)
+        try:
+            executor.execute(parsed_analysis, force=force)
+        except StageCancelled:
+            if parsed_job is not None:
+                cancelled_job = session.get(ProcessingJob, parsed_job)
+                if cancelled_job is not None and cancelled_job.status is not JobStatus.CANCELLED:
+                    cancelled_job.status = JobStatus.CANCELLED
+                    cancelled_job.completed_at = datetime.now(timezone.utc)
+                    session.commit()
+            return {"analysis_id": str(parsed_analysis), "cancelled": True}
+        except Exception as error:
+            if parsed_job is not None:
+                failed_job = session.get(ProcessingJob, parsed_job)
+                if failed_job is not None and failed_job.status is not JobStatus.CANCELLED:
+                    failed_job.status = JobStatus.FAILED
+                    failed_job.completed_at = datetime.now(timezone.utc)
+                    failed_job.error_message = type(error).__name__[:2048]
+                    session.commit()
+            if getattr(error, "retryable", False):
+                raise self.retry(
+                    args=[analysis_id, job_id, force],
+                    exc=error,
+                    max_retries=MAX_RETRIES,
+                ) from error
+            raise
+        if parsed_job is not None:
+            finished_job = session.get(ProcessingJob, parsed_job)
+            if finished_job is not None and finished_job.status is not JobStatus.CANCELLED:
+                finished_job.status = JobStatus.SUCCEEDED
+                finished_job.completed_at = datetime.now(timezone.utc)
+                session.commit()
+        return {
+            "analysis_id": str(parsed_analysis),
+            "job_id": str(parsed_job) if parsed_job else None,
+            "skipped": False,
+        }
+    finally:
+        session.close()
+
+
 @celery_app.task(name="clipfactory.worker_heartbeat")  # type: ignore[untyped-decorator]
 def worker_heartbeat() -> dict[str, str]:
     """Expose latest worker liveness timestamp for health checks."""

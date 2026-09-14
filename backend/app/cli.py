@@ -59,6 +59,14 @@ from app.transcription.reconstruction.benchmark import (
 from app.transcription.reconstruction.capture import capture_hash, load_capture, save_capture
 from app.transcription.reconstruction.service import ContextualReconstructor
 from app.transcription.reconstruction.types import ProviderAvailability, ProviderHealth
+from app.transformation.handoff import build_stage4_1_handoff
+from app.transformation.queue import (
+    TransformationQueueError,
+    get_analysis_for_candidate,
+    list_strategies,
+    queue_transformation_analysis,
+    validate_candidate_for_transformation,
+)
 from app.workers.tasks import run_pipeline_stage
 
 app = typer.Typer(no_args_is_help=True)
@@ -431,9 +439,99 @@ def candidate_handoff(candidate_id: UUID) -> None:
     typer.echo(json.dumps(handoff, ensure_ascii=False, default=str))
 
 
+@app.command("transformation-analyze")
+def transformation_analyze(
+    candidate_id: UUID,
+    force: bool = typer.Option(False, "--force/--no-force"),
+) -> None:
+    """Queue one explicit candidate-scoped Stage 4.0 eligibility analysis."""
+
+    with create_session_factory()() as session:
+        try:
+            candidate = validate_candidate_for_transformation(session, candidate_id)
+        except TransformationQueueError as error:
+            raise typer.BadParameter(str(error)) from error
+        outcome = queue_transformation_analysis(session, candidate, force=force)
+    typer.echo(
+        json.dumps(
+            {
+                "analysis_id": str(outcome.analysis_id),
+                "job_id": str(outcome.job_id) if outcome.job_id else None,
+                "status": outcome.status,
+                "queued": outcome.queued,
+                "cached": outcome.cached,
+                "active": outcome.active,
+            }
+        )
+    )
+
+
+def _transformation_strategy_payload(row: object) -> dict[str, object]:
+    return {
+        "id": str(row.id),  # type: ignore[attr-defined]
+        "strategy_type": row.strategy_type.value,  # type: ignore[attr-defined]
+        "disposition": row.disposition.value,  # type: ignore[attr-defined]
+        "is_current": row.is_current,  # type: ignore[attr-defined]
+        "rank": row.rank,  # type: ignore[attr-defined]
+        "intensity": row.intensity.value,  # type: ignore[attr-defined]
+        "direction_summary": row.direction_summary,  # type: ignore[attr-defined]
+        "added_value_focus": row.added_value_focus,  # type: ignore[attr-defined]
+        "substantive_value_kind": row.substantive_value_kind.value,  # type: ignore[attr-defined]
+        "external_verification_requirement": row.external_verification_requirement.value,  # type: ignore[attr-defined]
+        "verification_requirements": list(row.verification_requirements or []),  # type: ignore[attr-defined]
+        "rejection_reasons": list(row.rejection_reasons or []),  # type: ignore[attr-defined]
+        "strategy_fingerprint": row.strategy_fingerprint,  # type: ignore[attr-defined]
+    }
+
+
+@app.command("transformation-analysis")
+def transformation_analysis(candidate_id: UUID) -> None:
+    """Print the current Stage 4.0 eligibility analysis and strategies."""
+
+    with create_session_factory()() as session:
+        analysis = get_analysis_for_candidate(session, candidate_id)
+        if analysis is None:
+            raise typer.BadParameter("transformation analysis does not exist")
+        rows = list_strategies(session, analysis.id)
+        outcome = analysis.eligibility_outcome
+        payload = {
+            "id": str(analysis.id),
+            "execution_status": analysis.execution_status.value,
+            "eligibility_outcome": outcome.value if outcome else None,
+            "eligibility_reasons": list(analysis.eligibility_reasons or []),
+            "assessments": analysis.assessments,
+            "source_moment": analysis.source_moment,
+            "platform_risk": analysis.platform_risk,
+            "transformation_intensity": (
+                analysis.transformation_intensity.value
+                if analysis.transformation_intensity
+                else None
+            ),
+            "provider_mode": analysis.provider_mode.value,
+            "provider_status": analysis.provider_status,
+            "input_fingerprint": analysis.input_fingerprint,
+            "output_fingerprint": analysis.output_fingerprint,
+            "cache_eligible": analysis.cache_eligible,
+            "strategies": [_transformation_strategy_payload(row) for row in rows],
+        }
+    typer.echo(json.dumps(payload, ensure_ascii=False, default=str))
+
+
+@app.command("transformation-handoff")
+def transformation_handoff(candidate_id: UUID) -> None:
+    """Print the read-only Stage 4.0 -> Stage 4.1 handoff."""
+
+    with create_session_factory()() as session:
+        handoff = build_stage4_1_handoff(session, candidate_id)
+        if handoff is None:
+            raise typer.BadParameter("candidate does not exist")
+    typer.echo(json.dumps(handoff, ensure_ascii=False, default=str))
+
+
 @app.command()
 def transcript(source_id: UUID) -> None:
     """Print the current timestamped transcript as JSON."""
+
     with create_session_factory()() as session:
         current = session.query(Transcript).filter_by(source_video_id=source_id).one_or_none()
         if current is None:

@@ -39,6 +39,7 @@ class JobKind(str, Enum):
     PROBE = "PROBE"
     CANDIDATE_ANALYSIS = "CANDIDATE_ANALYSIS"
     CANDIDATE_REFINEMENT = "CANDIDATE_REFINEMENT"
+    TRANSFORMATION_ELIGIBILITY = "TRANSFORMATION_ELIGIBILITY"
 
 
 class JobStatus(str, Enum):
@@ -240,3 +241,132 @@ class AdmissionPriority(str, Enum):
     MEDIUM = "MEDIUM"
     LOW = "LOW"
     AVOID = "AVOID"
+
+
+class TransformationEligibilityOutcome(str, Enum):
+    """Stage 4.0 result: whether a credible transformation path exists.
+
+    ``NO_TRANSFORMATION_STRATEGY_WORTH_USING`` is a normal successful outcome,
+    not an error. Processing lifecycle is tracked separately by
+    ``TransformationExecutionStatus``.
+    """
+
+    ELIGIBLE_FOR_TRANSFORMATION = "ELIGIBLE_FOR_TRANSFORMATION"
+    ELIGIBLE_WITH_CAUTION = "ELIGIBLE_WITH_CAUTION"
+    TRANSFORMATION_REQUIRED = "TRANSFORMATION_REQUIRED"
+    NO_TRANSFORMATION_STRATEGY_WORTH_USING = "NO_TRANSFORMATION_STRATEGY_WORTH_USING"
+    INSUFFICIENT_TRANSCRIPT_CONFIDENCE = "INSUFFICIENT_TRANSCRIPT_CONFIDENCE"
+    INSUFFICIENT_CONTEXT = "INSUFFICIENT_CONTEXT"
+    UNRESOLVED_POLICY_OR_PROVENANCE_RISK = "UNRESOLVED_POLICY_OR_PROVENANCE_RISK"
+
+
+class TransformationExecutionStatus(str, Enum):
+    """Stage 4.0 processing lifecycle, separate from eligibility outcome."""
+
+    QUEUED = "QUEUED"
+    ANALYZING = "ANALYZING"
+    COMPLETE = "COMPLETE"
+    PROVIDER_DEGRADED = "PROVIDER_DEGRADED"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+
+
+class TransformationStrategyType(str, Enum):
+    """Bounded closed set of Stage 4.0 strategy directions."""
+
+    CONTEXT_HOOK = "CONTEXT_HOOK"
+    HOOK_PLUS_TAKEAWAY = "HOOK_PLUS_TAKEAWAY"
+    EXPLANATORY = "EXPLANATORY"
+    COMMENTARY = "COMMENTARY"
+    ANALYSIS = "ANALYSIS"
+    SUMMARY = "SUMMARY"
+    COMPARISON = "COMPARISON"
+    COUNTERPOINT = "COUNTERPOINT"
+    REACTION_FRAMING = "REACTION_FRAMING"
+    QUESTION_EXPLANATION_TAKEAWAY = "QUESTION_EXPLANATION_TAKEAWAY"
+    CLAIM_CONTEXT_CONCLUSION = "CLAIM_CONTEXT_CONCLUSION"
+    DEBATE_CONTEXT = "DEBATE_CONTEXT"
+    NEWS_CONTEXT = "NEWS_CONTEXT"
+    SOURCE_AS_EVIDENCE = "SOURCE_AS_EVIDENCE"
+    SOURCE_LED_MINIMAL = "SOURCE_LED_MINIMAL"
+
+
+class TransformationIntensity(str, Enum):
+    """Least-intrusive-sufficient transformation intensity."""
+
+    MINIMAL = "MINIMAL"
+    MODERATE = "MODERATE"
+    STRONG = "STRONG"
+
+
+class StrategyDisposition(str, Enum):
+    """Whether a discovered strategy direction is recommended or rejected."""
+
+    RECOMMENDED = "RECOMMENDED"
+    REJECTED = "REJECTED"
+
+
+class StrategyOrigin(str, Enum):
+    """Whether a strategy direction was discovered deterministically or by a provider."""
+
+    DETERMINISTIC = "DETERMINISTIC"
+    PROVIDER = "PROVIDER"
+
+
+class SubstantiveValueKind(str, Enum):
+    """Substantive value a strategy contributes beyond the source moment.
+
+    Presentation-only changes (captions, crop, zoom, borders, music, B-roll,
+    speed, filters) are never a substantive value kind and receive zero credit.
+    """
+
+    MISSING_CONTEXT = "MISSING_CONTEXT"
+    INFERENCE = "INFERENCE"
+    EXPLANATION = "EXPLANATION"
+    COMPARISON = "COMPARISON"
+    COUNTERPOINT = "COUNTERPOINT"
+    VERIFICATION_CORRECTION = "VERIFICATION_CORRECTION"
+    SYNTHESIS = "SYNTHESIS"
+    AUTHORED_THESIS = "AUTHORED_THESIS"
+    USEFUL_TAKEAWAY = "USEFUL_TAKEAWAY"
+    SOURCE_AS_EVIDENCE = "SOURCE_AS_EVIDENCE"
+
+
+class SourceMomentStructure(str, Enum):
+    """Small deterministic model of the source moment's rhetorical shape."""
+
+    CLAIM = "CLAIM"
+    PAYOFF = "PAYOFF"
+    QUESTION_ANSWER = "QUESTION_ANSWER"
+    EXPLANATION = "EXPLANATION"
+    DEBATE = "DEBATE"
+    STORY = "STORY"
+    JOKE = "JOKE"
+    NEWS = "NEWS"
+    UNKNOWN = "UNKNOWN"
+
+
+class PlatformRiskKind(str, Enum):
+    """Decision-support platform-risk dimensions (not legal conclusions)."""
+
+    YOUTUBE_REUSED_CONTENT = "YOUTUBE_REUSED_CONTENT"
+    YOUTUBE_INAUTHENTIC_REPETITIVE = "YOUTUBE_INAUTHENTIC_REPETITIVE"
+    FACEBOOK_UNORIGINAL_CONTENT = "FACEBOOK_UNORIGINAL_CONTENT"
+    SPAM_TEMPLATE_HEAVY = "SPAM_TEMPLATE_HEAVY"
+    SOURCE_DOMINANCE = "SOURCE_DOMINANCE"
+
+
+class PlatformRiskLevel(str, Enum):
+    """Bounded platform-risk level for one risk dimension."""
+
+    LOW = "LOW"
+    MODERATE = "MODERATE"
+    HIGH = "HIGH"
+    UNDETERMINED = "UNDETERMINED"
+
+
+class ExternalFactRequirement(str, Enum):
+    """Whether a strategy depends on an unverified outside fact."""
+
+    NOT_REQUIRED = "NOT_REQUIRED"
+    REQUIRES_EXTERNAL_FACT_VERIFICATION = "REQUIRES_EXTERNAL_FACT_VERIFICATION"
