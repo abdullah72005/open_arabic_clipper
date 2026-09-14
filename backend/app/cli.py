@@ -60,6 +60,14 @@ from app.transcription.reconstruction.capture import capture_hash, load_capture,
 from app.transcription.reconstruction.service import ContextualReconstructor
 from app.transcription.reconstruction.types import ProviderAvailability, ProviderHealth
 from app.transformation.handoff import build_stage4_1_handoff
+from app.transformation.planning.handoff import build_stage4_2_handoff
+from app.transformation.planning.queue import (
+    PlanningQueueError,
+    get_plan_set_for_candidate,
+    list_plans,
+    queue_transformation_planning,
+    validate_candidate_for_planning,
+)
 from app.transformation.queue import (
     TransformationQueueError,
     get_analysis_for_candidate,
@@ -523,6 +531,95 @@ def transformation_handoff(candidate_id: UUID) -> None:
 
     with create_session_factory()() as session:
         handoff = build_stage4_1_handoff(session, candidate_id)
+        if handoff is None:
+            raise typer.BadParameter("candidate does not exist")
+    typer.echo(json.dumps(handoff, ensure_ascii=False, default=str))
+
+
+@app.command("transformation-plan-generate")
+def transformation_plan_generate(
+    candidate_id: UUID,
+    force: bool = typer.Option(False, "--force/--no-force"),
+) -> None:
+    """Queue one explicit candidate-scoped Stage 4.1 planning run."""
+
+    with create_session_factory()() as session:
+        try:
+            candidate, analysis = validate_candidate_for_planning(session, candidate_id)
+        except PlanningQueueError as error:
+            raise typer.BadParameter(str(error)) from error
+        outcome = queue_transformation_planning(session, candidate, analysis, force=force)
+    typer.echo(
+        json.dumps(
+            {
+                "plan_set_id": str(outcome.plan_set_id),
+                "job_id": str(outcome.job_id) if outcome.job_id else None,
+                "status": outcome.status,
+                "queued": outcome.queued,
+                "cached": outcome.cached,
+                "active": outcome.active,
+            }
+        )
+    )
+
+
+def _plan_payload(row: object) -> dict[str, object]:
+    return {
+        "id": str(row.id),  # type: ignore[attr-defined]
+        "plan_key": row.plan_key,  # type: ignore[attr-defined]
+        "is_current": row.is_current,  # type: ignore[attr-defined]
+        "status": row.status.value,  # type: ignore[attr-defined]
+        "generation_rank": row.generation_rank,  # type: ignore[attr-defined]
+        "strategy_candidate_id": str(row.strategy_candidate_id),  # type: ignore[attr-defined]
+        "strategy_type": row.strategy_type.value,  # type: ignore[attr-defined]
+        "intensity": row.intensity.value,  # type: ignore[attr-defined]
+        "blocks": list(row.blocks or []),  # type: ignore[attr-defined]
+        "hero_block_index": row.hero_block_index,  # type: ignore[attr-defined]
+        "hero_source_start": row.hero_source_start,  # type: ignore[attr-defined]
+        "hero_source_end": row.hero_source_end,  # type: ignore[attr-defined]
+        "hero_appearance_time": row.hero_appearance_time,  # type: ignore[attr-defined]
+        "original_value_kinds": list(row.original_value_kinds or []),  # type: ignore[attr-defined]
+        "narration_need": row.narration_need,  # type: ignore[attr-defined]
+        "narration_requirements": row.narration_requirements,  # type: ignore[attr-defined]
+        "external_fact_dependencies": list(row.external_fact_dependencies or []),  # type: ignore[attr-defined]
+        "derived_durations": row.derived_durations,  # type: ignore[attr-defined]
+        "provider_input_fingerprint": row.provider_input_fingerprint,  # type: ignore[attr-defined]
+        "plan_output_fingerprint": row.plan_output_fingerprint,  # type: ignore[attr-defined]
+    }
+
+
+@app.command("transformation-plans")
+def transformation_plans(candidate_id: UUID) -> None:
+    """Print the current Stage 4.1 plan set and its plans."""
+
+    with create_session_factory()() as session:
+        plan_set = get_plan_set_for_candidate(session, candidate_id)
+        if plan_set is None:
+            raise typer.BadParameter("transformation plan set does not exist")
+        rows = list_plans(session, plan_set.id)
+        outcome = plan_set.planning_outcome
+        payload = {
+            "id": str(plan_set.id),
+            "execution_status": plan_set.execution_status.value,
+            "planning_outcome": outcome.value if outcome else None,
+            "outcome_reasons": list(plan_set.outcome_reasons or []),
+            "provider_mode": plan_set.provider_mode.value,
+            "provider_status": plan_set.provider_status,
+            "strategy_attempts": list(plan_set.strategy_attempts or []),
+            "input_fingerprint": plan_set.input_fingerprint,
+            "output_fingerprint": plan_set.output_fingerprint,
+            "cache_eligible": plan_set.cache_eligible,
+            "plans": [_plan_payload(row) for row in rows],
+        }
+    typer.echo(json.dumps(payload, ensure_ascii=False, default=str))
+
+
+@app.command("transformation-plan-handoff")
+def transformation_plan_handoff(candidate_id: UUID) -> None:
+    """Print the read-only Stage 4.1 -> Stage 4.2 handoff."""
+
+    with create_session_factory()() as session:
+        handoff = build_stage4_2_handoff(session, candidate_id)
         if handoff is None:
             raise typer.BadParameter("candidate does not exist")
     typer.echo(json.dumps(handoff, ensure_ascii=False, default=str))

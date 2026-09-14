@@ -32,6 +32,9 @@ class ProcessingJob(Base):
     transformation_analysis_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("transformation_eligibility_analyses.id", ondelete="SET NULL"), index=True
     )
+    transformation_plan_set_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("transformation_plan_sets.id", ondelete="SET NULL"), index=True
+    )
     kind: Mapped[JobKind] = mapped_column(
         Enum(JobKind, name="job_kind", native_enum=False, create_constraint=True),
         nullable=False,

@@ -88,8 +88,8 @@ shared Redis priority/budget controller. Deterministic entity/ambiguity and
 boundary refinement produce `CANDIDATE_REFINED`, `FINAL_TRANSCRIPT_READY`,
 `NEEDS_MANUAL_TRANSCRIPT_REVIEW`, `PROVIDER_DEGRADED`, `REFINEMENT_FAILED`, or
 `CANCELLED`. `FINAL_TRANSCRIPT_READY` is transcript readiness, not publishing
-readiness. Stage 4 receives a typed read-only Stage 3.5 handoff; Stage 4.0 is
-implemented and Stage 4.1 is not. See
+readiness. Stage 4 receives a typed read-only Stage 3.5 handoff; Stage 4.0 and
+Stage 4.1 are implemented and Stage 4.2 is not. See
 `docs/STAGE_3_5_OPERATIONS.md`.
 
 ## Stage 4.0 transformation eligibility
@@ -118,3 +118,32 @@ or `UNRESOLVED_POLICY_OR_PROVENANCE_RISK`. Zero recommended directions is a vali
 success. Stage 4.1 receives a typed read-only handoff and is responsible for
 planning; Stage 4.0 produces directions, not scripts. See
 `docs/STAGE_4_0_OPERATIONS.md`.
+
+## Stage 4.1 transformation plan generation
+
+Stage 4.1 is explicit, candidate-scoped work after a current, non-stale Stage 4.0
+analysis with at least one current recommended strategy. It is **not** part of
+the automatic `_NEXT_STAGE` chain and never advances every candidate. It accepts
+a usable `CANDIDATE` Stage 3.5 refinement and never requires `FINAL_CLIP`. It
+produces zero to three concrete plans (normally at most one per recommended
+strategy) and never selects or approves a winner.
+
+Every valid plan has exactly one hero source excerpt placed as block 0 or 1;
+source spans are selected by indexed Stage 3.5 word references (or a safe
+full-window sentinel when word coverage is insufficient), and actual timestamps
+and excerpt text are resolved deterministically, never trusted from the provider.
+Authored material before the hero is capped (a stricter 1.5 s cap for short,
+dense, joke, or payoff-first moments), blocks are capped at eight, and the source
+hook/payoff is preserved. Original-value blocks must state what the viewer learns
+beyond the excerpt; presentation-only edits, paraphrase scaffolding, fake hooks,
+distortion, unsupported facts, and value kinds inconsistent with the Stage 4.0
+strategy are rejected before persistence. External facts are carried as
+verification placeholders that block dependent blocks; nothing is fabricated.
+Narration is an abstract semantic requirement only (need, purpose, language,
+register, duration, placement, dependencies) and never selects a TTS provider,
+model, or voice. The result is `PLANS_GENERATED`,
+`PLANS_GENERATED_WITH_VERIFICATION_REQUIRED`, `PLANNING_DEFERRED`,
+`NO_VALID_PLAN_FROM_STRATEGY`, or `PROVIDER_UNAVAILABLE`; a deferred,
+provider-unavailable, or zero-plan outcome is a successful semantic result, not a
+source/pipeline failure. Stage 6 will generate speech; channel configuration will
+decide the persistent narrator. See `docs/STAGE_4_1_OPERATIONS.md`.

@@ -40,6 +40,11 @@ def build_stage4_1_handoff(
             "candidate_key": candidate.candidate_key,
             "source_id": str(candidate.source_video_id),
             "disposition": candidate.disposition.value,
+            "coarse_start": candidate.start_time,
+            "coarse_end": candidate.end_time,
+            "start_segment_index": candidate.start_segment_index,
+            "end_segment_index": candidate.end_segment_index,
+            "segment_indexes": list(candidate.segment_indexes or []),
         },
         "stage3": {
             "clip_score": candidate.clip_score,
@@ -72,6 +77,8 @@ def build_stage4_1_handoff(
             "code_switch_suspected": candidate.code_switch_suspected,
         },
         "entity_evidence": [],
+        "source_moment": {},
+        "assessments": {},
         "eligibility_outcome": None,
         "eligibility_reasons": [],
         "transformation_necessity": None,
@@ -91,7 +98,7 @@ def build_stage4_1_handoff(
         "current": False,
         "stale": False,
         "ready_for_stage4_1": False,
-        "stage4_1_implemented": False,
+        "stage4_1_implemented": True,
     }
     if analysis is None:
         base["reason"] = "NO_ANALYSIS"
@@ -104,6 +111,8 @@ def build_stage4_1_handoff(
     )
     base["eligibility_reasons"] = list(analysis.eligibility_reasons or [])
     assessments = analysis.assessments or {}
+    base["assessments"] = dict(assessments)
+    base["source_moment"] = dict(analysis.source_moment or {})
     base["transformation_necessity"] = assessments.get("transformation_necessity")
     base["transformation_potential"] = assessments.get("transformation_potential")
     base["platform_risk"] = dict(analysis.platform_risk or {})
@@ -121,6 +130,7 @@ def build_stage4_1_handoff(
         "status": analysis.provider_status,
         "identity": dict(analysis.provider_identity or {}),
         "input_fingerprint": analysis.provider_input_fingerprint,
+        "evidence": dict(analysis.provider_evidence or {}),
     }
 
     refinement = (

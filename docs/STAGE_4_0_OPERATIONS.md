@@ -287,8 +287,10 @@ content types/scores/hooks/idea/topic; provenance/rights/originality;
 dialect/code-switch/entity evidence; eligibility outcome/reasons; transformation
 necessity/potential; platform-risk evidence; recommended and useful rejected
 strategies with intensity/retention/damage/dominance/added-value/originality and
-verification requirements; provider/routing evidence; cache/current/stale state;
-and `stage4_1_implemented=false`. If current upstream input no longer matches the
+source-moment evidence; the full aggregate assessments snapshot; candidate
+coarse bounds and segment indexes; sanitized provider evidence; verification
+requirements; provider/routing evidence; cache/current/stale state; and
+`stage4_1_implemented=true` (Stage 4.1 is implemented). If current upstream input no longer matches the
 analysis input fingerprint, the handoff reports stale/not-ready rather than
 mixing current data with old strategies. `NO_TRANSFORMATION_STRATEGY_WORTH_USING`
 returns a valid handoff with `ready_for_stage4_1=false`, not 500/404.

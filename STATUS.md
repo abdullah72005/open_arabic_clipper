@@ -1,5 +1,83 @@
 # Runtime status
 
+## Stage 4.1 transformation plan generation (2026-09-14)
+
+Stage 4.1 turns each current recommended Stage 4.0 strategy direction into zero
+to three concrete structured transformation plans. It is explicit,
+candidate-scoped work after a current, non-stale Stage 4.0 analysis with at least
+one current recommended strategy, accepts a usable `CANDIDATE` Stage 3.5
+refinement, and is **never** added to the automatic `_NEXT_STAGE` chain.
+
+- **No lifecycle change.** It extends the existing Celery/`ProcessingJob`
+  platform with a `TRANSFORMATION_PLANNING` job kind and a nullable
+  `processing_jobs.transformation_plan_set_id` FK. It adds no `PipelineStage`,
+  no `PipelineRun`, and never advances the source lifecycle. Stage 4.2 and 4.3
+  are not implemented.
+- **Input gate.** Queueing requires a current retained candidate, a usable
+  Stage 3.5 refinement, and a current, non-stale Stage 4.0 handoff
+  (`ready_for_stage4_1=true`) with at least one current recommended strategy. A
+  stale Stage 4.0 analysis is a prerequisite conflict, never a reason to mix
+  current transcript data with old strategies. Only bounded inputs are sent: the
+  effective refined transcript, indexed word evidence, bounded nearby context,
+  Stage 3 evidence, the Stage 4.0 source moment/assessments/risk, dialect/
+  entities/unresolved evidence, and target/narration semantic context.
+- **Plan schema.** `transformation_plan_sets` is one durable envelope per
+  candidate; `transformation_plans` is one stable row per
+  `(plan_set, strategy_candidate)`. Execution lifecycle
+  (`QUEUED`/`PLANNING`/`COMPLETE`/`PROVIDER_DEGRADED`/`FAILED`/`CANCELLED`) is
+  separate from semantic outcome (`PLANS_GENERATED`,
+  `PLANS_GENERATED_WITH_VERIFICATION_REQUIRED`, `PLANNING_DEFERRED`,
+  `NO_VALID_PLAN_FROM_STRATEGY`, `PROVIDER_UNAVAILABLE`). A zero-plan, deferred,
+  or provider-unavailable plan set is a successful semantic result with no fake
+  plan rows. Blocks are validated JSON on the plan (closed set:
+  `SOURCE_EXCERPT`, `ORIGINAL_VALUE`, `TRANSITION`, `TEXTUAL_ANNOTATION`,
+  `FACT_VERIFICATION_PLACEHOLDER`).
+- **Deterministic first.** Deterministic logic owns readiness, bounds, routing,
+  source-span resolution (indexed Stage 3.5 word references or a safe
+  full-window sentinel; provider timestamps/quotes are never trusted), hero
+  placement (block 0/1 with a 3 s authored-before-hero cap, 1.5 s for short,
+  dense, joke, or payoff-first moments), duration arithmetic, substantive-value/
+  paraphrase/cosmetic rejection, narration/TTS separation, verification
+  dependency enforcement, material distinction, persistence eligibility, and
+  fingerprint/cache composition. Every valid plan has exactly one hero source
+  excerpt and at least one source excerpt; blocks are capped at eight and plans
+  at three.
+- **Providers are optional.** `deterministic` makes zero Gemini/Qwen calls
+  (conservative grounded fallback only for `SOURCE_LED_MINIMAL`/
+  `SOURCE_AS_EVIDENCE`); `adaptive` (default) batches per tier, at most one
+  hosted call per tier and two per plan-set run, through the shared HIGH
+  admission gate (`gemini-3.5-flash-lite` routine, `gemini-3.8-flash`
+  low-thinking for genuinely complex strategies), temperature 0, strict
+  structured output, and never falls back to Qwen; `local_only` uses Qwen only
+  when `CLIPFACTORY_LOCAL_QWEN_ENABLED=true`. Missing key/outage/429/quota/
+  safety refusal/malformed output never fails the source: accepted per-strategy
+  checkpoints survive, only unfinished work stays non-cache-eligible, and a
+  later normal request retries it. Planning mode is separately configurable
+  (`CLIPFACTORY_TRANSFORMATION_PLANNING_MODE`) and decoupled from Stage 4.0 mode.
+- **Narration and TTS.** Narration is an abstract semantic requirement (need,
+  purpose, language, register, duration, placement, dependencies) and never
+  selects a TTS provider, model, or voice; channel configuration will decide the
+  persistent narrator and Stage 6 generates speech. Narration is never
+  automatically required; a `NONE` plan is fully valid.
+- **Dialect and target.** Source dialect is preserved byte-for-byte from Stage
+  3.5 evidence; a future target market may shape original-block framing and a
+  broadly understandable narration register but must never alter source speech
+  or relabel the dialect. No channel/account/target-market persistence model was
+  added.
+- **Verification.** A strategy marked `REQUIRES_EXTERNAL_FACT_VERIFICATION`
+  must yield a structured placeholder that names the claim and blocks dependent
+  blocks; no fact is fabricated and there is no browsing/research subsystem.
+- **API/CLI/handoff.** Minimal endpoints queue/read one plan set and expose a
+  typed read-only Stage 4.2 handoff (`stage4_2_implemented=false`,
+  `stage4_3_implemented=false`) with exact ordered blocks, hero span, narration
+  semantics, verification dependencies, and Stage 4.0 risk.
+
+Deterministic verification: 63 focused Stage 4.1 tests plus the full backend
+suite (937 passed) in Docker Python 3.12 with the repository compose/.env files
+mounted (86% coverage, above the 79% gate), with no live provider calls in the
+automated suite. See
+[docs/STAGE_4_1_OPERATIONS.md](docs/STAGE_4_1_OPERATIONS.md).
+
 ## Stage 4.0 transformation eligibility and strategy discovery (2026-09-14)
 
 Stage 4.0 decides, per refined Stage 3 candidate, whether a credible substantive
@@ -10,8 +88,8 @@ refinement and is **not** added to the automatic `_NEXT_STAGE` chain.
 - **No lifecycle change.** It extends the existing Celery/`ProcessingJob`
   platform with a `TRANSFORMATION_ELIGIBILITY` job kind and a nullable
   `processing_jobs.transformation_analysis_id` FK. It adds no `PipelineStage`,
-  no `PipelineRun`, and never advances the source lifecycle; Stage 4.1 is not
-  implemented.
+  no `PipelineRun`, and never advances the source lifecycle; Stage 4.1 is
+  implemented separately (see above) and adds none of these either.
 - **Input resolution.** Queueing requires a current retained candidate and a
   usable, audio-backed Stage 3.5 refinement. A usable `FINAL_CLIP` row is
   preferred when already ready, otherwise a usable `CANDIDATE` row is used; a
@@ -63,8 +141,10 @@ refinement and is **not** added to the automatic `_NEXT_STAGE` chain.
   `active_job_id IS NULL` compare-and-swap), yielding one analysis and at most one
   active job with no escaped `IntegrityError`/500.
 - **API/CLI/handoff.** Minimal endpoints queue/read one analysis and expose a
-  typed read-only Stage 4.1 handoff (`stage4_1_implemented=false`) that reports
-  stale instead of mixing current transcript data with old strategies.
+  typed read-only Stage 4.1 handoff (`stage4_1_implemented=true`) that now also
+  exposes source-moment evidence, aggregate assessments, candidate coarse bounds/
+  segment indexes, and sanitized provider evidence, and reports stale instead of
+  mixing current transcript data with old strategies.
 
 Deterministic verification: 72 focused Stage 4.0 tests (passing both with and
 without a Gemini key present) plus the full backend suite in Docker Python 3.12
@@ -101,7 +181,7 @@ transcript and boundary refinement (candidate 5/5 s, final 8/8 s context, max
 150 s) through the existing job system, with optional selective Gemini
 transcription/adjudication behind a shared priority/budget gate. Rendering,
 publishing, review UI, and authorization remain out of scope; Stage 4.0 is
-implemented (explicit, candidate-scoped) and Stage 4.1 is not.
+implemented (explicit, candidate-scoped); Stage 4.1 is implemented and Stage 4.2 is not.
 
 ## Stage 3.5 candidate-scoped refinement (2026-09-12)
 
@@ -174,8 +254,8 @@ expensive compute only on requested candidates/final clips:
   candidate-grade batch (score-ordered, default 5, max 10, no bulk FINAL_CLIP),
   submit manual text/resolutions, and fetch a typed read-only Stage 4 handoff
   (refined transcript/exact bounds + Stage 3 evidence; never mislabels
-  candidate-grade output as final-ready). Stage 4.0 is implemented and Stage 4.1 is not, and
-  `FINAL_TRANSCRIPT_READY` is not publishing readiness.
+  candidate-grade output as final-ready). Stage 4.0 and Stage 4.1 are implemented and Stage 4.2 is not,
+  and `FINAL_TRANSCRIPT_READY` is not publishing readiness.
 
 Deterministic verification adds Stage 3.5 tests plus the full existing suite:
 780 backend tests pass (Docker Python 3.12), coverage 87% (gate 79%). Stage 3.5

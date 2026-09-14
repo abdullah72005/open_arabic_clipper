@@ -373,3 +373,32 @@ This mode is separate from `CLIPFACTORY_RECONSTRUCTION_ROUTING_MODE`,
 `CLIPFACTORY_CANDIDATE_SEMANTIC_MODE`, and
 `CLIPFACTORY_REFINEMENT_ROUTING_MODE`. See
 [docs/STAGE_4_0_OPERATIONS.md](STAGE_4_0_OPERATIONS.md).
+
+## Stage 4.1 transformation plan generation configuration (2026-09-14)
+
+Stage 4.1 is explicit, candidate-scoped work after a current Stage 4.0 analysis.
+Its provider mode is **separately configurable** and defaults to `adaptive`; it
+is deliberately decoupled from Stage 4.0's mode so changing planning
+configuration never invalidates frozen Stage 4.0 analyses. All knobs are
+`CLIPFACTORY_`-prefixed:
+
+```bash
+# adaptive (default) | deterministic | local_only
+CLIPFACTORY_TRANSFORMATION_PLANNING_MODE=adaptive
+CLIPFACTORY_TRANSFORMATION_PLANNING_ROUTINE_MODEL=gemini-3.5-flash-lite
+CLIPFACTORY_TRANSFORMATION_PLANNING_STRONG_MODEL=gemini-3.8-flash
+CLIPFACTORY_TRANSFORMATION_PLANNING_MAX_OUTPUT_TOKENS=4096
+CLIPFACTORY_TRANSFORMATION_PLANNING_STRONG_THINKING_LEVEL=low
+```
+
+`deterministic` makes zero Gemini and zero Qwen calls and loads no model; a
+conservative deterministic fallback is allowed only for grounded
+`SOURCE_LED_MINIMAL`/`SOURCE_AS_EVIDENCE` intent. `adaptive` uses hosted Gemini
+with safe deterministic behavior, batches requests per tier (at most one call
+per tier and two per plan-set run) through the shared Gemini admission controller
+at `HIGH`, uses temperature 0 and strict structured output, and never silently
+falls back to Qwen. `local_only` uses Qwen/Ollama only when
+`CLIPFACTORY_LOCAL_QWEN_ENABLED=true` and never calls Gemini. Stage 4.1 never
+selects a TTS provider, model, or voice: those belong to future channel
+configuration and Stage 6 speech generation. See
+[docs/STAGE_4_1_OPERATIONS.md](STAGE_4_1_OPERATIONS.md).

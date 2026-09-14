@@ -63,6 +63,15 @@ from app.transcription.dialect import ArabicDialectProfile
 from app.transcription.normalization import normalize_transcript
 from app.transcription.reconstruction.providers import ReconstructionProvider
 from app.transformation.handoff import build_stage4_1_handoff
+from app.transformation.planning.handoff import build_stage4_2_handoff
+from app.transformation.planning.queue import (
+    PlanningQueueError,
+    get_plan_set,
+    get_plan_set_for_candidate,
+    list_plans,
+    queue_transformation_planning,
+    validate_candidate_for_planning,
+)
 from app.transformation.queue import (
     TransformationQueueError,
     get_analysis,
@@ -305,6 +314,86 @@ class Stage41HandoffResponse(BaseModel):
     stale: bool
     ready_for_stage4_1: bool
     stage4_1_implemented: bool
+    model_config = {"extra": "allow"}
+
+
+class TransformationPlanResponse(BaseModel):
+    id: UUID
+    plan_key: str
+    is_current: bool
+    status: str
+    generation_rank: int
+    strategy_candidate_id: UUID
+    strategy_type: str
+    intensity: str
+    strategy_fingerprint: str
+    blocks: list[dict[str, object]]
+    hero_block_index: int
+    hero_source_start: float | None
+    hero_source_end: float | None
+    hero_appearance_time: float
+    original_value_kinds: list[str]
+    narration_need: str
+    narration_requirements: dict[str, object]
+    external_fact_dependencies: list[dict[str, object]]
+    derived_durations: dict[str, object]
+    hook_payoff_evidence: dict[str, object]
+    stage40_risk: dict[str, object]
+    source_dialect: dict[str, object]
+    target_audience: dict[str, object]
+    planner_confidence: float
+    generation_origin: str
+    planning_provider_evidence: dict[str, object]
+    provider_input_fingerprint: str
+    plan_output_fingerprint: str
+
+
+class TransformationPlanSetResponse(BaseModel):
+    id: UUID
+    source_video_id: UUID
+    clip_candidate_id: UUID
+    transformation_analysis_id: UUID
+    refinement_id: UUID | None
+    refinement_priority: str
+    refinement_quality_level: str
+    execution_status: str
+    planning_outcome: str | None
+    outcome_reasons: list[str]
+    stage40_snapshot: dict[str, object]
+    target_context: dict[str, object]
+    provider_mode: str
+    provider_status: str
+    provider_identity: dict[str, object]
+    provider_evidence: dict[str, object]
+    strategy_attempts: list[dict[str, object]]
+    input_fingerprint: str
+    output_fingerprint: str
+    cache_eligible: bool
+    metrics: dict[str, object]
+    processing_duration: float | None
+    plans: list[TransformationPlanResponse]
+
+
+class PlanningQueueResponse(BaseModel):
+    plan_set_id: UUID
+    job_id: UUID | None
+    status: str
+    queued: bool
+    cached: bool
+    active: bool
+
+
+class Stage42HandoffResponse(BaseModel):
+    candidate: dict[str, object]
+    stage40: dict[str, object]
+    selected_refinement: dict[str, object] | None
+    plan_set: dict[str, object] | None
+    plans: list[dict[str, object]]
+    current: bool
+    stale: bool
+    cache_eligible: bool
+    stage4_2_implemented: bool
+    stage4_3_implemented: bool
     model_config = {"extra": "allow"}
 
 
@@ -932,6 +1021,70 @@ def create_app(
             raise HTTPException(status_code=404, detail="candidate not found")
         return Stage41HandoffResponse(**handoff)
 
+    @app.post(
+        "/api/candidates/{candidate_id}/transformation-plans",
+        response_model=PlanningQueueResponse,
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    def queue_transformation_plans_endpoint(
+        candidate_id: UUID,
+        force: bool = False,
+        database: Session = Depends(session),
+    ) -> PlanningQueueResponse:
+        """Explicitly queue one candidate-scoped Stage 4.1 planning run."""
+
+        try:
+            candidate, analysis = validate_candidate_for_planning(database, candidate_id)
+            outcome = queue_transformation_planning(database, candidate, analysis, force=force)
+        except PlanningQueueError as error:
+            raise _planning_http(error) from error
+        return PlanningQueueResponse(
+            plan_set_id=outcome.plan_set_id,
+            job_id=outcome.job_id,
+            status=outcome.status,
+            queued=outcome.queued,
+            cached=outcome.cached,
+            active=outcome.active,
+        )
+
+    @app.get(
+        "/api/candidates/{candidate_id}/transformation-plans",
+        response_model=TransformationPlanSetResponse,
+    )
+    def get_candidate_transformation_plans(
+        candidate_id: UUID, database: Session = Depends(session)
+    ) -> TransformationPlanSetResponse:
+        if database.get(ClipCandidate, candidate_id) is None:
+            raise HTTPException(status_code=404, detail="candidate not found")
+        plan_set = get_plan_set_for_candidate(database, candidate_id)
+        if plan_set is None:
+            raise HTTPException(status_code=404, detail="transformation plan set not found")
+        return _plan_set_response(database, plan_set)
+
+    @app.get(
+        "/api/transformation-plan-sets/{plan_set_id}",
+        response_model=TransformationPlanSetResponse,
+    )
+    def get_transformation_plan_set(
+        plan_set_id: UUID, database: Session = Depends(session)
+    ) -> TransformationPlanSetResponse:
+        plan_set = get_plan_set(database, plan_set_id)
+        if plan_set is None:
+            raise HTTPException(status_code=404, detail="transformation plan set not found")
+        return _plan_set_response(database, plan_set)
+
+    @app.get(
+        "/api/candidates/{candidate_id}/stage4-2-handoff",
+        response_model=Stage42HandoffResponse,
+    )
+    def get_stage4_2_handoff(
+        candidate_id: UUID, database: Session = Depends(session)
+    ) -> Stage42HandoffResponse:
+        handoff = build_stage4_2_handoff(database, candidate_id)
+        if handoff is None:
+            raise HTTPException(status_code=404, detail="candidate not found")
+        return Stage42HandoffResponse(**handoff)
+
     @app.patch("/api/sources/{source_id}/provenance", response_model=SourceResponse)
     def update_source_provenance(
         source_id: UUID,
@@ -1210,6 +1363,79 @@ def _transformation_response(database: Session, analysis: object) -> Transformat
         processing_duration=analysis.processing_duration,  # type: ignore[attr-defined]
         recommended_strategies=recommended,
         rejected_strategies=rejected,
+    )
+
+
+def _planning_http(error: PlanningQueueError) -> HTTPException:
+    detail = str(error)
+    code = 404 if "does not exist" in detail else 409
+    return HTTPException(status_code=code, detail=detail)
+
+
+def _plan_response(row: object) -> TransformationPlanResponse:
+    return TransformationPlanResponse(
+        id=row.id,  # type: ignore[attr-defined]
+        plan_key=row.plan_key,  # type: ignore[attr-defined]
+        is_current=row.is_current,  # type: ignore[attr-defined]
+        status=row.status.value,  # type: ignore[attr-defined]
+        generation_rank=row.generation_rank,  # type: ignore[attr-defined]
+        strategy_candidate_id=row.strategy_candidate_id,  # type: ignore[attr-defined]
+        strategy_type=row.strategy_type.value,  # type: ignore[attr-defined]
+        intensity=row.intensity.value,  # type: ignore[attr-defined]
+        strategy_fingerprint=row.strategy_fingerprint,  # type: ignore[attr-defined]
+        blocks=list(row.blocks or []),  # type: ignore[attr-defined]
+        hero_block_index=row.hero_block_index,  # type: ignore[attr-defined]
+        hero_source_start=row.hero_source_start,  # type: ignore[attr-defined]
+        hero_source_end=row.hero_source_end,  # type: ignore[attr-defined]
+        hero_appearance_time=row.hero_appearance_time,  # type: ignore[attr-defined]
+        original_value_kinds=list(row.original_value_kinds or []),  # type: ignore[attr-defined]
+        narration_need=row.narration_need,  # type: ignore[attr-defined]
+        narration_requirements=_without_secrets(dict(row.narration_requirements or {})),  # type: ignore[attr-defined]
+        external_fact_dependencies=[
+            dict(item)
+            for item in (row.external_fact_dependencies or [])  # type: ignore[attr-defined]
+        ],
+        derived_durations=dict(row.derived_durations or {}),  # type: ignore[attr-defined]
+        hook_payoff_evidence=dict(row.hook_payoff_evidence or {}),  # type: ignore[attr-defined]
+        stage40_risk=_without_secrets(dict(row.stage40_risk or {})),  # type: ignore[attr-defined]
+        source_dialect=dict(row.source_dialect or {}),  # type: ignore[attr-defined]
+        target_audience=dict(row.target_audience or {}),  # type: ignore[attr-defined]
+        planner_confidence=row.planner_confidence,  # type: ignore[attr-defined]
+        generation_origin=row.generation_origin.value,  # type: ignore[attr-defined]
+        planning_provider_evidence=_without_secrets(
+            dict(row.planning_provider_evidence or {})  # type: ignore[attr-defined]
+        ),
+        provider_input_fingerprint=row.provider_input_fingerprint,  # type: ignore[attr-defined]
+        plan_output_fingerprint=row.plan_output_fingerprint,  # type: ignore[attr-defined]
+    )
+
+
+def _plan_set_response(database: Session, plan_set: object) -> TransformationPlanSetResponse:
+    outcome = plan_set.planning_outcome  # type: ignore[attr-defined]
+    return TransformationPlanSetResponse(
+        id=plan_set.id,  # type: ignore[attr-defined]
+        source_video_id=plan_set.source_video_id,  # type: ignore[attr-defined]
+        clip_candidate_id=plan_set.clip_candidate_id,  # type: ignore[attr-defined]
+        transformation_analysis_id=plan_set.transformation_analysis_id,  # type: ignore[attr-defined]
+        refinement_id=plan_set.refinement_id,  # type: ignore[attr-defined]
+        refinement_priority=plan_set.refinement_priority,  # type: ignore[attr-defined]
+        refinement_quality_level=plan_set.refinement_quality_level,  # type: ignore[attr-defined]
+        execution_status=plan_set.execution_status.value,  # type: ignore[attr-defined]
+        planning_outcome=outcome.value if outcome else None,
+        outcome_reasons=list(plan_set.outcome_reasons or []),  # type: ignore[attr-defined]
+        stage40_snapshot=_without_secrets(dict(plan_set.stage40_snapshot or {})),  # type: ignore[attr-defined]
+        target_context=dict(plan_set.target_context or {}),  # type: ignore[attr-defined]
+        provider_mode=plan_set.provider_mode.value,  # type: ignore[attr-defined]
+        provider_status=plan_set.provider_status,  # type: ignore[attr-defined]
+        provider_identity=dict(plan_set.provider_identity or {}),  # type: ignore[attr-defined]
+        provider_evidence=_without_secrets(dict(plan_set.provider_evidence or {})),  # type: ignore[attr-defined]
+        strategy_attempts=[dict(item) for item in (plan_set.strategy_attempts or [])],  # type: ignore[attr-defined]
+        input_fingerprint=plan_set.input_fingerprint,  # type: ignore[attr-defined]
+        output_fingerprint=plan_set.output_fingerprint,  # type: ignore[attr-defined]
+        cache_eligible=plan_set.cache_eligible,  # type: ignore[attr-defined]
+        metrics=_without_secrets(dict(plan_set.metrics or {})),  # type: ignore[attr-defined]
+        processing_duration=plan_set.processing_duration,  # type: ignore[attr-defined]
+        plans=[_plan_response(row) for row in list_plans(database, plan_set.id)],  # type: ignore[attr-defined]
     )
 
 

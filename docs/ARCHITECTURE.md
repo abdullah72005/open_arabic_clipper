@@ -52,3 +52,38 @@ never overrides a hard blocker. Rights/provenance risk and
 originality/transformation risk stay separate; the platform-risk snapshot is
 decision support, never a legal or monetization guarantee. Stage 4.1 receives a
 typed read-only handoff only.
+
+## Stage 4.1 transformation plan generation
+
+Stage 4.1 lives in `app/transformation/planning/` and is explicit,
+candidate-scoped work after a current, non-stale Stage 4.0 analysis with at least
+one current recommended strategy. It consumes only that handoff, accepts a usable
+`CANDIDATE` Stage 3.5 refinement (never requires `FINAL_CLIP`), and produces zero
+to three concrete validated plans — normally at most one per current recommended
+strategy. It does not select, approve, authorize, or mark a winning plan, and it
+adds **no** `PipelineStage`, **no** `PipelineRun`, **no** `_NEXT_STAGE` entry,
+and no source lifecycle change. It extends the existing Celery/`ProcessingJob`
+platform with a `TRANSFORMATION_PLANNING` job kind and a nullable
+`processing_jobs.transformation_plan_set_id` FK. `transformation_plan_sets` (one
+durable planning envelope per candidate) and `transformation_plans` (one stable
+row per `(plan_set, strategy_candidate)`) persist the result; a zero-plan,
+deferred, degraded, or provider-unavailable plan set is recorded truthfully
+without fake plan rows. Bounded structured blocks are stored as validated JSON on
+the plan rather than a block table.
+
+Deterministic logic owns readiness, input bounds, routing, source-span
+resolution, hero placement, duration arithmetic, substantive-value validation,
+paraphrase/cosmetic rejection, narration/TTS separation, verification dependency
+enforcement, material distinction, persistence eligibility, and cache/fingerprint
+composition. An optional planning provider (hosted Gemini routine/strong tiers or
+an explicit `local_only` Qwen) may only turn an already-approved strategy into a
+concrete plan; the provider selects source spans by indexed word references or a
+full-window sentinel and never supplies timestamps, quotes, TTS choices, or
+rendering instructions. Hosted calls are batched per tier (at most one call per
+tier and two per plan-set run) through the shared HIGH admission gate with
+temperature 0 and strict structured validation. A missing key/outage/429/quota/
+safety refusal/malformed output never fails the source: accepted per-strategy
+checkpoints survive, only unfinished work stays non-cache-eligible, and a later
+normal request retries it. Narration is an abstract semantic requirement; Stage
+4.1 decides WHAT narration communicates, channel configuration will decide WHO
+the persistent narrator is, and Stage 6 generates speech.

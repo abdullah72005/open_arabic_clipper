@@ -40,6 +40,7 @@ class JobKind(str, Enum):
     CANDIDATE_ANALYSIS = "CANDIDATE_ANALYSIS"
     CANDIDATE_REFINEMENT = "CANDIDATE_REFINEMENT"
     TRANSFORMATION_ELIGIBILITY = "TRANSFORMATION_ELIGIBILITY"
+    TRANSFORMATION_PLANNING = "TRANSFORMATION_PLANNING"
 
 
 class JobStatus(str, Enum):
@@ -370,3 +371,83 @@ class ExternalFactRequirement(str, Enum):
 
     NOT_REQUIRED = "NOT_REQUIRED"
     REQUIRES_EXTERNAL_FACT_VERIFICATION = "REQUIRES_EXTERNAL_FACT_VERIFICATION"
+
+
+class PlanExecutionStatus(str, Enum):
+    """Stage 4.1 processing lifecycle, separate from the planning outcome.
+
+    A truthfully deferred or provider-unavailable plan set is a successful
+    semantic result; it is never a source/pipeline failure.
+    """
+
+    QUEUED = "QUEUED"
+    PLANNING = "PLANNING"
+    COMPLETE = "COMPLETE"
+    PROVIDER_DEGRADED = "PROVIDER_DEGRADED"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+
+
+class PlanSemanticOutcome(str, Enum):
+    """Stage 4.1 semantic result of one candidate-scoped planning run."""
+
+    PLANS_GENERATED = "PLANS_GENERATED"
+    PLANS_GENERATED_WITH_VERIFICATION_REQUIRED = "PLANS_GENERATED_WITH_VERIFICATION_REQUIRED"
+    PLANNING_DEFERRED = "PLANNING_DEFERRED"
+    NO_VALID_PLAN_FROM_STRATEGY = "NO_VALID_PLAN_FROM_STRATEGY"
+    PROVIDER_UNAVAILABLE = "PROVIDER_UNAVAILABLE"
+
+
+class PlanStatus(str, Enum):
+    """Persisted status of one validated transformation plan."""
+
+    PLAN_GENERATED = "PLAN_GENERATED"
+    PLAN_GENERATED_WITH_VERIFICATION_REQUIRED = "PLAN_GENERATED_WITH_VERIFICATION_REQUIRED"
+
+
+class PlanBlockType(str, Enum):
+    """Smallest useful closed Stage 4.1 block vocabulary."""
+
+    SOURCE_EXCERPT = "SOURCE_EXCERPT"
+    ORIGINAL_VALUE = "ORIGINAL_VALUE"
+    TRANSITION = "TRANSITION"
+    TEXTUAL_ANNOTATION = "TEXTUAL_ANNOTATION"
+    FACT_VERIFICATION_PLACEHOLDER = "FACT_VERIFICATION_PLACEHOLDER"
+
+
+class SourceExcerptRole(str, Enum):
+    """Structural role of one source excerpt inside a plan."""
+
+    HERO = "HERO"
+    HOOK = "HOOK"
+    PAYOFF = "PAYOFF"
+    SUPPORT = "SUPPORT"
+
+
+class NarrationNeed(str, Enum):
+    """Abstract Stage 4.1 narration requirement level (never auto-required)."""
+
+    NONE = "NONE"
+    OPTIONAL = "OPTIONAL"
+    RECOMMENDED = "RECOMMENDED"
+    REQUIRED = "REQUIRED"
+
+
+class NarrationPurpose(str, Enum):
+    """What a future narration communicates; never how it sounds."""
+
+    CONTEXT = "CONTEXT"
+    ANALYSIS = "ANALYSIS"
+    COUNTERPOINT = "COUNTERPOINT"
+    EXPLANATION = "EXPLANATION"
+    TAKEAWAY = "TAKEAWAY"
+    HOOK = "HOOK"
+    TRANSITION = "TRANSITION"
+
+
+class DeliveryIntent(str, Enum):
+    """How an original-value block is intended to be delivered (abstract only)."""
+
+    ON_SCREEN_TEXT = "ON_SCREEN_TEXT"
+    NARRATION = "NARRATION"
+    FLEXIBLE = "FLEXIBLE"
