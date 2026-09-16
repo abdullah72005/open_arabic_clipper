@@ -139,9 +139,14 @@ class FakePlanningProvider:
     provider_name = "fake"
 
     def __init__(
-        self, plans: Sequence[PlanProviderPlan] = (), *, model: str = "fake-model"
+        self,
+        plans: Sequence[PlanProviderPlan] = (),
+        *,
+        model: str = "fake-model",
+        hosted: bool = True,
     ) -> None:
         self.model = model
+        self.hosted_provider = hosted
         self.calls = 0
         self.tiers: list[str] = []
         self.behavior = "ok"

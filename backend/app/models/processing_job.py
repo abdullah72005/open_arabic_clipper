@@ -48,6 +48,12 @@ class ProcessingJob(Base):
         index=True,
     )
     retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Durable per-execution ownership token. Every successful claim advances it,
+    # so a superseded worker can never persist, cancel, fail, or finalize a run
+    # that a newer claim owns.
+    claim_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
     task_id: Mapped[str | None] = mapped_column(String(255), index=True)
     error_code: Mapped[str | None] = mapped_column(String(128))
     error_message: Mapped[str | None] = mapped_column(String(2048))

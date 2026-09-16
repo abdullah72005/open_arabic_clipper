@@ -48,12 +48,17 @@ refinement, and is **never** added to the automatic `_NEXT_STAGE` chain.
   rejected, not only exact duplicates; chronology and non-overlap are preserved.
   `hero_appearance_time` and the persisted elapsed/authored evidence remain
   accurate and auditable.
-- **Hard TTS/rendering/evasion boundary.** Every provider-controlled free-text
-  field that can persist into a plan (purpose, semantic intent, why-unavailable,
-  draft line, continuity rationale, preservation constraints, verification text,
-  grounding refs, narration language/register) is checked against bounded,
-  explicit policy markers. TTS provider/model/voice selection, speaker identity,
-  frame-level rendering instructions, cosmetic-only transformation claims, and
+- **Hard TTS/rendering/evasion boundary.** Every provider-controlled string or
+  string list that can persist into plan rows, per-strategy checkpoints,
+  outcomes, or the Stage 4.2 handoff is checked against bounded, explicit policy
+  markers **before any no-valid-plan early return**: plan preservation
+  constraints, planner notes, no-valid reasons, block purpose, semantic intent,
+  why-unavailable, draft line, continuity rationale, verification rationale,
+  intended use, grounding refs, dependency ids, claim dependency, and narration
+  language/register/dependency ids. TTS provider-plus-voice selection (for
+  example "Use Gemini voice Charon"), named-speaker identity (for example "Have
+  Morgan Freeman narrate"), TTS provider/model/voice selection, frame-level
+  rendering instructions, cosmetic-only transformation claims, and
   platform/detection-evasion tactics (mirroring, pitch shifting, speed tricks,
   watermark removal/obfuscation) are rejected. Legitimate narration semantics
   (purpose, language, register, duration, placement, dependency) are preserved,
@@ -72,7 +77,9 @@ refinement, and is **never** added to the automatic `_NEXT_STAGE` chain.
   when `CLIPFACTORY_LOCAL_QWEN_ENABLED=true`. The two-call ceiling is a hard
   **raw** `generate_content` budget: there is no per-tier retry inside it, the
   provider refuses a third raw call, and persisted metrics report actual raw
-  hosted calls, not only tier invocations. Missing key/outage/429/quota/safety
+  hosted calls only: deterministic and `local_only`/Qwen planning report
+  `hosted_raw_calls=0`, and Gemini reports its real `generate_content` count
+  (never a generic provider-invocation count). Missing key/outage/429/quota/safety
   refusal/malformed output never fails the source: accepted per-strategy
   checkpoints survive (including across repeated forced reruns), only unfinished
   work stays non-cache-eligible, and a later normal request retries it. Planning
@@ -93,26 +100,36 @@ refinement, and is **never** added to the automatic `_NEXT_STAGE` chain.
   dependent content. Linkage is deterministic and persisted: a placeholder lists
   the integer block indexes of dependent substantive blocks, those blocks carry
   the placeholder's claim id in `dependency_ids`, and narration depends on a
-  claim through `verification_dependency_ids`. Bogus, missing, nonexistent, or
-  unlinked references are rejected; `must_verify_before_execution=true` is
-  preserved. No fact is fabricated and there is no browsing/research subsystem.
+  claim through `verification_dependency_ids`. Malformed/non-integer provider
+  block references are rejected at the parse boundary, never silently dropped.
+  Bogus, missing, nonexistent, self-referential, non-substantive, or unlinked
+  references are rejected; `must_verify_before_execution=true` is preserved. No
+  fact is fabricated and there is no browsing/research subsystem.
 - **Durable execution.** A duplicate/redelivered Celery invocation of the same
   `(plan_set_id, job_id)` is fenced by an atomic `QUEUED -> RUNNING`
   `ProcessingJob` claim, so provider work runs exactly once; legitimate retries
   re-claim a `FAILED` job and a run abandoned by a crashed worker is reclaimable
-  after a bounded staleness window. The local-only executor retains and releases
-  the exact lease-bound provider wrapper, so the shared heavy-model lease always
-  exits on success, provider failure, cancellation, cache hit, and exception.
+  after a bounded staleness window. Every claim advances a durable per-execution
+  ownership token (`processing_jobs.claim_version`); the plan-set claim, plan
+  persistence, cancellation, failure, and job finalization are all fenced by that
+  token, so a reclaimed stale worker can neither persist, cancel, fail, nor
+  finalize a newer run. Failed planning jobs retain bounded sanitized operator
+  diagnostics (prerequisite messages or the exception type only; never keys,
+  transcripts, or provider payloads). The local-only executor retains and
+  releases the exact lease-bound provider wrapper, so the shared heavy-model
+  lease always exits on success, provider failure, cancellation, cache hit, and
+  exception.
 - **API/CLI/handoff.** Minimal endpoints queue/read one plan set and expose a
   typed read-only Stage 4.2 handoff (`stage4_2_implemented=false`,
   `stage4_3_implemented=false`) with exact ordered blocks, hero span, narration
   semantics, verification dependencies, and Stage 4.0 risk.
 
-Deterministic verification: 87 focused Stage 4.1 tests (63 original + 24
-review-remediation) plus the full backend suite in Docker Python 3.12 with the
-repository compose/.env files mounted, with no live provider calls in the
-automated suite. Planning policy/schema/validation versions advanced to
-`stage4.1-v2`/`stage4.1-schema-v2`/`stage4.1-validation-v2` so prior plans
+Deterministic verification: 106 focused Stage 4.1 tests (63 original + 24
+review-remediation + 19 final re-review remediation) plus the full backend suite
+in Docker Python 3.12 with the repository compose/.env files mounted, with no
+live provider calls in the automated suite. Planning policy/schema/validation
+versions advanced to
+`stage4.1-v3`/`stage4.1-schema-v3`/`stage4.1-validation-v3` so prior plans
 invalidate. See [docs/STAGE_4_1_OPERATIONS.md](docs/STAGE_4_1_OPERATIONS.md).
 
 ## Stage 4.0 transformation eligibility and strategy discovery (2026-09-14)

@@ -19,12 +19,13 @@ from app.core.enums import (
     TransformationStrategyType,
 )
 
-# v2 hardening: real verification-block linkage, hero elapsed-time cap,
-# minimum excerpt duration, narration-contract checks, overlapping-span
-# rejection, and the TTS/rendering/evasion boundary.
-POLICY_VERSION = "stage4.1-v2"
-SCHEMA_VERSION = "stage4.1-schema-v2"
-VALIDATION_VERSION = "stage4.1-validation-v2"
+# v3 hardening: complete provider-controlled text boundary (provider+voice,
+# named-speaker identity, planner notes, no-valid reasons, dependency/claim and
+# narration dependency fields), malformed verification-reference rejection, and
+# hosted raw-call metric correctness.
+POLICY_VERSION = "stage4.1-v3"
+SCHEMA_VERSION = "stage4.1-schema-v3"
+VALIDATION_VERSION = "stage4.1-validation-v3"
 INPUT_FINGERPRINT_VERSION = "1"
 OUTPUT_FINGERPRINT_VERSION = "1"
 PLAN_FINGERPRINT_VERSION = "1"
@@ -263,6 +264,41 @@ TTS_SELECTION_MARKERS: tuple[str, ...] = (
     "gemini tts",
     "male voice",
     "female voice",
+)
+# TTS provider identities. A provider token co-occurring with a voice/narration
+# context is provider-plus-voice selection, even when no explicit TTS marker is
+# present (for example "Use Gemini voice Charon").
+TTS_PROVIDER_TOKENS: tuple[str, ...] = (
+    "gemini",
+    "google",
+    "openai",
+    "anthropic",
+    "elevenlabs",
+    "polly",
+    "azure",
+    "amazon",
+    "microsoft",
+    "qwen",
+    "ollama",
+    "coqui",
+    "speechify",
+    "murf",
+    "descript",
+    "play.ht",
+    "wellsaid",
+)
+# Voice/narration context cues bounded to selection contexts.
+VOICE_SELECTION_CONTEXT_MARKERS: tuple[str, ...] = (
+    "voice",
+    "narrat",
+    "tts",
+    "text-to-speech",
+    "text to speech",
+    "synthes",
+    "speech",
+    "speak",
+    "speaker",
+    "vocal",
 )
 RENDERING_INSTRUCTION_MARKERS: tuple[str, ...] = (
     "ffmpeg",

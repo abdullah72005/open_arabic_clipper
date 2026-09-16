@@ -35,6 +35,7 @@ HttpRequest = Callable[[str, str, bytes | None, dict[str, str], float], bytes]
 
 class LocalPlanningProvider:
     provider_name = "ollama"
+    hosted_provider = False
 
     def __init__(
         self,

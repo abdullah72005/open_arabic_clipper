@@ -262,6 +262,9 @@ class PlanProviderBlock:
     intended_use: str | None = None
     must_verify_before_execution: bool = False
     dependent_block_ids: tuple[int, ...] = ()
+    # True when the raw provider list contained malformed/non-integer entries
+    # preserved for deterministic rejection instead of silent dropping.
+    dependent_block_ids_invalid: bool = False
 
 
 @dataclass(frozen=True)

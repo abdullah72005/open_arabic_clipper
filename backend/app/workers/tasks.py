@@ -327,13 +327,11 @@ def run_transformation_planning(
         except StageCancelled:
             return {"plan_set_id": str(parsed_plan_set), "cancelled": True}
         except Exception as error:
+            # The executor owns durable claim fencing and records sanitized
+            # diagnostics on its own failure paths; a never-claimed job is
+            # failed here in the same fenced, sanitized way.
             if parsed_job is not None and not getattr(executor, "skipped_duplicate", False):
-                failed_job = session.get(ProcessingJob, parsed_job)
-                if failed_job is not None and failed_job.status is JobStatus.RUNNING:
-                    failed_job.status = JobStatus.FAILED
-                    failed_job.completed_at = datetime.now(timezone.utc)
-                    failed_job.error_message = type(error).__name__[:2048]
-                    session.commit()
+                executor.record_failure(error)
             if getattr(error, "retryable", False):
                 raise self.retry(
                     args=[plan_set_id, job_id, force],

@@ -76,6 +76,30 @@ class PlanningCancelled(StageCancelled):
     """Cooperative cancellation while Stage 4.1 planning was running."""
 
 
+def _sanitize_error_message(error: Exception | None) -> str:
+    """Bounded operator diagnostics that never leak credentials or transcripts."""
+
+    if error is None:
+        return "Stage 4.1 planning failed"
+    if isinstance(error, PlanningInputError):
+        # Repository-owned prerequisite messages only; no provider payloads.
+        return str(error)[:300]
+    if isinstance(error, PlanningProviderError):
+        return f"transformation_planning_provider_{error.category}"[:300]
+    # Unknown/unexpected errors expose only the exception type.
+    return type(error).__name__[:300]
+
+
+def _sanitize_error_code(error: Exception | None) -> str:
+    if error is None:
+        return "PLANNING_FAILED"
+    if isinstance(error, PlanningInputError):
+        return "PLANNING_INPUT"
+    if isinstance(error, PlanningProviderError):
+        return f"PROVIDER_{error.category}"[:128]
+    return type(error).__name__[:128]
+
+
 class _LeaseBoundPlanningProvider:
     """Acquire the shared heavy-model lease lazily around real local inference."""
 
@@ -85,6 +109,8 @@ class _LeaseBoundPlanningProvider:
         self._lease: object | None = None
         self.provider_name = getattr(inner, "provider_name", "ollama")
         self.model = getattr(inner, "model", None)
+        # Local inference is never a hosted call, regardless of the inner provider.
+        self.hosted_provider = False
 
     def _enter(self) -> object:
         if self._lease is None:
@@ -134,6 +160,7 @@ class _AdmissionBoundPlanningProvider:
         self._admission = admission
         self.provider_name = getattr(inner, "provider_name", "gemini")
         self.model = getattr(inner, "model", None)
+        self.hosted_provider = bool(getattr(inner, "hosted_provider", False))
         self._released = False
 
     def plan(self, requests: Sequence[object], tier: str = "ROUTINE") -> dict[str, object]:
@@ -197,19 +224,87 @@ class TransformationPlanningExecutor:
         self._effective: PlanningProvider | None = None
         # True when this executor atomically owns the executing job's run claim.
         self._job_owner = False
+        # The durable claim version this executor wrote (None when no job).
+        self._claim_version: int | None = None
+        # The plan set under execution, for wrapper-driven failure diagnostics.
+        self._plan_set_id: object | None = None
+        # True when a newer claim superseded this executor's claim.
+        self.claim_lost = False
         # True when a duplicate/redelivered invocation was fenced out.
         self.skipped_duplicate = False
 
     def set_active_job(self, job_id: object | None) -> None:
         self._active_job_id = job_id
 
-    def _job_cancelled(self) -> bool:
+    def _job_status(self) -> JobStatus | None:
         if self._active_job_id is None:
-            return False
-        status = self._session.scalar(
+            return None
+        return self._session.scalar(
             select(ProcessingJob.status).where(ProcessingJob.id == self._active_job_id)
         )
-        return status is JobStatus.CANCELLED
+
+    def _job_cancelled(self) -> bool:
+        return self._job_status() is JobStatus.CANCELLED
+
+    def _claim_is_current(self) -> bool:
+        """Fresh read-only durable ownership check (no lock held)."""
+
+        if self.claim_lost:
+            return False
+        if self._active_job_id is None:
+            return True
+        if self._job_owner and self._claim_version is not None:
+            stored = self._session.scalar(
+                select(ProcessingJob.claim_version).where(ProcessingJob.id == self._active_job_id)
+            )
+            if stored != self._claim_version:
+                self._job_owner = False
+                self.claim_lost = True
+                return False
+            return True
+        # Not an owner: only safe while no live RUNNING claim owns the job.
+        return self._job_status() is not JobStatus.RUNNING
+
+    def _fence_claim(self) -> bool:
+        """Atomically lock and verify this executor's durable claim token.
+
+        Emitted inside the caller's transaction so the guarded mutation commits
+        only when the token is still current.
+        """
+
+        if self._active_job_id is None:
+            return True
+        if not self._job_owner or self._claim_version is None:
+            self.claim_lost = True
+            return False
+        result = self._session.execute(
+            update(ProcessingJob)
+            .where(
+                ProcessingJob.id == self._active_job_id,
+                # The durable token alone decides ownership: a newer claim
+                # always advances it, so only the current run may mutate.
+                ProcessingJob.claim_version == self._claim_version,
+            )
+            .values(claim_version=self._claim_version)
+            .execution_options(synchronize_session=False)
+        )
+        if int(result.rowcount) != 1:
+            self._job_owner = False
+            self.claim_lost = True
+            return False
+        return True
+
+    def _claim_guard(self) -> bool:
+        if self.claim_lost:
+            return False
+        if self._active_job_id is None:
+            return True
+        if self._job_owner and self._claim_version is not None:
+            return self._fence_claim()
+        return self._job_status() is not JobStatus.RUNNING
+
+    def _should_stop(self) -> bool:
+        return self._job_cancelled() or not self._claim_is_current()
 
     def _provider_identity(self) -> dict[str, object]:
         if self._configured_identity is not None:
@@ -317,17 +412,29 @@ class TransformationPlanningExecutor:
         )
         return bool(status in _ACTIVE_JOB_STATUSES)
 
-    def _claim(self, plan_set: TransformationPlanSet) -> None:
+    def _claim(self, plan_set: TransformationPlanSet) -> bool:
+        """Claim the plan set, fenced by the durable job ownership token."""
+
+        if not self._claim_guard():
+            self._session.rollback()
+            return False
         plan_set.active_job_id = str(self._active_job_id) if self._active_job_id else None
         plan_set.execution_status = PlanExecutionStatus.PLANNING
         self._session.commit()
+        return True
 
     def _mark_cancelled(self, plan_set: TransformationPlanSet) -> None:
+        if not self._claim_guard():
+            self._session.rollback()
+            return
         plan_set.execution_status = PlanExecutionStatus.CANCELLED
         plan_set.active_job_id = None
         self._session.commit()
 
-    def _mark_failed(self, plan_set: TransformationPlanSet) -> None:
+    def _mark_failed(self, plan_set: TransformationPlanSet, error: Exception | None = None) -> None:
+        if not self._claim_guard():
+            self._session.rollback()
+            return
         if self._job_cancelled():
             plan_set.execution_status = PlanExecutionStatus.CANCELLED
         else:
@@ -336,16 +443,19 @@ class TransformationPlanningExecutor:
         self._session.commit()
 
     def _claim_job(self) -> bool:
-        """Atomically claim the executing job for this run (QUEUED -> RUNNING).
+        """Atomically claim the executing job and advance its durable token.
 
         A duplicate/redelivered invocation of the same ``(plan_set_id, job_id)``
         observes a live RUNNING claim and is fenced out, so provider work runs
         exactly once. Legitimate retries re-claim a FAILED job. A run abandoned
-        by a crashed worker is reclaimable after ``_JOB_CLAIM_STALE_SECONDS``.
+        by a crashed worker is reclaimable after ``_JOB_CLAIM_STALE_SECONDS``,
+        and the reclaimed token invalidates the old worker's right to persist,
+        cancel, fail, or finalize.
         """
 
         if self._active_job_id is None:
             self._job_owner = True
+            self._claim_version = None
             return True
         now = datetime.now(timezone.utc)
         stale_before = now - timedelta(seconds=_JOB_CLAIM_STALE_SECONDS)
@@ -362,35 +472,95 @@ class TransformationPlanningExecutor:
                     ),
                 ),
             )
-            .values(status=JobStatus.RUNNING, started_at=now)
+            .values(
+                status=JobStatus.RUNNING,
+                started_at=now,
+                claim_version=ProcessingJob.claim_version + 1,
+            )
             .execution_options(synchronize_session=False)
         )
         claimed = int(result.rowcount) == 1
         self._session.commit()
         self._job_owner = claimed
+        if claimed:
+            self._claim_version = self._session.scalar(
+                select(ProcessingJob.claim_version).where(ProcessingJob.id == self._active_job_id)
+            )
         return claimed
 
-    def _finish_job(self, status: JobStatus) -> None:
-        """Finalize the claimed job only while this run still owns it."""
+    def _finish_job(self, status: JobStatus, error: Exception | None = None) -> None:
+        """Finalize the claimed job only while this run still owns the token."""
 
         if self._active_job_id is None or not self._job_owner:
             return
-        self._session.execute(
+        values: dict[str, object] = {
+            "status": status,
+            "completed_at": datetime.now(timezone.utc),
+        }
+        if status is JobStatus.FAILED:
+            values["error_code"] = _sanitize_error_code(error)
+            values["error_message"] = _sanitize_error_message(error)
+        result = self._session.execute(
             update(ProcessingJob)
             .where(
                 ProcessingJob.id == self._active_job_id,
+                ProcessingJob.claim_version == self._claim_version,
                 ProcessingJob.status == JobStatus.RUNNING,
             )
+            .values(**values)
+            .execution_options(synchronize_session=False)
+        )
+        if int(result.rowcount) == 1:
+            self._session.commit()
+        else:
+            self._session.rollback()
+            self._job_owner = False
+            self.claim_lost = True
+
+    def record_failure(self, error: Exception) -> None:
+        """Best-effort fenced sanitized FAILED finalization for the task wrapper."""
+
+        plan_set = (
+            self._session.get(TransformationPlanSet, self._plan_set_id)
+            if self._plan_set_id is not None
+            else None
+        )
+        if self._job_owner and self._claim_version is not None:
+            if plan_set is not None:
+                self._mark_failed(plan_set, error)
+            self._finish_job(JobStatus.FAILED, error)
+            return
+        if self._active_job_id is None:
+            if plan_set is not None:
+                self._mark_failed(plan_set, error)
+            return
+        # Never claimed: only an unowned QUEUED job may be failed safely.
+        result = self._session.execute(
+            update(ProcessingJob)
+            .where(
+                ProcessingJob.id == self._active_job_id,
+                ProcessingJob.status == JobStatus.QUEUED,
+            )
             .values(
-                status=status,
+                status=JobStatus.FAILED,
                 completed_at=datetime.now(timezone.utc),
+                error_code=_sanitize_error_code(error),
+                error_message=_sanitize_error_message(error),
             )
             .execution_options(synchronize_session=False)
         )
-        self._session.commit()
+        if int(result.rowcount) == 1:
+            if plan_set is not None:
+                plan_set.execution_status = PlanExecutionStatus.FAILED
+                plan_set.active_job_id = None
+            self._session.commit()
+        else:
+            self._session.rollback()
 
     def execute(self, plan_set_id: object, *, force: bool = False) -> StageExecutionResult:
         self.skipped_duplicate = False
+        self.claim_lost = False
+        self._plan_set_id = plan_set_id
         plan_set = self._session.get(TransformationPlanSet, plan_set_id)
         if plan_set is None:
             raise PlanningInputError("transformation plan set is missing")
@@ -398,24 +568,30 @@ class TransformationPlanningExecutor:
             self._mark_cancelled(plan_set)
             self._finish_job(JobStatus.CANCELLED)
             raise PlanningCancelled("Stage 4.1 planning cancelled before start")
-        try:
-            _candidate, _analysis, refinement, inputs, fingerprint = self._resolve(plan_set)
-        except PlanningInputError:
-            self._mark_failed(plan_set)
-            self._finish_job(JobStatus.FAILED)
-            raise
+        # Claim before resolving inputs so a planning-input failure can be
+        # recorded with sanitized diagnostics against the owned job.
         if not self._claim_job():
             # Another delivery already owns this exact job; do no provider work.
             self.skipped_duplicate = True
             return StageExecutionResult(plan_set.output_fingerprint, plan_set)
         try:
+            try:
+                _candidate, _analysis, refinement, inputs, fingerprint = self._resolve(plan_set)
+            except PlanningInputError as error:
+                self._mark_failed(plan_set, error)
+                self._finish_job(JobStatus.FAILED, error)
+                raise
             if self.is_cache_hit(plan_set, force=force):
                 self._finish_job(JobStatus.SUCCEEDED)
                 return StageExecutionResult(plan_set.output_fingerprint, plan_set)
             if self._claimed_by_other_job(plan_set):
                 self._finish_job(JobStatus.SUCCEEDED)
                 return StageExecutionResult(plan_set.output_fingerprint, plan_set)
-            self._claim(plan_set)
+            if not self._claim_is_current():
+                # A newer claim superseded this run before any plan-set mutation.
+                return StageExecutionResult(plan_set.output_fingerprint, plan_set)
+            if not self._claim(plan_set):
+                return StageExecutionResult(plan_set.output_fingerprint, plan_set)
             started = monotonic()
             outcome = self._run_service(plan_set, inputs, fingerprint)
             if self._job_cancelled():
@@ -423,6 +599,9 @@ class TransformationPlanningExecutor:
                 self._finish_job(JobStatus.CANCELLED)
                 raise PlanningCancelled("Stage 4.1 planning cancelled before persistence")
             result = self._persist(plan_set, refinement, inputs, outcome, monotonic() - started)
+            if result is None:
+                # Claim was superseded before persistence; the newer run owns state.
+                return StageExecutionResult(plan_set.output_fingerprint, plan_set)
             self._finish_job(JobStatus.SUCCEEDED)
             return result
         finally:
@@ -440,7 +619,7 @@ class TransformationPlanningExecutor:
             provider=self._effective_provider(),
             provider_identity=self._provider_identity(),
             mode=self._mode,
-            is_cancelled=self._job_cancelled,
+            is_cancelled=self._should_stop,
         )
         try:
             return service.plan(
@@ -452,9 +631,9 @@ class TransformationPlanningExecutor:
             self._mark_cancelled(plan_set)
             self._finish_job(JobStatus.CANCELLED)
             raise
-        except Exception:
-            self._mark_failed(plan_set)
-            self._finish_job(JobStatus.FAILED)
+        except Exception as error:
+            self._mark_failed(plan_set, error)
+            self._finish_job(JobStatus.FAILED, error)
             raise
 
     def _checkpoints(self, plan_set: TransformationPlanSet) -> dict[str, dict[str, object]]:
@@ -477,7 +656,11 @@ class TransformationPlanningExecutor:
         inputs: PlanningInputs,
         outcome: PlanningOutcome,
         processing_duration: float,
-    ) -> StageExecutionResult:
+    ) -> StageExecutionResult | None:
+        # Fence the durable token before any plan-set/plan mutation commits.
+        if not self._claim_guard():
+            self._session.rollback()
+            return None
         plan_set.refinement_id = refinement.id
         plan_set.refinement_priority = refinement.priority.value
         plan_set.refinement_quality_level = refinement.quality_level

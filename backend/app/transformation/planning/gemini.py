@@ -105,6 +105,7 @@ class _GeminiPlanningOutput(BaseModel):
 
 class GeminiPlanningProvider:
     provider_name = "gemini"
+    hosted_provider = True
 
     def __init__(
         self,

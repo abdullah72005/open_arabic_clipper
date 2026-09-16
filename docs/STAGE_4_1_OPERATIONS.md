@@ -191,18 +191,24 @@ loop is used.
 
 ### Hard TTS/rendering/evasion boundary
 
-Every provider-controlled free-text field that can persist into a plan is also
-checked against bounded, explicit policy markers: purpose, semantic intent,
-why-unavailable, draft line, continuity rationale, preservation constraints,
-verification rationale, intended use, grounding refs, and narration language/
-register. Rejected output includes TTS provider/model/voice selection, speaker
-identity, frame-level rendering instructions (`ffmpeg`, timeline, shot list,
-storyboard, keyframe, render instructions), cosmetic-only transformation claims
-(mirroring, pitch shifting, speed tricks, watermark removal/obfuscation), and
-platform-detection/copyright-evasion tactics. Markers are explicit phrases, so
-ordinary semantic wording such as "model" in "explain the model" is never
-blocked. Legitimate narration semantics (purpose, language, register, duration,
-placement, verification dependency) are preserved.
+Every provider-controlled string or string list that can persist into plan rows,
+per-strategy checkpoints, outcomes, or the Stage 4.2 handoff is checked against
+bounded, explicit policy markers **before any no-valid-plan early return**:
+plan preservation constraints, planner notes, no-valid reasons, block purpose,
+semantic intent, why-unavailable, draft line, continuity rationale, verification
+rationale, intended use, grounding refs, dependency ids, claim dependency, and
+narration language/register/dependency ids. Rejected output includes TTS
+provider-plus-voice selection (`Use Gemini voice Charon`), named-speaker
+identity (`Have Morgan Freeman narrate`), TTS provider/model/voice selection,
+frame-level rendering instructions (`ffmpeg`, timeline, shot list, storyboard,
+keyframe, render instructions), cosmetic-only transformation claims (mirroring,
+pitch shifting, speed tricks, watermark removal/obfuscation), and
+platform-detection/copyright-evasion tactics. Markers are explicit phrases and
+provider-plus-voice/named-speaker detection is bounded (it requires a
+provider/voice or narration cue), so ordinary semantic wording such as "model"
+in "explain the model" is never blocked. Legitimate narration semantics
+(purpose, language, register, duration, placement, verification dependency) are
+preserved.
 
 ## Narration abstraction (future TTS contract)
 
@@ -264,7 +270,10 @@ names the claim/dependency and why it is needed. Linkage is deterministic and
 persisted: the placeholder lists the integer block indexes of dependent
 substantive blocks, those blocks carry the placeholder's `claim_dependency` value
 in `dependency_ids`, and narration may depend on a claim through
-`verification_dependency_ids`. Bogus, missing, nonexistent, or unlinked
+`verification_dependency_ids`. Malformed/non-integer provider references
+(numeric strings, floats, booleans, nested objects) are rejected at the strict
+parse boundary, never silently dropped; valid integer indexes are preserved.
+Bogus, missing, nonexistent, self-referential, non-substantive, or unlinked
 references are rejected; the plan status becomes verification-required; the
 dependency blocks execution until verified. `must_verify_before_execution=true`
 is preserved. No placeholder text may imply verification already happened. There
@@ -300,7 +309,10 @@ independently, so one malformed item never invalidates accepted siblings. The
 two-call ceiling is a hard **raw** `generate_content` budget: Stage 4.1 performs
 no per-tier retry inside it, the provider refuses a third raw call, and persisted
 metrics report actual raw hosted calls (`hosted_raw_calls`) in addition to outer
-tier invocations (`routine_calls`/`strong_calls`).
+tier invocations (`routine_calls`/`strong_calls`). `hosted_raw_calls` is never a
+generic provider-invocation count: deterministic and `local_only`/Qwen planning
+report `0`, a non-hosted provider reports `0`, and only a provider that declares
+itself hosted (Gemini) contributes its real raw-call count.
 
 Provider output must identify the exact requested Stage 4.0 strategy ID/key.
 Unknown, rejected, stale, duplicate, or omitted strategy identities are invalid
@@ -349,6 +361,22 @@ executor, so provider work runs exactly once; the loser records
 `FAILED` job, and a run abandoned by a crashed worker is reclaimable after a
 bounded staleness window. The plan-set `active_job_id` compare-and-swap remains
 as an additional guard.
+
+Every successful claim advances a durable per-execution ownership token
+(`processing_jobs.claim_version`). The plan-set claim, plan persistence,
+cancellation, failure, and job finalization are all fenced by that token inside
+the same transaction, so a worker whose stale RUNNING claim was reclaimed can
+neither persist, cancel, fail, nor finalize the newer run; its provider work is
+aborted at the next ownership check. The token is not a local boolean or the job
+ID: it is persisted and advanced on every claim.
+
+Failed planning jobs retain bounded, sanitized operator diagnostics. A
+prerequisite (planning-input) failure records the repository-owned prerequisite
+message; an unexpected failure records only the exception type; a provider
+failure records only its category. API keys, transcript bodies, prompts, and
+provider payloads are never written to `error_message`/`error_code`, and
+executor-level finalization records the diagnostics atomically so no later
+wrapper can race it.
 
 The `local_only` executor retains the exact lease-bound provider wrapper and
 releases it on every exit path (success, provider failure, cancellation, cache
@@ -469,12 +497,13 @@ ruff format app tests alembic && ruff check app tests alembic
 
 All Stage 4.1 tests are deterministic and hermetic: providers are mocked and no
 test makes a live Gemini, Qwen, web, TTS, or rendering call even when a key is
-present. The hardening pass advanced planning versions to
-`stage4.1-v2` / `stage4.1-schema-v2` / `stage4.1-validation-v2` (real
-verification-block linkage, hero elapsed-time cap, minimum excerpt duration,
-narration-contract checks, overlapping-span rejection, and the
-TTS/rendering/evasion boundary), so prior plans invalidate through the input
-fingerprint. Known limitation: the repository's strict `mypy` configuration
-already reports the same class of `no-any-return`/`untyped-decorator` findings in
-the frozen Stage 4.0 provider modules and the FastAPI app; Stage 4.1 matches that
-existing convention rather than introducing a new lint regime.
+present. The final re-review remediation advanced planning versions to
+`stage4.1-v3` / `stage4.1-schema-v3` / `stage4.1-validation-v3` (complete
+provider-text boundary before any no-valid return, provider-plus-voice and
+named-speaker rejection, malformed verification-reference rejection, hosted
+raw-call metric correctness, durable claim-token fencing, and sanitized failure
+diagnostics), so prior plans invalidate through the input fingerprint. Known
+limitation: the repository's strict `mypy` configuration already reports the
+same class of `no-any-return`/`untyped-decorator` findings in the frozen Stage
+4.0 provider modules and the FastAPI app; Stage 4.1 matches that existing
+convention rather than introducing a new lint regime.

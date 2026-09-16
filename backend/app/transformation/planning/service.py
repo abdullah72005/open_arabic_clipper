@@ -391,15 +391,22 @@ class PlanningService:
         return plan, attempt
 
     def _raw_hosted_calls(self) -> int:
-        """Actual raw hosted calls reported by the provider (not tier invocations)."""
+        """Actual raw hosted generate_content calls, never generic invocations.
 
+        Local-only/Qwen, deterministic, and any non-hosted provider report zero;
+        only a provider that declares itself hosted contributes its real raw-call
+        count.
+        """
+
+        if self._provider is None or not getattr(self._provider, "hosted_provider", False):
+            return 0
         counter = getattr(self._provider, "raw_call_count", None)
         if callable(counter):
             try:
                 return int(counter())
             except Exception:
-                return self._provider_calls
-        return self._provider_calls
+                return 0
+        return 0
 
     def _validate(
         self,

@@ -36,8 +36,10 @@ from app.transformation.planning.policy import (
     PLATFORM_EVASION_MARKERS,
     PRESENTATION_ONLY_TERMS,
     RENDERING_INSTRUCTION_MARKERS,
+    TTS_PROVIDER_TOKENS,
     TTS_SELECTION_MARKERS,
     VERIFIED_CLAIM_MARKERS,
+    VOICE_SELECTION_CONTEXT_MARKERS,
     Stage41Config,
     additive_value_kinds,
     is_strict_hero_window,
@@ -79,6 +81,7 @@ REJECT_NARRATION_UNSPECIFIED = "NARRATION_REQUIREMENT_INCOMPLETE"
 REJECT_NARRATION_CONTRADICTION = "NARRATION_CONTRADICTION"
 REJECT_NO_VALUE = "NO_SUBSTANTIVE_VALUE"
 REJECT_TTS_SELECTION = "TTS_SELECTION_FORBIDDEN"
+REJECT_SPEAKER_SELECTION = "SPEAKER_SELECTION_FORBIDDEN"
 REJECT_RENDERING_INSTRUCTION = "RENDERING_INSTRUCTION_FORBIDDEN"
 REJECT_EVASION = "PLATFORM_EVASION_FORBIDDEN"
 REJECT_COSMETIC_CLAIM = "COSMETIC_CLAIM_FORBIDDEN"
@@ -185,23 +188,111 @@ def _is_generic(text: str) -> bool:
     return False
 
 
+# A capitalized multi-word sequence that looks like a person name. Bounded
+# detection only: ordinary lowercase semantic wording and single common words
+# are never treated as speaker identity.
+_SPEAKER_NAME = r"[A-Z][\w'-]*(?:\s+[A-Z][\w'-]*)+"
+_NAMED_SPEAKER_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(rf"\b(?:have|has|let|use|using|with|featuring)\s+{_SPEAKER_NAME}"),
+    re.compile(rf"\b(?:voiced|narrated|spoken)\s+by\s+{_SPEAKER_NAME}"),
+    re.compile(
+        rf"\b(?:narrat\w*|voiceover\w*|voice[\s-]?over\w*|voice|speak\w*|vocal\w*)"
+        rf"\s+(?:by\s+|as\s+)?{_SPEAKER_NAME}"
+    ),
+    re.compile(
+        rf"\b{_SPEAKER_NAME}\s+(?:as\s+(?:the\s+)?)?"
+        r"(?:narrat\w*|voiceover\w*|voice[\s-]?over\w*|voice|speak\w*|vocal\w*)"
+    ),
+)
+
+
+def _provider_voice_selection(text: str) -> bool:
+    """Provider token co-occurring with a voice/narration context."""
+
+    lowered = text.casefold()
+    if not any(token in lowered for token in TTS_PROVIDER_TOKENS):
+        return False
+    return any(marker in lowered for marker in VOICE_SELECTION_CONTEXT_MARKERS)
+
+
+def _named_speaker_selection(text: str) -> bool:
+    """Explicit named-speaker/narrator identity selection.
+
+    A narration/voice cue must be present so ordinary capitalized semantic
+    wording (for example a strategy label) is never mistaken for a person name.
+    """
+
+    lowered = text.casefold()
+    if not any(marker in lowered for marker in VOICE_SELECTION_CONTEXT_MARKERS):
+        return False
+    return any(pattern.search(text) for pattern in _NAMED_SPEAKER_PATTERNS)
+
+
 def boundary_violation(text: str) -> str | None:
     """Hard Stage 4.1 boundary over one provider-controlled free-text field.
 
     Bounded, explicit phrase markers only, so legitimate semantic wording such
-    as "explain the model" is never blocked.
+    as "explain the model" is never blocked. Provider-plus-voice and named
+    speaker identity are rejected even without an explicit TTS marker.
     """
 
     if not text or not text.strip():
         return None
     if _has_marker(text, TTS_SELECTION_MARKERS):
         return REJECT_TTS_SELECTION
+    if _provider_voice_selection(text):
+        return REJECT_TTS_SELECTION
+    if _named_speaker_selection(text):
+        return REJECT_SPEAKER_SELECTION
     if _has_marker(text, RENDERING_INSTRUCTION_MARKERS):
         return REJECT_RENDERING_INSTRUCTION
     if _has_marker(text, PLATFORM_EVASION_MARKERS):
         return REJECT_EVASION
     if _has_marker(text, COSMETIC_EVASION_MARKERS):
         return REJECT_COSMETIC_CLAIM
+    return None
+
+
+def _provider_plan_boundary_texts(plan: PlanProviderPlan) -> list[str]:
+    """Every provider-controlled string/string list that can persist.
+
+    Covers plan rows, per-strategy checkpoints, outcome reasons, and the Stage
+    4.2 handoff: planner notes, no-valid reasons, block free text, grounding and
+    dependency references, claim ids, and narration semantic fields.
+    """
+
+    texts: list[str] = [plan.no_valid_reason, plan.planner_notes]
+    texts.extend(plan.preservation_constraints)
+    for block in plan.blocks:
+        texts.extend(
+            [
+                block.purpose,
+                block.semantic_intent or "",
+                block.why_unavailable or "",
+                block.draft_line or "",
+                block.continuity_rationale or "",
+                block.verification_rationale or "",
+                block.intended_use or "",
+                block.claim_dependency or "",
+                *block.preservation_constraints,
+                *block.grounding_refs,
+                *block.dependency_ids,
+            ]
+        )
+    narration = plan.narration
+    if narration.language:
+        texts.append(narration.language)
+    if narration.register:
+        texts.append(narration.register)
+    texts.extend(narration.verification_dependency_ids)
+    return texts
+
+
+def provider_plan_boundary_violation(plan: PlanProviderPlan) -> str | None:
+    for text in _provider_plan_boundary_texts(plan):
+        violation = boundary_violation(text)
+        if violation is not None:
+            return violation
     return None
 
 
@@ -281,6 +372,9 @@ def _resolve_block(
     inputs: PlanningInputs,
     config: Stage41Config,
 ) -> tuple[PlanBlock | None, str | None]:
+    # Malformed provider block references are rejected, never silently dropped.
+    if raw.dependent_block_ids_invalid:
+        return None, REJECT_VERIFICATION_BLOCK_REFERENCE
     if raw.block_type is PlanBlockType.SOURCE_EXCERPT:
         span, error = resolve_source_span(raw, inputs, config)
         if span is None or error is not None:
@@ -465,6 +559,12 @@ def validate_provider_plan(
     provider_input_fingerprint: str,
 ) -> ValidationResult:
     """Validate one provider plan against deterministic Stage 4.1 rules."""
+
+    # Provider-controlled text is validated before any no_valid_plan early
+    # return so a forbidden reason or note can never bypass the boundary.
+    provider_boundary = provider_plan_boundary_violation(provider_plan)
+    if provider_boundary is not None:
+        return ValidationResult(plan=None, reasons=(provider_boundary,))
 
     if provider_plan.no_valid_plan:
         reason = provider_plan.no_valid_reason or "PROVIDER_DECLINED"

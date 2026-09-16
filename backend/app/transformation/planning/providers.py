@@ -261,6 +261,7 @@ class DeterministicPlanningProvider:
 
     provider_name = "deterministic"
     model = None
+    hosted_provider = False
 
     def plan(
         self, requests: Sequence[PlanningRequest], tier: str = "ROUTINE"
@@ -376,26 +377,29 @@ def _float(value: object) -> float:
     return max(0.0, number)
 
 
-def _bounded_int_list(value: object, limit: int = _BOUNDED_LIST) -> tuple[int, ...]:
-    """Parse dependent block references into validated integer block indexes."""
+def _bounded_int_list(value: object, limit: int = _BOUNDED_LIST) -> tuple[tuple[int, ...], bool]:
+    """Parse dependent block references into validated integer block indexes.
+
+    Malformed/non-integer provider references (numeric strings, floats,
+    booleans, nested objects) are never silently dropped: the second return
+    value flags them so the deterministic boundary rejects the plan.
+    """
 
     if not isinstance(value, list):
-        return ()
+        return (), False
     items: list[int] = []
+    invalid = False
     for item in value:
-        if isinstance(item, bool):
+        if isinstance(item, bool) or not isinstance(item, int):
+            invalid = True
             continue
-        candidate: int | None = None
-        if isinstance(item, int):
-            candidate = int(item)
-        elif isinstance(item, str) and item.strip().lstrip("-").isdigit():
-            candidate = int(item.strip())
-        if candidate is None or candidate in items:
+        candidate = int(item)
+        if candidate in items:
             continue
         items.append(candidate)
         if len(items) >= limit:
             break
-    return tuple(items)
+    return tuple(items), invalid
 
 
 def _int_or_none(value: object) -> int | None:
@@ -408,6 +412,9 @@ def _parse_block(entry: Mapping[str, object]) -> PlanProviderBlock | None:
     block_type = _enum(entry.get("block_type"), PlanBlockType)
     if block_type is None:
         return None
+    dependent_block_ids, dependent_block_ids_invalid = _bounded_int_list(
+        entry.get("dependent_block_ids")
+    )
     return PlanProviderBlock(
         block_type=block_type,  # type: ignore[arg-type]
         purpose=_bounded_text(entry.get("purpose"), _BOUNDED_FIELD),
@@ -431,7 +438,10 @@ def _parse_block(entry: Mapping[str, object]) -> PlanProviderBlock | None:
         or None,
         intended_use=_bounded_text(entry.get("intended_use"), _BOUNDED_FIELD) or None,
         must_verify_before_execution=bool(entry.get("must_verify_before_execution", False)),
-        dependent_block_ids=_bounded_int_list(entry.get("dependent_block_ids")),
+        dependent_block_ids=dependent_block_ids,
+        dependent_block_ids_invalid=(
+            dependent_block_ids_invalid or bool(entry.get("dependent_block_ids_invalid", False))
+        ),
     )
 
 
@@ -570,6 +580,7 @@ def _block_payload(block: PlanProviderBlock) -> dict[str, object]:
         "intended_use": block.intended_use,
         "must_verify_before_execution": block.must_verify_before_execution,
         "dependent_block_ids": list(block.dependent_block_ids),
+        "dependent_block_ids_invalid": block.dependent_block_ids_invalid,
     }
 
 
