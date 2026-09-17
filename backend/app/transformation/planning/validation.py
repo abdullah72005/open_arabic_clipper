@@ -261,33 +261,64 @@ def _identity_imitation_selection(text: str) -> bool:
     return any(pattern.search(text) for pattern in _IMITATION_SELECTION_PATTERNS)
 
 
-# Explicit narrator/voice/speaker identity-selection grammar that names a
-# single-token identity (for example "Use narrator Charon" or "Use a voice
-# called Charon"). Bounded to genuine selection grammar (a selection verb, or a
-# called/named/id connector) so ordinary wording such as "the narrator explains
-# the model" or "explain the economic model" is never blocked.
-_SPEAKER_ROLE_WORD = r"(?i:voice|narrator|narrater|speaker)"
-_SELECTION_VERB = r"(?i:use|using|with|choose|select|set|assign|pick|employ)"
+# Bounded bilingual (English + Arabic) explicit narrator/voice/speaker identity
+# selection with single- OR multi-token identities. Detection is anchored to
+# genuine selection grammar (a selection verb, a narrated/voiced/spoken-by
+# phrase, or an "as <role>" / "ك<role>" connector) so ordinary prose such as
+# "The narrator named several causes", "the narrator frames the argument", or
+# "explain the economic model" is never blocked.
+_SPEAKER_ROLE_WORD = r"(?i:voice|narrator|narrater|speaker|vocalist)"
+_SELECTION_VERB = r"(?i:use|using|with|choose|select|set|assign|pick|employ|appoint)"
 _PROPER_TOKEN = r"[A-Z][\w'-]*"
-_ANY_TOKEN = r"[\w'-]+"
-_EXPLICIT_SINGLE_SPEAKER_PATTERNS: tuple[re.Pattern[str], ...] = (
-    # "Use narrator Charon", "use a voice called Charon", "with the speaker Amina"
+_PERSON_NAME = rf"{_PROPER_TOKEN}(?:\s+{_PROPER_TOKEN})*"
+# A capitalized function word is never a person identity.
+_EN_NON_IDENTITY = r"(?!(?:The|A|An|This|That|These|Those|He|She|It|They|We|You|I)\b)"
+_EN_SPEAKER_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # "Narrated by Charon", "voiced by Morgan Freeman", "spoken by Amina"
+    re.compile(rf"\b(?i:narrated|voiced|spoken)\s+by\s+{_PERSON_NAME}"),
+    # "Charon as [the] narrator|speaker|voice", "Morgan Freeman as narrator"
+    re.compile(
+        rf"\b{_EN_NON_IDENTITY}{_PERSON_NAME}\s+(?i:as)\s+"
+        rf"(?:the\s+|a\s+|an\s+)?{_SPEAKER_ROLE_WORD}\b"
+    ),
+    # "Use Charon as narrator", "Set Charon as the speaker", "Assign Charon as voice"
+    re.compile(
+        rf"\b{_SELECTION_VERB}\s+(?:the\s+|a\s+|an\s+)?{_EN_NON_IDENTITY}{_PERSON_NAME}\s+"
+        rf"(?i:as)\s+(?:the\s+|a\s+|an\s+)?{_SPEAKER_ROLE_WORD}\b"
+    ),
+    # "Use narrator Charon", "Use a voice called Charon", "with the speaker Amina"
     re.compile(
         rf"\b{_SELECTION_VERB}\s+(?:a\s+|an\s+|the\s+)?{_SPEAKER_ROLE_WORD}\s+"
-        rf"(?:(?i:called|named|id|name|identifier)\s+)?{_PROPER_TOKEN}\b"
+        rf"(?:(?i:called|named)\s+)?{_EN_NON_IDENTITY}{_PERSON_NAME}"
     ),
-    # "a voice called Charon", "narrator named amina", "speaker id 42"
-    re.compile(
-        rf"\b{_SPEAKER_ROLE_WORD}\s+(?:(?i:called|named)\s+{_ANY_TOKEN}"
-        rf"|(?i:id|name|identifier)\s+(?:is\s+)?{_ANY_TOKEN})\b"
-    ),
+    # "a voice called Charon", "narrator named Amina" (proper-name identity only,
+    # so "the narrator named several causes" is ordinary prose, not selection)
+    re.compile(rf"\b{_SPEAKER_ROLE_WORD}\s+(?i:called|named)\s+{_EN_NON_IDENTITY}{_PERSON_NAME}"),
+)
+
+# Arabic selection grammar. Arabic has no letter case, so detection requires an
+# explicit selection verb or an explicit "as <role>" (ك) connector rather than a
+# bare role-before-word sequence (which would match ordinary prose).
+_AR_WORD = r"[\u0600-\u06FF][\u0600-\u06FF\u064B-\u0652\u0670]*"
+_AR_ROLE_STEM = r"(?:صوت|نبر|متحدث|راو|سارد|معلق|ناطق|تعليق|قارئ)"
+_AR_SELECT = r"(?:استخدم|استعمل|اختر|اختار|حدد|عيّن|عين|اضبط|اجعل|استعن|كلّف|كلف)"
+_AR_AS_ROLE = rf"ك[\u064B-\u0652]*{_AR_ROLE_STEM}"
+_ARABIC_SPEAKER_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # selection verb + role + identity: "استخدم صوت شيرون للسرد"
+    re.compile(rf"{_AR_SELECT}\s+(?:ال)?{_AR_ROLE_STEM}(?![\u0600-\u06FF])\s+{_AR_WORD}"),
+    # selection verb + identity + role: "اختر شيرون راوياً", "عيّن شيرون متحدثاً"
+    re.compile(rf"{_AR_SELECT}\s+{_AR_WORD}\s+(?:ال)?{_AR_ROLE_STEM}"),
+    # identity + ك + role: "شيرون كراوٍ"
+    re.compile(rf"{_AR_WORD}\s+{_AR_AS_ROLE}"),
 )
 
 
-def _explicit_single_speaker_selection(text: str) -> bool:
-    """Explicit single-token narrator/voice/speaker identity selection."""
+def _explicit_speaker_selection(text: str) -> bool:
+    """Explicit narrator/voice/speaker identity selection (English or Arabic)."""
 
-    return any(pattern.search(text) for pattern in _EXPLICIT_SINGLE_SPEAKER_PATTERNS)
+    if any(pattern.search(text) for pattern in _EN_SPEAKER_PATTERNS):
+        return True
+    return any(pattern.search(text) for pattern in _ARABIC_SPEAKER_PATTERNS)
 
 
 def boundary_violation(text: str) -> str | None:
@@ -308,7 +339,7 @@ def boundary_violation(text: str) -> str | None:
         return REJECT_SPEAKER_SELECTION
     if _identity_imitation_selection(text):
         return REJECT_SPEAKER_SELECTION
-    if _explicit_single_speaker_selection(text):
+    if _explicit_speaker_selection(text):
         return REJECT_SPEAKER_SELECTION
     if _has_marker(text, RENDERING_INSTRUCTION_MARKERS):
         return REJECT_RENDERING_INSTRUCTION

@@ -235,11 +235,16 @@ pitch shifting, speed tricks, watermark removal/obfuscation), and
 platform-detection/copyright-evasion tactics. Markers are explicit phrases and
 provider-plus-voice/named-speaker detection is bounded (it requires a
 provider/voice or narration cue); imitation detection requires an explicit
-imitation/style cue and a capitalized person name. Explicit single-token
-narrator/voice/speaker identity selection is also rejected (`Use narrator
-Charon to explain the claim`, `Use a voice called Charon`), bounded to genuine
-selection grammar (a selection verb or a called/named/id connector) so ordinary
-wording such as "the narrator explains the model" is not blocked. Ordinary
+imitation/style cue and a capitalized person name. Explicit per-video
+narrator/voice/speaker identity selection is also rejected bilingually
+(English and Arabic) for single- and multi-token identities: `Narrated by
+Charon`, `Use Charon as narrator`, `Set Charon as the speaker`, `Use narrator
+Charon to explain the claim`, `Use a voice called Charon`, `استخدم صوت شيرون
+للسرد`, `شيرون كراوٍ`. Detection is bounded to genuine selection grammar (a
+selection verb, a `narrated/voiced/spoken by` phrase, an `as <role>` connector,
+or the Arabic `ك<role>` connector); `named`/`called` requires a proper-name
+identity, so ordinary prose such as "The narrator named several causes" is not
+blocked. Ordinary
 semantic wording
 such as "model" in "explain the model" is never blocked, and ordinary discussion
 of a named person (for example "Reference Morgan Freeman's career as context")
@@ -553,11 +558,11 @@ ruff format app tests alembic && ruff check app tests alembic
 
 All Stage 4.1 tests are deterministic and hermetic: providers are mocked and no
 test makes a live Gemini, Qwen, web, TTS, or rendering call even when a key is
-present. The final truthfulness and speaker-boundary closure remediation
-advanced planning versions to `stage4.1-v6` / `stage4.1-schema-v6` /
-`stage4.1-validation-v6` (invalid/malformed provider work can never assert a
-false `NO_VALID_PLAN_FROM_STRATEGY`; explicit single-token narrator/voice/speaker
-identity selection is rejected), so prior plans and checkpoints invalidate
+present. The bilingual speaker-boundary closure remediation advanced planning
+versions to `stage4.1-v7` / `stage4.1-schema-v7` / `stage4.1-validation-v7`
+(explicit per-video narrator/voice/speaker identity selection is rejected in
+English and Arabic for single- and multi-token identities, with ordinary prose
+preserved), so prior plans and checkpoints invalidate
 through the input fingerprint. Known
 limitation: the repository's strict `mypy` configuration already reports the
 same class of `no-any-return`/`untyped-decorator` findings in the frozen Stage

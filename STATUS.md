@@ -65,16 +65,21 @@ refinement, and is **never** added to the automatic `_NEXT_STAGE` chain.
   Morgan Freeman narrate"), named-person imitation/identity-selection phrased
   without any voice/narration/TTS word (for example "Make it sound like Morgan
   Freeman", "In the style of Morgan Freeman", "Impersonate Morgan Freeman",
-  "Morgan Freeman's voice"), explicit single-token narrator/voice/speaker
-  identity selection (for example "Use narrator Charon to explain the claim",
-  "Use a voice called Charon"), TTS provider/model/voice selection, frame-level
+  "Morgan Freeman's voice"), explicit bilingual (English and Arabic) per-video
+  narrator/voice/speaker identity selection for single- and multi-token
+  identities (for example "Narrated by Charon", "Use Charon as narrator", "Set
+  Charon as the speaker", "Use narrator Charon to explain the claim", "Use a
+  voice called Charon", "استخدم صوت شيرون للسرد", "شيرون كراوٍ"), TTS
+  provider/model/voice selection, frame-level
   rendering instructions, cosmetic-only transformation claims, and
   platform/detection-evasion tactics (mirroring, pitch shifting, speed tricks,
   watermark removal/obfuscation) are rejected. Legitimate narration semantics
   (purpose, language, register, duration, placement, dependency) are preserved,
-  ordinary semantic words such as "model" are not blocked, and ordinary
-  discussion of a named person (for example "Reference Morgan Freeman's career
-  as context") is not treated as identity selection. The planner service runs
+  ordinary semantic words such as "model" are not blocked, ordinary wording such
+  as "The narrator named several causes" is not treated as selection, and
+  ordinary discussion of a named person (for example "Reference Morgan Freeman's
+  career as context") is not treated as identity selection. The planner service
+  runs
   this boundary for **every** parsed provider result, including explicit
   `no_valid_plan=true` payloads, before any field can be persisted,
   checkpointed, used as an attempt/outcome reason, reused from cache, or exposed
@@ -154,13 +159,14 @@ refinement, and is **never** added to the automatic `_NEXT_STAGE` chain.
   `stage4_3_implemented=false`) with exact ordered blocks, hero span, narration
   semantics, verification dependencies, and Stage 4.0 risk.
 
-Deterministic verification: 145 focused Stage 4.1 tests (63 original + 24
+Deterministic verification: 165 focused Stage 4.1 tests (63 original + 24
 review-remediation + 19 final re-review remediation + 20 final-closure
 remediation + 8 provider no-valid boundary closure + 11 final truthfulness and
-speaker-boundary closure) plus the full backend suite in Docker Python 3.12 with
-the repository compose/.env files mounted, with no live provider calls in the
-automated suite. Planning policy/schema/validation versions advanced to
-`stage4.1-v6`/`stage4.1-schema-v6`/`stage4.1-validation-v6` so prior plans and
+speaker-boundary closure + 20 bilingual speaker-boundary closure) plus the full
+backend suite in Docker Python 3.12 with the repository compose/.env files
+mounted, with no live provider calls in the automated suite. Planning
+policy/schema/validation versions advanced to
+`stage4.1-v7`/`stage4.1-schema-v7`/`stage4.1-validation-v7` so prior plans and
 checkpoints invalidate. See
 [docs/STAGE_4_1_OPERATIONS.md](docs/STAGE_4_1_OPERATIONS.md).
 

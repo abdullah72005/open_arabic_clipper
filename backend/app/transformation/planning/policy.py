@@ -19,12 +19,12 @@ from app.core.enums import (
     TransformationStrategyType,
 )
 
-# v6 truthfulness hardening: invalid/malformed provider work can never assert
-# a false no-valid conclusion (it stays deferred/retryable), and explicit
-# single-token narrator/voice/speaker identity selection is rejected.
-POLICY_VERSION = "stage4.1-v6"
-SCHEMA_VERSION = "stage4.1-schema-v6"
-VALIDATION_VERSION = "stage4.1-validation-v6"
+# v7 bilingual speaker-boundary closure: explicit per-video narrator/voice/
+# speaker identity selection is rejected in English and Arabic for single- and
+# multi-token identities, with ordinary prose preserved.
+POLICY_VERSION = "stage4.1-v7"
+SCHEMA_VERSION = "stage4.1-schema-v7"
+VALIDATION_VERSION = "stage4.1-validation-v7"
 INPUT_FINGERPRINT_VERSION = "1"
 OUTPUT_FINGERPRINT_VERSION = "1"
 PLAN_FINGERPRINT_VERSION = "1"
