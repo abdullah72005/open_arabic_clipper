@@ -17,9 +17,13 @@ directions for Stage 4.1, returning
 `NO_TRANSFORMATION_STRATEGY_WORTH_USING` as a normal successful outcome when none
 does. Stage 4.1 then turns each current recommended direction into zero to three
 concrete structured transformation plans (source hero plus substantive value),
-without selecting a winner. It does not reframe, render, synthesize speech,
-publish, or automatically authorize content; Stage 4.2 and later are not
-implemented.
+without selecting a winner. Stage 4.2 then independently governs every current
+plan — retention preservation, substantive originality, source dominance,
+semantic fidelity, filler/redundancy, narration burden, verification, and
+observable YouTube/Facebook reuse/spam risk — marking each plan eligible,
+cautioned, blocked, revision-required, rejected, or deferred, without selecting a
+winner. It does not reframe, render, synthesize speech, publish, or automatically
+authorize content; Stage 4.3 and later are not implemented.
 
 Only process material you own or are explicitly authorized to process. URL
 ingest downloads permitted public sources directly; an optional outbound proxy
@@ -269,7 +273,8 @@ reports `CANDIDATE_REFINED`, `FINAL_TRANSCRIPT_READY`,
 `NEEDS_MANUAL_TRANSCRIPT_REVIEW`, `PROVIDER_DEGRADED`, `REFINEMENT_FAILED`, or
 `CANCELLED`. It never retranscribes or uploads a whole source, is never added to
 the automatic stage chain, and `FINAL_TRANSCRIPT_READY` is not publishing
-readiness; Stage 4.0 and Stage 4.1 are implemented and Stage 4.2 is not. Queue and inspect refinements:
+readiness; Stage 4.0, Stage 4.1, and Stage 4.2 are implemented and Stage 4.3 is
+not. Queue and inspect refinements:
 
 ```bash
 python -m app.cli candidate-refine CANDIDATE_ID --priority CANDIDATE
@@ -352,6 +357,44 @@ API: `POST /api/candidates/{id}/transformation-plans`, `GET
 [Stage 4.1 operations](docs/STAGE_4_1_OPERATIONS.md) for the plan schema, block
 contract, source/dialect rules, narration abstraction, provider behavior,
 fingerprints, and handoff.
+
+### Stage 4.2 governance
+
+Stage 4.2 (`TRANSFORMATION_GOVERNANCE`) is explicit, candidate-scoped work that
+independently governs every current Stage 4.1 plan and answers whether it is good
+and safe enough for Stage 4.3 to consider. It is a critic/governor: it never
+generates, mutates, repairs, or selects a plan, adds no pipeline stage or run,
+and never advances the source lifecycle. Deterministic logic owns integrity,
+evidence, independent categorical dimensions (retention preservation, source-moment
+damage, substantive originality, source dominance, semantic fidelity, filler,
+redundancy, narration burden, verification, template feel, coherence,
+proportionality, and observable YouTube/Facebook reuse/spam risk), hard gates,
+status precedence, platform-risk interpretation, and fingerprints; an optional
+Gemini provider supplies only bounded observable semantic findings and can never
+assign a status or platform classification. Each plan becomes
+`APPROVED_FOR_SELECTION`, `APPROVED_WITH_CAUTION`,
+`BLOCKED_PENDING_VERIFICATION`, `REVISION_REQUIRED`, `REJECTED_BY_GOVERNOR`, or
+`GOVERNANCE_DEFERRED`; the candidate summary is `PLANS_ELIGIBLE_FOR_SELECTION`,
+`NO_GOVERNOR_APPROVED_PLAN`, or `GOVERNANCE_DEFERRED`. Semantic fidelity,
+presentation-only transformation, fabricated claims, and misleading hooks are
+hard failures that no dimension offsets. Narration `NONE` is valid and no TTS
+provider/model/voice is ever selected. Rights, platform originality, and
+spam/repetition stay separate; account/channel repetition is deferred to Stage 7.
+Stage 4.3 remains unimplemented and no winner is selected.
+
+```bash
+python -m app.cli transformation-govern CANDIDATE_ID
+python -m app.cli transformation-governance CANDIDATE_ID
+python -m app.cli transformation-governance-handoff CANDIDATE_ID
+```
+
+API: `POST /api/candidates/{id}/transformation-governance`, `GET
+/api/candidates/{id}/transformation-governance`, `GET
+/api/transformation-governance-sets/{id}`, and `GET
+/api/candidates/{id}/stage4-3-handoff`. See
+[Stage 4.2 operations](docs/STAGE_4_2_OPERATIONS.md) for statuses, hard gates,
+dimensions, the platform-policy profile and official sources, provider behavior,
+cache/fingerprints, concurrency, and the read-only Stage 4.3 handoff.
 
 Stage 3 semantic mode defaults to `deterministic`: zero Gemini calls and zero
 Qwen model loads. `adaptive` uses Gemini only when a key is configured, and

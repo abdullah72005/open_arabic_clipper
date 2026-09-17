@@ -1,5 +1,114 @@
 # Runtime status
 
+## Stage 4.2 retention/originality/platform-risk governor (2026-09-17)
+
+Stage 4.2 independently governs every current Stage 4.1 transformation plan and
+answers whether it is good and safe enough to be considered by Stage 4.3. It is
+explicit, candidate-scoped, critic-only work: it never generates, mutates,
+repairs, or selects a plan, adds **no** `PipelineStage`, **no** `PipelineRun`,
+**no** `_NEXT_STAGE` entry, and never advances the source lifecycle.
+
+- **No lifecycle change.** It extends the Celery/`ProcessingJob` platform with a
+  `TRANSFORMATION_GOVERNANCE` job kind and a nullable
+  `processing_jobs.transformation_governance_set_id` FK. New persistence is
+  `transformation_governance_sets` (one envelope per Stage 4.1 plan set) and
+  `transformation_governance_results` (one stable row per plan), with check
+  constraints binding `eligible_for_stage4_3` to the approved statuses. Stage 4.3
+  is not implemented and there is no selected-plan field anywhere.
+- **Immutable input.** Queueing requires a current retained candidate, a usable
+  `CANDIDATE`/`FINAL_CLIP` Stage 3.5 refinement (never requires `FINAL_CLIP`), a
+  current non-stale complete/degraded Stage 4.1 plan set with at least one current
+  plan, and exact fingerprint matches. Stale input is refused before provider
+  work; malformed persisted content is never reinterpreted or repaired. Critical
+  integrity (identity, current flags, closed block types/indexes, hero/source-span
+  integrity, chronology/overlap, narration abstraction, verification linkage,
+  prohibited TTS/render/evasion text, plan output fingerprint) is revalidated
+  deterministically.
+- **Execution vs semantic outcome.** Lifecycle
+  (`QUEUED`/`GOVERNING`/`COMPLETE`/`PROVIDER_DEGRADED`/`FAILED`/`CANCELLED`) is
+  separate from per-plan status
+  (`APPROVED_FOR_SELECTION`/`APPROVED_WITH_CAUTION`/`BLOCKED_PENDING_VERIFICATION`/
+  `REVISION_REQUIRED`/`REJECTED_BY_GOVERNOR`/`GOVERNANCE_DEFERRED`) and the
+  candidate outcome (`PLANS_ELIGIBLE_FOR_SELECTION`/`NO_GOVERNOR_APPROVED_PLAN`/
+  `GOVERNANCE_DEFERRED`). A rejection, revision, verification block,
+  all-ineligible result, or provider deferral is a successful semantic result.
+  `eligible_for_stage4_3` is true only for the two approved statuses (a filter,
+  not a ranking), enforced by a database check constraint. Candidate precedence:
+  any approved/caution → eligible; else any deferred → deferred; else
+  no-governor-approved-plan with separate verification/revision/rejection counts.
+- **Deterministic dimensions, no aggregate score.** Independent categorical
+  assessments with bounded reason codes/evidence are persisted for retention
+  preservation, source-moment damage, substantive originality, source dominance,
+  semantic fidelity, generic filler, redundant commentary, narration burden,
+  verification completeness, template/mass-produced feel, YouTube
+  reused/inauthentic/spam risk, Facebook unoriginal/spam risk, coherence, and
+  transformation proportionality. Severity classes `HARD_FAIL`/
+  `BLOCKING_CONDITION`/`REVISION`/`WARNING`/`ADVISORY` drive deterministic
+  precedence: integrity/prohibited/fidelity failures and no-value/presentation-
+  only/fabricated-claim/misleading-hook failures reject; unresolved essential
+  verification blocks; repairable retention/narration/filler/template/over-edit
+  damage requires revision; missing required semantic evidence defers; otherwise
+  caution or approval. A 12-second generic preamble before the hero fails;
+  narration interrupting a punchline is high source-moment damage; narration
+  `NONE` is valid and never penalized. Platform-specific risk alone never
+  globally hard-rejects.
+- **Rights/verification separation.** Claim state is explicit
+  (`GROUNDED_IN_SOURCE`/`EXTERNAL_REQUIRED_UNRESOLVED`/`UNSUPPORTED_OR_FABRICATED`/
+  `NOT_APPLICABLE`); Stage 4.2 never fabricates a placeholder, claims verification
+  happened, browses, or adds research infrastructure. Copyright/rights, platform
+  originality/reuse, and spam/repetition risk stay separate in persistence and
+  handoff. Account/channel repetition is `DEFERRED_TO_STAGE_7`.
+- **Platform-policy profile.** Immutable code-defined profile
+  `stage4.2-platform-policy-2026-09-17-v1` (checked 2026-09-17; official sources
+  re-confirmed: YouTube channel monetization, YouTube spam, Meta rewarding
+  original creators, Meta cracking down on spam, Facebook original-content
+  guidance). It encodes durable reused-content/inauthentic-content/spam concepts
+  on YouTube and original/unoriginal/spam concepts on Facebook, and contains no
+  evasion logic, monetization guarantee, algorithm-safety claim, or phrase such
+  as "safe for YouTube"/"will not be flagged". Policy/checked date participate in
+  the input fingerprint.
+- **Providers optional.** `deterministic` makes zero Gemini/Qwen calls; `adaptive`
+  (default) runs deterministic gates first and calls hosted Gemini only for
+  genuinely ambiguous/high-value plans, batched into one bounded plan-set request
+  (max three) with an optional single second strong call for plans whose first
+  valid critique stays `UNKNOWN`, hard-capped at two raw hosted calls per run and
+  never retried inside that ceiling. Every raw call acquires shared HIGH
+  admission; missing key/denial/429/timeout/outage/refusal/malformed output never
+  fails the candidate — the plan defers, the set degrades to `PROVIDER_DEGRADED`,
+  and accepted per-plan checkpoints are reused on a later request. `local_only`
+  uses Qwen only when `CLIPFACTORY_LOCAL_QWEN_ENABLED=true` and never Gemini.
+  Provider output is parsed with a tolerant top-level shape and strict per-item
+  validation; one malformed plan item never invalidates valid siblings. Gemini is
+  never asked whether a platform will flag/monetize/recommend and can never
+  assign a status or platform classification; platform-guarantee text, TTS/voice
+  identity, rendering instructions, and evasion tactics are discarded.
+- **Cache/concurrency.** Per-plan critiques are checkpointed under their
+  provider-input fingerprint and reused on exact match including forced reruns;
+  TTS provider/model/voice, render settings, publishing settings, and metadata do
+  not invalidate governance; platform-policy/config/mode/provider identity changes
+  do. Unfinished/deferred work makes the set non-cache-eligible. `QUEUED`/`FAILED`
+  → `RUNNING` job claims advance durable `claim_version`, duplicate/redelivered
+  invocations perform no provider work, liveness is a renewable heartbeat, stale
+  reclaim requires an abandoned heartbeat (not old `started_at`), cancellation is
+  polled against the exact executing job before/after each provider call and
+  before persistence, stale workers cannot persist/cancel/fail/finalize a newer
+  claim, and providers/Gemini key are released on every exit path.
+- **API/CLI/handoff.** `POST /api/candidates/{id}/transformation-governance`,
+  `GET /api/candidates/{id}/transformation-governance`,
+  `GET /api/transformation-governance-sets/{id}`, and
+  `GET /api/candidates/{id}/stage4-3-handoff`; CLI `transformation-govern`,
+  `transformation-governance`, `transformation-governance-handoff`; Celery
+  `clipfactory.run_transformation_governance`. The typed read-only Stage 4.3
+  handoff exposes per-plan governance with `stage4_3_implemented=false` and no
+  winner/selected plan/render-ready/publication state.
+
+Deterministic verification: 70 focused Stage 4.2 tests (governor, providers,
+service, executor/queue/cache/concurrency/cancellation, API/CLI/handoff/migration)
+plus the full backend suite in Docker Python 3.12 with the repository compose/.env
+files mounted, with no live provider calls in the automated suite. Versions:
+governor `stage4.2-v1`, schema `stage4.2-schema-v1`, validation
+`stage4.2-validation-v1`. See [docs/STAGE_4_2_OPERATIONS.md](docs/STAGE_4_2_OPERATIONS.md).
+
 ## Stage 4.1 transformation plan generation (2026-09-14)
 
 Stage 4.1 turns each current recommended Stage 4.0 strategy direction into zero

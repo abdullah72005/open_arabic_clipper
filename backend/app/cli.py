@@ -59,6 +59,14 @@ from app.transcription.reconstruction.benchmark import (
 from app.transcription.reconstruction.capture import capture_hash, load_capture, save_capture
 from app.transcription.reconstruction.service import ContextualReconstructor
 from app.transcription.reconstruction.types import ProviderAvailability, ProviderHealth
+from app.transformation.governance.handoff import build_stage4_3_handoff
+from app.transformation.governance.queue import (
+    GovernanceQueueError,
+    get_governance_set_for_candidate,
+    list_results,
+    queue_transformation_governance,
+    validate_candidate_for_governance,
+)
 from app.transformation.handoff import build_stage4_1_handoff
 from app.transformation.planning.handoff import build_stage4_2_handoff
 from app.transformation.planning.queue import (
@@ -620,6 +628,91 @@ def transformation_plan_handoff(candidate_id: UUID) -> None:
 
     with create_session_factory()() as session:
         handoff = build_stage4_2_handoff(session, candidate_id)
+        if handoff is None:
+            raise typer.BadParameter("candidate does not exist")
+    typer.echo(json.dumps(handoff, ensure_ascii=False, default=str))
+
+
+@app.command("transformation-govern")
+def transformation_govern(
+    candidate_id: UUID,
+    force: bool = typer.Option(False, "--force/--no-force"),
+) -> None:
+    """Queue one explicit candidate-scoped Stage 4.2 governance run."""
+
+    with create_session_factory()() as session:
+        try:
+            candidate, plan_set = validate_candidate_for_governance(session, candidate_id)
+        except GovernanceQueueError as error:
+            raise typer.BadParameter(str(error)) from error
+        outcome = queue_transformation_governance(session, candidate, plan_set, force=force)
+    typer.echo(
+        json.dumps(
+            {
+                "governance_set_id": str(outcome.governance_set_id),
+                "job_id": str(outcome.job_id) if outcome.job_id else None,
+                "status": outcome.status,
+                "queued": outcome.queued,
+                "cached": outcome.cached,
+                "active": outcome.active,
+            }
+        )
+    )
+
+
+def _governance_result_payload(row: object) -> dict[str, object]:
+    return {
+        "transformation_plan_id": str(row.transformation_plan_id),  # type: ignore[attr-defined]
+        "plan_output_fingerprint": row.plan_output_fingerprint,  # type: ignore[attr-defined]
+        "status": row.status.value,  # type: ignore[attr-defined]
+        "eligible_for_stage4_3": row.eligible_for_stage4_3,  # type: ignore[attr-defined]
+        "severity": row.severity,  # type: ignore[attr-defined]
+        "hard_gates": list(row.hard_gates or []),  # type: ignore[attr-defined]
+        "dimensions": dict(row.dimensions or {}),  # type: ignore[attr-defined]
+        "verification": dict(row.verification or {}),  # type: ignore[attr-defined]
+        "platform_risk": dict(row.platform_risk or {}),  # type: ignore[attr-defined]
+        "reason_codes": list(row.reason_codes or []),  # type: ignore[attr-defined]
+        "warnings": list(row.warnings or []),  # type: ignore[attr-defined]
+        "remediation": list(row.remediation or []),  # type: ignore[attr-defined]
+        "output_fingerprint": row.output_fingerprint,  # type: ignore[attr-defined]
+    }
+
+
+@app.command("transformation-governance")
+def transformation_governance(candidate_id: UUID) -> None:
+    """Print the current Stage 4.2 governance set and its per-plan results."""
+
+    with create_session_factory()() as session:
+        governance_set = get_governance_set_for_candidate(session, candidate_id)
+        if governance_set is None:
+            raise typer.BadParameter("transformation governance set does not exist")
+        rows = list_results(session, governance_set.id)
+        outcome = governance_set.governance_outcome
+        payload = {
+            "id": str(governance_set.id),
+            "execution_status": governance_set.execution_status.value,
+            "semantic_outcome": outcome.value if outcome else None,
+            "outcome_reasons": list(governance_set.outcome_reasons or []),
+            "summary_counts": dict(governance_set.summary_counts or {}),
+            "provider_mode": governance_set.provider_mode.value,
+            "provider_status": governance_set.provider_status,
+            "plan_attempts": list(governance_set.plan_attempts or []),
+            "platform_policy_profile_version": governance_set.platform_policy_profile_version,
+            "platform_policy_checked_at": governance_set.platform_policy_checked_at,
+            "input_fingerprint": governance_set.input_fingerprint,
+            "output_fingerprint": governance_set.output_fingerprint,
+            "cache_eligible": governance_set.cache_eligible,
+            "results": [_governance_result_payload(row) for row in rows],
+        }
+    typer.echo(json.dumps(payload, ensure_ascii=False, default=str))
+
+
+@app.command("transformation-governance-handoff")
+def transformation_governance_handoff(candidate_id: UUID) -> None:
+    """Print the read-only Stage 4.2 -> Stage 4.3 handoff (no winner)."""
+
+    with create_session_factory()() as session:
+        handoff = build_stage4_3_handoff(session, candidate_id)
         if handoff is None:
             raise typer.BadParameter("candidate does not exist")
     typer.echo(json.dumps(handoff, ensure_ascii=False, default=str))

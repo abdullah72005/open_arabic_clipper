@@ -402,3 +402,30 @@ falls back to Qwen. `local_only` uses Qwen/Ollama only when
 selects a TTS provider, model, or voice: those belong to future channel
 configuration and Stage 6 speech generation. See
 [docs/STAGE_4_1_OPERATIONS.md](STAGE_4_1_OPERATIONS.md).
+
+## Stage 4.2 governance configuration (2026-09-17)
+
+Stage 4.2 is explicit, candidate-scoped governance of every current Stage 4.1
+plan. Its provider mode is **separately configurable** and defaults to
+`adaptive`; it is deliberately decoupled from the Stage 4.0/4.1 modes so
+changing governance configuration never invalidates frozen Stage 4.0/4.1
+caches. All knobs are `CLIPFACTORY_`-prefixed:
+
+```bash
+# adaptive (default) | deterministic | local_only
+CLIPFACTORY_TRANSFORMATION_GOVERNANCE_MODE=adaptive
+CLIPFACTORY_TRANSFORMATION_GOVERNANCE_ROUTINE_MODEL=gemini-3.5-flash-lite
+CLIPFACTORY_TRANSFORMATION_GOVERNANCE_STRONG_MODEL=gemini-3.8-flash
+CLIPFACTORY_TRANSFORMATION_GOVERNANCE_MAX_OUTPUT_TOKENS=3072
+CLIPFACTORY_TRANSFORMATION_GOVERNANCE_STRONG_THINKING_LEVEL=low
+```
+
+`deterministic` makes zero Gemini and zero Qwen calls and loads no model;
+deterministic hard gates and dimensions always run. `adaptive` uses hosted
+Gemini selectively for plans whose deterministic evidence is genuinely
+ambiguous, acquires the shared Gemini admission controller at `HIGH` for every
+raw hosted call, uses temperature 0 and strict structured output, and never
+silently falls back to Qwen. `local_only` uses Qwen/Ollama only when
+`CLIPFACTORY_LOCAL_QWEN_ENABLED=true` and never calls Gemini. The governor never
+selects a TTS provider, model, or voice and never claims a platform outcome.
+See [docs/STAGE_4_2_OPERATIONS.md](STAGE_4_2_OPERATIONS.md).

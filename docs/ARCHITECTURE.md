@@ -87,3 +87,40 @@ checkpoints survive, only unfinished work stays non-cache-eligible, and a later
 normal request retries it. Narration is an abstract semantic requirement; Stage
 4.1 decides WHAT narration communicates, channel configuration will decide WHO
 the persistent narrator is, and Stage 6 generates speech.
+
+## Stage 4.2 retention, originality, and platform-risk governance
+
+Stage 4.2 lives in `app/transformation/governance/` and is explicit,
+candidate-scoped work after a current, non-stale, complete Stage 4.1 plan set
+with at least one current plan. It independently governs every current plan and
+answers whether it is good and safe enough to be considered by Stage 4.3. It is
+a critic/governor: it never generates, mutates, repairs, or selects a plan, adds
+**no** `PipelineStage`, **no** `PipelineRun`, **no** `_NEXT_STAGE` entry, and no
+source lifecycle change. It extends the existing Celery/`ProcessingJob` platform
+with a `TRANSFORMATION_GOVERNANCE` job kind and a nullable
+`processing_jobs.transformation_governance_set_id` FK. `transformation_governance_sets`
+(one durable envelope per Stage 4.1 plan set) and
+`transformation_governance_results` (one stable row per `(set, plan)`) persist
+independent per-plan results without touching the immutable Stage 4.1 plan.
+
+Deterministic logic owns integrity revalidation, evidence derivation, independent
+categorical dimensions (no overall score), hard gates, status precedence,
+platform-risk interpretation, reason/remediation codes, and fingerprint
+composition. Each plan becomes `APPROVED_FOR_SELECTION`,
+`APPROVED_WITH_CAUTION`, `BLOCKED_PENDING_VERIFICATION`, `REVISION_REQUIRED`,
+`REJECTED_BY_GOVERNOR`, or `GOVERNANCE_DEFERRED`, with an explicit
+`eligible_for_stage4_3` boolean that is a filter, not a ranking. Semantic
+fidelity, presentation-only transformation, fabricated critical claims, and
+misleading hooks are hard failures no other dimension offsets. An optional
+provider (hosted Gemini routine/strong, or explicit `local_only` Qwen) supplies
+only bounded observable semantic findings and can never assign a final status or
+platform classification. Every raw hosted call acquires the shared HIGH
+admission gate; at most two raw calls per governance run. Accepted per-plan
+critiques are checkpointed per provider-input fingerprint and reused on exact
+dependency match. The candidate summary is `PLANS_ELIGIBLE_FOR_SELECTION`,
+`NO_GOVERNOR_APPROVED_PLAN`, or `GOVERNANCE_DEFERRED`. Rights, platform
+originality, and spam/repetition stay separate; account/channel repetition is
+deferred to Stage 7. Stage 4.3 selection
+is not implemented and the read-only Stage 4.3 handoff contains no winner,
+`selected_plan_id`, render-ready state, or publication approval. See
+`docs/STAGE_4_2_OPERATIONS.md`.

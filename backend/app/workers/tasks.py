@@ -348,6 +348,62 @@ def run_transformation_planning(
         session.close()
 
 
+@celery_app.task(  # type: ignore[untyped-decorator]
+    bind=True, autoretry_for=(), name="clipfactory.run_transformation_governance"
+)
+def run_transformation_governance(
+    self: Task,
+    governance_set_id: str,
+    job_id: str | None = None,
+    force: bool = False,
+) -> dict[str, str | bool | None]:
+    """Run one explicit candidate-scoped Stage 4.2 governance run.
+
+    This extends the existing job system, not the pipeline: it creates no
+    ``PipelineRun``, schedules no next stage, selects no plan, and never touches
+    the whole-source stage chain.
+    """
+
+    from uuid import UUID as _UUID
+
+    from app.transformation.governance.executor import (
+        build_transformation_governance_executor,
+    )
+
+    parsed_set = _UUID(governance_set_id)
+    parsed_job = _UUID(job_id) if job_id else None
+    session = create_session_factory()()
+    try:
+        settings = get_settings()
+        if parsed_job is not None:
+            job = session.get(ProcessingJob, parsed_job)
+            if job is not None and job.status is JobStatus.CANCELLED:
+                return {"governance_set_id": str(parsed_set), "cancelled": True}
+        executor = build_transformation_governance_executor(session, settings)
+        executor.set_active_job(parsed_job)
+        try:
+            executor.execute(parsed_set, force=force)
+        except StageCancelled:
+            return {"governance_set_id": str(parsed_set), "cancelled": True}
+        except Exception as error:
+            if parsed_job is not None and not getattr(executor, "skipped_duplicate", False):
+                executor.record_failure(error)
+            if getattr(error, "retryable", False):
+                raise self.retry(
+                    args=[governance_set_id, job_id, force],
+                    exc=error,
+                    max_retries=MAX_RETRIES,
+                ) from error
+            raise
+        return {
+            "governance_set_id": str(parsed_set),
+            "job_id": str(parsed_job) if parsed_job else None,
+            "skipped": bool(getattr(executor, "skipped_duplicate", False)),
+        }
+    finally:
+        session.close()
+
+
 @celery_app.task(name="clipfactory.worker_heartbeat")  # type: ignore[untyped-decorator]
 def worker_heartbeat() -> dict[str, str]:
     """Expose latest worker liveness timestamp for health checks."""

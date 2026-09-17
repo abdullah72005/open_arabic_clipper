@@ -147,3 +147,39 @@ model, or voice. The result is `PLANS_GENERATED`,
 provider-unavailable, or zero-plan outcome is a successful semantic result, not a
 source/pipeline failure. Stage 6 will generate speech; channel configuration will
 decide the persistent narrator. See `docs/STAGE_4_1_OPERATIONS.md`.
+
+## Stage 4.2 retention, originality, and platform-risk governance
+
+Stage 4.2 is explicit, candidate-scoped work after a current, non-stale,
+complete Stage 4.1 plan set with at least one current plan. It is **not** part of
+the automatic `_NEXT_STAGE` chain and never advances every candidate. It
+independently governs every current plan and never generates, mutates, repairs,
+or selects one.
+
+Deterministic logic revalidates plan integrity and derives independent
+categorical dimensions — retention preservation, source-moment damage,
+substantive originality, source dominance, semantic fidelity, generic filler and
+redundant commentary, narration burden, verification completeness, plan-level
+template/mass-produced feel, observable YouTube/Facebook reuse/spam risk,
+coherence, and transformation proportionality — with no overall score. Hard
+failures (semantic distortion, context reversal, false attribution, literalized
+sarcasm, speculation-as-fact, unrelated source evidence, fake hooks, fabricated
+claims, presentation-only transformation, no substantive value) are never offset
+by another dimension. Essential unresolved external verification blocks a plan.
+Repairable retention/narration/filler/template/proportionality damage requires
+revision. Semantic-evidence deferral never falsely approves or rejects. Each plan
+becomes `APPROVED_FOR_SELECTION`, `APPROVED_WITH_CAUTION`,
+`BLOCKED_PENDING_VERIFICATION`, `REVISION_REQUIRED`, `REJECTED_BY_GOVERNOR`, or
+`GOVERNANCE_DEFERRED`, with `eligible_for_stage4_3` a filter, not a ranking. The
+candidate outcome is `PLANS_ELIGIBLE_FOR_SELECTION`, `NO_GOVERNOR_APPROVED_PLAN`,
+or `GOVERNANCE_DEFERRED`, preserving separate verification-blocked,
+revision-required, and rejected counts.
+
+The platform-policy profile is immutable and code-defined
+(`stage4.2-platform-policy-2026-09-17-v1`, checked 2026-09-17); it encodes durable
+YouTube reused/inauthentic/spam concepts and Facebook original/unoriginal/spam
+concepts and never claims algorithm safety or monetization. Copyright/rights,
+platform originality, and spam/repetition remain separate. Account/channel-level
+repetition is `DEFERRED_TO_STAGE_7`. Stage 4.3 selection is not implemented and
+the read-only handoff contains no winner. See
+`docs/STAGE_4_2_OPERATIONS.md`.

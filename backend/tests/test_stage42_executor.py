@@ -1,0 +1,279 @@
+"""Stage 4.2 executor, queue, cache, concurrency, and cancellation tests."""
+
+from __future__ import annotations
+
+from collections.abc import Iterator
+from typing import Any
+
+import pytest
+from sqlalchemy import Engine, select
+from sqlalchemy.orm import Session
+from stage41_support import FakePlanningProvider, make_source_value_plan, run_planning, seed_stage41
+from stage42_support import (
+    FakeGovernanceProvider,
+    FakeGovernanceSettings,
+    install_stage42_settings,
+    with_review_narration,
+)
+
+from app.core.enums import (
+    GovernanceExecutionStatus,
+    GovernanceSemanticOutcome,
+    JobKind,
+    JobStatus,
+    SemanticProviderMode,
+)
+from app.db.base import Base
+from app.models import (
+    ProcessingJob,
+    TransformationGovernanceResult,
+    TransformationGovernanceSet,
+)
+from app.transformation.governance.executor import (
+    GovernanceCancelled,
+    build_transformation_governance_executor,
+)
+from app.transformation.governance.inputs import GovernanceInputError
+from app.transformation.governance.queue import (
+    get_governance_set_for_candidate,
+    get_or_create_governance_set,
+    list_results,
+    queue_transformation_governance,
+    validate_candidate_for_governance,
+)
+
+
+@pytest.fixture  # type: ignore[untyped-decorator]
+def session(sqlite_engine: Engine) -> Iterator[Session]:
+    Base.metadata.create_all(sqlite_engine)
+    with Session(sqlite_engine) as session:
+        yield session
+
+
+@pytest.fixture(autouse=True)  # type: ignore[untyped-decorator]
+def _no_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("app.workers.tasks.run_transformation_planning.delay", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "app.workers.tasks.run_transformation_governance.delay", lambda *a, **k: None
+    )
+
+
+def _install(settings: FakeGovernanceSettings) -> None:
+    from _pytest.monkeypatch import MonkeyPatch
+
+    install_stage42_settings(MonkeyPatch(), settings)
+
+
+def _setup(
+    session: Session,
+    *,
+    narration: str = "NONE",
+    governance_provider: Any = None,
+) -> tuple[FakeGovernanceSettings, tuple[Any, ...], Any]:
+    settings = FakeGovernanceSettings(governance_provider=governance_provider)
+    _install(settings)
+    seed = seed_stage41(session, settings=settings)
+    strategy = seed[4][0]
+    plan = make_source_value_plan(str(strategy.id), strategy.strategy_key, narration_need=narration)
+    if narration == "RECOMMENDED":
+        plan = with_review_narration(plan)
+    planning_provider = FakePlanningProvider([plan])
+    plan_set = run_planning(
+        session, settings, seed, planning_provider, mode=SemanticProviderMode.ADAPTIVE
+    )
+    return settings, seed, plan_set
+
+
+def _run(
+    session: Session,
+    settings: FakeGovernanceSettings,
+    seed: tuple[Any, ...],
+    plan_set: Any,
+    *,
+    force: bool = False,
+) -> TransformationGovernanceSet:
+    candidate = seed[1]
+    governance_set = get_or_create_governance_set(session, candidate, plan_set)
+    executor = build_transformation_governance_executor(session, settings)
+    executor.execute(governance_set.id, force=force)
+    session.refresh(governance_set)
+    return governance_set
+
+
+def test_strong_plan_governed_without_provider_call(session: Session) -> None:
+    provider = FakeGovernanceProvider(auto=True)
+    settings, seed, plan_set = _setup(session, governance_provider=provider)
+    governance_set = _run(session, settings, seed, plan_set)
+    assert provider.calls == 0
+    assert governance_set.execution_status is GovernanceExecutionStatus.COMPLETE
+    assert (
+        governance_set.governance_outcome is GovernanceSemanticOutcome.PLANS_ELIGIBLE_FOR_SELECTION
+    )
+    results = list_results(session, governance_set.id)
+    assert results and all(row.eligible_for_stage4_3 for row in results)
+
+
+def test_cache_hit_makes_no_repeated_provider_call(session: Session) -> None:
+    provider = FakeGovernanceProvider(auto=True)
+    settings, seed, plan_set = _setup(
+        session, narration="RECOMMENDED", governance_provider=provider
+    )
+    governance_set = _run(session, settings, seed, plan_set)
+    assert provider.calls == 1
+    assert governance_set.cache_eligible is True
+    # Force re-enters the executor but reuses the accepted checkpoint.
+    _run(session, settings, seed, plan_set, force=True)
+    assert provider.calls == 1
+
+
+def test_provider_outage_does_not_fail_candidate(session: Session) -> None:
+    provider = FakeGovernanceProvider(auto=True)
+    provider.behavior = "outage"
+    settings, seed, plan_set = _setup(
+        session, narration="RECOMMENDED", governance_provider=provider
+    )
+    governance_set = _run(session, settings, seed, plan_set)
+    assert governance_set.execution_status is GovernanceExecutionStatus.PROVIDER_DEGRADED
+    assert governance_set.governance_outcome is GovernanceSemanticOutcome.GOVERNANCE_DEFERRED
+    assert governance_set.cache_eligible is False
+
+
+def test_concurrent_queue_yields_one_active_job(session: Session) -> None:
+    provider = FakeGovernanceProvider(auto=True)
+    settings, seed, plan_set = _setup(session, governance_provider=provider)
+    candidate, resolved_set = validate_candidate_for_governance(session, seed[1].id)
+    first = queue_transformation_governance(session, candidate, resolved_set)
+    second = queue_transformation_governance(session, candidate, resolved_set)
+    assert first.queued is True
+    assert second.active is True
+    jobs = session.scalars(
+        select(ProcessingJob).where(ProcessingJob.kind == JobKind.TRANSFORMATION_GOVERNANCE)
+    ).all()
+    assert len(jobs) == 1
+    assert provider.calls == 0
+
+
+def test_stale_stage41_input_is_refused_before_provider_work(session: Session) -> None:
+    provider = FakeGovernanceProvider(auto=True)
+    settings, seed, plan_set = _setup(session, governance_provider=provider)
+    assert provider.calls == 0
+    plan_set.input_fingerprint = "stale-fingerprint"
+    session.commit()
+    candidate = seed[1]
+    governance_set = get_or_create_governance_set(session, candidate, plan_set)
+    executor = build_transformation_governance_executor(session, settings)
+    with pytest.raises(GovernanceInputError):
+        executor.execute(governance_set.id)
+    assert provider.calls == 0
+
+
+def test_cancelled_job_cannot_persist_final_result(session: Session) -> None:
+    provider = FakeGovernanceProvider(auto=True)
+    settings, seed, plan_set = _setup(
+        session, narration="RECOMMENDED", governance_provider=provider
+    )
+    candidate, resolved_set = validate_candidate_for_governance(session, seed[1].id)
+    outcome = queue_transformation_governance(session, candidate, resolved_set)
+    job = session.get(ProcessingJob, outcome.job_id)
+    assert job is not None
+    job.status = JobStatus.CANCELLED
+    session.commit()
+    governance_set = get_governance_set_for_candidate(session, seed[1].id)
+    executor = build_transformation_governance_executor(session, settings)
+    executor.set_active_job(job.id)
+    with pytest.raises(GovernanceCancelled):
+        executor.execute(governance_set.id)
+    session.refresh(governance_set)
+    assert governance_set.execution_status is GovernanceExecutionStatus.CANCELLED
+    assert list_results(session, governance_set.id) == []
+    assert provider.calls == 0
+
+
+def test_force_reuses_accepted_checkpoint(session: Session) -> None:
+    provider = FakeGovernanceProvider(auto=True)
+    settings, seed, plan_set = _setup(
+        session, narration="RECOMMENDED", governance_provider=provider
+    )
+    _run(session, settings, seed, plan_set)
+    assert provider.calls == 1
+    second = FakeGovernanceProvider(auto=True)
+    settings2 = FakeGovernanceSettings(governance_provider=second)
+    _install(settings2)
+    _run(session, settings2, seed, plan_set, force=True)
+    assert second.calls == 0
+
+
+def test_governance_set_is_unique_per_plan_set(session: Session) -> None:
+    settings, seed, plan_set = _setup(session)
+    candidate = seed[1]
+    first = get_or_create_governance_set(session, candidate, plan_set)
+    second = get_or_create_governance_set(session, candidate, plan_set)
+    assert first.id == second.id
+
+
+def test_results_are_independent_per_plan(session: Session) -> None:
+    settings, seed, plan_set = _setup(session)
+    governance_set = _run(session, settings, seed, plan_set)
+    results = list_results(session, governance_set.id)
+    plan_ids = {row.transformation_plan_id for row in results}
+    assert len(plan_ids) == len(results)
+    assert all(isinstance(row, TransformationGovernanceResult) for row in results)
+
+
+def test_status_eligibility_constraint_is_enforced(session: Session) -> None:
+    from sqlalchemy.exc import IntegrityError
+
+    from app.core.enums import GovernancePlanStatus
+
+    settings, seed, plan_set = _setup(session)
+    governance_set = _run(session, settings, seed, plan_set)
+    row = list_results(session, governance_set.id)[0]
+    row.status = GovernancePlanStatus.APPROVED_FOR_SELECTION
+    row.eligible_for_stage4_3 = False
+    with pytest.raises(IntegrityError):
+        session.commit()
+    session.rollback()
+
+
+def test_platform_policy_profile_change_invalidates_governance(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.transformation.governance import fingerprints as fingerprints_module
+
+    settings, seed, plan_set = _setup(session)
+    governance_set = _run(session, settings, seed, plan_set)
+    executor = build_transformation_governance_executor(session, settings)
+    before = governance_set.input_fingerprint
+    assert executor.input_fingerprint(governance_set) == before
+    monkeypatch.setattr(
+        fingerprints_module,
+        "platform_policy_payload",
+        lambda: {"policy_profile_version": "changed-profile"},
+    )
+    assert executor.input_fingerprint(governance_set) != before
+
+
+def test_governance_fingerprint_excludes_tts_and_rendering_settings(session: Session) -> None:
+    import json
+
+    from app.transformation.governance.fingerprints import build_governance_input_payload
+    from app.transformation.governance.inputs import build_governance_inputs
+
+    settings, seed, plan_set = _setup(session)
+    inputs = build_governance_inputs(
+        session,
+        seed[1],
+        plan_set,
+        settings,
+        settings.stage42_config(),
+        settings.stage41_config(),
+    )
+    payload = build_governance_input_payload(
+        inputs=inputs,
+        config=settings.stage42_config(),
+        provider_mode="adaptive",
+        provider_identity={"provider": "fake"},
+    )
+    blob = json.dumps(payload).casefold()
+    for token in ("tts", "voice", "render", "publish", "caption_font", "resolution"):
+        assert token not in blob
