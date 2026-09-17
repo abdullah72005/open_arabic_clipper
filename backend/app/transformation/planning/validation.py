@@ -298,18 +298,23 @@ _EN_SPEAKER_PATTERNS: tuple[re.Pattern[str], ...] = (
 
 # Arabic selection grammar. Arabic has no letter case, so detection requires an
 # explicit selection verb or an explicit "as <role>" (ك) connector rather than a
-# bare role-before-word sequence (which would match ordinary prose).
+# bare role-before-word sequence (which would match ordinary prose). Identities
+# are bounded to at most three tokens.
 _AR_WORD = r"[\u0600-\u06FF][\u0600-\u06FF\u064B-\u0652\u0670]*"
+_AR_IDENTITY = rf"{_AR_WORD}(?:\s+{_AR_WORD}){{0,2}}"
+_AR_ROLE_FULL = r"(?:ال)?(?:صوت|نبرة|نبر|متحدث|راوي|راو|سارد|معلق|ناطق|تعليق|قارئ)"
 _AR_ROLE_STEM = r"(?:صوت|نبر|متحدث|راو|سارد|معلق|ناطق|تعليق|قارئ)"
 _AR_SELECT = r"(?:استخدم|استعمل|اختر|اختار|حدد|عيّن|عين|اضبط|اجعل|استعن|كلّف|كلف)"
 _AR_AS_ROLE = rf"ك[\u064B-\u0652]*{_AR_ROLE_STEM}"
 _ARABIC_SPEAKER_PATTERNS: tuple[re.Pattern[str], ...] = (
-    # selection verb + role + identity: "استخدم صوت شيرون للسرد"
-    re.compile(rf"{_AR_SELECT}\s+(?:ال)?{_AR_ROLE_STEM}(?![\u0600-\u06FF])\s+{_AR_WORD}"),
-    # selection verb + identity + role: "اختر شيرون راوياً", "عيّن شيرون متحدثاً"
-    re.compile(rf"{_AR_SELECT}\s+{_AR_WORD}\s+(?:ال)?{_AR_ROLE_STEM}"),
-    # identity + ك + role: "شيرون كراوٍ"
-    re.compile(rf"{_AR_WORD}\s+{_AR_AS_ROLE}"),
+    # selection verb + role + identity: "استخدم صوت شيرون للسرد",
+    # "استخدم الراوي محمد رمضان"
+    re.compile(rf"{_AR_SELECT}\s+{_AR_ROLE_FULL}(?![\u0600-\u06FF])\s+{_AR_IDENTITY}"),
+    # selection verb + identity + role: "اختر شيرون راوياً",
+    # "اختر محمد رمضان راوياً", "عيّن شيرون متحدثاً"
+    re.compile(rf"{_AR_SELECT}\s+{_AR_IDENTITY}\s+(?:ال)?{_AR_ROLE_STEM}"),
+    # identity + ك + role: "شيرون كراوٍ", "محمد رمضان كراوٍ"
+    re.compile(rf"{_AR_IDENTITY}\s+{_AR_AS_ROLE}"),
 )
 
 

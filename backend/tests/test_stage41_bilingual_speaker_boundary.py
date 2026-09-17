@@ -63,6 +63,11 @@ _REJECTED_AR = (
     "اختر شيرون راوياً",
     "شيرون كراوٍ",
     "عيّن شيرون متحدثاً",
+    # Bounded multi-token Arabic identities.
+    "اختر محمد رمضان راوياً",
+    "محمد رمضان كراوٍ",
+    "استخدم الراوي محمد رمضان",
+    "عيّن محمد رمضان متحدثاً",
 )
 _ALLOWED = (
     "The narrator named several causes",
@@ -70,8 +75,11 @@ _ALLOWED = (
     "Explain the economic model behind the productivity drop",
     "Reference Morgan Freeman's career as context for the claim",
     "The narrator explains the model to viewers",
+    # Ordinary Arabic prose without explicit selection grammar.
+    "الراوي يشرح الفكرة للمشاهدين",
+    "يوضح الراوي الأفكار الرئيسية بوضوح",
 )
-_LEAK_TOKENS = ("Charon", "شيرون", "Morgan", "Freeman")
+_LEAK_TOKENS = ("Charon", "شيرون", "Morgan", "Freeman", "رمضان")
 
 
 @pytest.fixture  # type: ignore[untyped-decorator]
@@ -203,6 +211,31 @@ def test_forbidden_speaker_in_no_valid_payload_never_persisted(session: Session)
     assert attempts[0]["status"] == "INVALID"
     assert plan_set.planning_outcome is PlanSemanticOutcome.PLANNING_DEFERRED
     assert plan_set.cache_eligible is False
+    assert not _leaks(json.dumps(attempts))
+    assert not _leaks(json.dumps(plan_set.outcome_reasons))
+    handoff = build_stage4_2_handoff(session, seed[1].id)
+    assert handoff is not None
+    assert not _leaks(json.dumps(handoff))
+
+
+def test_forbidden_multitoken_arabic_speaker_never_persisted(session: Session) -> None:
+    settings = FakeStage41Settings()
+    seed = _seed(
+        session,
+        settings,
+        strategy_type=TransformationStrategyType.ANALYSIS,
+        value_kind=SubstantiveValueKind.AUTHORED_THESIS,
+    )
+    strategy = seed[4][0]
+    provider = FakePlanningProvider([_forbidden_no_valid(strategy, "اختر محمد رمضان راوياً")])
+    plan_set = run_planning(session, settings, seed, provider)
+    session.refresh(plan_set)
+
+    attempts = plan_set.strategy_attempts or []
+    assert attempts[0]["status"] == "INVALID"
+    assert plan_set.planning_outcome is PlanSemanticOutcome.PLANNING_DEFERRED
+    assert plan_set.cache_eligible is False
+    assert list_plans(session, plan_set.id) == []
     assert not _leaks(json.dumps(attempts))
     assert not _leaks(json.dumps(plan_set.outcome_reasons))
     handoff = build_stage4_2_handoff(session, seed[1].id)

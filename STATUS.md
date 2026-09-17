@@ -69,7 +69,8 @@ refinement, and is **never** added to the automatic `_NEXT_STAGE` chain.
   narrator/voice/speaker identity selection for single- and multi-token
   identities (for example "Narrated by Charon", "Use Charon as narrator", "Set
   Charon as the speaker", "Use narrator Charon to explain the claim", "Use a
-  voice called Charon", "استخدم صوت شيرون للسرد", "شيرون كراوٍ"), TTS
+  voice called Charon", "استخدم صوت شيرون للسرد", "شيرون كراوٍ", "اختر محمد رمضان
+  راوياً"), TTS
   provider/model/voice selection, frame-level
   rendering instructions, cosmetic-only transformation claims, and
   platform/detection-evasion tactics (mirroring, pitch shifting, speed tricks,
@@ -159,14 +160,15 @@ refinement, and is **never** added to the automatic `_NEXT_STAGE` chain.
   `stage4_3_implemented=false`) with exact ordered blocks, hero span, narration
   semantics, verification dependencies, and Stage 4.0 risk.
 
-Deterministic verification: 165 focused Stage 4.1 tests (63 original + 24
+Deterministic verification: 172 focused Stage 4.1 tests (63 original + 24
 review-remediation + 19 final re-review remediation + 20 final-closure
 remediation + 8 provider no-valid boundary closure + 11 final truthfulness and
-speaker-boundary closure + 20 bilingual speaker-boundary closure) plus the full
+speaker-boundary closure + 20 bilingual speaker-boundary closure + 7 Arabic
+multi-token closure) plus the full
 backend suite in Docker Python 3.12 with the repository compose/.env files
 mounted, with no live provider calls in the automated suite. Planning
 policy/schema/validation versions advanced to
-`stage4.1-v7`/`stage4.1-schema-v7`/`stage4.1-validation-v7` so prior plans and
+`stage4.1-v8`/`stage4.1-schema-v8`/`stage4.1-validation-v8` so prior plans and
 checkpoints invalidate. See
 [docs/STAGE_4_1_OPERATIONS.md](docs/STAGE_4_1_OPERATIONS.md).
 

@@ -240,7 +240,7 @@ narrator/voice/speaker identity selection is also rejected bilingually
 (English and Arabic) for single- and multi-token identities: `Narrated by
 Charon`, `Use Charon as narrator`, `Set Charon as the speaker`, `Use narrator
 Charon to explain the claim`, `Use a voice called Charon`, `استخدم صوت شيرون
-للسرد`, `شيرون كراوٍ`. Detection is bounded to genuine selection grammar (a
+للسرد`, `شيرون كراوٍ`, `اختر محمد رمضان راوياً`. Detection is bounded to genuine selection grammar (a
 selection verb, a `narrated/voiced/spoken by` phrase, an `as <role>` connector,
 or the Arabic `ك<role>` connector); `named`/`called` requires a proper-name
 identity, so ordinary prose such as "The narrator named several causes" is not
@@ -558,11 +558,12 @@ ruff format app tests alembic && ruff check app tests alembic
 
 All Stage 4.1 tests are deterministic and hermetic: providers are mocked and no
 test makes a live Gemini, Qwen, web, TTS, or rendering call even when a key is
-present. The bilingual speaker-boundary closure remediation advanced planning
-versions to `stage4.1-v7` / `stage4.1-schema-v7` / `stage4.1-validation-v7`
-(explicit per-video narrator/voice/speaker identity selection is rejected in
-English and Arabic for single- and multi-token identities, with ordinary prose
-preserved), so prior plans and checkpoints invalidate
+present. The Arabic multi-token closure remediation advanced planning
+versions to `stage4.1-v8` / `stage4.1-schema-v8` / `stage4.1-validation-v8`
+(bounded Arabic selection grammar now covers multi-token identities such as
+`اختر محمد رمضان راوياً`, in addition to single- and multi-token English and
+single-token Arabic selection, with ordinary prose preserved), so prior plans
+and checkpoints invalidate
 through the input fingerprint. Known
 limitation: the repository's strict `mypy` configuration already reports the
 same class of `no-any-return`/`untyped-decorator` findings in the frozen Stage

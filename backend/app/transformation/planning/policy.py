@@ -19,12 +19,11 @@ from app.core.enums import (
     TransformationStrategyType,
 )
 
-# v7 bilingual speaker-boundary closure: explicit per-video narrator/voice/
-# speaker identity selection is rejected in English and Arabic for single- and
-# multi-token identities, with ordinary prose preserved.
-POLICY_VERSION = "stage4.1-v7"
-SCHEMA_VERSION = "stage4.1-schema-v7"
-VALIDATION_VERSION = "stage4.1-validation-v7"
+# v8 Arabic multi-token closure: bounded Arabic selection grammar covers
+# multi-token identities (for example "اختر محمد رمضان راوياً").
+POLICY_VERSION = "stage4.1-v8"
+SCHEMA_VERSION = "stage4.1-schema-v8"
+VALIDATION_VERSION = "stage4.1-validation-v8"
 INPUT_FINGERPRINT_VERSION = "1"
 OUTPUT_FINGERPRINT_VERSION = "1"
 PLAN_FINGERPRINT_VERSION = "1"
