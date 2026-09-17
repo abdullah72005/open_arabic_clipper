@@ -285,7 +285,8 @@ def test_paraphrase_original_block_is_rejected(session: Session) -> None:
     )
     plan_set = _run(session, settings, seed, FakePlanningProvider([plan]))
     assert list_plans(session, plan_set.id) == []
-    assert plan_set.planning_outcome is PlanSemanticOutcome.NO_VALID_PLAN_FROM_STRATEGY
+    # Invalid/malformed provider output is retryable, not a false no-valid plan.
+    assert plan_set.planning_outcome is PlanSemanticOutcome.PLANNING_DEFERRED
 
 
 def test_cosmetic_edits_never_count_as_original_value(session: Session) -> None:

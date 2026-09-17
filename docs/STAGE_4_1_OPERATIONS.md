@@ -109,6 +109,16 @@ non-cache-eligible, and persists only the bounded rejection code (never the raw
 provider text). A previously stored checkpoint is reusable only when its
 serialized content passes the current boundary/version contract.
 
+A `NO_VALID_PLAN_FROM_STRATEGY` semantic outcome is truthful only when every
+attempted strategy is a clean, validated explicit no-valid outcome with no
+invalid/malformed/deferred/omitted/provider-failure work outstanding. Any such
+outstanding work makes the outcome `PLANNING_DEFERRED` (or
+`PROVIDER_UNAVAILABLE`) and keeps the run non-cache-eligible, so a false
+"no strategy works" conclusion is never asserted. Accepted plans produced
+alongside an unrelated invalid strategy remain available under the existing
+degraded semantics, and a later retry with valid provider output can still
+generate and cache a valid plan.
+
 ## Block contract
 
 Closed block set: `SOURCE_EXCERPT`, `ORIGINAL_VALUE`, `TRANSITION`,
@@ -225,7 +235,12 @@ pitch shifting, speed tricks, watermark removal/obfuscation), and
 platform-detection/copyright-evasion tactics. Markers are explicit phrases and
 provider-plus-voice/named-speaker detection is bounded (it requires a
 provider/voice or narration cue); imitation detection requires an explicit
-imitation/style cue and a capitalized person name. Ordinary semantic wording
+imitation/style cue and a capitalized person name. Explicit single-token
+narrator/voice/speaker identity selection is also rejected (`Use narrator
+Charon to explain the claim`, `Use a voice called Charon`), bounded to genuine
+selection grammar (a selection verb or a called/named/id connector) so ordinary
+wording such as "the narrator explains the model" is not blocked. Ordinary
+semantic wording
 such as "model" in "explain the model" is never blocked, and ordinary discussion
 of a named person (for example "Reference Morgan Freeman's career as context")
 is not treated as identity selection. Legitimate narration semantics
@@ -538,12 +553,12 @@ ruff format app tests alembic && ruff check app tests alembic
 
 All Stage 4.1 tests are deterministic and hermetic: providers are mocked and no
 test makes a live Gemini, Qwen, web, TTS, or rendering call even when a key is
-present. The provider no-valid boundary-closure remediation advanced planning
-versions to `stage4.1-v5` / `stage4.1-schema-v5` / `stage4.1-validation-v5`
-(every parsed provider result, including explicit no-valid payloads, is
-boundary-validated before persistence, checkpoint, reason, cache reuse, or
-handoff exposure), so prior plans and checkpoints invalidate through the input
-fingerprint. Known
+present. The final truthfulness and speaker-boundary closure remediation
+advanced planning versions to `stage4.1-v6` / `stage4.1-schema-v6` /
+`stage4.1-validation-v6` (invalid/malformed provider work can never assert a
+false `NO_VALID_PLAN_FROM_STRATEGY`; explicit single-token narrator/voice/speaker
+identity selection is rejected), so prior plans and checkpoints invalidate
+through the input fingerprint. Known
 limitation: the repository's strict `mypy` configuration already reports the
 same class of `no-any-return`/`untyped-decorator` findings in the frozen Stage
 4.0 provider modules and the FastAPI app; Stage 4.1 matches that existing

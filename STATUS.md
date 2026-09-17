@@ -29,7 +29,12 @@ refinement, and is **never** added to the automatic `_NEXT_STAGE` chain.
   `PLANS_GENERATED_WITH_VERIFICATION_REQUIRED`, `PLANNING_DEFERRED`,
   `NO_VALID_PLAN_FROM_STRATEGY`, `PROVIDER_UNAVAILABLE`). A zero-plan, deferred,
   or provider-unavailable plan set is a successful semantic result with no fake
-  plan rows. Blocks are validated JSON on the plan (closed set:
+  plan rows. The `NO_VALID_PLAN_FROM_STRATEGY` conclusion is truthful only when
+  every attempted strategy is a clean, validated explicit no-valid outcome; any
+  invalid/malformed/deferred/omitted/provider-failure work makes the outcome
+  `PLANNING_DEFERRED` (or `PROVIDER_UNAVAILABLE`) and keeps it non-cache-eligible
+  rather than asserting a conclusion the provider never validly reached. Blocks
+  are validated JSON on the plan (closed set:
   `SOURCE_EXCERPT`, `ORIGINAL_VALUE`, `TRANSITION`, `TEXTUAL_ANNOTATION`,
   `FACT_VERIFICATION_PLACEHOLDER`).
 - **Deterministic first.** Deterministic logic owns readiness, bounds, routing,
@@ -60,7 +65,9 @@ refinement, and is **never** added to the automatic `_NEXT_STAGE` chain.
   Morgan Freeman narrate"), named-person imitation/identity-selection phrased
   without any voice/narration/TTS word (for example "Make it sound like Morgan
   Freeman", "In the style of Morgan Freeman", "Impersonate Morgan Freeman",
-  "Morgan Freeman's voice"), TTS provider/model/voice selection, frame-level
+  "Morgan Freeman's voice"), explicit single-token narrator/voice/speaker
+  identity selection (for example "Use narrator Charon to explain the claim",
+  "Use a voice called Charon"), TTS provider/model/voice selection, frame-level
   rendering instructions, cosmetic-only transformation claims, and
   platform/detection-evasion tactics (mirroring, pitch shifting, speed tricks,
   watermark removal/obfuscation) are rejected. Legitimate narration semantics
@@ -147,13 +154,13 @@ refinement, and is **never** added to the automatic `_NEXT_STAGE` chain.
   `stage4_3_implemented=false`) with exact ordered blocks, hero span, narration
   semantics, verification dependencies, and Stage 4.0 risk.
 
-Deterministic verification: 134 focused Stage 4.1 tests (63 original + 24
+Deterministic verification: 145 focused Stage 4.1 tests (63 original + 24
 review-remediation + 19 final re-review remediation + 20 final-closure
-remediation + 8 provider no-valid boundary closure) plus the full backend suite
-in Docker Python 3.12 with the repository compose/.env files mounted, with no
-live provider calls in the automated suite. Planning policy/schema/validation
-versions advanced to
-`stage4.1-v5`/`stage4.1-schema-v5`/`stage4.1-validation-v5` so prior plans and
+remediation + 8 provider no-valid boundary closure + 11 final truthfulness and
+speaker-boundary closure) plus the full backend suite in Docker Python 3.12 with
+the repository compose/.env files mounted, with no live provider calls in the
+automated suite. Planning policy/schema/validation versions advanced to
+`stage4.1-v6`/`stage4.1-schema-v6`/`stage4.1-validation-v6` so prior plans and
 checkpoints invalidate. See
 [docs/STAGE_4_1_OPERATIONS.md](docs/STAGE_4_1_OPERATIONS.md).
 

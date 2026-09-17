@@ -460,18 +460,30 @@ class PlanningService:
             plan.status.value == "PLAN_GENERATED_WITH_VERIFICATION_REQUIRED" for plan in ranked
         )
         deferred = any(attempt.status == _ATTEMPT_DEFERRED for attempt in attempts)
+        invalid = any(attempt.status == _ATTEMPT_INVALID for attempt in attempts)
+        # A truthful "no strategy works" conclusion requires every attempted
+        # strategy to be a clean, validated explicit no-valid outcome. Any
+        # invalid/malformed/deferred/omitted/provider-failure work makes the
+        # run retryable instead of asserting a conclusion the provider never
+        # validly reached.
+        truthful_no_plan = bool(attempts) and all(
+            attempt.status == _ATTEMPT_NO_VALID_PLAN for attempt in attempts
+        )
         if ranked and has_verification:
             outcome = PlanSemanticOutcome.PLANS_GENERATED_WITH_VERIFICATION_REQUIRED
         elif ranked:
             outcome = PlanSemanticOutcome.PLANS_GENERATED
         elif self._provider_failed and self._mode != "deterministic":
             outcome = PlanSemanticOutcome.PROVIDER_UNAVAILABLE
-        elif deferred:
+        elif deferred or invalid or self._unfinished:
             outcome = PlanSemanticOutcome.PLANNING_DEFERRED
         elif self._mode != "deterministic" and self._provider is None and attempts:
             outcome = PlanSemanticOutcome.PROVIDER_UNAVAILABLE
-        else:
+        elif truthful_no_plan:
             outcome = PlanSemanticOutcome.NO_VALID_PLAN_FROM_STRATEGY
+        else:
+            # Defensive: never assert a no-valid conclusion for unknown work.
+            outcome = PlanSemanticOutcome.PLANNING_DEFERRED
 
         cache_eligible = not self._unfinished
 

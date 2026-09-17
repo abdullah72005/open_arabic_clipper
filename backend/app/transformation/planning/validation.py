@@ -261,6 +261,35 @@ def _identity_imitation_selection(text: str) -> bool:
     return any(pattern.search(text) for pattern in _IMITATION_SELECTION_PATTERNS)
 
 
+# Explicit narrator/voice/speaker identity-selection grammar that names a
+# single-token identity (for example "Use narrator Charon" or "Use a voice
+# called Charon"). Bounded to genuine selection grammar (a selection verb, or a
+# called/named/id connector) so ordinary wording such as "the narrator explains
+# the model" or "explain the economic model" is never blocked.
+_SPEAKER_ROLE_WORD = r"(?i:voice|narrator|narrater|speaker)"
+_SELECTION_VERB = r"(?i:use|using|with|choose|select|set|assign|pick|employ)"
+_PROPER_TOKEN = r"[A-Z][\w'-]*"
+_ANY_TOKEN = r"[\w'-]+"
+_EXPLICIT_SINGLE_SPEAKER_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # "Use narrator Charon", "use a voice called Charon", "with the speaker Amina"
+    re.compile(
+        rf"\b{_SELECTION_VERB}\s+(?:a\s+|an\s+|the\s+)?{_SPEAKER_ROLE_WORD}\s+"
+        rf"(?:(?i:called|named|id|name|identifier)\s+)?{_PROPER_TOKEN}\b"
+    ),
+    # "a voice called Charon", "narrator named amina", "speaker id 42"
+    re.compile(
+        rf"\b{_SPEAKER_ROLE_WORD}\s+(?:(?i:called|named)\s+{_ANY_TOKEN}"
+        rf"|(?i:id|name|identifier)\s+(?:is\s+)?{_ANY_TOKEN})\b"
+    ),
+)
+
+
+def _explicit_single_speaker_selection(text: str) -> bool:
+    """Explicit single-token narrator/voice/speaker identity selection."""
+
+    return any(pattern.search(text) for pattern in _EXPLICIT_SINGLE_SPEAKER_PATTERNS)
+
+
 def boundary_violation(text: str) -> str | None:
     """Hard Stage 4.1 boundary over one provider-controlled free-text field.
 
@@ -278,6 +307,8 @@ def boundary_violation(text: str) -> str | None:
     if _named_speaker_selection(text):
         return REJECT_SPEAKER_SELECTION
     if _identity_imitation_selection(text):
+        return REJECT_SPEAKER_SELECTION
+    if _explicit_single_speaker_selection(text):
         return REJECT_SPEAKER_SELECTION
     if _has_marker(text, RENDERING_INSTRUCTION_MARKERS):
         return REJECT_RENDERING_INSTRUCTION

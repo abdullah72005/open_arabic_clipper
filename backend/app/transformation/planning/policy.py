@@ -19,12 +19,12 @@ from app.core.enums import (
     TransformationStrategyType,
 )
 
-# v5 closure hardening: every parsed provider result, including an explicit
-# no_valid_plan payload, is boundary-validated before persistence, checkpoint,
-# reason, cache reuse, or handoff exposure.
-POLICY_VERSION = "stage4.1-v5"
-SCHEMA_VERSION = "stage4.1-schema-v5"
-VALIDATION_VERSION = "stage4.1-validation-v5"
+# v6 truthfulness hardening: invalid/malformed provider work can never assert
+# a false no-valid conclusion (it stays deferred/retryable), and explicit
+# single-token narrator/voice/speaker identity selection is rejected.
+POLICY_VERSION = "stage4.1-v6"
+SCHEMA_VERSION = "stage4.1-schema-v6"
+VALIDATION_VERSION = "stage4.1-validation-v6"
 INPUT_FINGERPRINT_VERSION = "1"
 OUTPUT_FINGERPRINT_VERSION = "1"
 PLAN_FINGERPRINT_VERSION = "1"
