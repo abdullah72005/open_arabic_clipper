@@ -10,12 +10,13 @@ every exit path.
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from time import monotonic
 
 from sqlalchemy import and_, or_, select, update
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.enums import (
     AdmissionPriority,
@@ -69,11 +70,76 @@ _ACTIVE_JOB_STATUSES = {JobStatus.QUEUED, JobStatus.RUNNING}
 _DEGRADED_PROVIDER_STATUSES = {"PROVIDER_DEGRADED", "RATE_LIMITED"}
 # A run that never finalizes (worker crash) may be reclaimed after this window.
 _JOB_CLAIM_STALE_SECONDS = 3_600.0
+# A live worker renews its heartbeat at least this often; kept well under the
+# stale window so a stalled-but-live provider call is never reclaimed.
+_JOB_HEARTBEAT_INTERVAL_SECONDS = 30.0
 _CLAIMABLE_JOB_STATUSES = (JobStatus.QUEUED, JobStatus.FAILED)
 
 
 class PlanningCancelled(StageCancelled):
     """Cooperative cancellation while Stage 4.1 planning was running."""
+
+
+class _LivenessHeartbeat:
+    """Renew one job claim's durable liveness from a background thread.
+
+    The worker process may block inside a provider call for longer than the
+    stale window, so liveness is renewed independently of the provider call
+    using a short-lived session on the same engine. Renewal never changes job
+    status or claim ownership and is a no-op once the claim is superseded or the
+    job is terminal.
+    """
+
+    def __init__(
+        self,
+        *,
+        bind: object,
+        job_id: object,
+        claim_version: int,
+        interval_seconds: float,
+    ) -> None:
+        self._factory = sessionmaker(bind=bind)
+        self._job_id = job_id
+        self._claim_version = claim_version
+        self._interval = max(0.01, float(interval_seconds))
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, name="stage41-liveness-heartbeat", daemon=True
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self, timeout: float = 5.0) -> None:
+        self._stop.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=timeout)
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._interval):
+            self._renew()
+
+    def _renew(self) -> None:
+        session = self._factory()
+        try:
+            session.execute(
+                update(ProcessingJob)
+                .where(
+                    ProcessingJob.id == self._job_id,
+                    ProcessingJob.claim_version == self._claim_version,
+                    ProcessingJob.status == JobStatus.RUNNING,
+                )
+                .values(heartbeat_at=datetime.now(timezone.utc))
+                .execution_options(synchronize_session=False)
+            )
+            session.commit()
+        except Exception:
+            try:
+                session.rollback()
+            except Exception:
+                pass
+        finally:
+            session.close()
 
 
 def _sanitize_error_message(error: Exception | None) -> str:
@@ -208,6 +274,8 @@ class TransformationPlanningExecutor:
         mode: SemanticProviderMode = SemanticProviderMode.DETERMINISTIC,
         lease_factory: HeavyModelLeaseFactory | NoopHeavyModelLeaseFactory | None = None,
         admission: object | None = None,
+        job_claim_stale_seconds: float = _JOB_CLAIM_STALE_SECONDS,
+        heartbeat_interval_seconds: float = _JOB_HEARTBEAT_INTERVAL_SECONDS,
     ) -> None:
         self._session = session
         self._settings = settings
@@ -219,6 +287,8 @@ class TransformationPlanningExecutor:
         self._mode = mode
         self._lease_factory = lease_factory or NoopHeavyModelLeaseFactory()
         self._admission = admission
+        self._job_claim_stale_seconds = max(0.0, float(job_claim_stale_seconds))
+        self._heartbeat_interval_seconds = max(0.01, float(heartbeat_interval_seconds))
         self._active_job_id: object | None = None
         # The exact effective provider wrapper that may own a heavy-model lease.
         self._effective: PlanningProvider | None = None
@@ -265,11 +335,15 @@ class TransformationPlanningExecutor:
         # Not an owner: only safe while no live RUNNING claim owns the job.
         return self._job_status() is not JobStatus.RUNNING
 
-    def _fence_claim(self) -> bool:
+    def _fence_claim(self, *, require_running: bool = True) -> bool:
         """Atomically lock and verify this executor's durable claim token.
 
         Emitted inside the caller's transaction so the guarded mutation commits
-        only when the token is still current.
+        only when the token is still current. When ``require_running`` is set,
+        the job must also still be RUNNING: an API cancellation after the
+        worker's last cancellation read must reject success-like persistence.
+        A superseded (newer) claim is recorded as ``claim_lost``; a
+        still-owned-but-not-RUNNING claim is rejected without hiding the claim.
         """
 
         if self._active_job_id is None:
@@ -277,31 +351,52 @@ class TransformationPlanningExecutor:
         if not self._job_owner or self._claim_version is None:
             self.claim_lost = True
             return False
+        conditions = [
+            ProcessingJob.id == self._active_job_id,
+            # The durable token alone decides ownership: a newer claim always
+            # advances it, so only the current run may mutate.
+            ProcessingJob.claim_version == self._claim_version,
+        ]
+        if require_running:
+            conditions.append(ProcessingJob.status == JobStatus.RUNNING)
         result = self._session.execute(
             update(ProcessingJob)
-            .where(
-                ProcessingJob.id == self._active_job_id,
-                # The durable token alone decides ownership: a newer claim
-                # always advances it, so only the current run may mutate.
-                ProcessingJob.claim_version == self._claim_version,
-            )
+            .where(*conditions)
             .values(claim_version=self._claim_version)
             .execution_options(synchronize_session=False)
         )
-        if int(result.rowcount) != 1:
+        if int(result.rowcount) == 1:
+            return True
+        stored = self._session.scalar(
+            select(ProcessingJob.claim_version).where(ProcessingJob.id == self._active_job_id)
+        )
+        if stored != self._claim_version:
             self._job_owner = False
             self.claim_lost = True
-            return False
-        return True
+        return False
 
-    def _claim_guard(self) -> bool:
+    def _claim_guard(self, *, require_running: bool = True) -> bool:
         if self.claim_lost:
             return False
         if self._active_job_id is None:
             return True
         if self._job_owner and self._claim_version is not None:
-            return self._fence_claim()
+            return self._fence_claim(require_running=require_running)
         return self._job_status() is not JobStatus.RUNNING
+
+    def _reconcile_cancelled(self, plan_set: TransformationPlanSet) -> None:
+        """Truthfully mark a cancelled run after persisted cancellation.
+
+        Fenced on the durable claim version only: the API may already have set
+        the job CANCELLED, but no newer claim may overwrite its state.
+        """
+
+        if not self._claim_guard(require_running=False):
+            self._session.rollback()
+            return
+        plan_set.execution_status = PlanExecutionStatus.CANCELLED
+        plan_set.active_job_id = None
+        self._session.commit()
 
     def _should_stop(self) -> bool:
         return self._job_cancelled() or not self._claim_is_current()
@@ -424,16 +519,25 @@ class TransformationPlanningExecutor:
         return True
 
     def _mark_cancelled(self, plan_set: TransformationPlanSet) -> None:
-        if not self._claim_guard():
-            self._session.rollback()
+        # Primary fence requires the job to still be RUNNING. If the API already
+        # cancelled it (the normal cancellation signal), reconcile truthfully
+        # under the durable claim version instead of leaving PLANNING behind.
+        if not self._claim_guard(require_running=True):
+            if self.claim_lost or self._job_status() is not JobStatus.CANCELLED:
+                self._session.rollback()
+                return
+            self._reconcile_cancelled(plan_set)
             return
         plan_set.execution_status = PlanExecutionStatus.CANCELLED
         plan_set.active_job_id = None
         self._session.commit()
 
     def _mark_failed(self, plan_set: TransformationPlanSet, error: Exception | None = None) -> None:
-        if not self._claim_guard():
-            self._session.rollback()
+        if not self._claim_guard(require_running=True):
+            if not self.claim_lost and self._job_status() is JobStatus.CANCELLED:
+                self._reconcile_cancelled(plan_set)
+            else:
+                self._session.rollback()
             return
         if self._job_cancelled():
             plan_set.execution_status = PlanExecutionStatus.CANCELLED
@@ -447,10 +551,12 @@ class TransformationPlanningExecutor:
 
         A duplicate/redelivered invocation of the same ``(plan_set_id, job_id)``
         observes a live RUNNING claim and is fenced out, so provider work runs
-        exactly once. Legitimate retries re-claim a FAILED job. A run abandoned
-        by a crashed worker is reclaimable after ``_JOB_CLAIM_STALE_SECONDS``,
-        and the reclaimed token invalidates the old worker's right to persist,
-        cancel, fail, or finalize.
+        exactly once. Legitimate retries re-claim a FAILED job, clearing stale
+        terminal failure metadata and prior ``completed_at``. A run is only
+        reclaimable once its renewable heartbeat is genuinely abandoned; an old
+        ``started_at`` alone is never enough, so a live worker stalled inside a
+        provider call keeps its claim. The reclaimed token invalidates the old
+        worker's right to persist, cancel, fail, or finalize.
         """
 
         if self._active_job_id is None:
@@ -458,7 +564,7 @@ class TransformationPlanningExecutor:
             self._claim_version = None
             return True
         now = datetime.now(timezone.utc)
-        stale_before = now - timedelta(seconds=_JOB_CLAIM_STALE_SECONDS)
+        stale_before = now - timedelta(seconds=self._job_claim_stale_seconds)
         result = self._session.execute(
             update(ProcessingJob)
             .where(
@@ -467,15 +573,29 @@ class TransformationPlanningExecutor:
                     ProcessingJob.status.in_(_CLAIMABLE_JOB_STATUSES),
                     and_(
                         ProcessingJob.status == JobStatus.RUNNING,
-                        ProcessingJob.started_at.is_not(None),
-                        ProcessingJob.started_at < stale_before,
+                        or_(
+                            and_(
+                                ProcessingJob.heartbeat_at.is_not(None),
+                                ProcessingJob.heartbeat_at < stale_before,
+                            ),
+                            and_(
+                                ProcessingJob.heartbeat_at.is_(None),
+                                ProcessingJob.started_at.is_not(None),
+                                ProcessingJob.started_at < stale_before,
+                            ),
+                        ),
                     ),
                 ),
             )
             .values(
                 status=JobStatus.RUNNING,
                 started_at=now,
+                heartbeat_at=now,
                 claim_version=ProcessingJob.claim_version + 1,
+                # A retried job must never expose stale terminal failure state.
+                error_code=None,
+                error_message=None,
+                completed_at=None,
             )
             .execution_options(synchronize_session=False)
         )
@@ -518,21 +638,43 @@ class TransformationPlanningExecutor:
             self.claim_lost = True
 
     def record_failure(self, error: Exception) -> None:
-        """Best-effort fenced sanitized FAILED finalization for the task wrapper."""
+        """Best-effort fenced sanitized FAILED finalization for the task wrapper.
 
+        Recoverable after a prior commit/flush failure: the session is rolled
+        back before any read or fenced write, then durable claim ownership is
+        re-checked so a stale or superseded worker never overwrites a newer
+        claim's state.
+        """
+
+        try:
+            self._session.rollback()
+        except Exception:
+            pass
         plan_set = (
             self._session.get(TransformationPlanSet, self._plan_set_id)
             if self._plan_set_id is not None
             else None
         )
-        if self._job_owner and self._claim_version is not None:
-            if plan_set is not None:
-                self._mark_failed(plan_set, error)
-            self._finish_job(JobStatus.FAILED, error)
-            return
         if self._active_job_id is None:
             if plan_set is not None:
                 self._mark_failed(plan_set, error)
+            return
+        if self._claim_version is not None:
+            stored = self._session.scalar(
+                select(ProcessingJob.claim_version).where(ProcessingJob.id == self._active_job_id)
+            )
+            if stored == self._claim_version:
+                status = self._job_status()
+                if status is JobStatus.RUNNING:
+                    self._job_owner = True
+                    if plan_set is not None:
+                        self._mark_failed(plan_set, error)
+                    self._finish_job(JobStatus.FAILED, error)
+                elif status is JobStatus.CANCELLED:
+                    if plan_set is not None:
+                        self._reconcile_cancelled(plan_set)
+                return
+            # A newer claim owns this job; never overwrite its state.
             return
         # Never claimed: only an unowned QUEUED job may be failed safely.
         result = self._session.execute(
@@ -574,6 +716,7 @@ class TransformationPlanningExecutor:
             # Another delivery already owns this exact job; do no provider work.
             self.skipped_duplicate = True
             return StageExecutionResult(plan_set.output_fingerprint, plan_set)
+        heartbeat = self._start_heartbeat()
         try:
             try:
                 _candidate, _analysis, refinement, inputs, fingerprint = self._resolve(plan_set)
@@ -600,12 +743,27 @@ class TransformationPlanningExecutor:
                 raise PlanningCancelled("Stage 4.1 planning cancelled before persistence")
             result = self._persist(plan_set, refinement, inputs, outcome, monotonic() - started)
             if result is None:
-                # Claim was superseded before persistence; the newer run owns state.
+                # Claim was superseded or cancelled before persistence; the
+                # current durable state owns the outcome.
                 return StageExecutionResult(plan_set.output_fingerprint, plan_set)
             self._finish_job(JobStatus.SUCCEEDED)
             return result
         finally:
+            if heartbeat is not None:
+                heartbeat.stop()
             self._release_owned_providers()
+
+    def _start_heartbeat(self) -> _LivenessHeartbeat | None:
+        if self._active_job_id is None or not self._job_owner or self._claim_version is None:
+            return None
+        heartbeat = _LivenessHeartbeat(
+            bind=self._session.get_bind(),
+            job_id=self._active_job_id,
+            claim_version=self._claim_version,
+            interval_seconds=self._heartbeat_interval_seconds,
+        )
+        heartbeat.start()
+        return heartbeat
 
     def _run_service(
         self,
@@ -657,9 +815,15 @@ class TransformationPlanningExecutor:
         outcome: PlanningOutcome,
         processing_duration: float,
     ) -> StageExecutionResult | None:
-        # Fence the durable token before any plan-set/plan mutation commits.
-        if not self._claim_guard():
+        # Fence the durable token AND a still-RUNNING job before any plan-set
+        # or plan mutation commits: an API cancellation after the last
+        # cancellation read must reject completion.
+        if not self._claim_guard(require_running=True):
             self._session.rollback()
+            if not self.claim_lost and self._job_status() is JobStatus.CANCELLED:
+                # Reflect the persisted cancellation truthfully instead of
+                # leaving the plan set in PLANNING.
+                self._reconcile_cancelled(plan_set)
             return None
         plan_set.refinement_id = refinement.id
         plan_set.refinement_priority = refinement.priority.value

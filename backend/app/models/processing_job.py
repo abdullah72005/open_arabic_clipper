@@ -58,6 +58,9 @@ class ProcessingJob(Base):
     error_code: Mapped[str | None] = mapped_column(String(128))
     error_message: Mapped[str | None] = mapped_column(String(2048))
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Durable renewable liveness signal. A worker actively executing refreshes
+    # it; stale reclaim requires an abandoned heartbeat, not an old started_at.
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()

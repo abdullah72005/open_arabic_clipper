@@ -19,13 +19,13 @@ from app.core.enums import (
     TransformationStrategyType,
 )
 
-# v3 hardening: complete provider-controlled text boundary (provider+voice,
-# named-speaker identity, planner notes, no-valid reasons, dependency/claim and
-# narration dependency fields), malformed verification-reference rejection, and
-# hosted raw-call metric correctness.
-POLICY_VERSION = "stage4.1-v3"
-SCHEMA_VERSION = "stage4.1-schema-v3"
-VALIDATION_VERSION = "stage4.1-validation-v3"
+# v4 closure hardening: cancellation fences persistence, renewable heartbeat
+# liveness for stale reclaim, named-person imitation/identity bypass rejection,
+# all malformed verification-reference shapes, and retry failure-metadata
+# clearing.
+POLICY_VERSION = "stage4.1-v4"
+SCHEMA_VERSION = "stage4.1-schema-v4"
+VALIDATION_VERSION = "stage4.1-validation-v4"
 INPUT_FINGERPRINT_VERSION = "1"
 OUTPUT_FINGERPRINT_VERSION = "1"
 PLAN_FINGERPRINT_VERSION = "1"

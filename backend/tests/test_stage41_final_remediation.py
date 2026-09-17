@@ -684,6 +684,9 @@ def test_stale_worker_claim_cannot_persist_or_finalize(sqlite_engine: Engine) ->
             # A is held past the reclaim threshold; B reclaims and finishes.
             stale_job = session_b.get(ProcessingJob, job_id)
             stale_job.started_at = datetime.now(timezone.utc) - timedelta(seconds=7200)
+            # No heartbeat was started (A stalled before provider work), so the
+            # abandoned liveness signal is what makes the claim reclaimable.
+            stale_job.heartbeat_at = datetime.now(timezone.utc) - timedelta(seconds=7200)
             session_b.commit()
             provider_b = FakePlanningProvider(
                 [make_source_value_plan(str(strategy_id), strategy_key)]

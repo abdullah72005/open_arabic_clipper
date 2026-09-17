@@ -190,18 +190,19 @@ def _is_generic(text: str) -> bool:
 
 # A capitalized multi-word sequence that looks like a person name. Bounded
 # detection only: ordinary lowercase semantic wording and single common words
-# are never treated as speaker identity.
+# are never treated as speaker identity. Cue words are matched
+# case-insensitively (sentence-initial capitals); the person name is not.
 _SPEAKER_NAME = r"[A-Z][\w'-]*(?:\s+[A-Z][\w'-]*)+"
 _NAMED_SPEAKER_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(rf"\b(?:have|has|let|use|using|with|featuring)\s+{_SPEAKER_NAME}"),
-    re.compile(rf"\b(?:voiced|narrated|spoken)\s+by\s+{_SPEAKER_NAME}"),
+    re.compile(rf"\b(?i:have|has|let|use|using|with|featuring)\s+{_SPEAKER_NAME}"),
+    re.compile(rf"\b(?i:voiced|narrated|spoken)\s+by\s+{_SPEAKER_NAME}"),
     re.compile(
-        rf"\b(?:narrat\w*|voiceover\w*|voice[\s-]?over\w*|voice|speak\w*|vocal\w*)"
+        rf"\b(?i:narrat\w*|voiceover\w*|voice[\s-]?over\w*|voice|speak\w*|vocal\w*)"
         rf"\s+(?:by\s+|as\s+)?{_SPEAKER_NAME}"
     ),
     re.compile(
         rf"\b{_SPEAKER_NAME}\s+(?:as\s+(?:the\s+)?)?"
-        r"(?:narrat\w*|voiceover\w*|voice[\s-]?over\w*|voice|speak\w*|vocal\w*)"
+        r"(?i:narrat\w*|voiceover\w*|voice[\s-]?over\w*|voice|speak\w*|vocal\w*)"
     ),
 )
 
@@ -228,6 +229,38 @@ def _named_speaker_selection(text: str) -> bool:
     return any(pattern.search(text) for pattern in _NAMED_SPEAKER_PATTERNS)
 
 
+# Bounded named-person imitation/identity-selection phrases. These are explicit
+# selection instructions that carry their own cue ("sound like", "in the style
+# of", "impersonate", "<Name>'s voice"), so no separate voice marker is needed.
+# Ordinary discussion of a person is not matched.
+_IMITATION_SELECTION_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(rf"\b(?i:sound)(?:s|ing|ed)?\s+(?:just\s+)?(?i:like)\s+{_SPEAKER_NAME}"),
+    re.compile(
+        rf"\b(?i:in)\s+the\s+(?i:style|manner|vein|likeness|voice|tone|delivery)"
+        rf"\s+(?i:of)\s+{_SPEAKER_NAME}"
+    ),
+    re.compile(
+        rf"\b(?i:impersonat|imitat|mimic|emulat|clone|replicat|reproduc|recreat)\w*"
+        rf"\s+(?:(?i:of|like|the)\s+)?{_SPEAKER_NAME}"
+    ),
+    re.compile(
+        rf"\b(?i:as)\s+{_SPEAKER_NAME}\s+(?i:would)\s+"
+        r"(?i:say|sound|speak|deliver|narrate|tell|read)"
+    ),
+    re.compile(rf"\b{_SPEAKER_NAME}['\u2019]s?\s+(?i:voice|style|sound|tone|delivery)"),
+    re.compile(
+        rf"\b(?i:voice|sound|tone|delivery|impersonation|imitation|likeness)"
+        rf"\s+(?i:of)\s+{_SPEAKER_NAME}"
+    ),
+)
+
+
+def _identity_imitation_selection(text: str) -> bool:
+    """Explicit named-person imitation/identity-selection instructions."""
+
+    return any(pattern.search(text) for pattern in _IMITATION_SELECTION_PATTERNS)
+
+
 def boundary_violation(text: str) -> str | None:
     """Hard Stage 4.1 boundary over one provider-controlled free-text field.
 
@@ -243,6 +276,8 @@ def boundary_violation(text: str) -> str | None:
     if _provider_voice_selection(text):
         return REJECT_TTS_SELECTION
     if _named_speaker_selection(text):
+        return REJECT_SPEAKER_SELECTION
+    if _identity_imitation_selection(text):
         return REJECT_SPEAKER_SELECTION
     if _has_marker(text, RENDERING_INSTRUCTION_MARKERS):
         return REJECT_RENDERING_INSTRUCTION

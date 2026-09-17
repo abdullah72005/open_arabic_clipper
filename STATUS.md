@@ -57,12 +57,17 @@ refinement, and is **never** added to the automatic `_NEXT_STAGE` chain.
   intended use, grounding refs, dependency ids, claim dependency, and narration
   language/register/dependency ids. TTS provider-plus-voice selection (for
   example "Use Gemini voice Charon"), named-speaker identity (for example "Have
-  Morgan Freeman narrate"), TTS provider/model/voice selection, frame-level
+  Morgan Freeman narrate"), named-person imitation/identity-selection phrased
+  without any voice/narration/TTS word (for example "Make it sound like Morgan
+  Freeman", "In the style of Morgan Freeman", "Impersonate Morgan Freeman",
+  "Morgan Freeman's voice"), TTS provider/model/voice selection, frame-level
   rendering instructions, cosmetic-only transformation claims, and
   platform/detection-evasion tactics (mirroring, pitch shifting, speed tricks,
   watermark removal/obfuscation) are rejected. Legitimate narration semantics
   (purpose, language, register, duration, placement, dependency) are preserved,
-  and ordinary semantic words such as "model" are not blocked.
+  ordinary semantic words such as "model" are not blocked, and ordinary
+  discussion of a named person (for example "Reference Morgan Freeman's career
+  as context") is not treated as identity selection.
 - **Narration contract.** A plan whose substantive block requires narration
   delivery while `NarrationNeed.NONE` is recorded is rejected, and a
   narration-disallowed context cannot accept an essential narration-only
@@ -100,36 +105,47 @@ refinement, and is **never** added to the automatic `_NEXT_STAGE` chain.
   dependent content. Linkage is deterministic and persisted: a placeholder lists
   the integer block indexes of dependent substantive blocks, those blocks carry
   the placeholder's claim id in `dependency_ids`, and narration depends on a
-  claim through `verification_dependency_ids`. Malformed/non-integer provider
-  block references are rejected at the parse boundary, never silently dropped.
-  Bogus, missing, nonexistent, self-referential, non-substantive, or unlinked
-  references are rejected; `must_verify_before_execution=true` is preserved. No
-  fact is fabricated and there is no browsing/research subsystem.
+  claim through `verification_dependency_ids`. Every malformed verification
+  reference shape is rejected at the strict provider parse boundary rather than
+  treated as empty: non-list strings, booleans, objects, floats, supplied nulls,
+  nested values, and malformed items anywhere in a list (including past the
+  bounded valid-item cap). Valid integer indexes are preserved. Bogus, missing,
+  nonexistent, self-referential, non-substantive, or unlinked references are
+  rejected; `must_verify_before_execution=true` is preserved. No fact is
+  fabricated and there is no browsing/research subsystem.
 - **Durable execution.** A duplicate/redelivered Celery invocation of the same
   `(plan_set_id, job_id)` is fenced by an atomic `QUEUED -> RUNNING`
-  `ProcessingJob` claim, so provider work runs exactly once; legitimate retries
-  re-claim a `FAILED` job and a run abandoned by a crashed worker is reclaimable
-  after a bounded staleness window. Every claim advances a durable per-execution
-  ownership token (`processing_jobs.claim_version`); the plan-set claim, plan
-  persistence, cancellation, failure, and job finalization are all fenced by that
-  token, so a reclaimed stale worker can neither persist, cancel, fail, nor
-  finalize a newer run. Failed planning jobs retain bounded sanitized operator
-  diagnostics (prerequisite messages or the exception type only; never keys,
-  transcripts, or provider payloads). The local-only executor retains and
-  releases the exact lease-bound provider wrapper, so the shared heavy-model
-  lease always exits on success, provider failure, cancellation, cache hit, and
-  exception.
+  `ProcessingJob` claim, so provider work runs exactly once. Legitimate retries
+  re-claim a `FAILED` job and clear stale terminal failure metadata (`error_code`,
+  `error_message`, prior `completed_at`). Every claim advances a durable
+  per-execution ownership token (`processing_jobs.claim_version`), and every
+  worker-owned planning-state mutation is fenced on the token **and**
+  `status == RUNNING`, so neither plan-set claim, persistence, cancellation,
+  failure, nor finalization can commit after an API cancellation. A reclaimed
+  stale worker can neither persist, cancel, fail, nor finalize a newer run.
+  Liveness is a renewable durable heartbeat (`processing_jobs.heartbeat_at`)
+  renewed from a background thread while the worker executes, so a live worker
+  stalled inside a provider call is never reclaimed merely because its original
+  `started_at` is old; only a genuinely abandoned heartbeat is reclaimable. A
+  cancelled API job is truthfully reconciled to `CANCELLED` on the plan set
+  without a newer claim being overwritten. Failed planning jobs retain bounded
+  sanitized operator diagnostics (prerequisite messages or the exception type
+  only; never keys, transcripts, or provider payloads), and failure recording
+  rolls back a pending-rollback session and re-checks durable ownership first.
+  The local-only executor retains and releases the exact lease-bound provider
+  wrapper, so the shared heavy-model lease always exits on success, provider
+  failure, cancellation, cache hit, and exception.
 - **API/CLI/handoff.** Minimal endpoints queue/read one plan set and expose a
   typed read-only Stage 4.2 handoff (`stage4_2_implemented=false`,
   `stage4_3_implemented=false`) with exact ordered blocks, hero span, narration
   semantics, verification dependencies, and Stage 4.0 risk.
 
-Deterministic verification: 106 focused Stage 4.1 tests (63 original + 24
-review-remediation + 19 final re-review remediation) plus the full backend suite
-in Docker Python 3.12 with the repository compose/.env files mounted, with no
-live provider calls in the automated suite. Planning policy/schema/validation
-versions advanced to
-`stage4.1-v3`/`stage4.1-schema-v3`/`stage4.1-validation-v3` so prior plans
+Deterministic verification: 126 focused Stage 4.1 tests (63 original + 24
+review-remediation + 19 final re-review remediation + 20 final-closure
+remediation) plus the full backend suite in Docker Python 3.12 with the
+repository compose/.env files mounted, with no live provider calls in the
+automated suite. Planning policy/schema/validation versions advanced to
+`stage4.1-v4`/`stage4.1-schema-v4`/`stage4.1-validation-v4` so prior plans
 invalidate. See [docs/STAGE_4_1_OPERATIONS.md](docs/STAGE_4_1_OPERATIONS.md).
 
 ## Stage 4.0 transformation eligibility and strategy discovery (2026-09-14)

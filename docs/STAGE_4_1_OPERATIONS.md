@@ -199,14 +199,20 @@ semantic intent, why-unavailable, draft line, continuity rationale, verification
 rationale, intended use, grounding refs, dependency ids, claim dependency, and
 narration language/register/dependency ids. Rejected output includes TTS
 provider-plus-voice selection (`Use Gemini voice Charon`), named-speaker
-identity (`Have Morgan Freeman narrate`), TTS provider/model/voice selection,
+identity (`Have Morgan Freeman narrate`), named-person imitation/
+identity-selection phrased without any voice/narration/TTS word (`Make it sound
+like Morgan Freeman`, `In the style of Morgan Freeman`, `Impersonate Morgan
+Freeman`, `Morgan Freeman's voice`), TTS provider/model/voice selection,
 frame-level rendering instructions (`ffmpeg`, timeline, shot list, storyboard,
 keyframe, render instructions), cosmetic-only transformation claims (mirroring,
 pitch shifting, speed tricks, watermark removal/obfuscation), and
 platform-detection/copyright-evasion tactics. Markers are explicit phrases and
 provider-plus-voice/named-speaker detection is bounded (it requires a
-provider/voice or narration cue), so ordinary semantic wording such as "model"
-in "explain the model" is never blocked. Legitimate narration semantics
+provider/voice or narration cue); imitation detection requires an explicit
+imitation/style cue and a capitalized person name. Ordinary semantic wording
+such as "model" in "explain the model" is never blocked, and ordinary discussion
+of a named person (for example "Reference Morgan Freeman's career as context")
+is not treated as identity selection. Legitimate narration semantics
 (purpose, language, register, duration, placement, verification dependency) are
 preserved.
 
@@ -270,9 +276,11 @@ names the claim/dependency and why it is needed. Linkage is deterministic and
 persisted: the placeholder lists the integer block indexes of dependent
 substantive blocks, those blocks carry the placeholder's `claim_dependency` value
 in `dependency_ids`, and narration may depend on a claim through
-`verification_dependency_ids`. Malformed/non-integer provider references
-(numeric strings, floats, booleans, nested objects) are rejected at the strict
-parse boundary, never silently dropped; valid integer indexes are preserved.
+`verification_dependency_ids`. Every malformed verification-reference shape is
+rejected at the strict parse boundary rather than treated as empty: a supplied
+non-list (string, boolean, object, float, nested value, or explicit null) and
+malformed items anywhere in a list, including past the bounded valid-item cap.
+Valid integer indexes are preserved.
 Bogus, missing, nonexistent, self-referential, non-substantive, or unlinked
 references are rejected; the plan status becomes verification-required; the
 dependency blocks execution until verified. `must_verify_before_execution=true`
@@ -358,17 +366,32 @@ A duplicate/redelivered Celery invocation of the same `(plan_set_id, job_id)` is
 fenced by an atomic `QUEUED -> RUNNING` `ProcessingJob` claim performed inside the
 executor, so provider work runs exactly once; the loser records
 `skipped_duplicate` and performs no provider work. Legitimate retries re-claim a
-`FAILED` job, and a run abandoned by a crashed worker is reclaimable after a
-bounded staleness window. The plan-set `active_job_id` compare-and-swap remains
-as an additional guard.
+`FAILED` job and clear stale terminal failure metadata (`error_code`,
+`error_message`, prior `completed_at`), and a run abandoned by a crashed worker is
+reclaimable once its renewable heartbeat goes stale. The plan-set `active_job_id`
+compare-and-swap remains as an additional guard.
 
 Every successful claim advances a durable per-execution ownership token
-(`processing_jobs.claim_version`). The plan-set claim, plan persistence,
-cancellation, failure, and job finalization are all fenced by that token inside
-the same transaction, so a worker whose stale RUNNING claim was reclaimed can
-neither persist, cancel, fail, nor finalize the newer run; its provider work is
-aborted at the next ownership check. The token is not a local boolean or the job
-ID: it is persisted and advanced on every claim.
+(`processing_jobs.claim_version`), and every worker-owned planning-state mutation
+is fenced inside the same transaction on both that token **and**
+`ProcessingJob.status == RUNNING`. An API cancellation written after the worker's
+last cancellation read therefore rejects plan persistence: no plans or completed
+plan-set state commit, and the persisted cancellation is reconciled truthfully
+(job and plan set both `CANCELLED`). Cancellation/failure plan-set updates and
+job finalization are fenced the same way, so a worker whose stale RUNNING claim
+was reclaimed can neither persist, cancel, fail, nor finalize the newer run; its
+provider work is aborted at the next ownership check. The token is not a local
+boolean or the job ID: it is persisted and advanced on every claim.
+
+Liveness is a separate durable, renewable heartbeat
+(`processing_jobs.heartbeat_at`). Once a worker owns a claim it renews the
+heartbeat from a short-lived background session while it executes, including
+while blocked inside a provider call. Stale reclaim requires an abandoned
+heartbeat (or, for legacy rows without one, an old `started_at`), so a live worker
+stalled inside provider work is never reclaimed merely because its original
+`started_at` is old; only a genuinely dead/abandoned worker becomes reclaimable.
+Duplicate delivery of a live claim still performs zero provider work, and
+claim-version fencing remains the final guard against stale persistence.
 
 Failed planning jobs retain bounded, sanitized operator diagnostics. A
 prerequisite (planning-input) failure records the repository-owned prerequisite
@@ -376,7 +399,9 @@ message; an unexpected failure records only the exception type; a provider
 failure records only its category. API keys, transcript bodies, prompts, and
 provider payloads are never written to `error_message`/`error_code`, and
 executor-level finalization records the diagnostics atomically so no later
-wrapper can race it.
+wrapper can race it. Failure recording first rolls back a pending-rollback
+session, re-checks durable claim ownership, and refuses to overwrite a newer
+claim's state.
 
 The `local_only` executor retains the exact lease-bound provider wrapper and
 releases it on every exit path (success, provider failure, cancellation, cache
@@ -497,12 +522,12 @@ ruff format app tests alembic && ruff check app tests alembic
 
 All Stage 4.1 tests are deterministic and hermetic: providers are mocked and no
 test makes a live Gemini, Qwen, web, TTS, or rendering call even when a key is
-present. The final re-review remediation advanced planning versions to
-`stage4.1-v3` / `stage4.1-schema-v3` / `stage4.1-validation-v3` (complete
-provider-text boundary before any no-valid return, provider-plus-voice and
-named-speaker rejection, malformed verification-reference rejection, hosted
-raw-call metric correctness, durable claim-token fencing, and sanitized failure
-diagnostics), so prior plans invalidate through the input fingerprint. Known
+present. The final-closure remediation advanced planning versions to
+`stage4.1-v4` / `stage4.1-schema-v4` / `stage4.1-validation-v4` (cancellation
+fencing of plan persistence, renewable heartbeat liveness for stale reclaim,
+named-person imitation/identity bypass rejection, all malformed
+verification-reference shapes, and retry failure-metadata clearing), so prior
+plans invalidate through the input fingerprint. Known
 limitation: the repository's strict `mypy` configuration already reports the
 same class of `no-any-return`/`untyped-decorator` findings in the frozen Stage
 4.0 provider modules and the FastAPI app; Stage 4.1 matches that existing

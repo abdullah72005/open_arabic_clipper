@@ -377,16 +377,22 @@ def _float(value: object) -> float:
     return max(0.0, number)
 
 
-def _bounded_int_list(value: object, limit: int = _BOUNDED_LIST) -> tuple[tuple[int, ...], bool]:
+def _bounded_int_list(
+    value: object, *, present: bool = False, limit: int = _BOUNDED_LIST
+) -> tuple[tuple[int, ...], bool]:
     """Parse dependent block references into validated integer block indexes.
 
-    Malformed/non-integer provider references (numeric strings, floats,
-    booleans, nested objects) are never silently dropped: the second return
-    value flags them so the deterministic boundary rejects the plan.
+    A supplied non-list value (string, boolean, object, null, float, nested) is
+    flagged invalid rather than treated as empty, and every item is inspected
+    even past the bounded valid-item cap. Malformed/non-integer references are
+    never silently dropped: the second return value flags them so the
+    deterministic boundary rejects the plan.
     """
 
-    if not isinstance(value, list):
+    if not present:
         return (), False
+    if not isinstance(value, list):
+        return (), True
     items: list[int] = []
     invalid = False
     for item in value:
@@ -396,9 +402,8 @@ def _bounded_int_list(value: object, limit: int = _BOUNDED_LIST) -> tuple[tuple[
         candidate = int(item)
         if candidate in items:
             continue
-        items.append(candidate)
-        if len(items) >= limit:
-            break
+        if len(items) < limit:
+            items.append(candidate)
     return tuple(items), invalid
 
 
@@ -413,7 +418,8 @@ def _parse_block(entry: Mapping[str, object]) -> PlanProviderBlock | None:
     if block_type is None:
         return None
     dependent_block_ids, dependent_block_ids_invalid = _bounded_int_list(
-        entry.get("dependent_block_ids")
+        entry.get("dependent_block_ids"),
+        present="dependent_block_ids" in entry,
     )
     return PlanProviderBlock(
         block_type=block_type,  # type: ignore[arg-type]
