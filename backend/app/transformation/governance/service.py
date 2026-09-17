@@ -294,7 +294,8 @@ class GovernanceService:
             plan_id = evaluation.plan.plan_id
             critique = critiques.get(plan_id)
             if critique is None:
-                # Keep the first accepted critique; only mark deferred.
+                # Preserve the first accepted critique checkpoint (if any) and
+                # mark this plan truthfully deferred.
                 apply_semantic_review(evaluation, evaluation.critique, SEMANTIC_UNAVAILABLE)
                 attempts.append(
                     _attempt(
@@ -302,10 +303,23 @@ class GovernanceService:
                         _ATTEMPT_DEFERRED,
                         (ProviderErrorCategory.PROVIDER_ERROR.value,),
                         fingerprints[plan_id],
+                        evaluation.critique,
                     )
                 )
                 continue
+            # The bounded strong call resolved the ambiguity: apply it and persist
+            # it as the plan checkpoint so a forced rerun with unchanged inputs
+            # reuses it and makes zero additional hosted calls.
             apply_semantic_review(evaluation, critique, SEMANTIC_AVAILABLE)
+            attempts.append(
+                _attempt(
+                    evaluation.plan,
+                    _ATTEMPT_REVIEWED,
+                    (),
+                    fingerprints[plan_id],
+                    critique,
+                )
+            )
 
     def _call_provider(
         self,

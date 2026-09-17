@@ -77,6 +77,9 @@ _READY_STATUSES = {
 }
 _ACTIVE_JOB_STATUSES = {JobStatus.QUEUED, JobStatus.RUNNING}
 _JOB_CLAIM_STALE_SECONDS = 3_600.0
+# Public alias: the queue uses the same heartbeat-abandonment rule to recover a
+# genuinely abandoned RUNNING job.
+JOB_CLAIM_STALE_SECONDS = _JOB_CLAIM_STALE_SECONDS
 _JOB_HEARTBEAT_INTERVAL_SECONDS = 30.0
 _CLAIMABLE_JOB_STATUSES = (JobStatus.QUEUED, JobStatus.FAILED)
 
@@ -893,6 +896,7 @@ def build_transformation_governance_executor(
 
 __all__ = [
     "GovernanceCancelled",
+    "JOB_CLAIM_STALE_SECONDS",
     "TransformationGovernanceExecutor",
     "build_transformation_governance_executor",
 ]

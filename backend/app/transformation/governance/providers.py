@@ -26,6 +26,7 @@ from app.core.enums import (
     UnsupportedClaimFinding,
 )
 from app.transformation.governance.policy import (
+    ACCEPTED_PROVIDER_FINDING_CODES,
     GOVERNOR_SCHEMA_VERSION,
     PLATFORM_GUARANTEE_MARKERS,
     Stage42Config,
@@ -294,17 +295,38 @@ def _provider_text_forbidden(text: str) -> bool:
     return False
 
 
-def _valid_indexes(value: object, limit: int) -> tuple[int, ...]:
-    if not isinstance(value, list):
+def _valid_indexes(value: object, limit: int, block_count: int) -> tuple[int, ...]:
+    """Keep only indexes that address a real block in the requested plan."""
+
+    if not isinstance(value, list) or block_count <= 0:
         return ()
     indexes: list[int] = []
     for item in value:
         if isinstance(item, bool) or not isinstance(item, int):
             continue
+        if not (0 <= item < block_count):
+            continue
         indexes.append(int(item))
         if len(indexes) >= limit:
             break
     return tuple(indexes)
+
+
+def _accepted_finding_codes(value: object) -> tuple[str, ...]:
+    """Keep only closed accepted provider codes; discard arbitrary text."""
+
+    if not isinstance(value, list):
+        return ()
+    codes: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            continue
+        code = item.strip().upper()
+        if code in ACCEPTED_PROVIDER_FINDING_CODES and code not in codes:
+            codes.append(code)
+        if len(codes) >= _BOUNDED_CODES:
+            break
+    return tuple(codes)
 
 
 def _parse_critique(
@@ -328,20 +350,23 @@ def _parse_critique(
     if None in (fidelity, value, retention, coherence, narration, template, unsupported):
         return None
 
-    codes_raw = entry.get("finding_codes")
-    codes: list[str] = []
-    if isinstance(codes_raw, list):
-        for item in codes_raw:
-            if isinstance(item, str) and item.strip():
-                codes.append(item.strip()[:64])
-            if len(codes) >= _BOUNDED_CODES:
-                break
+    codes = _accepted_finding_codes(entry.get("finding_codes"))
+    # A forbidden attempt hidden in a raw (even non-accepted) finding code still
+    # rejects the critique; only closed accepted codes are ever persisted.
+    raw_codes = entry.get("finding_codes")
+    if isinstance(raw_codes, list) and any(
+        isinstance(item, str) and _provider_text_forbidden(item) for item in raw_codes
+    ):
+        return None
     summary = _bounded_text(entry.get("summary"), _BOUNDED_SUMMARY)
     if _provider_text_forbidden(summary) or any(_provider_text_forbidden(code) for code in codes):
         return None
     confidence = entry.get("confidence", 0.0)
     if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
         confidence = 0.0
+
+    raw_blocks = plan.get("blocks")
+    block_count = len(raw_blocks) if isinstance(raw_blocks, list) else 0
 
     return ProviderCritique(
         plan_id=plan_id,
@@ -353,8 +378,8 @@ def _parse_critique(
         narration=narration,
         template_feel=template,
         unsupported_claim=unsupported,
-        finding_codes=tuple(codes),
-        block_indexes=_valid_indexes(entry.get("block_indexes"), _BOUNDED_INDEXES),
+        finding_codes=codes,
+        block_indexes=_valid_indexes(entry.get("block_indexes"), _BOUNDED_INDEXES, block_count),
         summary=summary,
         confidence=clamp(float(confidence)),
     )

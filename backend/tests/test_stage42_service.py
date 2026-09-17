@@ -245,3 +245,71 @@ def test_checkpoints_are_reused_without_provider_call():
     second = second_service.govern(inputs, input_fingerprint="in", checkpoints=checkpoints)
     assert second_provider.calls == 0
     assert second.attempts[0].status == "REUSED"
+
+
+def test_second_strong_call_checkpoint_is_persisted_and_reused():
+    plan = make_plan(
+        plan_id="j" * 8,
+        fingerprint="fp-j",
+        blocks=[source_block(0), original_block(1, kind="EXPLANATION")],
+        narration_need="RECOMMENDED",
+        narration={"estimated_duration": 4.0, "placement_block_index": 1},
+        original_value_kinds=("EXPLANATION",),
+    )
+    inputs = _inputs([plan])
+    unknown = make_critique(plan, fidelity="UNKNOWN")
+    resolved = make_critique(plan, fidelity="PASS")
+    provider = FakeGovernanceProvider(responses=[{plan.plan_id: unknown}, {plan.plan_id: resolved}])
+    service = GovernanceService(
+        config=DEFAULT_CONFIG,
+        provider=provider,
+        provider_identity={"provider": "fake"},
+        mode=SemanticProviderMode.ADAPTIVE,
+    )
+    outcome = service.govern(inputs, input_fingerprint="in")
+    assert provider.calls == 2
+    persisted = outcome.attempts[-1]
+    assert persisted.checkpoint is not None
+    assert persisted.checkpoint["critique"]["fidelity"] == "PASS"  # type: ignore[index]
+
+    replay_provider = FakeGovernanceProvider(auto=True)
+    replay_service = GovernanceService(
+        config=DEFAULT_CONFIG,
+        provider=replay_provider,
+        provider_identity={"provider": "fake"},
+        mode=SemanticProviderMode.ADAPTIVE,
+    )
+    checkpoints = {
+        plan.plan_id: {
+            "provider_input_fingerprint": persisted.provider_input_fingerprint,
+            "critique": persisted.checkpoint["critique"],  # type: ignore[index]
+        }
+    }
+    replay = replay_service.govern(inputs, input_fingerprint="in", checkpoints=checkpoints)
+    assert replay_provider.calls == 0
+    assert replay.attempts[0].status == "REUSED"
+
+
+def test_second_strong_call_failure_stays_truthfully_deferred():
+    plan = make_plan(
+        plan_id="k" * 8,
+        fingerprint="fp-k",
+        blocks=[source_block(0), original_block(1, kind="EXPLANATION")],
+        narration_need="RECOMMENDED",
+        narration={"estimated_duration": 4.0, "placement_block_index": 1},
+        original_value_kinds=("EXPLANATION",),
+    )
+    inputs = _inputs([plan])
+    unknown = make_critique(plan, fidelity="UNKNOWN")
+    provider = FakeGovernanceProvider(responses=[{plan.plan_id: unknown}, None])
+    service = GovernanceService(
+        config=DEFAULT_CONFIG,
+        provider=provider,
+        provider_identity={"provider": "fake"},
+        mode=SemanticProviderMode.ADAPTIVE,
+    )
+    outcome = service.govern(inputs, input_fingerprint="in")
+    assert provider.calls == 2
+    assert outcome.semantic_outcome is GovernanceSemanticOutcome.GOVERNANCE_DEFERRED
+    # The first accepted critique remains checkpointed for a later retry.
+    assert outcome.attempts[-1].checkpoint is not None

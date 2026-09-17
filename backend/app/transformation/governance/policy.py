@@ -51,6 +51,28 @@ ADMISSION_PRIORITY = "HIGH"
 
 ACCOUNT_LEVEL_REPETITION = "DEFERRED_TO_STAGE_7"
 
+# Closed set of provider finding codes that may be persisted as bounded provider
+# evidence. Any other value is discarded at the provider boundary so a provider
+# can never smuggle arbitrary durable reason-like text into persistence.
+ACCEPTED_PROVIDER_FINDING_CODES: frozenset[str] = frozenset(
+    {
+        "CONTEXT_DISTORTION",
+        "FALSE_ATTRIBUTION",
+        "SARCASM_LITERALIZED",
+        "SPECULATION_AS_FACT",
+        "UNRELATED_SOURCE_EVIDENCE",
+        "FAKE_HOOK",
+        "UNSUPPORTED_CLAIM",
+        "REDUNDANT_PARAPHRASE",
+        "GENERIC_FILLER",
+        "SOURCE_MOMENT_INTERRUPTED",
+        "NARRATION_UNNECESSARY",
+        "NARRATION_POSITION_DAMAGING",
+        "TEMPLATE_SHAPED",
+        "COHERENCE_MIXED",
+    }
+)
+
 PLATFORM_LIMITATIONS: tuple[str, ...] = (
     "Decision support only; not a legal, copyright, monetization, recommendation, "
     "or enforcement guarantee.",
@@ -185,6 +207,7 @@ class Stage42Config:
 DEFAULT_CONFIG = Stage42Config()
 
 __all__ = [
+    "ACCEPTED_PROVIDER_FINDING_CODES",
     "COSMETIC_EVASION_MARKERS",
     "DISTORTION_MARKERS",
     "FAKE_HOOK_MARKERS",
@@ -202,18 +225,26 @@ __all__ = [
     "Stage42Config",
     "governance_config_payload",
     "governance_policy_payload",
+    "is_strict_hero_window",
     "platform_policy_payload",
 ]
 
 
-def is_strict_hero_window(structure: str, duration: float, density: float) -> bool:
-    """Short, dense, joke, or payoff-first moments get the stricter hero cap."""
+def is_strict_hero_window(
+    structure: str, duration: float, density: float, config: Stage42Config
+) -> bool:
+    """Short, dense, joke, or payoff-first moments get the stricter hero cap.
+
+    The ``short_moment_seconds`` and ``high_moment_density_floor`` thresholds are
+    read from ``Stage42Config`` (so they are output-affecting and part of the
+    input fingerprint) rather than being hard-coded.
+    """
 
     if structure in {"JOKE", "PAYOFF"}:
         return True
-    if duration <= 8.0:
+    if duration <= max(0.0, float(config.short_moment_seconds)):
         return True
-    return density >= 0.75
+    return density >= max(0.0, float(config.high_moment_density_floor))
 
 
 def governance_policy_payload() -> dict[str, object]:

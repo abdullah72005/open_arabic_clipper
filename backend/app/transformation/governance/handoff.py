@@ -110,6 +110,7 @@ def build_stage4_3_handoff(
     results = {
         str(row.transformation_plan_id): row for row in list_results(session, governance_set.id)
     }
+    stale, current = _staleness(session, governance_set)
     base["governance_set"] = {
         "id": str(governance_set.id),
         "execution_status": governance_set.execution_status.value,
@@ -130,6 +131,10 @@ def build_stage4_3_handoff(
         "cache_eligible": bool(governance_set.cache_eligible),
         "summary_counts": dict(governance_set.summary_counts or {}),
         "outcome_reasons": list(governance_set.outcome_reasons or []),
+        # Explicit governance freshness. A stale result is never represented as
+        # currently eligible for Stage 4.3.
+        "current": current,
+        "stale": stale,
     }
 
     plans: list[dict[str, object]] = []
@@ -137,13 +142,18 @@ def build_stage4_3_handoff(
         for plan in stage41.get("plans", []):
             plan_id = str(plan.get("plan_id"))
             result = results.get(plan_id)
+            governance = _result_dict(result) if result is not None else None
+            if governance is not None:
+                governance["stale"] = stale
+                if stale:
+                    governance["eligible_for_stage4_3"] = False
             plans.append(
                 {
                     "plan_id": plan_id,
                     "strategy": plan.get("strategy"),
                     "intensity": (plan.get("strategy") or {}).get("intensity"),
                     "blocks": plan.get("blocks"),
-                    "governance": _result_dict(result) if result is not None else None,
+                    "governance": governance,
                 }
             )
     base["plans"] = plans

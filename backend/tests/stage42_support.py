@@ -44,6 +44,7 @@ class FakeGovernanceProvider:
         critiques: Mapping[str, ProviderCritique] | None = None,
         *,
         auto: bool = False,
+        responses: Sequence[Mapping[str, ProviderCritique] | None] | None = None,
         hosted: bool = True,
         model: str = "fake-governance-model",
     ) -> None:
@@ -55,6 +56,7 @@ class FakeGovernanceProvider:
         self.released = 0
         self._critiques = dict(critiques or {})
         self._auto = auto
+        self._responses = list(responses) if responses is not None else None
 
     def govern(self, request: object, tier: str = "ROUTINE") -> ProviderGovernanceResult:
         self.calls += 1
@@ -74,6 +76,13 @@ class FakeGovernanceProvider:
             raise GovernanceProviderError(ProviderErrorCategory.MALFORMED_OUTPUT.value)
         plan_ids = [str(item.get("plan_id")) for item in request.plans]  # type: ignore[attr-defined]
         found: list[ProviderCritique] = []
+        if self._responses is not None:
+            index = min(self.calls - 1, len(self._responses) - 1)
+            response = self._responses[index] or {}
+            for plan_id in plan_ids:
+                if plan_id in response:
+                    found.append(response[plan_id])
+            return ProviderGovernanceResult(critiques=tuple(found))
         for plan_id in plan_ids:
             if plan_id in self._critiques:
                 found.append(self._critiques[plan_id])

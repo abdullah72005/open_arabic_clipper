@@ -277,3 +277,141 @@ def test_governance_fingerprint_excludes_tts_and_rendering_settings(session: Ses
     blob = json.dumps(payload).casefold()
     for token in ("tts", "voice", "render", "publish", "caption_font", "resolution"):
         assert token not in blob
+
+
+def _expire_running_job(session: Session, job: ProcessingJob, *, stale: bool) -> None:
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc)
+    age = timedelta(seconds=7200) if stale else timedelta(seconds=0)
+    job.status = JobStatus.RUNNING
+    job.claim_version = 3
+    job.started_at = now - age
+    job.heartbeat_at = now - age
+    session.commit()
+
+
+def test_queue_recovers_abandoned_running_job(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provider = FakeGovernanceProvider(auto=True)
+    settings, seed, plan_set = _setup(session, governance_provider=provider)
+    candidate, resolved_set = validate_candidate_for_governance(session, seed[1].id)
+    first = queue_transformation_governance(session, candidate, resolved_set)
+    job = session.get(ProcessingJob, first.job_id)
+    assert job is not None
+    _expire_running_job(session, job, stale=True)
+
+    dispatched: list[tuple[object, object]] = []
+    monkeypatch.setattr(
+        "app.transformation.governance.queue._dispatch",
+        lambda sid, jid, force: dispatched.append((sid, jid)),
+    )
+    outcome = queue_transformation_governance(session, candidate, resolved_set)
+    assert outcome.skipped_reason == "RECOVERED_STALE_RUNNING"
+    assert outcome.active is True
+    assert dispatched == [(first.governance_set_id, job.id)]
+    assert provider.calls == 0
+
+
+def test_queue_does_not_recover_live_running_job(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provider = FakeGovernanceProvider(auto=True)
+    settings, seed, plan_set = _setup(session, governance_provider=provider)
+    candidate, resolved_set = validate_candidate_for_governance(session, seed[1].id)
+    first = queue_transformation_governance(session, candidate, resolved_set)
+    job = session.get(ProcessingJob, first.job_id)
+    assert job is not None
+    _expire_running_job(session, job, stale=False)
+
+    dispatched: list[object] = []
+    monkeypatch.setattr(
+        "app.transformation.governance.queue._dispatch",
+        lambda sid, jid, force: dispatched.append((sid, jid)),
+    )
+    outcome = queue_transformation_governance(session, candidate, resolved_set)
+    assert outcome.active is True
+    assert outcome.skipped_reason is None
+    assert dispatched == []
+
+
+def test_redelivered_job_makes_no_duplicate_provider_call(session: Session) -> None:
+    provider = FakeGovernanceProvider(auto=True)
+    settings, seed, plan_set = _setup(
+        session, narration="RECOMMENDED", governance_provider=provider
+    )
+    candidate, resolved_set = validate_candidate_for_governance(session, seed[1].id)
+    first = queue_transformation_governance(session, candidate, resolved_set)
+    job = session.get(ProcessingJob, first.job_id)
+    assert job is not None
+
+    executor = build_transformation_governance_executor(session, settings)
+    executor.set_active_job(job.id)
+    executor.execute(first.governance_set_id)
+    assert provider.calls == 1
+
+    redelivered = build_transformation_governance_executor(session, settings)
+    redelivered.set_active_job(job.id)
+    redelivered.execute(first.governance_set_id)
+    assert redelivered.skipped_duplicate is True
+    assert provider.calls == 1
+
+
+def test_stale_worker_cannot_overwrite_newer_claim(session: Session) -> None:
+    provider = FakeGovernanceProvider(auto=True)
+    settings, seed, plan_set = _setup(
+        session, narration="RECOMMENDED", governance_provider=provider
+    )
+    candidate, resolved_set = validate_candidate_for_governance(session, seed[1].id)
+    first = queue_transformation_governance(session, candidate, resolved_set)
+    job = session.get(ProcessingJob, first.job_id)
+    assert job is not None
+    _expire_running_job(session, job, stale=True)
+
+    newer = build_transformation_governance_executor(session, settings)
+    newer.set_active_job(job.id)
+    newer.execute(first.governance_set_id)
+    session.refresh(job)
+    assert job.claim_version >= 4
+
+    stale_worker = build_transformation_governance_executor(session, settings)
+    stale_worker.set_active_job(job.id)
+    stale_worker._job_owner = True  # type: ignore[attr-defined]
+    stale_worker._claim_version = 3  # type: ignore[attr-defined]
+    assert stale_worker._claim_guard(require_running=True) is False  # type: ignore[attr-defined]
+    assert stale_worker.claim_lost is True
+
+
+def test_stage4_3_handoff_reports_stale_governance(session: Session) -> None:
+    import json
+
+    from app.models import TransformationPlan
+    from app.transformation.governance.handoff import build_stage4_3_handoff
+
+    settings, seed, plan_set = _setup(session)
+    _run(session, settings, seed, plan_set)
+
+    fresh = build_stage4_3_handoff(session, seed[1].id)
+    assert fresh is not None
+    assert fresh["governance_set"]["current"] is True
+    assert fresh["governance_set"]["stale"] is False
+
+    row = session.scalars(
+        select(TransformationPlan).where(TransformationPlan.plan_set_id == plan_set.id)
+    ).first()
+    assert row is not None
+    row.blocks = [dict(block) for block in (row.blocks or [])] + [
+        {"index": 99, "block_type": "TRANSITION", "estimated_duration": 1.0}
+    ]
+    session.commit()
+
+    stale = build_stage4_3_handoff(session, seed[1].id)
+    assert stale is not None
+    assert stale["governance_set"]["stale"] is True
+    assert stale["governance_set"]["current"] is True
+    assert stale["plans"]
+    assert all(plan["governance"]["eligible_for_stage4_3"] is False for plan in stale["plans"])
+    serialized = json.dumps(stale)
+    assert "selected_plan_id" not in serialized
+    assert stale["stage4_3_implemented"] is False

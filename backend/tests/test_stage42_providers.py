@@ -139,3 +139,32 @@ def test_unbounded_summary_is_truncated():
     request = _request([plan])
     result = parse_governance_result({"critiques": [_entry(plan, summary="x" * 4000)]}, request)
     assert len(result.critiques[0].summary) <= 600
+
+
+def test_arbitrary_finding_codes_are_discarded():
+    plan = make_plan()
+    request = _request([plan])
+    result = parse_governance_result(
+        {
+            "critiques": [
+                _entry(
+                    plan,
+                    finding_codes=["totally made up code", "CONTEXT_DISTORTION", "unbounded text"],
+                )
+            ]
+        },
+        request,
+    )
+    assert result.critiques[0].finding_codes == ("CONTEXT_DISTORTION",)
+
+
+def test_out_of_range_block_indexes_are_dropped():
+    plan = make_plan()
+    request = _request([plan])
+    block_count = len(plan.blocks)
+    result = parse_governance_result(
+        {"critiques": [_entry(plan, block_indexes=[0, 1, 99, -1])]}, request
+    )
+    indexes = result.critiques[0].block_indexes
+    assert all(0 <= index < block_count for index in indexes)
+    assert 99 not in indexes and -1 not in indexes

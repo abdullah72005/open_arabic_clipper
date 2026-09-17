@@ -202,11 +202,21 @@ identity, or channel voice is ever selected or mentioned.
 
 Claim state is explicit:
 
-- `GROUNDED_IN_SOURCE` — may proceed;
-- `EXTERNAL_REQUIRED_UNRESOLVED` — essential correctly linked external
-  dependency → `BLOCKED_PENDING_VERIFICATION` when the rest is sound;
+- `GROUNDED_IN_SOURCE` — the substantive authored blocks declare source/evidence
+  grounding references; may proceed;
+- `EXTERNAL_REQUIRED_UNRESOLVED` — an essential correctly linked external
+  dependency, or an authored substantive block with no declared grounding (a
+  numeric or non-numeric ungrounded claim such as "The merger closes next
+  Monday"), → `BLOCKED_PENDING_VERIFICATION` when the rest is sound;
 - `UNSUPPORTED_OR_FABRICATED` → `REJECTED_BY_GOVERNOR`;
 - `NOT_APPLICABLE`.
+
+Absence of a verification placeholder is never proof of grounding. A plan with
+substantive authored material but no grounding references is treated as an
+unresolved verification dependency, so it can never silently reach
+`APPROVED_FOR_SELECTION` without valid grounding/verification. Legitimate
+source-grounded explanation/source-as-evidence plans (which declare grounding)
+are unaffected.
 
 Stage 4.2 never creates missing placeholders, never claims verification occurred,
 never browses at runtime, and adds no research/fact-checking infrastructure.
@@ -490,3 +500,40 @@ present. Known limitation: the repository's strict `mypy` configuration already
 reports `no-any-return`/untyped-decorator findings in the frozen Stage 4.0/4.1
 modules; Stage 4.2 matches that convention rather than introducing a new lint
 regime.
+
+## Corrective patch (2026-09-17)
+
+1. **Verification grounding.** See the Verification section: an ungrounded
+   authored claim (numeric or not) is an unresolved verification dependency and
+   cannot silently reach `APPROVED_FOR_SELECTION`.
+2. **Stale `RUNNING` recovery.** When queueing and the only active job is a
+   `RUNNING` job whose heartbeat is older than the shared stale window
+   (`JOB_CLAIM_STALE_SECONDS`), the queue re-dispatches the same job id so the
+   executor's atomic `QUEUED`/`FAILED`/stale-`RUNNING` → `RUNNING` claim performs
+   the claim-version-bumping reclaim. A live/heartbeating job is never reclaimed;
+   the superseded worker's `claim_version` fence prevents it from persisting,
+   cancelling, failing, or finalizing the newer claim; and redelivered
+   invocations of an already-terminal job are fenced out with no duplicate
+   provider call. The queue outcome carries
+   `skipped_reason="RECOVERED_STALE_RUNNING"`.
+3. **Handoff freshness.** `build_stage4_3_handoff` invokes the governance
+   staleness check and exposes `governance_set.current` and
+   `governance_set.stale`, plus a per-plan `governance.stale`. When stale, every
+   plan's `eligible_for_stage4_3` is reported `false`; a stale governance result
+   is never represented as currently eligible. `stage4_3_implemented` stays
+   `false` and no winner is chosen.
+4. **Second-call checkpointing.** A bounded strong second critique that resolves
+   an initially `UNKNOWN` plan is applied and persisted as that plan's checkpoint
+   under its provider-input fingerprint, so a forced rerun with unchanged inputs
+   reuses it and makes zero additional hosted calls. If the second call fails, the
+   first accepted critique is preserved and the plan stays truthfully
+   `GOVERNANCE_DEFERRED`.
+5. **Strict hero thresholds.** `Stage42Config.short_moment_seconds` and
+   `Stage42Config.high_moment_density_floor` are the only thresholds used by
+   `is_strict_hero_window`; both appear in `governance_config_payload` and thus
+   invalidate the input fingerprint when changed.
+6. **Provider boundary.** Only closed `ACCEPTED_PROVIDER_FINDING_CODES` are
+   persisted (arbitrary text is discarded; forbidden text in any raw finding code
+   still rejects the critique), and block indexes outside the requested plan's
+   block range are dropped. Bounded sanitized summaries and valid provider
+   semantic enums are preserved.

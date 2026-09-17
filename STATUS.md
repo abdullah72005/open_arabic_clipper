@@ -102,12 +102,40 @@ repairs, or selects a plan, adds **no** `PipelineStage`, **no** `PipelineRun`,
   handoff exposes per-plan governance with `stage4_3_implemented=false` and no
   winner/selected plan/render-ready/publication state.
 
-Deterministic verification: 70 focused Stage 4.2 tests (governor, providers,
+Deterministic verification: 83 focused Stage 4.2 tests (governor, providers,
 service, executor/queue/cache/concurrency/cancellation, API/CLI/handoff/migration)
 plus the full backend suite in Docker Python 3.12 with the repository compose/.env
 files mounted, with no live provider calls in the automated suite. Versions:
 governor `stage4.2-v1`, schema `stage4.2-schema-v1`, validation
 `stage4.2-validation-v1`. See [docs/STAGE_4_2_OPERATIONS.md](docs/STAGE_4_2_OPERATIONS.md).
+
+### Stage 4.2 corrective patch (2026-09-17)
+
+- **Verification grounding.** A substantive authored block is grounded only when
+  it declares source/evidence references; an ungrounded authored claim (numeric
+  or not, e.g. "The merger closes next Monday") is an unresolved verification
+  dependency and becomes `BLOCKED_PENDING_VERIFICATION`, never a silent
+  `GROUNDED_IN_SOURCE`/`APPROVED_FOR_SELECTION`. Legitimate source-grounded
+  explanation/source-as-evidence plans are unaffected.
+- **Stale RUNNING recovery.** Queueing re-dispatches a genuinely abandoned
+  Stage 4.2 `RUNNING` job (heartbeat older than the shared stale window) so the
+  executor's atomic claim performs the claim-version-bumping reclaim; a live
+  job is never reclaimed, stale workers cannot persist/finalize a newer claim,
+  and redelivered invocations make no duplicate provider call.
+- **Handoff freshness.** The read-only Stage 4.3 handoff exposes explicit
+  `current`/`stale` governance state and never reports a stale result as
+  currently eligible for Stage 4.3.
+- **Second-call checkpoint.** A bounded strong second critique that resolves an
+  initially unknown plan is persisted as that plan's checkpoint, so a forced
+  rerun with unchanged inputs reuses it with zero additional hosted calls; a
+  failed second call preserves the first accepted checkpoint and stays
+  truthfully deferred.
+- **Strict hero thresholds** (`short_moment_seconds`,
+  `high_moment_density_floor`) now actually govern strict hero-window
+  classification and remain fingerprint-invalidating.
+- **Provider boundary** persists only closed accepted finding codes (arbitrary
+  text is discarded, forbidden text still rejects) and drops block indexes
+  outside the requested plan's block range.
 
 ## Stage 4.1 transformation plan generation (2026-09-14)
 

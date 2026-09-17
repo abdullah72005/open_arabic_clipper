@@ -404,7 +404,7 @@ def derive_evidence(
         value = source_moment.get("source_moment_density")
         if isinstance(value, (int, float)) and not isinstance(value, bool):
             density = float(value)
-    strict = is_strict_hero_window(structure, inputs.duration, density)
+    strict = is_strict_hero_window(structure, inputs.duration, density, config)
     elapsed_cap = (
         config.strict_elapsed_before_hero_seconds
         if strict
@@ -499,6 +499,29 @@ def _fabricated_numeric_claim(
     return tuple(indexes)
 
 
+def _block_has_grounding(block: dict[str, object]) -> bool:
+    refs = block.get("grounding_refs")
+    if not isinstance(refs, list):
+        return False
+    return any(isinstance(ref, str) and ref.strip() for ref in refs)
+
+
+def _ungrounded_substantive_indexes(plan: PlanEvidence) -> tuple[int, ...]:
+    """Substantive blocks that declare no source/evidence grounding at all.
+
+    A plan carrying substantive authored material but no grounding references is
+    an unresolved verification dependency, never silently grounded.
+    """
+
+    return tuple(
+        _int(block.get("index"))
+        for block in _blocks(plan)
+        if _block_type(block)
+        in {PlanBlockType.ORIGINAL_VALUE.value, PlanBlockType.TEXTUAL_ANNOTATION.value}
+        and not _block_has_grounding(block)
+    )
+
+
 def _template_level(evidence: dict[str, object], plan: PlanEvidence) -> str:
     substantive = int(evidence["substantive_count"])
     intents = [str(item) for item in evidence["intents"]]
@@ -584,10 +607,26 @@ def _verification(
                     "must_verify_before_execution": False,
                 }
             ]
-        elif evidence["substantive_count"]:
-            state = ClaimGroundingState.GROUNDED_IN_SOURCE.value
         else:
-            state = ClaimGroundingState.NOT_APPLICABLE.value
+            # A substantive authored block is grounded only when it demonstrably
+            # cites source evidence. Absence of a placeholder is never proof of
+            # grounding: an ungrounded authored claim (numeric or not) is an
+            # unresolved verification dependency, so it can never silently pass.
+            ungrounded = _ungrounded_substantive_indexes(plan)
+            if ungrounded:
+                state = ClaimGroundingState.EXTERNAL_REQUIRED_UNRESOLVED.value
+                claims = [
+                    {
+                        "claim_id": None,
+                        "state": state,
+                        "dependent_block_indexes": list(ungrounded),
+                        "must_verify_before_execution": False,
+                    }
+                ]
+            elif evidence["substantive_count"]:
+                state = ClaimGroundingState.GROUNDED_IN_SOURCE.value
+            else:
+                state = ClaimGroundingState.NOT_APPLICABLE.value
     return {
         "claim_state": state,
         "claims": claims,

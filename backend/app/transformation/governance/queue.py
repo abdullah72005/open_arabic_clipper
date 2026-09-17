@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
@@ -24,7 +25,10 @@ from app.models import (
     TransformationGovernanceSet,
     TransformationPlanSet,
 )
-from app.transformation.governance.executor import build_transformation_governance_executor
+from app.transformation.governance.executor import (
+    JOB_CLAIM_STALE_SECONDS,
+    build_transformation_governance_executor,
+)
 from app.transformation.governance.inputs import (
     GovernanceInputError,
 )
@@ -119,7 +123,10 @@ def _active_job(
 
 
 def _active_outcome(
-    governance_set: TransformationGovernanceSet, job: ProcessingJob
+    governance_set: TransformationGovernanceSet,
+    job: ProcessingJob,
+    *,
+    skipped_reason: str | None = None,
 ) -> GovernanceQueueOutcome:
     return GovernanceQueueOutcome(
         governance_set_id=governance_set.id,
@@ -128,7 +135,37 @@ def _active_outcome(
         queued=False,
         cached=False,
         active=True,
+        skipped_reason=skipped_reason,
     )
+
+
+def _as_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value
+
+
+def _job_heartbeat_stale(job: ProcessingJob, *, now: datetime | None = None) -> bool:
+    """Whether a RUNNING job's liveness is genuinely abandoned.
+
+    Matches the executor's stale-reclaim rule: an old ``started_at`` alone is not
+    enough; the heartbeat (or ``started_at`` when no heartbeat exists) must be
+    older than the shared stale window. A live/queued job is never stale.
+    """
+
+    if job.status is not JobStatus.RUNNING:
+        return False
+    current = now or datetime.now(timezone.utc)
+    threshold = current - timedelta(seconds=JOB_CLAIM_STALE_SECONDS)
+    heartbeat = _as_utc(job.heartbeat_at)
+    if heartbeat is not None:
+        return heartbeat < threshold
+    started = _as_utc(job.started_at)
+    if started is not None:
+        return started < threshold
+    return False
 
 
 def _claim_governance_set(
@@ -188,6 +225,16 @@ def queue_transformation_governance(
     for _attempt in range(2):
         active = _active_job(session, governance_set)
         if active is not None:
+            if _job_heartbeat_stale(active):
+                # Recover a genuinely abandoned RUNNING job by re-dispatching the
+                # same job id: the executor's atomic claim performs the
+                # claim-version-bumping stale reclaim, so the old worker can
+                # neither persist nor finalize a newer result, and a live job is
+                # never reclaimed.
+                _dispatch(governance_set.id, active.id, force)
+                return _active_outcome(
+                    governance_set, active, skipped_reason="RECOVERED_STALE_RUNNING"
+                )
             return _active_outcome(governance_set, active)
         if governance_set.active_job_id is not None:
             _clear_stale_claim(session, governance_set)

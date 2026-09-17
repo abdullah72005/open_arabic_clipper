@@ -470,3 +470,90 @@ def test_provider_unknown_on_required_evidence_defers():
     critique = make_critique(plan, fidelity="UNKNOWN")
     governance = _governance(plan, provider_mode_deterministic=False, critique=critique)
     assert governance.status is GovernancePlanStatus.GOVERNANCE_DEFERRED
+
+
+def test_ungrounded_non_numeric_external_claim_cannot_be_approved():
+    plan = make_plan(
+        blocks=[
+            source_block(0),
+            original_block(
+                1,
+                intent="The merger closes next Monday",
+                kind="EXPLANATION",
+                grounding=(),
+            ),
+        ],
+        original_value_kinds=("EXPLANATION",),
+    )
+    governance = _governance(plan)
+    assert governance.status is GovernancePlanStatus.BLOCKED_PENDING_VERIFICATION
+    assert governance.status is not GovernancePlanStatus.APPROVED_FOR_SELECTION
+    assert governance.eligible_for_stage4_3 is False
+    assert governance.verification["claim_state"] == "EXTERNAL_REQUIRED_UNRESOLVED"
+    assert "EXTERNAL_VERIFICATION_REQUIRED" in governance.reason_codes
+
+
+def test_grounded_non_numeric_external_claim_still_passes():
+    plan = make_plan(
+        blocks=[
+            source_block(0),
+            original_block(
+                1,
+                intent="The merger closes next Monday",
+                kind="EXPLANATION",
+                grounding=("source_excerpt",),
+            ),
+        ],
+        original_value_kinds=("EXPLANATION",),
+    )
+    governance = _governance(plan)
+    assert governance.status is GovernancePlanStatus.APPROVED_FOR_SELECTION
+    assert governance.verification["claim_state"] == "GROUNDED_IN_SOURCE"
+
+
+def test_strict_hero_thresholds_are_config_governed():
+    from app.transformation.governance.policy import Stage42Config
+
+    plan = make_plan(
+        blocks=[
+            original_block(0, kind="EXPLANATION", duration=2.0),
+            source_block(1, duration=6.0),
+        ],
+        hero_index=1,
+        original_value_kinds=("EXPLANATION",),
+    )
+    inputs = make_inputs([plan], stage40_assessments={"moment_density": 0.5})
+    default_eval = evaluate_plan(plan, inputs, DEFAULT_CONFIG, provider_mode_deterministic=True)
+    assert finalize(default_eval)[0] is GovernancePlanStatus.REVISION_REQUIRED
+
+    relaxed = Stage42Config(short_moment_seconds=3.0, high_moment_density_floor=0.9)
+    relaxed_eval = evaluate_plan(plan, inputs, relaxed, provider_mode_deterministic=True)
+    assert finalize(relaxed_eval)[0] is GovernancePlanStatus.APPROVED_FOR_SELECTION
+
+
+def test_strict_hero_thresholds_invalidate_fingerprint():
+    from app.transformation.governance.fingerprints import (
+        build_governance_input_payload,
+        governance_input_fingerprint,
+    )
+    from app.transformation.governance.policy import Stage42Config
+
+    plan = make_plan()
+    inputs = make_inputs([plan])
+    base = governance_input_fingerprint(
+        build_governance_input_payload(
+            inputs=inputs,
+            config=DEFAULT_CONFIG,
+            provider_mode="deterministic",
+            provider_identity={"provider": "deterministic"},
+        )
+    )
+    changed = governance_input_fingerprint(
+        build_governance_input_payload(
+            inputs=inputs,
+            config=Stage42Config(short_moment_seconds=9.0),
+            provider_mode="deterministic",
+            provider_identity={"provider": "deterministic"},
+        )
+    )
+    assert base != changed
