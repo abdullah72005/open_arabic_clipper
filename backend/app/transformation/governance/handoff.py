@@ -21,6 +21,15 @@ from app.transformation.governance.queue import (
 )
 from app.transformation.planning.handoff import build_stage4_2_handoff
 
+# Truthful fail-closed governance freshness. Only VERIFIED_CURRENT may retain
+# Stage 4.3 eligibility; STALE/NOT_CURRENT/UNVERIFIABLE force ineligibility.
+FRESHNESS_VERIFIED_CURRENT = "VERIFIED_CURRENT"
+FRESHNESS_STALE = "STALE"
+FRESHNESS_NOT_CURRENT = "NOT_CURRENT"
+FRESHNESS_UNVERIFIABLE = "UNVERIFIABLE"
+
+_CURRENT_GOVERNANCE_STATUSES = {"COMPLETE", "PROVIDER_DEGRADED"}
+
 
 def _as_uuid(value: uuid.UUID | str) -> uuid.UUID:
     return value if isinstance(value, uuid.UUID) else uuid.UUID(str(value))
@@ -110,7 +119,8 @@ def build_stage4_3_handoff(
     results = {
         str(row.transformation_plan_id): row for row in list_results(session, governance_set.id)
     }
-    stale, current = _staleness(session, governance_set)
+    freshness = _governance_freshness(session, governance_set)
+    verified_current = freshness == FRESHNESS_VERIFIED_CURRENT
     base["governance_set"] = {
         "id": str(governance_set.id),
         "execution_status": governance_set.execution_status.value,
@@ -131,10 +141,11 @@ def build_stage4_3_handoff(
         "cache_eligible": bool(governance_set.cache_eligible),
         "summary_counts": dict(governance_set.summary_counts or {}),
         "outcome_reasons": list(governance_set.outcome_reasons or []),
-        # Explicit governance freshness. A stale result is never represented as
-        # currently eligible for Stage 4.3.
-        "current": current,
-        "stale": stale,
+        # Truthful fail-closed freshness. A stale, not-current, or unverifiable
+        # result is never represented as currently eligible for Stage 4.3.
+        "freshness": freshness,
+        "current": verified_current,
+        "stale": freshness == FRESHNESS_STALE,
     }
 
     plans: list[dict[str, object]] = []
@@ -144,8 +155,9 @@ def build_stage4_3_handoff(
             result = results.get(plan_id)
             governance = _result_dict(result) if result is not None else None
             if governance is not None:
-                governance["stale"] = stale
-                if stale:
+                governance["freshness"] = freshness
+                governance["stale"] = freshness == FRESHNESS_STALE
+                if not verified_current:
                     governance["eligible_for_stage4_3"] = False
             plans.append(
                 {
@@ -160,9 +172,21 @@ def build_stage4_3_handoff(
     return base
 
 
-def _staleness(session: Session, governance_set: Any) -> tuple[bool, bool]:
+def _governance_freshness(session: Session, governance_set: Any) -> str:
+    """Fail-closed governance freshness for the read-only Stage 4.3 handoff.
+
+    Returns exactly one of ``VERIFIED_CURRENT``, ``STALE``, ``NOT_CURRENT``, or
+    ``UNVERIFIABLE``. Anything that is not an explicitly verified current result
+    forces Stage 4.3 ineligibility.
+    """
+
     if not governance_set.input_fingerprint:
-        return False, False
+        return FRESHNESS_UNVERIFIABLE
+    if (
+        governance_set.execution_status.value not in _CURRENT_GOVERNANCE_STATUSES
+        or governance_set.governance_outcome is None
+    ):
+        return FRESHNESS_NOT_CURRENT
     from app.transformation.governance.executor import (
         build_transformation_governance_executor,
     )
@@ -171,10 +195,18 @@ def _staleness(session: Session, governance_set: Any) -> tuple[bool, bool]:
         executor = build_transformation_governance_executor(session, get_settings())
         current = executor.input_fingerprint(governance_set)
     except Exception:
-        return False, False
+        return FRESHNESS_UNVERIFIABLE
     if not current:
-        return False, False
-    return (current != governance_set.input_fingerprint), True
+        return FRESHNESS_UNVERIFIABLE
+    if current != governance_set.input_fingerprint:
+        return FRESHNESS_STALE
+    return FRESHNESS_VERIFIED_CURRENT
 
 
-__all__ = ["build_stage4_3_handoff"]
+__all__ = [
+    "FRESHNESS_NOT_CURRENT",
+    "FRESHNESS_STALE",
+    "FRESHNESS_UNVERIFIABLE",
+    "FRESHNESS_VERIFIED_CURRENT",
+    "build_stage4_3_handoff",
+]

@@ -102,7 +102,7 @@ repairs, or selects a plan, adds **no** `PipelineStage`, **no** `PipelineRun`,
   handoff exposes per-plan governance with `stage4_3_implemented=false` and no
   winner/selected plan/render-ready/publication state.
 
-Deterministic verification: 83 focused Stage 4.2 tests (governor, providers,
+Deterministic verification: 89 focused Stage 4.2 tests (governor, providers,
 service, executor/queue/cache/concurrency/cancellation, API/CLI/handoff/migration)
 plus the full backend suite in Docker Python 3.12 with the repository compose/.env
 files mounted, with no live provider calls in the automated suite. Versions:
@@ -136,6 +136,18 @@ governor `stage4.2-v1`, schema `stage4.2-schema-v1`, validation
 - **Provider boundary** persists only closed accepted finding codes (arbitrary
   text is discarded, forbidden text still rejects) and drops block indexes
   outside the requested plan's block range.
+- **Real source-grounding resolution (P1).** Grounding references are resolved
+  against real plan source evidence (source-excerpt block indexes, word-index
+  ranges, source/time spans within the refined window, or a quote of real source
+  excerpt text). Provider labels such as `strategy`, `source_excerpt`, or any
+  arbitrary string are not proof; unresolvable grounding makes the claim an
+  unresolved verification dependency (`BLOCKED_PENDING_VERIFICATION`), never a
+  silent approval.
+- **Fail-closed Stage 4.3 handoff freshness (P1).** The handoff exposes
+  `freshness` ∈ {`VERIFIED_CURRENT`, `STALE`, `NOT_CURRENT`, `UNVERIFIABLE`}.
+  Only `VERIFIED_CURRENT` may retain per-plan `eligible_for_stage4_3`; a missing
+  fingerprint, unresolved inputs, or a fingerprint recomputation error is
+  `UNVERIFIABLE`, and every non-verified state forces `eligible_for_stage4_3=false`.
 
 ## Stage 4.1 transformation plan generation (2026-09-14)
 

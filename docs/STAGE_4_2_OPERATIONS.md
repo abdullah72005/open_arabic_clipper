@@ -202,21 +202,26 @@ identity, or channel voice is ever selected or mentioned.
 
 Claim state is explicit:
 
-- `GROUNDED_IN_SOURCE` — the substantive authored blocks declare source/evidence
-  grounding references; may proceed;
+- `GROUNDED_IN_SOURCE` — every substantive authored block declares at least one
+  grounding reference that deterministically resolves to real plan source
+  evidence (an existing source-excerpt block index, a word-index range, a
+  source/time span inside the refined window, or a quote of real source-excerpt
+  text); may proceed;
 - `EXTERNAL_REQUIRED_UNRESOLVED` — an essential correctly linked external
-  dependency, or an authored substantive block with no declared grounding (a
-  numeric or non-numeric ungrounded claim such as "The merger closes next
-  Monday"), → `BLOCKED_PENDING_VERIFICATION` when the rest is sound;
+  dependency, or an authored substantive block whose grounding references do
+  **not** resolve (including provider-declared labels such as `strategy` or
+  `source_excerpt`, numeric or non-numeric external claims such as "The merger
+  closes next Monday"), → `BLOCKED_PENDING_VERIFICATION` when the rest is sound;
 - `UNSUPPORTED_OR_FABRICATED` → `REJECTED_BY_GOVERNOR`;
 - `NOT_APPLICABLE`.
 
-Absence of a verification placeholder is never proof of grounding. A plan with
-substantive authored material but no grounding references is treated as an
-unresolved verification dependency, so it can never silently reach
-`APPROVED_FOR_SELECTION` without valid grounding/verification. Legitimate
-source-grounded explanation/source-as-evidence plans (which declare grounding)
-are unaffected.
+Provider-declared grounding labels are never proof. Absence of a verification
+placeholder is never proof of grounding. A plan with substantive authored
+material but no resolvable grounding is treated as an unresolved verification
+dependency, so it can never silently reach `APPROVED_FOR_SELECTION` without
+valid grounding/verification. Legitimate source-grounded
+explanation/source-as-evidence plans that reference real source evidence are
+unaffected.
 
 Stage 4.2 never creates missing placeholders, never claims verification occurred,
 never browses at runtime, and adds no research/fact-checking infrastructure.
@@ -417,6 +422,22 @@ set summary, and every current plan with its independent governance result.
 no render-ready state, no publication approval, and no automatic queue action**.
 Stage 4.1 generation order is preserved; no governor preference rank is added.
 
+Freshness is fail-closed and truthful. `governance_set.freshness` is exactly one
+of:
+
+- `VERIFIED_CURRENT` — the stored input fingerprint recomputes to the same value
+  from current inputs; per-plan `eligible_for_stage4_3` is preserved as persisted;
+- `STALE` — the recomputed fingerprint differs from the stored one;
+- `NOT_CURRENT` — the governance set is not in a completed/degraded state or has
+  no semantic outcome;
+- `UNVERIFIABLE` — the stored input fingerprint is missing, inputs cannot
+  resolve, or fingerprint recomputation raises.
+
+For `STALE`, `NOT_CURRENT`, or `UNVERIFIABLE`, every handoff plan reports
+`eligible_for_stage4_3=false`; only an explicitly verified current result may
+retain eligibility. `governance_set.current`/`stale` and per-plan
+`governance.freshness`/`stale` mirror this state.
+
 ## Reason codes and remediation
 
 Closed reason codes include `PLAN_INTEGRITY_INVALID`, `NO_SUBSTANTIVE_VALUE`,
@@ -537,3 +558,15 @@ regime.
    still rejects the critique), and block indexes outside the requested plan's
    block range are dropped. Bounded sanitized summaries and valid provider
    semantic enums are preserved.
+7. **Real source-grounding resolution (P1).** Grounding references are resolved
+   against the immutable plan's own source excerpts (block indexes, word-index
+   ranges, source/time spans within the refined window, or quoted source-excerpt
+   text). Provider labels (`strategy`, `source_excerpt`, arbitrary strings) are
+   not proof; unresolvable grounding is `EXTERNAL_REQUIRED_UNRESOLVED` /
+   `BLOCKED_PENDING_VERIFICATION`.
+8. **Fail-closed handoff freshness (P1).** `freshness` is
+   `VERIFIED_CURRENT`/`STALE`/`NOT_CURRENT`/`UNVERIFIABLE`; only
+   `VERIFIED_CURRENT` retains eligibility. A missing governance input
+   fingerprint, unresolved inputs, or a fingerprint recomputation error is
+   `UNVERIFIABLE` and forces every handoff plan `eligible_for_stage4_3=false`.
+   `stage4_3_implemented` stays `false` and no winner is selected.

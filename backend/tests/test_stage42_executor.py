@@ -8,11 +8,12 @@ from typing import Any
 import pytest
 from sqlalchemy import Engine, select
 from sqlalchemy.orm import Session
-from stage41_support import FakePlanningProvider, make_source_value_plan, run_planning, seed_stage41
+from stage41_support import FakePlanningProvider, run_planning, seed_stage41
 from stage42_support import (
     FakeGovernanceProvider,
     FakeGovernanceSettings,
     install_stage42_settings,
+    make_source_value_plan,
     with_review_narration,
 )
 
@@ -394,8 +395,11 @@ def test_stage4_3_handoff_reports_stale_governance(session: Session) -> None:
 
     fresh = build_stage4_3_handoff(session, seed[1].id)
     assert fresh is not None
+    assert fresh["governance_set"]["freshness"] == "VERIFIED_CURRENT"
     assert fresh["governance_set"]["current"] is True
     assert fresh["governance_set"]["stale"] is False
+    assert fresh["plans"]
+    assert all(plan["governance"]["eligible_for_stage4_3"] is True for plan in fresh["plans"])
 
     row = session.scalars(
         select(TransformationPlan).where(TransformationPlan.plan_set_id == plan_set.id)
@@ -408,10 +412,68 @@ def test_stage4_3_handoff_reports_stale_governance(session: Session) -> None:
 
     stale = build_stage4_3_handoff(session, seed[1].id)
     assert stale is not None
+    assert stale["governance_set"]["freshness"] == "STALE"
     assert stale["governance_set"]["stale"] is True
-    assert stale["governance_set"]["current"] is True
+    assert stale["governance_set"]["current"] is False
     assert stale["plans"]
     assert all(plan["governance"]["eligible_for_stage4_3"] is False for plan in stale["plans"])
     serialized = json.dumps(stale)
     assert "selected_plan_id" not in serialized
     assert stale["stage4_3_implemented"] is False
+
+
+def test_stage4_3_handoff_missing_fingerprint_is_unverifiable(session: Session) -> None:
+    from app.transformation.governance.handoff import build_stage4_3_handoff
+
+    settings, seed, plan_set = _setup(session)
+    governance_set = _run(session, settings, seed, plan_set)
+    governance_set.input_fingerprint = ""
+    session.commit()
+
+    handoff = build_stage4_3_handoff(session, seed[1].id)
+    assert handoff is not None
+    assert handoff["governance_set"]["freshness"] == "UNVERIFIABLE"
+    assert handoff["governance_set"]["current"] is False
+    assert handoff["plans"]
+    assert all(plan["governance"]["eligible_for_stage4_3"] is False for plan in handoff["plans"])
+
+
+def test_stage4_3_handoff_fingerprint_failure_is_unverifiable(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.transformation.governance import executor as executor_module
+    from app.transformation.governance.handoff import build_stage4_3_handoff
+
+    settings, seed, plan_set = _setup(session)
+    _run(session, settings, seed, plan_set)
+
+    class _Boom:
+        def input_fingerprint(self, governance_set: object) -> str:
+            raise RuntimeError("fingerprint recomputation failed")
+
+    monkeypatch.setattr(
+        executor_module,
+        "build_transformation_governance_executor",
+        lambda session, settings: _Boom(),
+    )
+    handoff = build_stage4_3_handoff(session, seed[1].id)
+    assert handoff is not None
+    assert handoff["governance_set"]["freshness"] == "UNVERIFIABLE"
+    assert handoff["plans"]
+    assert all(plan["governance"]["eligible_for_stage4_3"] is False for plan in handoff["plans"])
+
+
+def test_stage4_3_handoff_not_current_is_ineligible(session: Session) -> None:
+    from app.core.enums import GovernanceExecutionStatus
+    from app.transformation.governance.handoff import build_stage4_3_handoff
+
+    settings, seed, plan_set = _setup(session)
+    governance_set = _run(session, settings, seed, plan_set)
+    governance_set.execution_status = GovernanceExecutionStatus.FAILED
+    session.commit()
+
+    handoff = build_stage4_3_handoff(session, seed[1].id)
+    assert handoff is not None
+    assert handoff["governance_set"]["freshness"] == "NOT_CURRENT"
+    assert handoff["plans"]
+    assert all(plan["governance"]["eligible_for_stage4_3"] is False for plan in handoff["plans"])

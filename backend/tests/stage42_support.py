@@ -11,6 +11,7 @@ from stage41_support import (
     FakeStage41Settings,
     install_stage41_settings,
 )
+from stage41_support import make_source_value_plan as _make_source_value_plan
 
 from app.core.enums import (
     CoherenceFinding,
@@ -32,6 +33,18 @@ from app.transformation.governance.types import (
 from app.transformation.planning.policy import DEFAULT_CONFIG as STAGE41_CONFIG
 from app.transformation.planning.policy import Stage41Config
 from app.transformation.planning.types import PlanningContext
+
+
+def make_source_value_plan(*args: object, **kwargs: object) -> object:
+    """Stage 4.1 source-value plan with real resolvable source grounding.
+
+    Stage 4.2 no longer treats arbitrary labels such as ``strategy`` as proof, so
+    Stage 4.2 end-to-end tests declare a grounding reference that resolves to the
+    plan's own hero source-excerpt block.
+    """
+
+    kwargs.setdefault("grounding", ("block:0",))
+    return _make_source_value_plan(*args, **kwargs)
 
 
 class FakeGovernanceProvider:
@@ -274,7 +287,7 @@ def original_block(
     kind: str = "SOURCE_AS_EVIDENCE",
     duration: float = 5.0,
     interrupts: bool = False,
-    grounding: Sequence[str] = ("strategy",),
+    grounding: Sequence[str] = ("block:0",),
     dependency_ids: Sequence[str] = (),
 ) -> dict[str, object]:
     return {

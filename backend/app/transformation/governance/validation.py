@@ -499,27 +499,162 @@ def _fabricated_numeric_claim(
     return tuple(indexes)
 
 
-def _block_has_grounding(block: dict[str, object]) -> bool:
-    refs = block.get("grounding_refs")
-    if not isinstance(refs, list):
-        return False
-    return any(isinstance(ref, str) and ref.strip() for ref in refs)
+_INT_RE = re.compile(r"\d+")
+_FLOAT_RE = re.compile(r"-?\d+(?:\.\d+)?")
+_RANGE_RE = re.compile(r"(-?\d+(?:\.\d+)?)\s*[-:]\s*(-?\d+(?:\.\d+)?)")
+_BLOCK_REF_PREFIXES = ("block:", "blocks:", "excerpt:", "source_block:", "source-block:")
+_WORD_REF_PREFIXES = ("word:", "words:")
+_SPAN_REF_PREFIXES = ("source:", "span:", "time:")
+_MIN_QUOTE_CHARS = 4
 
 
-def _ungrounded_substantive_indexes(plan: PlanEvidence) -> tuple[int, ...]:
-    """Substantive blocks that declare no source/evidence grounding at all.
+def _source_evidence(
+    plan: PlanEvidence,
+) -> tuple[set[int], list[tuple[float, float]], list[tuple[int, int]], list[str]]:
+    """Real, relevant source evidence declared by the immutable plan itself."""
 
-    A plan carrying substantive authored material but no grounding references is
-    an unresolved verification dependency, never silently grounded.
+    indexes: set[int] = set()
+    spans: list[tuple[float, float]] = []
+    word_ranges: list[tuple[int, int]] = []
+    texts: list[str] = []
+    for block in _blocks(plan):
+        if _block_type(block) != PlanBlockType.SOURCE_EXCERPT.value:
+            continue
+        index = _int(block.get("index"))
+        if index >= 0:
+            indexes.add(index)
+        start = block.get("source_start")
+        end = block.get("source_end")
+        if (
+            isinstance(start, (int, float))
+            and not isinstance(start, bool)
+            and isinstance(end, (int, float))
+            and not isinstance(end, bool)
+        ):
+            spans.append((float(start), float(end)))
+        word_start = block.get("word_start_index")
+        word_end = block.get("word_end_index")
+        if (
+            isinstance(word_start, int)
+            and not isinstance(word_start, bool)
+            and isinstance(word_end, int)
+            and not isinstance(word_end, bool)
+        ):
+            word_ranges.append((word_start, word_end))
+        text = block.get("source_text")
+        if isinstance(text, str) and text.strip():
+            texts.append(text.casefold())
+    return indexes, spans, word_ranges, texts
+
+
+def _first_int(value: str) -> int | None:
+    match = _INT_RE.search(value)
+    return int(match.group(0)) if match else None
+
+
+def _float_range(value: str) -> tuple[float, float] | None:
+    match = _RANGE_RE.search(value)
+    if match is None:
+        return None
+    return float(match.group(1)), float(match.group(2))
+
+
+def _ref_resolves(
+    ref: object,
+    indexes: set[int],
+    spans: list[tuple[float, float]],
+    word_ranges: list[tuple[int, int]],
+    texts: list[str],
+    refined_start: float,
+    refined_end: float,
+) -> bool:
+    """Resolve one grounding reference against real plan source evidence.
+
+    Provider-declared labels such as ``strategy`` or ``source_excerpt`` are
+    never proof: only a reference that addresses an existing source-excerpt
+    block/word/time span or quotes real source excerpt text counts.
     """
 
-    return tuple(
-        _int(block.get("index"))
-        for block in _blocks(plan)
-        if _block_type(block)
-        in {PlanBlockType.ORIGINAL_VALUE.value, PlanBlockType.TEXTUAL_ANNOTATION.value}
-        and not _block_has_grounding(block)
-    )
+    if not isinstance(ref, str):
+        return False
+    value = ref.strip()
+    if not value:
+        return False
+    lowered = value.casefold()
+
+    for prefix in _BLOCK_REF_PREFIXES:
+        if lowered.startswith(prefix):
+            index = _first_int(lowered[len(prefix) :])
+            return index is not None and index in indexes
+
+    for prefix in _WORD_REF_PREFIXES:
+        if lowered.startswith(prefix):
+            body = lowered[len(prefix) :]
+            span = _float_range(body)
+            if span is not None:
+                low, high = span
+                return any(not (high < start or low > end) for start, end in word_ranges)
+            index = _first_int(body)
+            return index is not None and any(start <= index <= end for start, end in word_ranges)
+
+    for prefix in _SPAN_REF_PREFIXES:
+        if lowered.startswith(prefix):
+            body = lowered[len(prefix) :]
+            span = _float_range(body)
+            if span is not None:
+                low, high = span
+                if any(not (high < start or low > end) for start, end in spans):
+                    return True
+                return low >= refined_start and high <= refined_end
+            point = _FLOAT_RE.search(body)
+            if point is not None:
+                value_f = float(point.group(0))
+                if any(start <= value_f <= end for start, end in spans):
+                    return True
+                return refined_start <= value_f <= refined_end
+            return False
+
+    if value.isdigit():
+        return int(value) in indexes
+
+    if len(lowered) >= _MIN_QUOTE_CHARS and any(lowered in text for text in texts):
+        return True
+    return False
+
+
+def _ungrounded_substantive_indexes(
+    plan: PlanEvidence, inputs: GovernanceInputs
+) -> tuple[int, ...]:
+    """Substantive blocks whose grounding does not resolve to real evidence.
+
+    An authored factual claim with no resolvable source grounding is an
+    unresolved verification dependency, never silently grounded.
+    """
+
+    indexes, spans, word_ranges, texts = _source_evidence(plan)
+    ungrounded: list[int] = []
+    for block in _blocks(plan):
+        if _block_type(block) not in {
+            PlanBlockType.ORIGINAL_VALUE.value,
+            PlanBlockType.TEXTUAL_ANNOTATION.value,
+        }:
+            continue
+        refs = block.get("grounding_refs")
+        grounded = isinstance(refs, list) and any(
+            _ref_resolves(
+                ref,
+                indexes,
+                spans,
+                word_ranges,
+                texts,
+                inputs.refined_start,
+                inputs.refined_end,
+            )
+            for ref in refs
+        )
+        if not grounded:
+            ungrounded.append(_int(block.get("index")))
+    return tuple(ungrounded)
 
 
 def _template_level(evidence: dict[str, object], plan: PlanEvidence) -> str:
@@ -612,7 +747,7 @@ def _verification(
             # cites source evidence. Absence of a placeholder is never proof of
             # grounding: an ungrounded authored claim (numeric or not) is an
             # unresolved verification dependency, so it can never silently pass.
-            ungrounded = _ungrounded_substantive_indexes(plan)
+            ungrounded = _ungrounded_substantive_indexes(plan, inputs)
             if ungrounded:
                 state = ClaimGroundingState.EXTERNAL_REQUIRED_UNRESOLVED.value
                 claims = [

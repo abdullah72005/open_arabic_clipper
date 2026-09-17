@@ -501,7 +501,7 @@ def test_grounded_non_numeric_external_claim_still_passes():
                 1,
                 intent="The merger closes next Monday",
                 kind="EXPLANATION",
-                grounding=("source_excerpt",),
+                grounding=("source:21-27",),
             ),
         ],
         original_value_kinds=("EXPLANATION",),
@@ -511,12 +511,82 @@ def test_grounded_non_numeric_external_claim_still_passes():
     assert governance.verification["claim_state"] == "GROUNDED_IN_SOURCE"
 
 
+def test_block_and_quote_grounding_refs_resolve():
+    plan = make_plan(
+        blocks=[
+            source_block(0),
+            original_block(
+                1,
+                intent="Explain what the speaker meant",
+                kind="EXPLANATION",
+                grounding=("block:0",),
+            ),
+        ],
+        original_value_kinds=("EXPLANATION",),
+    )
+    assert _governance(plan).status is GovernancePlanStatus.APPROVED_FOR_SELECTION
+
+    quoted = make_plan(
+        fingerprint="plan-fingerprint-quoted",
+        blocks=[
+            source_block(0),
+            original_block(
+                1,
+                intent="Explain what the speaker meant",
+                kind="EXPLANATION",
+                grounding=("the source speaker said something",),
+            ),
+        ],
+        original_value_kinds=("EXPLANATION",),
+    )
+    assert _governance(quoted).verification["claim_state"] == "GROUNDED_IN_SOURCE"
+
+
+def test_arbitrary_grounding_labels_do_not_approve_external_claim():
+    for label in ("strategy", "source_excerpt", "excerpt", "evidence", "label"):
+        plan = make_plan(
+            fingerprint=f"plan-fingerprint-{label.replace(' ', '-')}",
+            blocks=[
+                source_block(0),
+                original_block(
+                    1,
+                    intent="The merger closes next Monday",
+                    kind="EXPLANATION",
+                    grounding=(label,),
+                ),
+            ],
+            original_value_kinds=("EXPLANATION",),
+        )
+        governance = _governance(plan)
+        assert governance.status is GovernancePlanStatus.BLOCKED_PENDING_VERIFICATION
+        assert governance.eligible_for_stage4_3 is False
+
+
+def test_external_claim_with_unresolvable_grounding_remains_ineligible():
+    plan = make_plan(
+        blocks=[
+            source_block(0),
+            original_block(
+                1,
+                intent="The merger closes next Monday",
+                kind="EXPLANATION",
+                grounding=("block:99", "word:900-950", "span:1-2"),
+            ),
+        ],
+        original_value_kinds=("EXPLANATION",),
+    )
+    governance = _governance(plan)
+    assert governance.status is GovernancePlanStatus.BLOCKED_PENDING_VERIFICATION
+    assert governance.eligible_for_stage4_3 is False
+    assert governance.verification["claim_state"] == "EXTERNAL_REQUIRED_UNRESOLVED"
+
+
 def test_strict_hero_thresholds_are_config_governed():
     from app.transformation.governance.policy import Stage42Config
 
     plan = make_plan(
         blocks=[
-            original_block(0, kind="EXPLANATION", duration=2.0),
+            original_block(0, kind="EXPLANATION", duration=2.0, grounding=("block:1",)),
             source_block(1, duration=6.0),
         ],
         hero_index=1,
