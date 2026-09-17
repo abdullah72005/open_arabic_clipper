@@ -19,13 +19,12 @@ from app.core.enums import (
     TransformationStrategyType,
 )
 
-# v4 closure hardening: cancellation fences persistence, renewable heartbeat
-# liveness for stale reclaim, named-person imitation/identity bypass rejection,
-# all malformed verification-reference shapes, and retry failure-metadata
-# clearing.
-POLICY_VERSION = "stage4.1-v4"
-SCHEMA_VERSION = "stage4.1-schema-v4"
-VALIDATION_VERSION = "stage4.1-validation-v4"
+# v5 closure hardening: every parsed provider result, including an explicit
+# no_valid_plan payload, is boundary-validated before persistence, checkpoint,
+# reason, cache reuse, or handoff exposure.
+POLICY_VERSION = "stage4.1-v5"
+SCHEMA_VERSION = "stage4.1-schema-v5"
+VALIDATION_VERSION = "stage4.1-validation-v5"
 INPUT_FINGERPRINT_VERSION = "1"
 OUTPUT_FINGERPRINT_VERSION = "1"
 PLAN_FINGERPRINT_VERSION = "1"

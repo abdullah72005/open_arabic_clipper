@@ -67,7 +67,14 @@ refinement, and is **never** added to the automatic `_NEXT_STAGE` chain.
   (purpose, language, register, duration, placement, dependency) are preserved,
   ordinary semantic words such as "model" are not blocked, and ordinary
   discussion of a named person (for example "Reference Morgan Freeman's career
-  as context") is not treated as identity selection.
+  as context") is not treated as identity selection. The planner service runs
+  this boundary for **every** parsed provider result, including explicit
+  `no_valid_plan=true` payloads, before any field can be persisted,
+  checkpointed, used as an attempt/outcome reason, reused from cache, or exposed
+  through the Stage 4.2 handoff; a no-valid payload with forbidden text is a safe
+  invalid/malformed result (never an explicit decline) and stores only the
+  bounded rejection code, while a clean bounded no-valid reason remains a
+  legitimate `NO_VALID_PLAN_FROM_STRATEGY` outcome.
 - **Narration contract.** A plan whose substantive block requires narration
   delivery while `NarrationNeed.NONE` is recorded is rejected, and a
   narration-disallowed context cannot accept an essential narration-only
@@ -140,13 +147,15 @@ refinement, and is **never** added to the automatic `_NEXT_STAGE` chain.
   `stage4_3_implemented=false`) with exact ordered blocks, hero span, narration
   semantics, verification dependencies, and Stage 4.0 risk.
 
-Deterministic verification: 126 focused Stage 4.1 tests (63 original + 24
+Deterministic verification: 134 focused Stage 4.1 tests (63 original + 24
 review-remediation + 19 final re-review remediation + 20 final-closure
-remediation) plus the full backend suite in Docker Python 3.12 with the
-repository compose/.env files mounted, with no live provider calls in the
-automated suite. Planning policy/schema/validation versions advanced to
-`stage4.1-v4`/`stage4.1-schema-v4`/`stage4.1-validation-v4` so prior plans
-invalidate. See [docs/STAGE_4_1_OPERATIONS.md](docs/STAGE_4_1_OPERATIONS.md).
+remediation + 8 provider no-valid boundary closure) plus the full backend suite
+in Docker Python 3.12 with the repository compose/.env files mounted, with no
+live provider calls in the automated suite. Planning policy/schema/validation
+versions advanced to
+`stage4.1-v5`/`stage4.1-schema-v5`/`stage4.1-validation-v5` so prior plans and
+checkpoints invalidate. See
+[docs/STAGE_4_1_OPERATIONS.md](docs/STAGE_4_1_OPERATIONS.md).
 
 ## Stage 4.0 transformation eligibility and strategy discovery (2026-09-14)
 

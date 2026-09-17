@@ -96,6 +96,19 @@ per-strategy attempt data rather than as fabricated empty plan rows. Repeated
 identical work reuses the plan UUID; upstream changes recompute the semantic
 fingerprint without creating duplicates.
 
+Every parsed provider result — including one that sets
+`no_valid_plan=true` — passes the complete provider-text boundary before any of
+its fields can be persisted, checkpointed, used as an attempt/outcome reason,
+reused from cache, or exposed through the Stage 4.2 handoff. A clean, bounded
+explicit no-valid reason is a legitimate terminal `NO_VALID_PLAN`; a no-valid
+payload whose reason, notes, blocks, or narration fields contain forbidden
+provider text (TTS provider/voice selection, rendering instructions,
+platform-evasion tactics, or speaker imitation/identity) is treated as a safe
+invalid/malformed provider result instead of an explicit decline, keeps the run
+non-cache-eligible, and persists only the bounded rejection code (never the raw
+provider text). A previously stored checkpoint is reusable only when its
+serialized content passes the current boundary/version contract.
+
 ## Block contract
 
 Closed block set: `SOURCE_EXCERPT`, `ORIGINAL_VALUE`, `TRANSITION`,
@@ -197,7 +210,10 @@ bounded, explicit policy markers **before any no-valid-plan early return**:
 plan preservation constraints, planner notes, no-valid reasons, block purpose,
 semantic intent, why-unavailable, draft line, continuity rationale, verification
 rationale, intended use, grounding refs, dependency ids, claim dependency, and
-narration language/register/dependency ids. Rejected output includes TTS
+narration language/register/dependency ids. The planner service calls this
+validator for every parsed provider result, including explicit
+`no_valid_plan=true` payloads, so the boundary cannot be bypassed by branching on
+the no-valid flag first. Rejected output includes TTS
 provider-plus-voice selection (`Use Gemini voice Charon`), named-speaker
 identity (`Have Morgan Freeman narrate`), named-person imitation/
 identity-selection phrased without any voice/narration/TTS word (`Make it sound
@@ -522,12 +538,12 @@ ruff format app tests alembic && ruff check app tests alembic
 
 All Stage 4.1 tests are deterministic and hermetic: providers are mocked and no
 test makes a live Gemini, Qwen, web, TTS, or rendering call even when a key is
-present. The final-closure remediation advanced planning versions to
-`stage4.1-v4` / `stage4.1-schema-v4` / `stage4.1-validation-v4` (cancellation
-fencing of plan persistence, renewable heartbeat liveness for stale reclaim,
-named-person imitation/identity bypass rejection, all malformed
-verification-reference shapes, and retry failure-metadata clearing), so prior
-plans invalidate through the input fingerprint. Known
+present. The provider no-valid boundary-closure remediation advanced planning
+versions to `stage4.1-v5` / `stage4.1-schema-v5` / `stage4.1-validation-v5`
+(every parsed provider result, including explicit no-valid payloads, is
+boundary-validated before persistence, checkpoint, reason, cache reuse, or
+handoff exposure), so prior plans and checkpoints invalidate through the input
+fingerprint. Known
 limitation: the repository's strict `mypy` configuration already reports the
 same class of `no-any-return`/`untyped-decorator` findings in the frozen Stage
 4.0 provider modules and the FastAPI app; Stage 4.1 matches that existing

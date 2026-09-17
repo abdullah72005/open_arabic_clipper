@@ -351,27 +351,37 @@ class PlanningService:
         reused: bool,
     ) -> tuple[ValidatedPlan | None, StrategyAttempt]:
         provider_plan = result.plans[0]
-        if provider_plan.no_valid_plan:
-            attempt_status = _ATTEMPT_NO_VALID_PLAN
-            plan = None
-        else:
-            validation = self._validate(
-                strategy,
-                provider_plan,
-                inputs,
-                provider_evidence=provider_evidence,
-                provider_input_fp=provider_input_fp,
-            )
+        # Every parsed provider result — including an explicit ``no_valid_plan``
+        # — must pass the complete deterministic provider-text/boundary
+        # validation before any of its fields can be persisted, checkpointed,
+        # used as an attempt/outcome reason, or reused from cache. The validator
+        # checks forbidden text before its own no-valid early return; branching
+        # on ``no_valid_plan`` first would let adversarial reasons bypass it.
+        validation = self._validate(
+            strategy,
+            provider_plan,
+            inputs,
+            provider_evidence=provider_evidence,
+            provider_input_fp=provider_input_fp,
+        )
+        if validation.plan is not None:
             plan = validation.plan
-            if plan is None:
-                attempt_status = _ATTEMPT_INVALID
-                reasons = validation.reasons
-                self._unfinished = True
-                return None, _attempt(strategy, attempt_status, reasons, None, provider_input_fp)
             attempt_status = (
                 _ATTEMPT_VERIFICATION
                 if plan.status.value == "PLAN_GENERATED_WITH_VERIFICATION_REQUIRED"
                 else _ATTEMPT_GENERATED
+            )
+        elif validation.explicit_no_plan:
+            # A clean, bounded explicit decline is a legitimate no-plan result.
+            plan = None
+            attempt_status = _ATTEMPT_NO_VALID_PLAN
+        else:
+            # Forbidden/malformed provider output (including inside an explicit
+            # no-valid payload) is a safe invalid result, never an explicit
+            # no-plan, and persists no raw provider text.
+            self._unfinished = True
+            return None, _attempt(
+                strategy, _ATTEMPT_INVALID, validation.reasons, None, provider_input_fp
             )
         checkpoint = {
             "provider_input_fingerprint": provider_input_fp,
@@ -381,7 +391,7 @@ class PlanningService:
             strategy_id=str(strategy.get("id", "")),
             strategy_key=str(strategy.get("strategy_key", "")),
             status=attempt_status,
-            reasons=(provider_plan.no_valid_reason,) if provider_plan.no_valid_plan else (),
+            reasons=tuple(validation.reasons) if validation.explicit_no_plan else (),
             provider_input_fingerprint=provider_input_fp,
             # Always persist the checkpoint, including on reuse, so an accepted
             # provider result stays durable across repeated forced reruns and
