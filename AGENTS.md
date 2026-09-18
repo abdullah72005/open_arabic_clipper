@@ -185,7 +185,8 @@
   Qwen remains installed and disabled by default and is never used in adaptive
   refinement. Stage 4.0 transformation eligibility/strategy discovery is
   implemented as explicit candidate-scoped work; Stage 4.1 concrete plan
-  generation is implemented; Stage 4.2 is not.
+  generation is implemented; Stage 4.2 governance and Stage 4.3 deterministic
+  final-plan selection are implemented.
 - Stage 4.1 adds concrete structured transformation plan generation in
   `app/transformation/planning/` as explicit, candidate-scoped work after a
   current, non-stale Stage 4.0 analysis with at least one current recommended
@@ -239,9 +240,9 @@
   and a nullable `processing_jobs.transformation_plan_set_id` FK. Planning
   policy/schema/validation versions are `stage4.1-v2`. A read-only
   Stage 4.2 handoff exposes exact ordered blocks, hero span, narration semantics,
-  verification dependencies, and Stage 4.0 risk with `stage4_2_implemented`
-  and `stage4_3_implemented` set to `false`. Stage 4.2 governor and Stage 4.3
-  selection are not implemented.
+  verification dependencies, and Stage 4.0 risk. Stage 4.2 governance and Stage
+  4.3 deterministic final-plan selection are implemented separately; the
+  Stage 4.2 -> 4.3 handoff truthfully reports `stage4_3_implemented=true`.
 
 ## Local development facts (not product requirements)
 

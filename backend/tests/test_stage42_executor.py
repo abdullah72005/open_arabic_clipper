@@ -419,7 +419,7 @@ def test_stage4_3_handoff_reports_stale_governance(session: Session) -> None:
     assert all(plan["governance"]["eligible_for_stage4_3"] is False for plan in stale["plans"])
     serialized = json.dumps(stale)
     assert "selected_plan_id" not in serialized
-    assert stale["stage4_3_implemented"] is False
+    assert stale["stage4_3_implemented"] is True
 
 
 def test_stage4_3_handoff_missing_fingerprint_is_unverifiable(session: Session) -> None:

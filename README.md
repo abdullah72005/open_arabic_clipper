@@ -23,7 +23,8 @@ semantic fidelity, filler/redundancy, narration burden, verification, and
 observable YouTube/Facebook reuse/spam risk — marking each plan eligible,
 cautioned, blocked, revision-required, rejected, or deferred, without selecting a
 winner. It does not reframe, render, synthesize speech, publish, or automatically
-authorize content; Stage 4.3 and later are not implemented.
+authorize content; Stage 4.3 deterministically selects zero or one current
+survivor, and later stages remain unimplemented.
 
 Only process material you own or are explicitly authorized to process. URL
 ingest downloads permitted public sources directly; an optional outbound proxy
@@ -273,8 +274,8 @@ reports `CANDIDATE_REFINED`, `FINAL_TRANSCRIPT_READY`,
 `NEEDS_MANUAL_TRANSCRIPT_REVIEW`, `PROVIDER_DEGRADED`, `REFINEMENT_FAILED`, or
 `CANCELLED`. It never retranscribes or uploads a whole source, is never added to
 the automatic stage chain, and `FINAL_TRANSCRIPT_READY` is not publishing
-readiness; Stage 4.0, Stage 4.1, and Stage 4.2 are implemented and Stage 4.3 is
-not. Queue and inspect refinements:
+readiness; Stage 4.0, Stage 4.1, Stage 4.2, and Stage 4.3 are implemented.
+Queue and inspect refinements:
 
 ```bash
 python -m app.cli candidate-refine CANDIDATE_ID --priority CANDIDATE
@@ -380,7 +381,34 @@ presentation-only transformation, fabricated claims, and misleading hooks are
 hard failures that no dimension offsets. Narration `NONE` is valid and no TTS
 provider/model/voice is ever selected. Rights, platform originality, and
 spam/repetition stay separate; account/channel repetition is deferred to Stage 7.
-Stage 4.3 remains unimplemented and no winner is selected.
+
+### Stage 4.3 deterministic final-plan selection
+
+Stage 4.3 is explicit, candidate-scoped, synchronous, transaction-safe, and
+provider-free. It consumes the authoritative Stage 4.2 -> 4.3 handoff plus current
+Stage 4.1 plan rows and commits each candidate to exactly zero or one current
+survivor: `PLAN_SELECTED`, `PLAN_SELECTED_WITH_CAUTION`, `NO_SELECTABLE_PLAN`,
+`SELECTION_DEFERRED`, or `STALE_SELECTION_INPUT`. Only `VERIFIED_CURRENT`
+governance can select; a conservative caution allowlist, a readable
+lexicographic hierarchy with no aggregate score, and a partial unique index
+guarantee one current result per candidate. It never replans, re-governs,
+rewrites, researches, refines transcripts, or renders, and it adds no pipeline
+stage, job kind, or `_NEXT_STAGE` entry. Selection and execution readiness are
+separate, and CANDIDATE-grade planning remains selectable without requiring
+`FINAL_CLIP`.
+
+```bash
+python -m app.cli transformation-selection CANDIDATE_ID
+python -m app.cli transformation-selection-handoff CANDIDATE_ID
+```
+
+API: `POST /api/candidates/{id}/transformation-selection`, `GET
+/api/candidates/{id}/transformation-selection`, `GET
+/api/transformation-selections/{id}`, and `GET
+/api/candidates/{id}/execution-handoff`. See
+[Stage 4.3 operations](docs/STAGE_4_3_OPERATIONS.md) for statuses, the caution
+allowlist, the deterministic hierarchy, fingerprints, idempotency/concurrency,
+selection versus execution readiness, and explicit Stage 5/6 exclusions.
 
 ```bash
 python -m app.cli transformation-govern CANDIDATE_ID

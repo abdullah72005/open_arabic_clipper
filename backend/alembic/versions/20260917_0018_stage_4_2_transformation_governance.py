@@ -163,7 +163,7 @@ def upgrade() -> None:
             "updated_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()
         ),
         sa.CheckConstraint(
-            "cache_eligible IN (0, 1)",
+            "cache_eligible IN (true, false)",
             name="ck_transformation_governance_sets_cache_eligible_bool",
         ),
     )
@@ -253,12 +253,12 @@ def upgrade() -> None:
             name="uq_transformation_governance_results_set_plan",
         ),
         sa.CheckConstraint(
-            "eligible_for_stage4_3 IN (0, 1)",
+            "eligible_for_stage4_3 IN (true, false)",
             name="ck_transformation_governance_results_eligible_bool",
         ),
         sa.CheckConstraint(
-            f"(eligible_for_stage4_3 = 1 AND status IN {_ELIGIBLE}) "
-            f"OR (eligible_for_stage4_3 = 0 AND status NOT IN {_ELIGIBLE})",
+            f"(eligible_for_stage4_3 AND status IN {_ELIGIBLE}) "
+            f"OR (NOT eligible_for_stage4_3 AND status NOT IN {_ELIGIBLE})",
             name="ck_transformation_governance_results_status_eligibility",
         ),
     )

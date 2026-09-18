@@ -88,8 +88,8 @@ shared Redis priority/budget controller. Deterministic entity/ambiguity and
 boundary refinement produce `CANDIDATE_REFINED`, `FINAL_TRANSCRIPT_READY`,
 `NEEDS_MANUAL_TRANSCRIPT_REVIEW`, `PROVIDER_DEGRADED`, `REFINEMENT_FAILED`, or
 `CANCELLED`. `FINAL_TRANSCRIPT_READY` is transcript readiness, not publishing
-readiness. Stage 4 receives a typed read-only Stage 3.5 handoff; Stage 4.0 and
-Stage 4.1 are implemented and Stage 4.2 is not. See
+readiness. Stage 4 receives a typed read-only Stage 3.5 handoff; Stage 4.0, Stage
+4.1, Stage 4.2, and Stage 4.3 are implemented. See
 `docs/STAGE_3_5_OPERATIONS.md`.
 
 ## Stage 4.0 transformation eligibility
@@ -180,6 +180,36 @@ The platform-policy profile is immutable and code-defined
 YouTube reused/inauthentic/spam concepts and Facebook original/unoriginal/spam
 concepts and never claims algorithm safety or monetization. Copyright/rights,
 platform originality, and spam/repetition remain separate. Account/channel-level
-repetition is `DEFERRED_TO_STAGE_7`. Stage 4.3 selection is not implemented and
-the read-only handoff contains no winner. See
+repetition is `DEFERRED_TO_STAGE_7`. The read-only Stage 4.2 -> 4.3 handoff
+contains no winner; deterministic selection is Stage 4.3. See
 `docs/STAGE_4_2_OPERATIONS.md`.
+
+## Stage 4.3 deterministic final-plan selection
+
+Stage 4.3 is explicit, candidate-scoped, **synchronous**, transaction-safe, and
+provider-free. It consumes the authoritative `build_stage4_3_handoff()` freshness
+contract plus current Stage 4.1 plan rows and commits each candidate to exactly
+zero or one current survivor: `PLAN_SELECTED`, `PLAN_SELECTED_WITH_CAUTION`,
+`NO_SELECTABLE_PLAN`, `SELECTION_DEFERRED`, or `STALE_SELECTION_INPUT`. Only
+`VERIFIED_CURRENT` governance can select; `STALE` yields no selection,
+`NOT_CURRENT`/`UNVERIFIABLE` defer, and internally inconsistent approved evidence
+fails closed as deferred and is never repaired. A conservative caution allowlist
+(`SOURCE_DOMINANCE_CONCERN`/`TEMPLATE_MASS_PRODUCED_FEEL` at MODERATE only)
+allows automatic caution selection; clean approvals always arbitrate first.
+Arbitration is a readable lexicographic comparison over Stage 4.2 evidence with
+no weighted aggregate score, ending in stable plan identity. It adds no Celery
+task, `ProcessingJob` kind, queue/executor, `PipelineStage`, `PipelineRun`, or
+`_NEXT_STAGE` entry, and it never replans, re-governs, rewrites, researches,
+refines transcripts, or renders.
+
+One table, `transformation_plan_selections`, persists one row per candidate +
+selection input fingerprint with a nullable `selected_plan_id`, an immutable
+snapshot of the selected governance evidence, per-alternative dispositions, and
+one database-current row per candidate enforced by a partial unique index.
+Concurrent POSTs converge through candidate-row locking, savepoint uniqueness
+recovery, and post-lock freshness revalidation. Selection and execution readiness
+are separate: readiness is computed live by the read-only execution handoff
+(`READY_FOR_FINAL_REFINEMENT`, `REQUIRES_FINAL_REFINEMENT_COMPATIBILITY_CHECK`,
+`READY_FOR_EXECUTION_PREP`, `BLOCKED`) and CANDIDATE-grade planning remains
+selectable without requiring `FINAL_CLIP`. Narration remains semantic only.
+See `docs/STAGE_4_3_OPERATIONS.md`.

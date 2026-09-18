@@ -52,7 +52,7 @@ class TransformationPlanSet(Base):
     __tablename__ = "transformation_plan_sets"
     __table_args__ = (
         CheckConstraint(
-            "cache_eligible IN (0, 1)",
+            "cache_eligible IN (true, false)",
             name="ck_transformation_plan_sets_cache_eligible_bool",
         ),
     )

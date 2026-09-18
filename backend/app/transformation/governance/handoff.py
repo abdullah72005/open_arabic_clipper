@@ -110,7 +110,7 @@ def build_stage4_3_handoff(
         ),
         "governance_set": None,
         "plans": [],
-        "stage4_3_implemented": False,
+        "stage4_3_implemented": True,
     }
     if governance_set is None:
         base["reason"] = "NO_GOVERNANCE_SET"

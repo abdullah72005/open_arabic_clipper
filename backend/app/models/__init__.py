@@ -18,6 +18,7 @@ from app.models.transformation_governance import (
     TransformationGovernanceSet,
 )
 from app.models.transformation_plan import TransformationPlan, TransformationPlanSet
+from app.models.transformation_selection import TransformationPlanSelection
 
 __all__ = [
     "AudioAnalysis",
@@ -35,6 +36,7 @@ __all__ = [
     "TransformationGovernanceResult",
     "TransformationGovernanceSet",
     "TransformationPlan",
+    "TransformationPlanSelection",
     "TransformationPlanSet",
     "TransformationStrategyCandidate",
 ]
