@@ -64,6 +64,32 @@ _ELIGIBLE_STATUSES = {
 }
 
 
+def _source_only_provider_plan(strategy_id: str, strategy_key: str) -> Any:
+    """A source-excerpt-only provider plan used by Stage 5.0 readiness tests."""
+
+    from app.core.enums import PlanBlockType, SourceExcerptRole
+    from app.transformation.planning.types import PlanProviderBlock, PlanProviderPlan
+
+    return PlanProviderPlan(
+        strategy_id=strategy_id,
+        strategy_key=strategy_key,
+        confidence=0.7,
+        blocks=(
+            PlanProviderBlock(
+                block_type=PlanBlockType.SOURCE_EXCERPT,
+                purpose="Hero source moment",
+                use_full_window=True,
+                source_role=SourceExcerptRole.HERO,
+            ),
+            PlanProviderBlock(
+                block_type=PlanBlockType.TRANSITION,
+                purpose="Structural transition",
+                estimated_duration=0.5,
+            ),
+        ),
+    )
+
+
 def _as_dict(value: object) -> dict[str, Any]:
     return dict(value) if isinstance(value, dict) else {}
 
@@ -191,6 +217,7 @@ def seed_selection_fixture(
     overall_outcome: GovernanceSemanticOutcome | None = None,
     planning_on_final: bool = False,
     plan_narration: str = "NONE",
+    source_only: bool = False,
     rights_risk: Any = None,
     originality_risk: Any = None,
     rights_status: Any = None,
@@ -266,8 +293,12 @@ def seed_selection_fixture(
     provider_plans: list[Any] = []
     for index, strategy in enumerate(strategies[: len(result_specs)]):
         if index == 0:
-            first_plan = make_source_value_plan(
-                str(strategy.id), strategy.strategy_key, narration_need=plan_narration
+            first_plan = (
+                _source_only_provider_plan(str(strategy.id), strategy.strategy_key)
+                if source_only
+                else make_source_value_plan(
+                    str(strategy.id), strategy.strategy_key, narration_need=plan_narration
+                )
             )
             if plan_narration == "RECOMMENDED":
                 first_plan = with_review_narration(first_plan)

@@ -159,3 +159,42 @@ revalidation. The selected Stage 4.2 evidence is snapshotted immutably because
 governance rows may be refreshed later; Stage 4.1 plans and Stage 4.2 rows are
 never mutated. Selection is not render or publication readiness, and narration
 remains semantic only. See `docs/STAGE_4_3_OPERATIONS.md`.
+
+## Stage 5.0 execution preflight and render contract
+
+Stage 5.0 is a new deterministic, provider-free `app/render` package that turns
+the current Stage 4.3 selection into one durable, evidence-bound execution/render
+contract per candidate/input fingerprint. It is synchronous and
+transaction-safe: no Celery task, `ProcessingJob` kind, queue/executor,
+`PipelineStage`, `PipelineRun`, or `_NEXT_STAGE` entry. It never renders,
+generates content, captions, tracks faces, synthesizes speech, or publishes.
+
+`policy.py` owns the versions, closed statuses/outcomes/reason codes,
+tolerances, protected semantic operators (negation/exclusivity/modality, English
++ Arabic), contraction expansions, filler tokens, the `SHORTS_1080X1920` render
+profile registry, and `Stage50Config`/`stage50_config_payload()`. `types.py`
+holds frozen value objects (`FinalClipEvidence`, `BoundSourceSpan`,
+`ContractBlock`, `MaterializationSlot`, media identity/facts, `ContractDraft`).
+`compatibility.py` evaluates the current `FINAL_CLIP` deterministically against
+the frozen Stage 4.1 plan excerpts (bounded alignment, wording/entity/number/
+operator comparison, timing and boundary bands, payoff/hook and grounding-quote
+coverage, meaning-critical unresolved spans) under a fixed outcome precedence.
+`binding.py` rebinds each `SOURCE_EXCERPT` to current `FINAL_CLIP` word evidence
+without ever mutating the plan. `media.py` performs stat-only managed-source
+identity and one bounded read-only ffprobe probe through an injectable seam with
+cached reuse. `fingerprints.py` composes canonical input/output/caption-source/
+media-identity/probe fingerprints that exclude TTS voice/provider/model, caption
+font/animation, crop, B-roll, codec tuning, publishing metadata, and final render
+artifact hashes. `service.py` runs preflight, assembles the contract, and
+persists/reuses it; `handoff.py` exposes the read-only Stage 5.1 handoff with
+`stage5_1_implemented=false`, `stage5_2_implemented=false`,
+`stage6_implemented=false`.
+
+`READY_FOR_RENDER_PLANNING`/`MATERIALIZATION_REQUIRED` persist a non-empty
+contract; every other status persists a reusable, non-executable preflight row.
+Persistence is one new table, `render_contracts` (unique candidate + input
+fingerprint, one database-current row per candidate via a partial unique index,
+`contract_ready`/status coupling check), added by migration `20260918_0020`.
+Stage 5.0 performs no BiDi manipulation and generates no subtitles; **Stage 5.1
+must add real rendered ASS/libass mixed Arabic–English caption regression
+tests**. See `docs/STAGE_5_0_OPERATIONS.md`.

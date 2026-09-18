@@ -11,6 +11,7 @@ from app.candidates.policy import Stage3Config
 from app.candidates.providers import SemanticProvider
 from app.core.enums import SemanticProviderMode
 from app.refinement.policy import AdmissionPolicy, Stage35Config
+from app.render.policy import Stage50Config
 from app.runtime.heavy_model_lease import HeavyModelLeaseFactory
 from app.transcription.correction import ContextualCorrector, CorrectionConfig
 from app.transcription.providers import CorrectionProvider, OpenAICompatibleCorrectionProvider
@@ -190,6 +191,11 @@ class Settings(BaseSettings):
     transformation_governance_strong_model: str = Field(default="gemini-3.8-flash", max_length=256)
     transformation_governance_max_output_tokens: int = Field(default=3_072, gt=0, le=8_192)
     transformation_governance_strong_thinking_level: Literal["low", "medium", "high"] = "low"
+    # Stage 5.0 deterministic render-contract configuration. No TTS voice,
+    # caption font, crop, or publishing setting participates.
+    render_contract_profile: Literal["SHORTS_1080X1920"] = "SHORTS_1080X1920"
+    render_contract_max_frame_rate: float = Field(default=60.0, gt=0, le=240)
+    render_contract_probe_reuse_enabled: bool = True
     transcription_queue_concurrency: int = Field(default=1, gt=0)
     cors_origins: list[str] = ["http://localhost:3301"]
 
@@ -549,6 +555,15 @@ class Settings(BaseSettings):
         return Stage42Config(
             provider_max_output_tokens=self.transformation_governance_max_output_tokens,
             provider_strong_thinking_level=self.transformation_governance_strong_thinking_level,
+        )
+
+    def stage50_config(self) -> Stage50Config:
+        """Build bounded Stage 5.0 render-contract configuration (no providers)."""
+
+        return Stage50Config(
+            profile_key=self.render_contract_profile,
+            max_frame_rate=self.render_contract_max_frame_rate,
+            probe_reuse_enabled=self.render_contract_probe_reuse_enabled,
         )
 
     def transformation_governance_semantic_mode(self) -> SemanticProviderMode:

@@ -5,6 +5,7 @@ from app.models.candidate_refinement import CandidateRefinement
 from app.models.clip_candidate import ClipCandidate
 from app.models.pipeline_run import PipelineRun
 from app.models.processing_job import ProcessingJob
+from app.models.render_contract import RenderContract
 from app.models.source_quality_assessment import SourceQualityAssessment
 from app.models.source_video import SourceVideo
 from app.models.transcript import Transcript
@@ -28,6 +29,7 @@ __all__ = [
     "ClipCandidate",
     "PipelineRun",
     "ProcessingJob",
+    "RenderContract",
     "SourceQualityAssessment",
     "SourceVideo",
     "Transcript",

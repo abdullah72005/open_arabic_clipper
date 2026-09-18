@@ -1,0 +1,332 @@
+"""Stage 5.0 execution preflight readiness and status semantics."""
+
+from __future__ import annotations
+
+from collections.abc import Iterator
+from typing import Any
+
+import pytest
+from sqlalchemy import Engine
+from sqlalchemy.orm import Session
+from stage43_support import FakeGovernanceSettings, install_selection_settings
+from stage50_support import (
+    FakeProber,
+    add_final,
+    no_video_prober,
+    seed_stage50,
+)
+
+from app.core.enums import RenderContractStatus
+from app.db.base import Base
+from app.media.ffprobe import MediaMetadata
+from app.models import RenderContract, TransformationPlanSelection
+from app.render.policy import MATERIALIZATION_REQUIRED, READY_FOR_RENDER_PLANNING
+from app.render.service import (
+    create_render_contract,
+    get_current_render_contract,
+    read_render_contract,
+)
+
+
+@pytest.fixture  # type: ignore[untyped-decorator]
+def session(sqlite_engine: Engine) -> Iterator[Session]:
+    Base.metadata.create_all(sqlite_engine)
+    with Session(sqlite_engine) as session:
+        yield session
+
+
+def _install(monkeypatch: Any) -> FakeGovernanceSettings:
+    settings = FakeGovernanceSettings()
+    install_selection_settings(monkeypatch, settings)
+    return settings
+
+
+def test_no_selected_plan_is_blocked(session: Session, monkeypatch: Any) -> None:
+    settings = _install(monkeypatch)
+    fixture = seed_stage50(session, settings=settings)
+    selection = session.query(TransformationPlanSelection).one()
+    session.delete(selection)
+    session.flush()
+    view = create_render_contract(
+        session, fixture.selection.candidate.id, storage=fixture.storage, prober=fixture.prober
+    )
+    assert view is not None
+    assert view.row.status is RenderContractStatus.BLOCKED
+    assert view.row.contract_ready is False
+
+
+def test_stale_selection_has_no_executable_contract(session: Session, monkeypatch: Any) -> None:
+    settings = _install(monkeypatch)
+    fixture = seed_stage50(session, settings=settings)
+    selection = session.query(TransformationPlanSelection).one()
+    selection.input_fingerprint = "stale-fingerprint"
+    session.flush()
+    view = create_render_contract(
+        session, fixture.selection.candidate.id, storage=fixture.storage, prober=fixture.prober
+    )
+    assert view is not None
+    assert view.row.contract_ready is False
+    assert view.row.status is RenderContractStatus.BLOCKED
+
+
+def test_missing_final_clip_requires_refinement_without_scheduling(
+    session: Session, monkeypatch: Any
+) -> None:
+    settings = _install(monkeypatch)
+    fixture = seed_stage50(session, settings=settings, planning_on_final=False)
+    before = session.query(TransformationPlanSelection).count()
+    view = create_render_contract(
+        session, fixture.selection.candidate.id, storage=fixture.storage, prober=fixture.prober
+    )
+    assert view is not None
+    assert view.row.status is RenderContractStatus.FINAL_CLIP_REFINEMENT_REQUIRED
+    assert view.row.contract_ready is False
+    # No new selection or refinement rows are created.
+    assert session.query(TransformationPlanSelection).count() == before
+
+
+def test_compatible_final_clip_is_executable_with_materialization(
+    session: Session, monkeypatch: Any
+) -> None:
+    settings = _install(monkeypatch)
+    fixture = seed_stage50(session, settings=settings)
+    view = create_render_contract(
+        session, fixture.selection.candidate.id, storage=fixture.storage, prober=fixture.prober
+    )
+    assert view is not None
+    assert view.row.status is RenderContractStatus.MATERIALIZATION_REQUIRED
+    assert view.row.contract_ready is True
+    payload = view.row.contract_payload
+    assert payload["materialization"]["required"] is True
+    assert payload["caption_input"]["logical_order_preserved"] is True
+
+
+def test_ready_readiness_mapping_is_ready_for_stage_5_1() -> None:
+    from app.render.service import _readiness
+
+    ready = _readiness(
+        status=READY_FOR_RENDER_PLANNING,
+        executable=True,
+        materialization_required=False,
+        source_media_ready=True,
+        transcript_ready=True,
+        compatibility_ready=True,
+        verification_ready=True,
+        reason_codes=[],
+    )
+    assert ready["final_render_ready"] is True
+    assert ready["next_action"] == "PROCEED_TO_STAGE_5_1"
+    assert ready["downstream_stage_eligibility"] == "READY_FOR_DOWNSTREAM_COMPOSITION"
+
+    pending = _readiness(
+        status=MATERIALIZATION_REQUIRED,
+        executable=True,
+        materialization_required=True,
+        source_media_ready=True,
+        transcript_ready=True,
+        compatibility_ready=True,
+        verification_ready=True,
+        reason_codes=["NARRATION_MATERIALIZATION_REQUIRED"],
+    )
+    assert pending["final_render_ready"] is False
+    assert pending["next_action"] == "STAGE_6_MATERIALIZATION_REQUIRED"
+
+
+def test_negation_change_requires_upstream_revalidation(session: Session, monkeypatch: Any) -> None:
+    settings = _install(monkeypatch)
+    fixture = seed_stage50(session, settings=settings, planning_on_final=False)
+    plan_text = fixture.selection.refinement.final_transcript
+    add_final(
+        session,
+        fixture,
+        transcript=plan_text.replace("collapsed productivity", "did not collapse productivity"),
+        output_fingerprint="newer-final-fp",
+    )
+    view = create_render_contract(
+        session, fixture.selection.candidate.id, storage=fixture.storage, prober=fixture.prober
+    )
+    assert view is not None
+    assert view.row.status is RenderContractStatus.UPSTREAM_REVALIDATION_REQUIRED
+    assert view.row.contract_ready is False
+
+
+def test_missing_source_media_is_unavailable(session: Session, monkeypatch: Any) -> None:
+    settings = _install(monkeypatch)
+    fixture = seed_stage50(session, settings=settings)
+    fixture.source_path.unlink()
+    session.flush()
+    view = create_render_contract(
+        session, fixture.selection.candidate.id, storage=fixture.storage, prober=fixture.prober
+    )
+    assert view is not None
+    assert view.row.status is RenderContractStatus.SOURCE_MEDIA_UNAVAILABLE
+
+
+def test_unmanaged_source_path_is_unavailable(session: Session, monkeypatch: Any) -> None:
+    settings = _install(monkeypatch)
+    fixture = seed_stage50(session, settings=settings)
+    fixture.selection.source.source_uri = "/tmp/not-managed-source.mp4"
+    session.flush()
+    view = create_render_contract(
+        session, fixture.selection.candidate.id, storage=fixture.storage, prober=fixture.prober
+    )
+    assert view is not None
+    assert view.row.status is RenderContractStatus.SOURCE_MEDIA_UNAVAILABLE
+
+
+def test_no_video_stream_is_unavailable(session: Session, monkeypatch: Any) -> None:
+    settings = _install(monkeypatch)
+    fixture = seed_stage50(session, settings=settings)
+    view = create_render_contract(
+        session,
+        fixture.selection.candidate.id,
+        storage=fixture.storage,
+        prober=no_video_prober(),
+    )
+    assert view is not None
+    assert view.row.status is RenderContractStatus.SOURCE_MEDIA_UNAVAILABLE
+
+
+def test_source_span_beyond_duration_is_invalid(session: Session, monkeypatch: Any) -> None:
+    settings = _install(monkeypatch)
+    fixture = seed_stage50(session, settings=settings)
+    short = FakeProber(
+        MediaMetadata(
+            duration_seconds=10.0,
+            video_codec="h264",
+            width=1920,
+            height=1080,
+            frames_per_second=30.0,
+            audio_codec="aac",
+            audio_sample_rate=48_000,
+        )
+    )
+    view = create_render_contract(
+        session, fixture.selection.candidate.id, storage=fixture.storage, prober=short
+    )
+    assert view is not None
+    assert view.row.status is RenderContractStatus.INVALID_SOURCE_BINDING
+
+
+def test_repeated_request_reuses_same_current_contract(session: Session, monkeypatch: Any) -> None:
+    settings = _install(monkeypatch)
+    fixture = seed_stage50(session, settings=settings)
+    first = create_render_contract(
+        session, fixture.selection.candidate.id, storage=fixture.storage, prober=fixture.prober
+    )
+    second = create_render_contract(
+        session, fixture.selection.candidate.id, storage=fixture.storage, prober=fixture.prober
+    )
+    assert first is not None and second is not None
+    assert first.row.id == second.row.id
+    assert second.row.metrics.get("contract_cache_hits", 0) >= 1
+
+
+def test_probe_reuse_across_contract_versions(session: Session, monkeypatch: Any) -> None:
+    settings = _install(monkeypatch)
+    fixture = seed_stage50(session, settings=settings, planning_on_final=False)
+    final = add_final(
+        session,
+        fixture,
+        transcript=fixture.selection.refinement.final_transcript,
+        output_fingerprint="final-fp-a",
+    )
+    prober = FakeProber()
+    first = create_render_contract(
+        session, fixture.selection.candidate.id, storage=fixture.storage, prober=prober
+    )
+    assert first is not None
+    assert prober.calls == 1
+    final.output_fingerprint = "final-fp-b"
+    session.flush()
+    second = create_render_contract(
+        session, fixture.selection.candidate.id, storage=fixture.storage, prober=prober
+    )
+    assert second is not None
+    assert second.row.id != first.row.id
+    # Cached probe facts are reused for the unchanged source media identity.
+    assert prober.calls == 1
+
+
+def test_read_freshness_and_current_contract(session: Session, monkeypatch: Any) -> None:
+    settings = _install(monkeypatch)
+    fixture = seed_stage50(session, settings=settings)
+    created = create_render_contract(
+        session, fixture.selection.candidate.id, storage=fixture.storage, prober=fixture.prober
+    )
+    assert created is not None
+    view = read_render_contract(session, fixture.selection.candidate.id)
+    assert view is not None
+    assert view.row.id == created.row.id
+    assert view.live_freshness == "CURRENT"
+    assert view.effective is True
+    assert get_current_render_contract(session, fixture.selection.candidate.id) is not None
+
+
+def test_readiness_constants_are_consistent(session: Session, monkeypatch: Any) -> None:
+    settings = _install(monkeypatch)
+    fixture = seed_stage50(session, settings=settings)
+    view = create_render_contract(
+        session, fixture.selection.candidate.id, storage=fixture.storage, prober=fixture.prober
+    )
+    assert view is not None
+    readiness = view.row.readiness
+    if view.row.status is RenderContractStatus.MATERIALIZATION_REQUIRED:
+        assert readiness["next_action"] == "STAGE_6_MATERIALIZATION_REQUIRED"
+        assert readiness["final_render_ready"] is False
+    assert view.row.status.value in {MATERIALIZATION_REQUIRED, READY_FOR_RENDER_PLANNING}
+
+
+def test_preflight_does_not_mutate_upstream_rows(session: Session, monkeypatch: Any) -> None:
+    settings = _install(monkeypatch)
+    fixture = seed_stage50(session, settings=settings)
+    plan = fixture.selection.plans[0]
+    selection = fixture.selection.governance_set
+    before_blocks = [dict(block) for block in plan.blocks]
+    before_plan_fp = plan.plan_output_fingerprint
+    before_governance = dict(selection.provider_evidence or {})
+    before_selection_status = session.query(TransformationPlanSelection).one().status
+
+    create_render_contract(
+        session, fixture.selection.candidate.id, storage=fixture.storage, prober=fixture.prober
+    )
+
+    session.refresh(plan)
+    assert [dict(block) for block in plan.blocks] == before_blocks
+    assert plan.plan_output_fingerprint == before_plan_fp
+    assert dict(selection.provider_evidence or {}) == before_governance
+    assert session.query(TransformationPlanSelection).one().status == before_selection_status
+
+
+def test_only_one_current_contract_after_repeated_requests(
+    session: Session, monkeypatch: Any
+) -> None:
+    _install(monkeypatch)
+    fixture = seed_stage50(session)
+    create_render_contract(
+        session, fixture.selection.candidate.id, storage=fixture.storage, prober=fixture.prober
+    )
+    create_render_contract(
+        session, fixture.selection.candidate.id, storage=fixture.storage, prober=fixture.prober
+    )
+    current = [
+        row
+        for row in session.query(RenderContract).all()
+        if row.clip_candidate_id == fixture.selection.candidate.id and row.is_current
+    ]
+    assert len(current) == 1
+
+
+def test_status_enum_has_no_compatibility_check_required(session: Session) -> None:
+    assert "COMPATIBILITY_CHECK_REQUIRED" not in {item.value for item in RenderContractStatus}
+
+
+def test_unusable_final_status_requires_refinement(session: Session, monkeypatch: Any) -> None:
+    settings = _install(monkeypatch)
+    fixture = seed_stage50(session, settings=settings, planning_on_final=False)
+    add_final(session, fixture, transcript="", output_fingerprint="empty-final-fp")
+    view = create_render_contract(
+        session, fixture.selection.candidate.id, storage=fixture.storage, prober=fixture.prober
+    )
+    assert view is not None
+    assert view.row.status is RenderContractStatus.FINAL_CLIP_REFINEMENT_REQUIRED

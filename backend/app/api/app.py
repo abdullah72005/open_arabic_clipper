@@ -40,6 +40,7 @@ from app.models import (
     CandidateRefinement,
     ClipCandidate,
     ProcessingJob,
+    RenderContract,
     SourceQualityAssessment,
     SourceVideo,
     Transcript,
@@ -55,6 +56,13 @@ from app.refinement.queue import (
     queue_candidate_batch,
     queue_candidate_refinement,
     validate_candidate_for_refinement,
+)
+from app.render.handoff import build_stage5_1_handoff
+from app.render.service import (
+    create_render_contract,
+    get_current_render_contract,
+    get_render_contract,
+    read_render_contract,
 )
 from app.services.health import CheckStatus, HealthService
 from app.services.source_adapters import SourceValidationError, normalize_source_url
@@ -533,6 +541,54 @@ class ExecutionHandoffResponse(BaseModel):
     execution_readiness: str
     stage5_implemented: bool
     stage6_tts_implemented: bool
+    model_config = {"extra": "allow"}
+
+
+class RenderContractResponse(BaseModel):
+    id: UUID
+    source_video_id: UUID
+    clip_candidate_id: UUID
+    transformation_selection_id: UUID | None
+    selected_plan_id: UUID | None
+    final_refinement_id: UUID | None
+    status: str
+    compatibility_outcome: str | None
+    is_current: bool
+    contract_ready: bool
+    reason_codes: list[str]
+    compatibility_evidence: dict[str, object]
+    source_media_identity: dict[str, object]
+    source_probe: dict[str, object]
+    readiness: dict[str, object]
+    contract_payload: dict[str, object]
+    selected_plan_fingerprint: str
+    planning_refinement_output_fingerprint: str
+    final_refinement_output_fingerprint: str
+    caption_source_fingerprint: str
+    source_media_fingerprint: str
+    probe_fingerprint: str
+    input_fingerprint: str
+    output_fingerprint: str
+    profile_key: str
+    profile_version: str
+    policy_version: str
+    schema_version: str
+    fingerprint_version: str
+    metrics: dict[str, object]
+    live_freshness: str
+    effective: bool
+    created_at: datetime
+    updated_at: datetime
+    model_config = {"extra": "allow"}
+
+
+class Stage51HandoffResponse(BaseModel):
+    candidate: dict[str, object]
+    contract: dict[str, object] | None
+    readiness: dict[str, object] | None
+    stage5_1_implemented: bool
+    stage5_2_implemented: bool
+    stage6_implemented: bool
     model_config = {"extra": "allow"}
 
 
@@ -1347,6 +1403,64 @@ def create_app(
             raise HTTPException(status_code=404, detail="candidate not found")
         return ExecutionHandoffResponse(**handoff)
 
+    @app.post(
+        "/api/candidates/{candidate_id}/render-contract",
+        response_model=RenderContractResponse,
+    )
+    def create_candidate_render_contract(
+        candidate_id: UUID, database: Session = Depends(session)
+    ) -> RenderContractResponse:
+        """Synchronously run Stage 5.0 preflight and reuse/persist one contract."""
+
+        view = create_render_contract(database, candidate_id)
+        if view is None:
+            raise HTTPException(status_code=404, detail="candidate not found")
+        response = _render_contract_response(view.row, view.live_freshness, view.effective)
+        database.commit()
+        return response
+
+    @app.get(
+        "/api/candidates/{candidate_id}/render-contract",
+        response_model=RenderContractResponse,
+    )
+    def get_candidate_render_contract(
+        candidate_id: UUID, database: Session = Depends(session)
+    ) -> RenderContractResponse:
+        view = read_render_contract(database, candidate_id)
+        if view is None:
+            raise HTTPException(status_code=404, detail="render contract not found")
+        return _render_contract_response(view.row, view.live_freshness, view.effective)
+
+    @app.get(
+        "/api/render-contracts/{contract_id}",
+        response_model=RenderContractResponse,
+    )
+    def get_render_contract_by_id(
+        contract_id: UUID, database: Session = Depends(session)
+    ) -> RenderContractResponse:
+        row = get_render_contract(database, contract_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="render contract not found")
+        # Always serialize the requested row with its own current/effective state.
+        current = get_current_render_contract(database, row.clip_candidate_id)
+        view = read_render_contract(database, row.clip_candidate_id)
+        live_freshness = view.live_freshness if view is not None else "NOT_CURRENT"
+        is_current_row = current is not None and current.id == row.id
+        effective = bool(is_current_row and view is not None and view.effective)
+        return _render_contract_response(row, live_freshness, effective)
+
+    @app.get(
+        "/api/candidates/{candidate_id}/stage5-1-handoff",
+        response_model=Stage51HandoffResponse,
+    )
+    def get_stage5_1_handoff(
+        candidate_id: UUID, database: Session = Depends(session)
+    ) -> Stage51HandoffResponse:
+        handoff = build_stage5_1_handoff(database, candidate_id)
+        if handoff is None:
+            raise HTTPException(status_code=404, detail="candidate not found")
+        return Stage51HandoffResponse(**handoff)
+
     @app.patch("/api/sources/{source_id}/provenance", response_model=SourceResponse)
     def update_source_provenance(
         source_id: UUID,
@@ -1811,6 +1925,49 @@ def _selection_response(
         policy_version=row.policy_version,
         schema_version=row.schema_version,
         fingerprint_version=row.fingerprint_version,
+        live_freshness=live_freshness,
+        effective=effective,
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+    )
+
+
+def _render_contract_response(
+    row: RenderContract, live_freshness: str, effective: bool
+) -> RenderContractResponse:
+    return RenderContractResponse(
+        id=row.id,
+        source_video_id=row.source_video_id,
+        clip_candidate_id=row.clip_candidate_id,
+        transformation_selection_id=row.transformation_selection_id,
+        selected_plan_id=row.selected_plan_id,
+        final_refinement_id=row.final_refinement_id,
+        status=row.status.value,
+        compatibility_outcome=(
+            row.compatibility_outcome.value if row.compatibility_outcome else None
+        ),
+        is_current=bool(row.is_current),
+        contract_ready=bool(row.contract_ready),
+        reason_codes=list(row.reason_codes or []),
+        compatibility_evidence=_without_secrets(dict(row.compatibility_evidence or {})),
+        source_media_identity=dict(row.source_media_identity or {}),
+        source_probe=_without_secrets(dict(row.source_probe or {})),
+        readiness=dict(row.readiness or {}),
+        contract_payload=_without_secrets(dict(row.contract_payload or {})),
+        selected_plan_fingerprint=row.selected_plan_fingerprint,
+        planning_refinement_output_fingerprint=row.planning_refinement_output_fingerprint,
+        final_refinement_output_fingerprint=row.final_refinement_output_fingerprint,
+        caption_source_fingerprint=row.caption_source_fingerprint,
+        source_media_fingerprint=row.source_media_fingerprint,
+        probe_fingerprint=row.probe_fingerprint,
+        input_fingerprint=row.input_fingerprint,
+        output_fingerprint=row.output_fingerprint,
+        profile_key=row.profile_key,
+        profile_version=row.profile_version,
+        policy_version=row.policy_version,
+        schema_version=row.schema_version,
+        fingerprint_version=row.fingerprint_version,
+        metrics=dict(row.metrics or {}),
         live_freshness=live_freshness,
         effective=effective,
         created_at=row.created_at,
