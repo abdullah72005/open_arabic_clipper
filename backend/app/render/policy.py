@@ -6,6 +6,14 @@ no audio decoding, no rendering. Protected semantic operator vocabularies are
 deliberately re-declared here (mirroring the frozen Stage 4.2 governed
 vocabulary) so Stage 5.0 can fail closed on meaning changes without touching
 Stage 4.2 behavior.
+
+Policy version ``stage5.0-v2`` and compatibility policy version
+``stage5.0-compatibility-v2`` invalidate every pre-fix render contract by
+changing the input fingerprint. They cover the corrective patch's behavior
+changes (strict recovered-code-switch admission and typographic-apostrophe
+normalization) and the now-complete fingerprint inputs (verification state plus
+the full ``stage50_config_payload``). The schema and fingerprint versions are
+unchanged because no persisted JSON shape changed.
 """
 
 from __future__ import annotations
@@ -13,10 +21,10 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 
-RENDER_CONTRACT_POLICY_VERSION = "stage5.0-v1"
+RENDER_CONTRACT_POLICY_VERSION = "stage5.0-v2"
 RENDER_CONTRACT_SCHEMA_VERSION = "stage5.0-schema-v1"
 RENDER_CONTRACT_FINGERPRINT_VERSION = "1"
-COMPATIBILITY_POLICY_VERSION = "stage5.0-compatibility-v1"
+COMPATIBILITY_POLICY_VERSION = "stage5.0-compatibility-v2"
 RENDER_PROFILE_VERSION = "stage5.0-render-profile-v1"
 
 # ---------------------------------------------------------------------------

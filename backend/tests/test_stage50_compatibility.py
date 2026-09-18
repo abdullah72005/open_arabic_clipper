@@ -68,11 +68,54 @@ def test_punctuation_and_normalization_only_change_is_compatible() -> None:
     assert result.outcome == COMPATIBLE_NON_MATERIAL_CHANGE
 
 
-def test_recovered_harmless_english_token_is_compatible() -> None:
-    result = evaluate(BASE_TEXT, BASE_TEXT + " indeed")
+def test_recovered_listed_code_switch_token_is_compatible() -> None:
+    plan = "النهارده بنشرح الفكرة"
+    final = make_final(
+        plan + " learning",
+        code_switch_evidence={"suspected": True, "tokens": ["learning"]},
+    )
+    result = evaluate(plan, "", final=final)
     assert result.outcome == COMPATIBLE_NON_MATERIAL_CHANGE
-    verdict = result.per_block[0]
-    assert verdict.recovered_code_switch_tokens
+    assert "learning" in result.per_block[0].recovered_code_switch_tokens
+
+
+def test_recovered_english_token_in_arabic_excerpt_is_compatible() -> None:
+    plan = "النهارده بنشرح الفكرة"
+    final = make_final(plan + " learning")
+    result = evaluate(plan, "", final=final)
+    assert result.outcome == COMPATIBLE_NON_MATERIAL_CHANGE
+    assert result.per_block[0].recovered_code_switch_tokens
+
+
+@pytest.mark.parametrize(
+    "final_text",
+    [
+        "the rate fell dramatically",
+        "the rate reportedly fell",
+        "the rate fell quite sharply",
+    ],
+)
+def test_inserted_english_intensifier_is_not_recovered(final_text: str) -> None:
+    result = evaluate("the rate fell", final_text)
+    assert result.outcome != COMPATIBLE_NON_MATERIAL_CHANGE
+    assert not result.per_block[0].recovered_code_switch_tokens
+
+
+def test_typographic_apostrophe_contracts_compare_equal() -> None:
+    assert evaluate("we can't do it", "we can\u2019t do it").outcome == (
+        COMPATIBLE_NON_MATERIAL_CHANGE
+    )
+    assert evaluate("we won't go", "we won\u2019t go").outcome == (COMPATIBLE_NON_MATERIAL_CHANGE)
+
+
+def test_negative_contraction_forms_preserve_negation() -> None:
+    # ASCII vs typographic negated contraction must not read as an operator change.
+    assert evaluate("we can't do it", "we can\u2019t do it").outcome == (
+        COMPATIBLE_NON_MATERIAL_CHANGE
+    )
+    # But a real negation change must still fail closed as material.
+    result = evaluate("we can do it", "we can\u2019t do it")
+    assert result.outcome == MATERIAL_SEMANTIC_CHANGE
 
 
 def test_negation_change_is_material_semantic() -> None:
@@ -196,7 +239,7 @@ def test_bounded_alignment_rebinds_word_indexes() -> None:
     "plan,final,expected",
     [
         ("the cat sat on the mat", "the cat sat on the mat", COMPATIBLE_NON_MATERIAL_CHANGE),
-        ("the cat sat", "the cat sat quickly", COMPATIBLE_NON_MATERIAL_CHANGE),
+        ("the cat sat on the mat", "the cat sat on a mat", COMPATIBLE_NON_MATERIAL_CHANGE),
     ],
 )
 def test_small_wording_change_is_compatible(plan: str, final: str, expected: str) -> None:

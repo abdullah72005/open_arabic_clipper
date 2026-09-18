@@ -85,6 +85,19 @@ def test_input_fingerprint_changes_with_policy_config() -> None:
     assert _fp() != _fp(stage50_config={"profile_key": "SHORTS_1080X1920", "max_frame_rate": 30.0})
 
 
+def test_input_fingerprint_changes_with_verification_state() -> None:
+    assert _fp() != _fp(verification_state="EXTERNAL_REQUIRED_UNRESOLVED")
+    assert _fp() != _fp(verification_unresolved=True)
+
+
+def test_input_fingerprint_changes_with_compatibility_tolerance() -> None:
+    changed = stage50_config_payload(Stage50Config())
+    tolerances = dict(changed["tolerances"])  # type: ignore[arg-type]
+    tolerances["compatible_edit_ratio"] = 0.99
+    changed["tolerances"] = tolerances
+    assert _fp() != _fp(stage50_config=changed)
+
+
 def test_tts_voice_provider_and_caption_style_are_not_fingerprint_inputs() -> None:
     config_payload = stage50_config_payload(Stage50Config())
     text = str(config_payload).casefold()

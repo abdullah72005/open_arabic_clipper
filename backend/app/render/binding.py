@@ -29,6 +29,26 @@ _TOKEN = re.compile(r"[\u0600-\u06FF]+|[A-Za-z]+|\d+(?:[.,:/-]\d+)*")
 _PUNCTUATION = re.compile(r"[.!؟?…,;:\"'`\-–—()\[\]{}]+")
 _SPACE = re.compile(r"\s+")
 
+# NFKC does not fold typographic/alternate apostrophes to ASCII, so ``can’t``
+# and ``can't`` must be unified explicitly before contraction expansion. The
+# frozen Stage 4.2 vocabulary is mirrored here; Stage 4.2 stays untouched.
+_APOSTROPHE_TRANSLATION = str.maketrans(
+    {
+        "\u2018": "'",  # left single quotation mark
+        "\u2019": "'",  # right single quotation mark
+        "\u02bc": "'",  # modifier letter apostrophe
+        "\uff07": "'",  # fullwidth apostrophe
+        "\u0060": "'",  # grave accent
+        "\u00b4": "'",  # acute accent
+    }
+)
+
+
+def normalize_apostrophes(text: str) -> str:
+    """Fold typographic/alternate apostrophes to ASCII before comparison."""
+
+    return text.translate(_APOSTROPHE_TRANSLATION)
+
 
 def expand_contractions(text: str) -> str:
     """Expand conservative English contractions before tokenizing."""
@@ -52,7 +72,7 @@ def analysis_tokens(text: str, *, keep_filler: bool = True) -> list[str]:
 
     if not text:
         return []
-    expanded = expand_contractions(text)
+    expanded = expand_contractions(normalize_apostrophes(text))
     normalized = matching_text(expanded)
     normalized = _PUNCTUATION.sub(" ", normalized)
     tokens = _TOKEN.findall(normalized)
@@ -356,5 +376,6 @@ __all__ = [
     "expand_contractions",
     "has_digit",
     "is_full_window_sentinel",
+    "normalize_apostrophes",
     "word_text",
 ]

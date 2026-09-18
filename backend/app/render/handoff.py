@@ -14,7 +14,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.models import ClipCandidate
-from app.render.service import get_current_render_contract
+from app.render.service import get_current_render_contract, read_render_contract
 
 _STAGE_FLAGS = {
     "stage5_1_implemented": False,
@@ -36,6 +36,9 @@ def build_stage5_1_handoff(
         return None
 
     row = get_current_render_contract(session, candidate.id)
+    view = read_render_contract(session, candidate.id)
+    live_freshness = view.live_freshness if view is not None else "NOT_CURRENT"
+    effective = bool(view.effective) if view is not None else False
     base: dict[str, Any] = {
         "candidate": {
             "id": str(candidate.id),
@@ -89,6 +92,8 @@ def build_stage5_1_handoff(
         ),
         "contract_ready": bool(row.contract_ready),
         "is_current": bool(row.is_current),
+        "live_freshness": live_freshness,
+        "effective": effective,
         "policy_version": row.policy_version,
         "schema_version": row.schema_version,
         "fingerprint_version": row.fingerprint_version,

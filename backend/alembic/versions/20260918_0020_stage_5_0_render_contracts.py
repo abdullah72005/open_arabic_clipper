@@ -115,7 +115,7 @@ def upgrade() -> None:
         sa.Column("output_fingerprint", sa.String(64), nullable=False, server_default=""),
         sa.Column("profile_key", sa.String(64), nullable=False, server_default=""),
         sa.Column("profile_version", sa.String(80), nullable=False, server_default=""),
-        sa.Column("policy_version", sa.String(64), nullable=False, server_default="stage5.0-v1"),
+        sa.Column("policy_version", sa.String(64), nullable=False, server_default="stage5.0-v2"),
         sa.Column(
             "schema_version", sa.String(64), nullable=False, server_default="stage5.0-schema-v1"
         ),

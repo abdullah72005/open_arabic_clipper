@@ -17,9 +17,12 @@ from stage50_support import (
 )
 
 from app.core.enums import RenderContractStatus
+from app.core.settings import Settings
+from app.core.settings import get_settings as core_get_settings
 from app.db.base import Base
 from app.media.ffprobe import MediaMetadata
 from app.models import RenderContract, TransformationPlanSelection
+from app.render.handoff import build_stage5_1_handoff
 from app.render.policy import MATERIALIZATION_REQUIRED, READY_FOR_RENDER_PLANNING
 from app.render.service import (
     create_render_contract,
@@ -261,6 +264,62 @@ def test_read_freshness_and_current_contract(session: Session, monkeypatch: Any)
     assert view.live_freshness == "CURRENT"
     assert view.effective is True
     assert get_current_render_contract(session, fixture.selection.candidate.id) is not None
+
+
+def test_read_freshness_is_stale_after_final_clip_change(
+    session: Session, monkeypatch: Any
+) -> None:
+    settings = _install(monkeypatch)
+    fixture = seed_stage50(session, settings=settings)
+    created = create_render_contract(
+        session, fixture.selection.candidate.id, storage=fixture.storage, prober=fixture.prober
+    )
+    assert created is not None and created.row.contract_ready is True
+    final = fixture.selection.refinement
+    final.final_transcript = final.final_transcript + " changed"
+    final.output_fingerprint = "changed-final-fp"
+    session.flush()
+    view = read_render_contract(session, fixture.selection.candidate.id)
+    assert view is not None
+    assert view.live_freshness == "STALE"
+    assert view.effective is False
+    handoff = build_stage5_1_handoff(session, fixture.selection.candidate.id)
+    assert handoff is not None
+    assert handoff["contract"]["effective"] is False
+    assert handoff["contract"]["live_freshness"] == "STALE"
+
+
+def test_read_freshness_is_stale_after_plan_change(session: Session, monkeypatch: Any) -> None:
+    settings = _install(monkeypatch)
+    fixture = seed_stage50(session, settings=settings)
+    create_render_contract(
+        session, fixture.selection.candidate.id, storage=fixture.storage, prober=fixture.prober
+    )
+    fixture.selection.plans[0].plan_output_fingerprint = "changed-plan-fp"
+    session.flush()
+    view = read_render_contract(session, fixture.selection.candidate.id)
+    assert view is not None
+    assert view.live_freshness == "STALE"
+    assert view.effective is False
+
+
+def test_read_freshness_is_stale_after_config_change(session: Session, monkeypatch: Any) -> None:
+    settings = _install(monkeypatch)
+    fixture = seed_stage50(session, settings=settings)
+    create_render_contract(
+        session, fixture.selection.candidate.id, storage=fixture.storage, prober=fixture.prober
+    )
+    storage_root = core_get_settings().storage_root
+    changed = Settings(
+        database_url="sqlite+pysqlite:///:memory:",
+        storage_root=storage_root,
+        render_contract_max_frame_rate=30.0,
+    )
+    monkeypatch.setattr("app.render.service.get_settings", lambda: changed)
+    view = read_render_contract(session, fixture.selection.candidate.id)
+    assert view is not None
+    assert view.live_freshness == "STALE"
+    assert view.effective is False
 
 
 def test_readiness_constants_are_consistent(session: Session, monkeypatch: Any) -> None:

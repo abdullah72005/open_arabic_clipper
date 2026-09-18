@@ -62,6 +62,7 @@ from app.render.types import BlockCompatibility, ClipWord, CompatibilityResult, 
 _SUBSTANTIVE_TYPES = {"ORIGINAL_VALUE", "TEXTUAL_ANNOTATION"}
 _GROUNDING_ENTITY_TYPES = {"PERSON", "PRODUCT", "PLACE", "ABBREVIATION", "TECHNICAL"}
 _LATIN = re.compile(r"[A-Za-z]")
+_ARABIC_SCRIPT = re.compile(r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]")
 
 
 def _block_index(block: Mapping[str, object]) -> int:
@@ -352,7 +353,7 @@ def _semantic_verdict(
             removed_tokens=tuple(removed),
         )
 
-    recovered = _recovered_code_switch(added, final=final)
+    recovered = _recovered_code_switch(added, final=final, plan_text=plan_text)
     if recovered:
         return BlockCompatibility(
             block_index=block_index,
@@ -510,19 +511,32 @@ def _entity_changed(plan_text: str, final_text: str) -> bool:
     return False
 
 
-def _recovered_code_switch(added: Sequence[str], *, final: FinalClipEvidence) -> list[str]:
+def _recovered_code_switch(
+    added: Sequence[str], *, final: FinalClipEvidence, plan_text: str
+) -> list[str]:
+    """Admit an added Latin token as recovered code-switch only with evidence.
+
+    A token is recovered only when it is listed in FINAL_CLIP code-switch
+    evidence (case-folded membership) or when the planning excerpt itself
+    contains Arabic-script tokens (the genuine omitted-English-in-Arabic case).
+    An arbitrary inserted English intensifier/hedge in an English excerpt is
+    never silently recovered; it flows through the normal change path.
+    """
+
     code_switch = {
         str(token).casefold()
         for token in _as_sequence(final.code_switch_evidence.get("tokens"))
         if isinstance(token, str)
     }
+    plan_has_arabic = bool(_ARABIC_SCRIPT.search(plan_text))
     recovered: list[str] = []
     for token in added:
         if token in PROTECTED_SEMANTIC_OPERATORS or has_digit(token):
             continue
-        if _LATIN.search(token):
-            if not code_switch or token in code_switch:
-                recovered.append(token)
+        if not _LATIN.search(token):
+            continue
+        if token in code_switch or plan_has_arabic:
+            recovered.append(token)
     return recovered
 
 

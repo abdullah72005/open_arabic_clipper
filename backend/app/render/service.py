@@ -82,6 +82,7 @@ from app.render.policy import (
     UPSTREAM_REVALIDATION_REQUIRED,
     Stage50Config,
     render_profile_for,
+    stage50_config_payload,
 )
 from app.render.types import (
     ContractBlock,
@@ -557,14 +558,14 @@ def _finalize(
     profile = render_profile_for(config.profile_key)
 
     compatibility_result = compatibility
+    # Fingerprint inputs are computed from live rows only, independent of the
+    # preflight exit path, so read-time freshness can recompute them exactly.
+    final_fp = final_row.output_fingerprint or "" if final_row is not None else ""
+    planning_fp = (selection.refinement_output_fingerprint if selection is not None else "") or ""
     caption_fp = ""
-    final_fp = ""
-    planning_fp = ""
-    if final_row is not None:
-        final_fp = final_row.output_fingerprint or ""
-    if compatibility_result is not None:
-        caption_fp = compatibility_result.caption_source_fingerprint
-        planning_fp = compatibility_result.planning_output_fingerprint
+    if final_row is not None and _is_usable_final(final_row):
+        caption_fp = _caption_source_fingerprint(final_row)
+    verification_state, verification_unresolved = _verification_flags(gathered.governance_snapshot)
 
     media_fp = source_media_identity_fingerprint(identity_payload) if identity_payload else ""
     facts_payload = facts.as_dict() if facts is not None else {}
@@ -577,6 +578,8 @@ def _finalize(
         caption_fingerprint=caption_fp,
         final_refinement_output_fingerprint=final_fp,
         planning_refinement_output_fingerprint=planning_fp,
+        verification_state=verification_state,
+        verification_unresolved=verification_unresolved,
         profile=profile,
         config=config,
     )
@@ -1531,6 +1534,8 @@ def _input_fingerprint(
     caption_fingerprint: str,
     final_refinement_output_fingerprint: str,
     planning_refinement_output_fingerprint: str,
+    verification_state: str,
+    verification_unresolved: bool,
     profile: Any,
     config: Stage50Config,
 ) -> str:
@@ -1599,20 +1604,41 @@ def _input_fingerprint(
             ),
             final_refinement_output_fingerprint=final_refinement_output_fingerprint,
             live_caption_source_fingerprint=caption_fingerprint,
-            verification_state="",
-            verification_unresolved=False,
+            verification_state=verification_state,
+            verification_unresolved=verification_unresolved,
             profile_key=profile.key,
             profile_version=profile.semantic_version,
-            stage50_config={
-                "profile_key": config.profile_key,
-                "max_frame_rate": config.max_frame_rate,
-                "probe_reuse_enabled": config.probe_reuse_enabled,
-                "policy_version": RENDER_CONTRACT_POLICY_VERSION,
-                "schema_version": RENDER_CONTRACT_SCHEMA_VERSION,
-                "fingerprint_version": RENDER_CONTRACT_FINGERPRINT_VERSION,
-            },
+            stage50_config=stage50_config_payload(config),
         )
     )
+
+
+def _caption_source_fingerprint(final_row: CandidateRefinement) -> str:
+    """Recompute the caption-source fingerprint from the live FINAL_CLIP row."""
+
+    return caption_source_fingerprint(
+        build_caption_source_payload(
+            final_transcript=final_row.final_transcript or "",
+            word_timestamps=final_row.word_timestamps or [],
+            dialect_profile=final_row.dialect_profile,
+            dialect_confidence=float(final_row.dialect_confidence or 0.0),
+            code_switch_evidence=dict(final_row.code_switch_evidence or {}),
+            final_refinement_output_fingerprint=final_row.output_fingerprint or "",
+        )
+    )
+
+
+def _verification_flags(governance: Mapping[str, object]) -> tuple[str, bool]:
+    """Live governance verification state used by the fingerprint and gate."""
+
+    verification = governance.get("verification")
+    if isinstance(verification, Mapping):
+        claim_state = verification.get("claim_state")
+        return (
+            str(claim_state) if claim_state is not None else "",
+            bool(verification.get("unresolved")),
+        )
+    return "", False
 
 
 def _compatibility_evidence(compatibility: Any) -> dict[str, object]:
@@ -1663,17 +1689,50 @@ def _protected_tokens(text: str) -> list[str]:
 def _live_freshness(
     session: Session, candidate: ClipCandidate, row: RenderContract, settings: Settings
 ) -> str:
-    """Recompute stat-only input freshness; never probe or call a provider."""
+    """Recompute the full stored input fingerprint from live rows.
 
-    try:
-        identity = _best_effort_identity(candidate, StorageService(settings.storage_root))
-    except (SourceMediaFailure, StorageValidationError, OSError):
-        return "UNVERIFIABLE"
+    Uses database reads plus the stat-only ``_best_effort_identity``: never
+    ffprobe, never a provider. Any recomputation failure is UNVERIFIABLE; only an
+    exact match to the persisted input fingerprint is CURRENT.
+    """
+
     if not row.input_fingerprint:
         return "UNVERIFIABLE"
-    if row.source_media_identity and dict(row.source_media_identity) != identity:
-        return "STALE"
-    return "CURRENT"
+    try:
+        gathered = _gather(session, candidate)
+        identity = _best_effort_identity(candidate, StorageService(settings.storage_root))
+        config = settings.stage50_config()
+        profile = render_profile_for(config.profile_key)
+        final_row = gathered.final_refinement
+        final_fp = (final_row.output_fingerprint or "") if final_row is not None else ""
+        planning_fp = (
+            (gathered.selection.refinement_output_fingerprint or "")
+            if gathered.selection is not None
+            else ""
+        )
+        caption_fp = (
+            _caption_source_fingerprint(final_row)
+            if final_row is not None and _is_usable_final(final_row)
+            else ""
+        )
+        verification_state, verification_unresolved = _verification_flags(
+            gathered.governance_snapshot
+        )
+        recomputed = _input_fingerprint(
+            candidate=candidate,
+            gathered=gathered,
+            identity_payload=identity,
+            caption_fingerprint=caption_fp,
+            final_refinement_output_fingerprint=final_fp,
+            planning_refinement_output_fingerprint=planning_fp,
+            verification_state=verification_state,
+            verification_unresolved=verification_unresolved,
+            profile=profile,
+            config=config,
+        )
+    except Exception:
+        return "UNVERIFIABLE"
+    return "CURRENT" if recomputed == row.input_fingerprint else "STALE"
 
 
 # ---------------------------------------------------------------------------

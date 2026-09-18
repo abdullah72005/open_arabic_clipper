@@ -163,7 +163,7 @@ class RenderContract(Base):
     profile_key: Mapped[str] = mapped_column(String(64), nullable=False, default="")
     profile_version: Mapped[str] = mapped_column(String(80), nullable=False, default="")
     policy_version: Mapped[str] = mapped_column(
-        String(64), nullable=False, default="stage5.0-v1", server_default="stage5.0-v1"
+        String(64), nullable=False, default="stage5.0-v2", server_default="stage5.0-v2"
     )
     schema_version: Mapped[str] = mapped_column(
         String(64),

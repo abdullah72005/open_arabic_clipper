@@ -85,13 +85,20 @@ Deterministic and pure over persisted evidence; provider timestamps are never
 trusted. Per `SOURCE_EXCERPT`: structural validation, bounded token alignment
 (`difflib`, 8 s window, max 600 words, ≥ 0.5 coverage), wording comparison over
 analysis-normalized tokens (NFKC, diacritics/tatweel stripped, alif/ya unified,
-Latin casefolded, contractions expanded), protected semantic operators
+Latin casefolded, typographic/alternate apostrophes folded to ASCII, contractions
+expanded), protected semantic operators
 (negation/exclusivity/modality; English + Arabic), digit/numeric-entity change,
 entity change, recovered code-switch tokens, change-ratio bands
 (≤0.20 compatible, ≤0.50 unresolved, >0.50 material), complete-thought and
 window-clipping boundary checks, timing-drift bands (≤1.5 bounded, ≤3.0
 boundary-adjusted, >3.0 material), payoff/hook coverage, grounding-quote
 preservation, meaning-critical unresolved spans, and word-evidence sufficiency.
+
+An added Latin token is admitted as a recovered code-switch **only** when it is
+listed in `FINAL_CLIP` code-switch evidence (case-folded) or the planning excerpt
+itself contains Arabic-script tokens. An arbitrary inserted English
+intensifier/hedge in an English excerpt is never silently recovered; it flows
+through the normal operator/number/entity/change-ratio path.
 
 Outcome precedence (most severe first): `SOURCE_SPAN_NO_LONGER_VALID` >
 `UNRESOLVED_COMPATIBILITY` > `MATERIAL_SEMANTIC_CHANGE` >
@@ -151,9 +158,12 @@ reversed or injected with U+202A–U+202E/U+2066–U+2069.
 
 `input_fingerprint` covers candidate/source identity, live `SourceMediaIdentity`,
 selection and plan identity/fingerprints, planning and `FINAL_CLIP` refinement
-identity/output fingerprints, live caption-source fingerprint, verification
-state, render profile, `stage50_config_payload()`, and policy/schema/fingerprint
-versions. `output_fingerprint` covers the full contract payload + status.
+identity/output fingerprints, live caption-source fingerprint, live governance
+verification state/unresolved, render profile, the full versioned
+`stage50_config_payload()` (tolerances, operator sets, contraction expansions,
+filler tokens, render profiles, compatibility policy version), and
+policy/schema/fingerprint versions. `output_fingerprint` covers the full contract
+payload + status.
 `caption_source_fingerprint`, `source_media_fingerprint`, and `probe_fingerprint`
 are separate. TTS provider/model/voice, generated narration audio, caption
 font/animation, face-tracking output, crop path, B-roll, final codec tuning,
@@ -179,16 +189,20 @@ database-current row per candidate via a partial unique index, bool checks, a
 
 POST locks the candidate row (PostgreSQL `FOR UPDATE`), re-reads inputs,
 reuses a matching current/historical row, marks prior rows non-current, and
-recovers concurrent inserts by fingerprint. GET recomputes live freshness from a
-stat-only identity check (`CURRENT`/`STALE`/`UNVERIFIABLE`); recompute failure is
-`UNVERIFIABLE` and `effective=false` (fail closed).
+recovers concurrent inserts by fingerprint. GET recomputes the **full** persisted
+`input_fingerprint` from live rows (database reads plus the stat-only
+`_best_effort_identity`; never ffprobe, never a provider) and returns `CURRENT`
+only on exact equality, `STALE` on mismatch, and `UNVERIFIABLE` on any
+recomputation failure; anything other than `CURRENT` yields `effective=false`
+(fail closed). The Stage 5.1 handoff surfaces `contract.live_freshness` and
+`contract.effective` and never presents a non-effective contract as ready.
 
 ## Versions
 
-- policy `stage5.0-v1`
+- policy `stage5.0-v2`
 - schema `stage5.0-schema-v1`
 - fingerprint `1`
-- compatibility policy `stage5.0-compatibility-v1`
+- compatibility policy `stage5.0-compatibility-v2`
 - render profile `stage5.0-render-profile-v1`
 - profile `SHORTS_1080X1920` (9:16, 1080×1920, `SOURCE_COMPATIBLE` fps, 30 fallback)
 

@@ -19,7 +19,11 @@ plan, enqueues `FINAL_CLIP` refinement, or advances the source lifecycle.
   operators (negation/exclusivity/modality, English + Arabic), entity/number
   changes, recovered code-switch tokens, change-ratio bands, complete-thought
   and window-clipping checks, timing-drift bands, payoff/hook coverage, and
-  meaning-critical unresolved spans. Outcome precedence is
+  meaning-critical unresolved spans. Typographic/alternate apostrophes fold to
+  ASCII before contraction expansion. An added Latin token is recovered only
+  when listed in `FINAL_CLIP` code-switch evidence or the planning excerpt
+  contains Arabic script; arbitrary inserted English intensifiers/hedges are
+  never silently recovered. Outcome precedence is
   `SOURCE_SPAN_NO_LONGER_VALID` > `UNRESOLVED_COMPATIBILITY` >
   `MATERIAL_SEMANTIC_CHANGE` > `MATERIAL_TIMING_CHANGE` >
   `COMPATIBLE_NON_MATERIAL_CHANGE` > `EXACT_MATCH`. Material/unresolved outcomes
@@ -48,12 +52,21 @@ plan, enqueues `FINAL_CLIP` refinement, or advances the source lifecycle.
   **Stage 5.1 MUST include real rendered ASS/libass regression testing for mixed
   Arabic–English captions.**
 - **Fingerprints.** Input/output/caption-source/media-identity/probe
-  fingerprints via `canonical_fingerprint`. TTS provider/model/voice, captions
-  font/animation, crop, B-roll, codec tuning, publishing metadata, and final
-  render artifact hashes are never inputs.
+  fingerprints via `canonical_fingerprint`. The input fingerprint covers live
+  governance verification state/unresolved and the full versioned
+  `stage50_config_payload()` (tolerances, operator sets, contraction expansions,
+  filler tokens, render profiles, compatibility policy version). TTS
+  provider/model/voice, captions font/animation, crop, B-roll, codec tuning,
+  publishing metadata, and final render artifact hashes are never inputs.
+- **Currentness.** `read_render_contract` recomputes the full persisted input
+  fingerprint from live rows (database reads plus stat-only identity; never
+  ffprobe, never a provider): `CURRENT` only on exact equality, `STALE` on
+  mismatch, `UNVERIFIABLE` on failure, `effective=false` otherwise. The Stage 5.1
+  handoff surfaces `contract.live_freshness` and `contract.effective`.
 - **Persistence.** One table `render_contracts` (one row per candidate + input
   fingerprint, one database-current row per candidate via a partial unique
-  index), migration `20260918_0020`. API endpoints and CLI commands expose the
+  index), migration `20260918_0020`. Policy `stage5.0-v2`, compatibility policy
+  `stage5.0-compatibility-v2`. API endpoints and CLI commands expose the
   contract and the read-only Stage 5.1 handoff
   (`stage5_1_implemented=false`, `stage5_2_implemented=false`,
   `stage6_implemented=false`). See `docs/STAGE_5_0_OPERATIONS.md`.
