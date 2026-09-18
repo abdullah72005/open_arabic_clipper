@@ -102,12 +102,12 @@ repairs, or selects a plan, adds **no** `PipelineStage`, **no** `PipelineRun`,
   handoff exposes per-plan governance with `stage4_3_implemented=false` and no
   winner/selected plan/render-ready/publication state.
 
-Deterministic verification: 98 focused Stage 4.2 tests (governor, providers,
+Deterministic verification: 108 focused Stage 4.2 tests (governor, providers,
 service, executor/queue/cache/concurrency/cancellation, API/CLI/handoff/migration)
 plus the full backend suite in Docker Python 3.12 with the repository compose/.env
 files mounted, with no live provider calls in the automated suite. Versions:
-governor `stage4.2-v3`, schema `stage4.2-schema-v1`, validation
-`stage4.2-validation-v3`. See [docs/STAGE_4_2_OPERATIONS.md](docs/STAGE_4_2_OPERATIONS.md).
+governor `stage4.2-v4`, schema `stage4.2-schema-v1`, validation
+`stage4.2-validation-v4`. See [docs/STAGE_4_2_OPERATIONS.md](docs/STAGE_4_2_OPERATIONS.md).
 
 ### Stage 4.2 corrective patch (2026-09-17)
 
@@ -156,6 +156,17 @@ governor `stage4.2-v3`, schema `stage4.2-schema-v1`, validation
   No deterministic entailment is claimed; Gemini stays non-authoritative and no
   web lookup/fact-checking is added. Support policy version
   `stage4.2-v3`/`stage4.2-validation-v3` invalidates prior governance.
+- **Direct-quote semantic-fidelity correction (P1).** A valid quote or matching
+  contiguous phrase is no longer by itself sufficient for `GROUNDED_IN_SOURCE`.
+  A direct-quote/reference-framed claim is grounded only when every added material
+  token is harmless attribution/interpretive framing; an added factual predicate,
+  changed predicate, event, date, or number (e.g. `"Microsoft launches product"`
+  plus `"files bankruptcy"`) is `AMBIGUOUS` → `SUPPORT_UNVERIFIED`, requiring
+  semantic review, `GOVERNANCE_DEFERRED` when the provider is unavailable, or
+  `BLOCKED_PENDING_VERIFICATION` when an essential external dependency exists.
+  Exact quotes with attribution, near-exact restatements, source-grounded
+  non-factual interpretation, and clearly-supported claims (zero hosted calls) are
+  preserved. Versions advanced to `stage4.2-v4`/`stage4.2-validation-v4`.
 - **Fail-closed Stage 4.3 handoff freshness (P1).** The handoff exposes
   `freshness` ∈ {`VERIFIED_CURRENT`, `STALE`, `NOT_CURRENT`, `UNVERIFIABLE`}.
   Only `VERIFIED_CURRENT` may retain per-plan `eligible_for_stage4_3`; a missing

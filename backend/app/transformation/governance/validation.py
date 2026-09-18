@@ -473,7 +473,7 @@ def derive_evidence(
 
 
 def _numeric_tokens(text: str) -> set[str]:
-    return {match.group(0) for match in _NUMERIC_RE.finditer(text)}
+    return {match.group(0).rstrip(".,") for match in _NUMERIC_RE.finditer(text)}
 
 
 def _fabricated_numeric_claim(
@@ -709,6 +709,110 @@ _INTERPRETIVE_FRAMING: frozenset[str] = frozenset(
     }
 )
 
+# Permitted attribution/reference vocabulary. A direct-quote or reference-framed
+# claim may restate source wording as long as the only tokens it adds are
+# attribution words that name the evidence, never a new factual predicate.
+_ATTRIBUTION_FRAMING: frozenset[str] = frozenset(
+    {
+        "according",
+        "per",
+        "speaker",
+        "speakers",
+        "source",
+        "sources",
+        "report",
+        "reports",
+        "reported",
+        "reportedly",
+        "article",
+        "author",
+        "host",
+        "hosts",
+        "guest",
+        "guests",
+        "interview",
+        "interviewer",
+        "interviewee",
+        "statement",
+        "claim",
+        "claims",
+        "claimed",
+        "said",
+        "says",
+        "say",
+        "stated",
+        "states",
+        "state",
+        "quoted",
+        "quotes",
+        "quote",
+        "quoting",
+        "words",
+        "wording",
+        "excerpt",
+        "transcript",
+        "clip",
+        "video",
+        "footage",
+        "comment",
+        "comments",
+        "remark",
+        "remarks",
+        "note",
+        "notes",
+        "noted",
+        "mention",
+        "mentions",
+        "mentioned",
+        "describes",
+        "described",
+        "calls",
+        "called",
+        "reference",
+        "references",
+        "referenced",
+        # Arabic attribution/reference forms.
+        "قال",
+        "قالت",
+        "يقول",
+        "تقول",
+        "صرح",
+        "صرحت",
+        "بحسب",
+        "نقلا",
+        "نقلًا",
+        "المصدر",
+        "مصدر",
+        "المتحدث",
+        "متحدث",
+        "المضيف",
+        "مضيف",
+        "الضيف",
+        "ضيف",
+        "تصريح",
+        "تصريحات",
+        "وفقا",
+        "وفقًا",
+        "حسب",
+        "ذكر",
+        "ذكرت",
+        "أشار",
+        "أشارت",
+        "كلمات",
+        "كلام",
+        "النص",
+        "التقرير",
+        "تقرير",
+        "اقتباس",
+        "مقتبس",
+        "المقطع",
+    }
+)
+
+# Tokens that may legitimately appear in a reference-framed claim without
+# introducing a new factual predicate.
+_CLAIM_FRAMING_TOKENS: frozenset[str] = _ATTRIBUTION_FRAMING | _INTERPRETIVE_FRAMING
+
 
 @dataclass(frozen=True)
 class _SourceEvidence:
@@ -913,16 +1017,41 @@ def _contiguous_ngram(tokens: list[str], folded_text: str, size: int) -> bool:
     )
 
 
+def _unaccounted_claim_tokens(
+    claim_text: str, claim_tokens: list[str], evidence_text: str, evidence_tokens: set[str]
+) -> list[str]:
+    """Material claim tokens not covered by cited wording or permitted framing.
+
+    A direct-quote/reference-framed claim is grounded only when every material
+    token it adds is either a permitted attribution/reference phrase or closed
+    interpretive framing that adds no factual predicate. Numbers are always
+    material, so an added numeric assertion is unaccounted even when it is too
+    short to survive content-token filtering (e.g. ``47``).
+    """
+
+    unaccounted = [
+        token
+        for token in claim_tokens
+        if token not in evidence_tokens and token not in _CLAIM_FRAMING_TOKENS
+    ]
+    evidence_numbers = _numeric_tokens(evidence_text)
+    for number in _numeric_tokens(claim_text):
+        if number not in evidence_numbers and number not in unaccounted:
+            unaccounted.append(number)
+    return unaccounted
+
+
 def _claim_support(block: dict[str, object], evidence: _SourceEvidence) -> str:
     """Conservative deterministic claim-to-evidence support classification.
 
     Lexical overlap establishes relevance only, never factual entailment. A claim
-    is deterministically SUPPORTED only for a supported direct quotation or a
-    near-exact restatement whose content tokens are all present in the cited
-    wording; a clearly-tied, non-factual interpretation with no new content
-    predicate is also supported. Every other factual claim is AMBIGUOUS (semantic
-    review / truthful defer-block), and a factual claim with no shared evidence is
-    UNSUPPORTED.
+    is deterministically SUPPORTED only for a supported direct quotation whose
+    added tokens are harmless attribution/interpretive framing, a near-exact
+    restatement whose content tokens are all present in the cited wording, or a
+    clearly-tied, non-factual interpretation with no new content predicate. A
+    valid quotation never launders an unsupported added factual predicate. Every
+    other factual claim is AMBIGUOUS (semantic review / truthful defer-block), and
+    a factual claim with no shared evidence is UNSUPPORTED.
     """
 
     refs = block.get("grounding_refs")
@@ -951,14 +1080,21 @@ def _claim_support(block: dict[str, object], evidence: _SourceEvidence) -> str:
     shared = [token for token in claim_tokens if token in evidence_tokens]
     factual = _has_factual_signal(claim_text)
 
-    # 1. Supported direct quotation with the quoted wording present in the source.
+    # 1. Supported direct quotation: the quoted wording (or a matching contiguous
+    #    phrase) must be present in the cited source, AND every other material
+    #    claim token must be accounted for by the cited wording or permitted
+    #    attribution/interpretive framing. A valid quote never masks an added
+    #    factual predicate, changed predicate, event, date, or number.
     if _quote_framing(claim_text):
-        if any(
+        quote_present = any(
             len(quoted) >= 4 and quoted.casefold() in folded_evidence
             for quoted in _quoted_spans(claim_text)
+        )
+        if not quote_present:
+            quote_present = _contiguous_ngram(claim_tokens, folded_evidence, 3)
+        if quote_present and not _unaccounted_claim_tokens(
+            claim_text, claim_tokens, evidence_text, evidence_tokens
         ):
-            return _SUPPORT_SUPPORTED
-        if _contiguous_ngram(claim_tokens, folded_evidence, 3):
             return _SUPPORT_SUPPORTED
         return _SUPPORT_AMBIGUOUS
 

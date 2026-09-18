@@ -757,3 +757,155 @@ def test_strict_hero_thresholds_invalidate_fingerprint():
         )
     )
     assert base != changed
+
+
+def test_direct_quote_with_attribution_is_grounded_and_eligible():
+    plan = make_plan(
+        blocks=[
+            source_block(0, text="We will double production by 2030."),
+            original_block(
+                1,
+                intent='According to the source, "we will double production by 2030"',
+                kind="SOURCE_AS_EVIDENCE",
+                grounding=("block:0",),
+            ),
+        ],
+        original_value_kinds=("SOURCE_AS_EVIDENCE",),
+    )
+    governance = _governance(plan)
+    assert governance.verification["claim_state"] == "GROUNDED_IN_SOURCE"
+    assert governance.status in {
+        GovernancePlanStatus.APPROVED_FOR_SELECTION,
+        GovernancePlanStatus.APPROVED_WITH_CAUTION,
+    }
+    assert governance.eligible_for_stage4_3 is True
+
+
+def test_quote_with_added_factual_predicate_is_not_grounded():
+    plan = make_plan(
+        blocks=[
+            source_block(0, text="Microsoft launches product today."),
+            original_block(
+                1,
+                intent="According to the source, Microsoft launches product and files bankruptcy",
+                kind="EXPLANATION",
+                grounding=("block:0",),
+            ),
+        ],
+        original_value_kinds=("EXPLANATION",),
+    )
+    evaluation = evaluate_plan(
+        plan, make_inputs([plan]), DEFAULT_CONFIG, provider_mode_deterministic=False
+    )
+    assert evaluation.requires_semantic_review is True
+    assert evaluation.verification["claim_state"] == "SUPPORT_UNVERIFIED"
+    governance = _governance(plan, provider_mode_deterministic=False)
+    assert governance.verification["claim_state"] != "GROUNDED_IN_SOURCE"
+    assert governance.status is GovernancePlanStatus.GOVERNANCE_DEFERRED
+    assert governance.status not in {
+        GovernancePlanStatus.APPROVED_FOR_SELECTION,
+        GovernancePlanStatus.APPROVED_WITH_CAUTION,
+    }
+    assert governance.eligible_for_stage4_3 is False
+
+
+def test_quote_with_changed_predicate_is_not_grounded():
+    plan = make_plan(
+        blocks=[
+            source_block(0, text='The speaker said "we will expand in 2026".'),
+            original_block(
+                1,
+                intent='The speaker said "we will expand in 2026" and the merger closes Friday',
+                kind="EXPLANATION",
+                grounding=("block:0",),
+            ),
+        ],
+        original_value_kinds=("EXPLANATION",),
+    )
+    governance = _governance(plan, provider_mode_deterministic=False)
+    assert governance.verification["claim_state"] != "GROUNDED_IN_SOURCE"
+    assert governance.status is not GovernancePlanStatus.APPROVED_FOR_SELECTION
+    assert governance.eligible_for_stage4_3 is False
+
+
+def test_quote_with_unsupported_number_is_not_grounded():
+    plan = make_plan(
+        blocks=[
+            source_block(0, text="We will double production."),
+            original_block(
+                1,
+                intent='According to the source, "we will double production" by 47 percent',
+                kind="EXPLANATION",
+                grounding=("block:0",),
+            ),
+        ],
+        original_value_kinds=("EXPLANATION",),
+    )
+    governance = _governance(plan, provider_mode_deterministic=False)
+    assert governance.verification["claim_state"] != "GROUNDED_IN_SOURCE"
+    assert governance.status not in {
+        GovernancePlanStatus.APPROVED_FOR_SELECTION,
+        GovernancePlanStatus.APPROVED_WITH_CAUTION,
+    }
+    assert governance.eligible_for_stage4_3 is False
+
+
+def test_quote_with_unsupported_event_is_not_grounded():
+    plan = make_plan(
+        blocks=[
+            source_block(0, text='The speaker said "we will expand in 2026".'),
+            original_block(
+                1,
+                intent='The speaker said "we will expand in 2026" at the annual conference',
+                kind="EXPLANATION",
+                grounding=("block:0",),
+            ),
+        ],
+        original_value_kinds=("EXPLANATION",),
+    )
+    governance = _governance(plan, provider_mode_deterministic=False)
+    assert governance.verification["claim_state"] != "GROUNDED_IN_SOURCE"
+    assert governance.eligible_for_stage4_3 is False
+
+
+def test_quote_with_interpretive_framing_remains_grounded():
+    plan = make_plan(
+        blocks=[
+            source_block(0, text="We will double production by 2030."),
+            original_block(
+                1,
+                intent='The source explains that "we will double production by 2030"',
+                kind="EXPLANATION",
+                grounding=("block:0",),
+            ),
+        ],
+        original_value_kinds=("EXPLANATION",),
+    )
+    governance = _governance(plan)
+    assert governance.verification["claim_state"] == "GROUNDED_IN_SOURCE"
+    assert governance.status in {
+        GovernancePlanStatus.APPROVED_FOR_SELECTION,
+        GovernancePlanStatus.APPROVED_WITH_CAUTION,
+    }
+
+
+def test_quote_with_added_claim_is_blocked_when_external_dependency_exists():
+    plan = make_plan(
+        blocks=[
+            source_block(0, text="Microsoft launches product today."),
+            original_block(
+                1,
+                intent="According to the source, Microsoft launches product and files bankruptcy",
+                kind="EXPLANATION",
+                grounding=("block:0",),
+            ),
+        ],
+        original_value_kinds=("EXPLANATION",),
+        verification_dependencies=(
+            {"claim_id": "claim-9", "block_indexes": [1], "must_verify_before_execution": True},
+        ),
+    )
+    governance = _governance(plan)
+    assert governance.verification["claim_state"] == "EXTERNAL_REQUIRED_UNRESOLVED"
+    assert governance.status is GovernancePlanStatus.BLOCKED_PENDING_VERIFICATION
+    assert governance.eligible_for_stage4_3 is False

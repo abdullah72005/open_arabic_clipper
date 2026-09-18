@@ -227,18 +227,22 @@ check is deliberately conservative and three-way:
 
 - **supported** → `GROUNDED_IN_SOURCE` only for:
   - a genuine direct quotation whose quoted wording is present in the cited
-    excerpt, or reliable quote framing with a matching multi-token quote; or
+    excerpt (or reliable quote framing with a matching multi-token contiguous
+    phrase), **and** whose added material tokens are all harmless attribution/
+    reference phrases or closed interpretive framing — a valid quote never masks
+    an added factual predicate, changed predicate, event, date, or number; or
   - a near-exact restatement whose content tokens are all present in the cited
     wording (no changed/additional factual predicate); or
   - a clearly-tied **non-factual** interpretation whose only non-cited tokens are
     interpretive framing words (no new content predicate);
 - **ambiguous** → `SUPPORT_UNVERIFIED` (semantic review): shared entity/topic
   only, a changed predicate over shared entities/dates, partial overlap, inferred
-  factual conclusions, or any factual signal beyond what the cited wording
-  directly supports. The selective provider may assess observable
-  support/fidelity when available; when unavailable the plan stays truthful
-  (`GOVERNANCE_DEFERRED`, or `BLOCKED_PENDING_VERIFICATION` when external fact
-  verification is essential) and is never approved;
+  factual conclusions, a quotation or restatement combined with any additional
+  factual assertion (new event, date, number, or causal claim), or any factual
+  signal beyond what the cited wording directly supports. The selective provider
+  may assess observable support/fidelity when available; when unavailable the
+  plan stays truthful (`GOVERNANCE_DEFERRED`, or `BLOCKED_PENDING_VERIFICATION`
+  when external fact verification is essential) and is never approved;
 - **unsupported** (a factual-signal claim with no shared evidence, i.e. an
   unrelated citation) → `EXTERNAL_REQUIRED_UNRESOLVED` /
   `BLOCKED_PENDING_VERIFICATION`.
@@ -265,9 +269,9 @@ not change its truthful state.
 
 Immutable, code-defined profile (never a dynamic engine, never runtime scraping):
 
-- governor policy: `stage4.2-v3`
+- governor policy: `stage4.2-v4`
 - schema: `stage4.2-schema-v1`
-- validation: `stage4.2-validation-v3`
+- validation: `stage4.2-validation-v4`
 - platform profile: `stage4.2-platform-policy-2026-09-17-v1`
 - checked date: `2026-09-17`
 
@@ -621,3 +625,16 @@ regime.
     files bankruptcy", "The merger delays Friday" → "The merger closes Friday")
     can no longer become `GROUNDED_IN_SOURCE` or eligible; clearly supported
     quotes/restatements make zero hosted calls.
+11. **Direct-quote semantic-fidelity correction (P1).** Quote presence no longer
+    masks unsupported additions. A direct-quote/reference-framed claim is
+    grounded only when every added material token is a permitted attribution/
+    reference phrase or closed interpretive framing; a supported quotation plus
+    an added factual predicate, changed predicate, event, date, or number (e.g.
+    `"Microsoft launches product"` plus `"files bankruptcy"`) is ambiguous →
+    `SUPPORT_UNVERIFIED`, requiring semantic review, `GOVERNANCE_DEFERRED` when
+    the provider is unavailable, or `BLOCKED_PENDING_VERIFICATION` when an
+    essential external dependency exists. Exact quotes with attribution,
+    near-exact restatements, source-grounded non-factual interpretation, and
+    clearly supported claims (zero hosted calls) are preserved. Policy/validation
+    versions advanced to `stage4.2-v4`/`stage4.2-validation-v4` so prior
+    governance is invalidated.

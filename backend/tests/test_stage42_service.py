@@ -373,3 +373,66 @@ def test_clearly_supported_restatement_makes_zero_hosted_calls():
     outcome = service.govern(_inputs([plan]), input_fingerprint="in")
     assert provider.calls == 0
     assert outcome.plans[0].status is GovernancePlanStatus.APPROVED_FOR_SELECTION
+
+
+def test_clearly_supported_direct_quote_makes_zero_hosted_calls():
+    plan = make_plan(
+        plan_id="n" * 8,
+        fingerprint="fp-n",
+        blocks=[
+            source_block(0, text="We will double production by 2030."),
+            original_block(
+                1,
+                intent='The speaker said "we will double production by 2030"',
+                kind="SOURCE_AS_EVIDENCE",
+                grounding=("block:0",),
+            ),
+        ],
+        original_value_kinds=("SOURCE_AS_EVIDENCE",),
+    )
+    provider = FakeGovernanceProvider(auto=True)
+    service = GovernanceService(
+        config=DEFAULT_CONFIG,
+        provider=provider,
+        provider_identity={"provider": "fake"},
+        mode=SemanticProviderMode.ADAPTIVE,
+    )
+    outcome = service.govern(_inputs([plan]), input_fingerprint="in")
+    assert provider.calls == 0
+    assert outcome.plans[0].status in {
+        GovernancePlanStatus.APPROVED_FOR_SELECTION,
+        GovernancePlanStatus.APPROVED_WITH_CAUTION,
+    }
+
+
+def test_quote_plus_added_claim_without_provider_defers_not_approves():
+    plan = make_plan(
+        plan_id="o" * 8,
+        fingerprint="fp-o",
+        blocks=[
+            source_block(0, text="Microsoft launches product today."),
+            original_block(
+                1,
+                intent="According to the source, Microsoft launches product and files bankruptcy",
+                kind="EXPLANATION",
+                grounding=("block:0",),
+            ),
+        ],
+        original_value_kinds=("EXPLANATION",),
+    )
+    service = GovernanceService(
+        config=DEFAULT_CONFIG,
+        provider=None,
+        provider_identity={"provider": "deterministic"},
+        mode=SemanticProviderMode.ADAPTIVE,
+    )
+    outcome = service.govern(_inputs([plan]), input_fingerprint="in")
+    assert outcome.semantic_outcome is GovernanceSemanticOutcome.GOVERNANCE_DEFERRED
+    assert all(
+        item.status
+        not in {
+            GovernancePlanStatus.APPROVED_FOR_SELECTION,
+            GovernancePlanStatus.APPROVED_WITH_CAUTION,
+        }
+        for item in outcome.plans
+    )

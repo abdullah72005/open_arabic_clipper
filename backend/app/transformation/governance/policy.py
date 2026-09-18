@@ -28,12 +28,15 @@ from app.transformation.planning.policy import (  # noqa: F401  (re-exported mar
     VOICE_SELECTION_CONTEXT_MARKERS,
 )
 
-# v3: factual claim support is conservative — lexical overlap never establishes
-# entailment; only supported quotes, near-exact restatements, or clearly-tied
-# non-factual interpretations are deterministically grounded.
-GOVERNOR_POLICY_VERSION = "stage4.2-v3"
+# v4: a direct-quote/reference-framed claim is grounded only when every added
+# material token is harmless attribution/interpretive framing; a valid quote may
+# never mask an added factual predicate, changed predicate, event, date, or
+# number. v3: factual claim support is conservative — lexical overlap never
+# establishes entailment; only supported quotes, near-exact restatements, or
+# clearly-tied non-factual interpretations are deterministically grounded.
+GOVERNOR_POLICY_VERSION = "stage4.2-v4"
 GOVERNOR_SCHEMA_VERSION = "stage4.2-schema-v1"
-GOVERNOR_VALIDATION_VERSION = "stage4.2-validation-v3"
+GOVERNOR_VALIDATION_VERSION = "stage4.2-validation-v4"
 INPUT_FINGERPRINT_VERSION = "1"
 OUTPUT_FINGERPRINT_VERSION = "1"
 PLAN_GOVERNANCE_FINGERPRINT_VERSION = "1"
