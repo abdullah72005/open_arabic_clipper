@@ -106,8 +106,8 @@ Deterministic verification: 108 focused Stage 4.2 tests (governor, providers,
 service, executor/queue/cache/concurrency/cancellation, API/CLI/handoff/migration)
 plus the full backend suite in Docker Python 3.12 with the repository compose/.env
 files mounted, with no live provider calls in the automated suite. Versions:
-governor `stage4.2-v4`, schema `stage4.2-schema-v1`, validation
-`stage4.2-validation-v4`. See [docs/STAGE_4_2_OPERATIONS.md](docs/STAGE_4_2_OPERATIONS.md).
+governor `stage4.2-v5`, schema `stage4.2-schema-v1`, validation
+`stage4.2-validation-v5`. See [docs/STAGE_4_2_OPERATIONS.md](docs/STAGE_4_2_OPERATIONS.md).
 
 ### Stage 4.2 corrective patch (2026-09-17)
 
@@ -167,6 +167,18 @@ governor `stage4.2-v4`, schema `stage4.2-schema-v1`, validation
   Exact quotes with attribution, near-exact restatements, source-grounded
   non-factual interpretation, and clearly-supported claims (zero hosted calls) are
   preserved. Versions advanced to `stage4.2-v4`/`stage4.2-validation-v4`.
+- **Meaning-changing semantic-operator protection (P1).** Deterministic support
+  comparison now protects negation, exclusivity, and modality/certainty/
+  obligation operators (English and Arabic) from stopword/presentation filtering;
+  apostrophe contractions are expanded (`can't` → `cannot`, `won't` → `will not`,
+  …) and Arabic punctuation is normalized so tokens compare exactly. A claim that
+  adds, drops, or changes a protected operator relative to its cited wording
+  (`only`, `cannot`, `لا`, `فقط`, `will`/`may`/`must`, `قد`/`سوف`, …) can never
+  become `GROUNDED_IN_SOURCE` through lexical overlap alone, even inside a valid
+  quote; it becomes `AMBIGUOUS` → `SUPPORT_UNVERIFIED`/`GOVERNANCE_DEFERRED`
+  pending semantic review. Permitted attribution framing and faithful identical
+  restatements remain grounded with zero hosted calls. Versions advanced to
+  `stage4.2-v5`/`stage4.2-validation-v5`.
 - **Fail-closed Stage 4.3 handoff freshness (P1).** The handoff exposes
   `freshness` ∈ {`VERIFIED_CURRENT`, `STALE`, `NOT_CURRENT`, `UNVERIFIABLE`}.
   Only `VERIFIED_CURRENT` may retain per-plan `eligible_for_stage4_3`; a missing

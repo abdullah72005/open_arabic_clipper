@@ -598,6 +598,131 @@ _SUPPORT_STOPWORDS: frozenset[str] = frozenset(
     }
 )
 
+# Meaning-changing semantic operators. Ordinary function words and presentation
+# filler may be dropped during support comparison without changing the
+# proposition, but these operators may not: if a claim adds, drops, or changes
+# one relative to its cited wording the claim is no longer a faithful
+# restatement and must defer to semantic review rather than inherit support.
+_NEGATION_OPERATORS: frozenset[str] = frozenset(
+    {
+        "not",
+        "no",
+        "never",
+        "none",
+        "cannot",
+        "without",
+        # Arabic negation.
+        "لا",
+        "لن",
+        "لم",
+        "ليس",
+        "ليست",
+        "ليسوا",
+        "ما",
+        "مش",
+    }
+)
+
+# ``just`` is ambiguous yet protected (its restriction sense must not vanish).
+# Colloquial ``بس`` is intentionally not protected because in Gulf/Levantine it
+# is overwhelmingly a discourse connective ("but"); protecting it would defer
+# ordinary claims. Explicit Arabic exclusivity is covered by ``فقط``/``حصرا``.
+_EXCLUSIVITY_OPERATORS: frozenset[str] = frozenset(
+    {
+        "only",
+        "solely",
+        "exclusively",
+        "except",
+        "unless",
+        "just",
+        "فقط",
+        "وحده",
+        "وحدها",
+        "حصرا",
+        "حصراً",
+    }
+)
+
+_MODALITY_OPERATORS: frozenset[str] = frozenset(
+    {
+        "will",
+        "would",
+        "may",
+        "might",
+        "must",
+        "should",
+        "can",
+        "could",
+        "shall",
+        "ought",
+        # Arabic modality/certainty/obligation.
+        "قد",
+        "يمكن",
+        "ممكن",
+        "يجب",
+        "لازم",
+        "سوف",
+        "سـ",
+        "ربما",
+    }
+)
+
+_PROTECTED_SEMANTIC_OPERATORS: frozenset[str] = (
+    _NEGATION_OPERATORS | _EXCLUSIVITY_OPERATORS | _MODALITY_OPERATORS
+)
+
+# The ``\w`` tokenizer splits apostrophe contractions (``can't`` becomes
+# ``can`` + ``t``), which would erase the negation. Expand the forms whose
+# meaning is a protected operator before tokenizing so both claim and evidence
+# normalize identically.
+_CONTRACTION_EXPANSIONS: tuple[tuple[str, str], ...] = (
+    ("can't", "cannot"),
+    ("can’t", "cannot"),
+    ("won't", "will not"),
+    ("won’t", "will not"),
+    ("don't", "do not"),
+    ("don’t", "do not"),
+    ("doesn't", "does not"),
+    ("doesn’t", "does not"),
+    ("didn't", "did not"),
+    ("didn’t", "did not"),
+    ("isn't", "is not"),
+    ("isn’t", "is not"),
+    ("aren't", "are not"),
+    ("aren’t", "are not"),
+    ("wasn't", "was not"),
+    ("wasn’t", "was not"),
+    ("weren't", "were not"),
+    ("weren’t", "were not"),
+    ("haven't", "have not"),
+    ("haven’t", "have not"),
+    ("hasn't", "has not"),
+    ("hasn’t", "has not"),
+    ("hadn't", "had not"),
+    ("hadn’t", "had not"),
+    ("shouldn't", "should not"),
+    ("shouldn’t", "should not"),
+    ("wouldn't", "would not"),
+    ("wouldn’t", "would not"),
+    ("couldn't", "could not"),
+    ("couldn’t", "could not"),
+    ("mustn't", "must not"),
+    ("mustn’t", "must not"),
+)
+
+# Arabic punctuation lives inside the ``\u0600-\u06ff`` tokenizer range, so it
+# otherwise attaches to the preceding token (``المصدر،``) and defeats exact
+# comparisons. Normalize it to whitespace for support comparison only.
+_ARABIC_PUNCTUATION_RE = re.compile(r"[\u060c\u061b\u061f\u066a-\u066d\u06d4]")
+
+
+def _normalize_for_support(text: str) -> str:
+    folded = text.casefold()
+    for surface, expansion in _CONTRACTION_EXPANSIONS:
+        folded = folded.replace(surface, expansion)
+    return _ARABIC_PUNCTUATION_RE.sub(" ", folded)
+
+
 _TEMPORAL_MARKERS: frozenset[str] = frozenset(
     {
         "next",
@@ -955,7 +1080,14 @@ def _resolve_ref(ref: object, evidence: _SourceEvidence) -> str | None:
 
 def _support_tokens(text: str) -> list[str]:
     tokens: list[str] = []
-    for token in _content_tokens(text):
+    for token in _tokens(_normalize_for_support(text)):
+        # Protected semantic operators survive every filter below so a
+        # meaning-changing word can never silently disappear from comparison.
+        if token in _PROTECTED_SEMANTIC_OPERATORS:
+            tokens.append(token)
+            continue
+        if token in _PRESENTATION_WORDS or token in _PRESENTATION_FILLER:
+            continue
         if token in _SUPPORT_STOPWORDS:
             continue
         if re.search(r"[\u0600-\u06ff]", token):
@@ -1079,6 +1211,15 @@ def _claim_support(block: dict[str, object], evidence: _SourceEvidence) -> str:
     folded_evidence = evidence_text.casefold()
     shared = [token for token in claim_tokens if token in evidence_tokens]
     factual = _has_factual_signal(claim_text)
+
+    # A claim that adds, drops, or changes a protected meaning-changing operator
+    # (negation, exclusivity, modality, certainty, obligation) relative to the
+    # cited wording is not a faithful restatement, even when the surrounding
+    # content tokens all overlap. It defers to semantic review rather than
+    # inheriting source support. This runs before the quote branch so a valid
+    # quotation can never launder an added *or dropped* operator.
+    if (set(claim_tokens) ^ evidence_tokens) & _PROTECTED_SEMANTIC_OPERATORS:
+        return _SUPPORT_AMBIGUOUS
 
     # 1. Supported direct quotation: the quoted wording (or a matching contiguous
     #    phrase) must be present in the cited source, AND every other material

@@ -225,6 +225,19 @@ grounding. Lexical overlap establishes **relevance only, never factual
 entailment**. Because no deterministic system can prove entailment, the support
 check is deliberately conservative and three-way:
 
+Before any supported path below, a claim must not add, drop, or change a
+protected meaning-changing operator relative to its cited wording. Protected
+operators are negation (`not`/`no`/`never`/`cannot`/`without`, contractions such
+as `can't`/`won't`/`didn't`, Arabic `لا`/`لن`/`لم`/`ليس`/`ليست`/`ليسوا`/`ما`/`مش`),
+exclusivity (`only`/`solely`/`exclusively`/`except`/`unless`/`just`, Arabic
+`فقط`/`وحده`/`وحدها`/`حصرا`; colloquial `بس` is intentionally excluded as it is
+usually a discourse connective), and modality/certainty/obligation
+(`will`/`would`/`may`/`might`/`must`/`should`/`can`/`could`/`shall`/`ought`,
+Arabic `قد`/`يمكن`/`ممكن`/`يجب`/`لازم`/`سوف`/`سـ`/`ربما`). They survive support
+normalization, contractions are expanded, and Arabic punctuation is normalized so
+tokens compare exactly. Any operator mismatch is ambiguous, never supported, even
+inside a valid quote.
+
 - **supported** → `GROUNDED_IN_SOURCE` only for:
   - a genuine direct quotation whose quoted wording is present in the cited
     excerpt (or reliable quote framing with a matching multi-token contiguous
@@ -269,9 +282,9 @@ not change its truthful state.
 
 Immutable, code-defined profile (never a dynamic engine, never runtime scraping):
 
-- governor policy: `stage4.2-v4`
+- governor policy: `stage4.2-v5`
 - schema: `stage4.2-schema-v1`
-- validation: `stage4.2-validation-v4`
+- validation: `stage4.2-validation-v5`
 - platform profile: `stage4.2-platform-policy-2026-09-17-v1`
 - checked date: `2026-09-17`
 
@@ -638,3 +651,13 @@ regime.
     clearly supported claims (zero hosted calls) are preserved. Policy/validation
     versions advanced to `stage4.2-v4`/`stage4.2-validation-v4` so prior
     governance is invalidated.
+12. **Meaning-changing semantic-operator protection (P1).** Negation,
+    exclusivity, and modality/certainty/obligation operators (English and Arabic)
+    are protected from stopword/presentation filtering; contractions are expanded
+    and Arabic punctuation is normalized. A claim that adds, drops, or changes a
+    protected operator relative to its cited wording can no longer become
+    `GROUNDED_IN_SOURCE` through lexical overlap alone, even inside a valid quote;
+    it is ambiguous → `SUPPORT_UNVERIFIED`/`GOVERNANCE_DEFERRED` pending semantic
+    review. Permitted attribution framing and faithful identical restatements
+    remain grounded with zero hosted calls. Policy/validation versions advanced to
+    `stage4.2-v5`/`stage4.2-validation-v5` so prior governance is invalidated.

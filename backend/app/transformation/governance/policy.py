@@ -28,15 +28,20 @@ from app.transformation.planning.policy import (  # noqa: F401  (re-exported mar
     VOICE_SELECTION_CONTEXT_MARKERS,
 )
 
-# v4: a direct-quote/reference-framed claim is grounded only when every added
-# material token is harmless attribution/interpretive framing; a valid quote may
-# never mask an added factual predicate, changed predicate, event, date, or
-# number. v3: factual claim support is conservative — lexical overlap never
-# establishes entailment; only supported quotes, near-exact restatements, or
-# clearly-tied non-factual interpretations are deterministically grounded.
-GOVERNOR_POLICY_VERSION = "stage4.2-v4"
+# v5: protected meaning-changing semantic operators (negation, exclusivity,
+# modality, certainty, obligation) survive stopword/presentation filtering and
+# must match between a claim and its cited wording before deterministic support;
+# apostrophe contractions are expanded and Arabic punctuation is normalized for
+# comparison. v4: a direct-quote/reference-framed claim is grounded only when
+# every added material token is harmless attribution/interpretive framing; a
+# valid quote may never mask an added factual predicate, changed predicate,
+# event, date, or number. v3: factual claim support is conservative — lexical
+# overlap never establishes entailment; only supported quotes, near-exact
+# restatements, or clearly-tied non-factual interpretations are deterministically
+# grounded.
+GOVERNOR_POLICY_VERSION = "stage4.2-v5"
 GOVERNOR_SCHEMA_VERSION = "stage4.2-schema-v1"
-GOVERNOR_VALIDATION_VERSION = "stage4.2-validation-v4"
+GOVERNOR_VALIDATION_VERSION = "stage4.2-validation-v5"
 INPUT_FINGERPRINT_VERSION = "1"
 OUTPUT_FINGERPRINT_VERSION = "1"
 PLAN_GOVERNANCE_FINGERPRINT_VERSION = "1"
