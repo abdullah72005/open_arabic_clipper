@@ -673,3 +673,45 @@ class TransformationExecutionReadiness(str, Enum):
     REQUIRES_FINAL_REFINEMENT_COMPATIBILITY_CHECK = "REQUIRES_FINAL_REFINEMENT_COMPATIBILITY_CHECK"
     READY_FOR_EXECUTION_PREP = "READY_FOR_EXECUTION_PREP"
     BLOCKED = "BLOCKED"
+
+
+class RenderContractStatus(str, Enum):
+    """Stage 5.0 deterministic execution-preflight outcome.
+
+    Only ``READY_FOR_RENDER_PLANNING`` and ``MATERIALIZATION_REQUIRED`` are
+    executable contracts; every other status is a truthful, persisted,
+    non-executable preflight result.
+    """
+
+    READY_FOR_RENDER_PLANNING = "READY_FOR_RENDER_PLANNING"
+    MATERIALIZATION_REQUIRED = "MATERIALIZATION_REQUIRED"
+    FINAL_CLIP_REFINEMENT_REQUIRED = "FINAL_CLIP_REFINEMENT_REQUIRED"
+    UPSTREAM_REVALIDATION_REQUIRED = "UPSTREAM_REVALIDATION_REQUIRED"
+    SOURCE_MEDIA_UNAVAILABLE = "SOURCE_MEDIA_UNAVAILABLE"
+    INVALID_SOURCE_BINDING = "INVALID_SOURCE_BINDING"
+    BLOCKED = "BLOCKED"
+
+
+class FinalClipCompatibilityOutcome(str, Enum):
+    """Deterministic Stage 5.0 FINAL_CLIP compatibility result."""
+
+    EXACT_MATCH = "EXACT_MATCH"
+    COMPATIBLE_NON_MATERIAL_CHANGE = "COMPATIBLE_NON_MATERIAL_CHANGE"
+    MATERIAL_SEMANTIC_CHANGE = "MATERIAL_SEMANTIC_CHANGE"
+    MATERIAL_TIMING_CHANGE = "MATERIAL_TIMING_CHANGE"
+    SOURCE_SPAN_NO_LONGER_VALID = "SOURCE_SPAN_NO_LONGER_VALID"
+    UNRESOLVED_COMPATIBILITY = "UNRESOLVED_COMPATIBILITY"
+
+
+class ExecutionSlotKind(str, Enum):
+    """Closed Stage 5.0 execution-slot vocabulary.
+
+    Describes what a future renderer must materialize; it is never a rendered
+    artifact, provider decision, voice, or caption file.
+    """
+
+    SOURCE_MEDIA = "SOURCE_MEDIA"
+    AUTHORED_NARRATION = "AUTHORED_NARRATION"
+    AUTHORED_TEXT = "AUTHORED_TEXT"
+    TRANSITION = "TRANSITION"
+    VERIFICATION_EVIDENCE = "VERIFICATION_EVIDENCE"

@@ -1,5 +1,89 @@
 # Runtime status
 
+## Stage 5.0 deterministic execution preflight and render contract (2026-09-18)
+
+Stage 5.0 turns the current Stage 4.3 selection into a durable, evidence-bound
+execution/render contract. It is synchronous, candidate-scoped,
+transaction-safe, and **provider-free**: no Celery task, no `ProcessingJob`
+kind, no executor/queue, no `PipelineStage`, no `PipelineRun`, and no
+`_NEXT_STAGE` entry. It never renders, generates content, captions, tracks
+faces, synthesizes speech, publishes, replans, re-governs, re-selects, patches a
+plan, enqueues `FINAL_CLIP` refinement, or advances the source lifecycle.
+
+- **Input.** The read-only Stage 4.3 `build_execution_handoff()` plus live rows.
+  A newer usable `FINAL_CLIP` (`REQUIRES_FINAL_REFINEMENT_COMPATIBILITY_CHECK`)
+  is reconciled through deterministic compatibility instead of blocking; every
+  other stale/ineffective selection fails closed as `BLOCKED`.
+- **FINAL_CLIP compatibility.** Pure, deterministic, provider-free evaluation
+  over persisted evidence: bounded token alignment, protected semantic
+  operators (negation/exclusivity/modality, English + Arabic), entity/number
+  changes, recovered code-switch tokens, change-ratio bands, complete-thought
+  and window-clipping checks, timing-drift bands, payoff/hook coverage, and
+  meaning-critical unresolved spans. Typographic/alternate apostrophes fold to
+  ASCII before contraction expansion. An added Latin token is recovered only
+  when listed in `FINAL_CLIP` code-switch evidence or the planning excerpt
+  contains Arabic script; arbitrary inserted English intensifiers/hedges are
+  never silently recovered. Outcome precedence is
+  `SOURCE_SPAN_NO_LONGER_VALID` > `UNRESOLVED_COMPATIBILITY` >
+  `MATERIAL_SEMANTIC_CHANGE` > `MATERIAL_TIMING_CHANGE` >
+  `COMPATIBLE_NON_MATERIAL_CHANGE` > `EXACT_MATCH`. Material/unresolved outcomes
+  become `UPSTREAM_REVALIDATION_REQUIRED`; spans that no longer bind become
+  `INVALID_SOURCE_BINDING`.
+- **Source-span rebinding.** Each `SOURCE_EXCERPT` binds to current `FINAL_CLIP`
+  word timings/text without mutating the frozen Stage 4.1 plan. Caption/quote
+  material must use `final_clip_text`, never the plan's copied `source_text`.
+- **Source media.** Managed-path identity (stat only, never a full-file hash),
+  cached probe reuse, and one bounded read-only ffprobe probe through an
+  injectable seam. Missing/unmanaged/corrupt/no-video/no-audio/invalid-duration
+  sources are `SOURCE_MEDIA_UNAVAILABLE`; spans beyond the media duration are
+  `INVALID_SOURCE_BINDING`.
+- **Contract.** Ordered execution blocks preserve Stage 4.1 order with closed
+  slot kinds (`SOURCE_MEDIA`, `AUTHORED_NARRATION`, `AUTHORED_TEXT`,
+  `TRANSITION`, `VERIFICATION_EVIDENCE`). Authored/narration slots are
+  materialization requirements, never fabricated content; a Stage 4.1 draft
+  line is only an `authoring_reference`. `READY_FOR_RENDER_PLANNING` and
+  `MATERIALIZATION_REQUIRED` are executable; all other statuses persist
+  `contract_ready=false` as reusable preflight rows. There is no persisted
+  `COMPATIBILITY_CHECK_REQUIRED`.
+- **Captions/logical order.** `caption_input` carries the exact `FINAL_CLIP`
+  transcript byte-for-byte, exact word timestamps, language/dialect/code-switch
+  evidence, `logical_order_preserved=true`, and `rendered_assets=null`. Stage 5.0
+  generates no ASS/libass/subtitles and performs no BiDi manipulation.
+  **Stage 5.1 MUST include real rendered ASS/libass regression testing for mixed
+  Arabic–English captions.**
+- **Fingerprints.** Input/output/caption-source/media-identity/probe
+  fingerprints via `canonical_fingerprint`. The input fingerprint covers live
+  governance verification state/unresolved and the full versioned
+  `stage50_config_payload()` (tolerances, operator sets, contraction expansions,
+  filler tokens, render profiles, compatibility policy version). TTS
+  provider/model/voice, captions font/animation, crop, B-roll, codec tuning,
+  publishing metadata, and final render artifact hashes are never inputs.
+- **Currentness.** `read_render_contract` recomputes the full persisted input
+  fingerprint from live rows (database reads plus stat-only identity; never
+  ffprobe, never a provider): `CURRENT` only on exact equality, `STALE` on
+  mismatch, `UNVERIFIABLE` on failure, `effective=false` otherwise. The Stage 5.1
+  handoff surfaces `contract.live_freshness` and `contract.effective`.
+- **Persistence.** One table `render_contracts` (one row per candidate + input
+  fingerprint, one database-current row per candidate via a partial unique
+  index), migration `20260918_0020`. Policy `stage5.0-v3`, compatibility policy
+  `stage5.0-compatibility-v3`. API endpoints and CLI commands expose the
+  contract and the read-only Stage 5.1 handoff
+  (`stage5_1_implemented=false`, `stage5_2_implemented=false`,
+  `stage6_implemented=false`). See `docs/STAGE_5_0_OPERATIONS.md`.
+- **Sealing patch (2026-09-18).** The boundary/timing classification was
+  previously unreachable (a no-wording-change verdict was absorbed as a minor
+  wording change); it now owns the per-block verdict whenever wording is
+  unchanged. Required-test completion covers bounded drift
+  (`TIMING_DRIFT_BOUNDED`), boundary adjustment (`BOUNDARY_ADJUSTED`), material
+  timing drift, cut/clipped thought (`EXCERPT_CUTS_THOUGHT` /
+  `EXCERPT_CLIPPED_BY_WINDOW`), zero-byte/corrupt source media, negative/reversed
+  planning spans, `TEXTUAL_ANNOTATION` -> `AUTHORED_TEXT` materialization, and
+  the unresolved-required-verification gate. Deterministic verification: 103
+  focused Stage 5.0 tests pass (101 default plus 2 PostgreSQL-gated). Both
+  PostgreSQL tests pass against the compose database with
+  `CLIPFACTORY_TEST_POSTGRES_URL` set (real Alembic upgrade/downgrade and
+  concurrent-current-row convergence).
+
 ## Stage 4.3 deterministic final-plan selection (2026-09-18)
 
 Stage 4.3 deterministically commits each current Stage 4.2 governance set to

@@ -41,6 +41,8 @@ from app.refinement.queue import (
     queue_candidate_refinement,
     validate_candidate_for_refinement,
 )
+from app.render.handoff import build_stage5_1_handoff
+from app.render.service import create_render_contract, read_render_contract
 from app.runtime.heavy_model_lease import HeavyModelLeaseBusy, HeavyModelUnsafe
 from app.runtime.memory import MemoryReadError, capture_memory
 from app.services.health import HealthService
@@ -767,6 +769,75 @@ def transformation_selection_handoff(candidate_id: UUID) -> None:
 
     with create_session_factory()() as session:
         handoff = build_execution_handoff(session, candidate_id)
+        if handoff is None:
+            raise typer.BadParameter("candidate does not exist")
+    typer.echo(json.dumps(handoff, ensure_ascii=False, default=str))
+
+
+def _render_contract_payload(row: object) -> dict[str, object]:
+    return {
+        "id": str(getattr(row, "id")),
+        "clip_candidate_id": str(getattr(row, "clip_candidate_id")),
+        "status": getattr(row, "status").value,
+        "compatibility_outcome": (
+            getattr(row, "compatibility_outcome").value
+            if getattr(row, "compatibility_outcome") is not None
+            else None
+        ),
+        "is_current": bool(getattr(row, "is_current")),
+        "contract_ready": bool(getattr(row, "contract_ready")),
+        "reason_codes": list(getattr(row, "reason_codes") or []),
+        "readiness": dict(getattr(row, "readiness") or {}),
+        "contract_payload": dict(getattr(row, "contract_payload") or {}),
+        "compatibility_evidence": dict(getattr(row, "compatibility_evidence") or {}),
+        "source_media_identity": dict(getattr(row, "source_media_identity") or {}),
+        "source_probe": dict(getattr(row, "source_probe") or {}),
+        "input_fingerprint": getattr(row, "input_fingerprint"),
+        "output_fingerprint": getattr(row, "output_fingerprint"),
+        "profile_key": getattr(row, "profile_key"),
+        "profile_version": getattr(row, "profile_version"),
+        "policy_version": getattr(row, "policy_version"),
+        "schema_version": getattr(row, "schema_version"),
+        "fingerprint_version": getattr(row, "fingerprint_version"),
+        "metrics": dict(getattr(row, "metrics") or {}),
+    }
+
+
+@app.command("render-contract")
+def render_contract(candidate_id: UUID) -> None:
+    """Run Stage 5.0 execution preflight and persist/reuse one current contract."""
+
+    with create_session_factory()() as session:
+        view = create_render_contract(session, candidate_id)
+        if view is None:
+            raise typer.BadParameter("candidate does not exist")
+        payload = _render_contract_payload(view.row)
+        payload["live_freshness"] = view.live_freshness
+        payload["effective"] = view.effective
+        session.commit()
+    typer.echo(json.dumps(payload, ensure_ascii=False, default=str))
+
+
+@app.command("render-contract-status")
+def render_contract_status(candidate_id: UUID) -> None:
+    """Print the current Stage 5.0 render contract without mutating anything."""
+
+    with create_session_factory()() as session:
+        view = read_render_contract(session, candidate_id)
+        if view is None:
+            raise typer.BadParameter("render contract does not exist")
+        payload = _render_contract_payload(view.row)
+        payload["live_freshness"] = view.live_freshness
+        payload["effective"] = view.effective
+    typer.echo(json.dumps(payload, ensure_ascii=False, default=str))
+
+
+@app.command("stage5-1-handoff")
+def stage5_1_handoff(candidate_id: UUID) -> None:
+    """Print the read-only Stage 5.0 -> Stage 5.1 handoff."""
+
+    with create_session_factory()() as session:
+        handoff = build_stage5_1_handoff(session, candidate_id)
         if handoff is None:
             raise typer.BadParameter("candidate does not exist")
     typer.echo(json.dumps(handoff, ensure_ascii=False, default=str))

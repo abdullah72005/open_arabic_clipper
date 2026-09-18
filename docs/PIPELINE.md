@@ -213,3 +213,37 @@ are separate: readiness is computed live by the read-only execution handoff
 `READY_FOR_EXECUTION_PREP`, `BLOCKED`) and CANDIDATE-grade planning remains
 selectable without requiring `FINAL_CLIP`. Narration remains semantic only.
 See `docs/STAGE_4_3_OPERATIONS.md`.
+
+## Stage 5.0 execution preflight and render contract
+
+Stage 5.0 is explicit, candidate-scoped, **synchronous**, transaction-safe, and
+provider-free. It consumes the read-only Stage 4.3 `build_execution_handoff()`
+plus live rows, validates publication-quality `FINAL_CLIP` evidence, performs
+bounded managed-source media preflight, and persists one current
+`RenderContract` per candidate/input fingerprint. Statuses are `BLOCKED`,
+`FINAL_CLIP_REFINEMENT_REQUIRED`, `UPSTREAM_REVALIDATION_REQUIRED`,
+`INVALID_SOURCE_BINDING`, `SOURCE_MEDIA_UNAVAILABLE`,
+`READY_FOR_RENDER_PLANNING`, and `MATERIALIZATION_REQUIRED`; only the last two
+are executable. It never renders, captions, tracks faces, synthesizes speech,
+publishes, replans, re-governs, re-selects, or advances the source lifecycle, and
+it adds no Celery task, `ProcessingJob` kind, queue/executor, `PipelineStage`,
+`PipelineRun`, or `_NEXT_STAGE` entry.
+
+FINAL_CLIP compatibility is deterministic over persisted evidence: bounded token
+alignment, protected semantic operators (negation/exclusivity/modality, English
++ Arabic), entity/number changes, recovered code-switch tokens, change-ratio
+bands, complete-thought/window-clipping checks, timing-drift bands, payoff/hook
+coverage, grounding-quote preservation, and meaning-critical unresolved spans.
+Material/unresolved outcomes become `UPSTREAM_REVALIDATION_REQUIRED`; spans that
+no longer bind become `INVALID_SOURCE_BINDING`. Source excerpts rebind to current
+`FINAL_CLIP` word timings without mutating the frozen Stage 4.1 plan; caption and
+quote material always uses `final_clip_text`. `caption_input` preserves the exact
+`FINAL_CLIP` transcript byte-for-byte with `logical_order_preserved=true` and no
+BiDi manipulation; no subtitle file is generated in Stage 5.0.
+
+One table, `render_contracts`, keeps one row per candidate + input fingerprint
+with one database-current row per candidate via a partial unique index; cached
+probe facts are reused for an unchanged media identity. `input_fingerprint`
+excludes TTS voice/provider/model, caption font/animation, crop, B-roll, codec
+tuning, publishing metadata, and final render artifact hashes. See
+`docs/STAGE_5_0_OPERATIONS.md`.
