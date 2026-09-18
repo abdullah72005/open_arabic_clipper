@@ -634,6 +634,86 @@ def test_newer_final_clip_requires_compatibility_check(session: Session, monkeyp
     assert handoff["execution_readiness"] == "REQUIRES_FINAL_REFINEMENT_COMPATIBILITY_CHECK"
 
 
+def test_execution_handoff_exposes_planning_refinement_output_fingerprint(
+    session: Session, monkeypatch: Any
+) -> None:
+    from app.transformation.selection.handoff import build_execution_handoff
+
+    settings = FakeGovernanceSettings()
+    install_selection_settings(monkeypatch, settings)
+    fixture = seed_selection_fixture(
+        session, settings=settings, result_specs=[_clean()], planning_on_final=True
+    )
+    _select(session, fixture.candidate.id)
+    handoff = build_execution_handoff(session, fixture.candidate.id)
+    assert handoff is not None
+    assert handoff["planning_refinement"]["output_fingerprint"] == "final-planning-output-fp"
+    assert handoff["planning_refinement"]["output_fingerprint"] != ""
+
+
+def test_same_refinement_id_changed_output_fingerprint_requires_compatibility(
+    session: Session, monkeypatch: Any
+) -> None:
+    from app.transformation.selection.handoff import build_execution_handoff
+    from app.transformation.selection.service import read_selection
+
+    settings = FakeGovernanceSettings()
+    install_selection_settings(monkeypatch, settings)
+    fixture = seed_selection_fixture(
+        session, settings=settings, result_specs=[_clean()], planning_on_final=True
+    )
+    view = _select(session, fixture.candidate.id)
+    stored_fingerprint = view.row.refinement_output_fingerprint
+    assert stored_fingerprint == "final-planning-output-fp"
+
+    # Stage 3.5 updates the same ``(candidate, priority)`` row in place, so the
+    # row ID is unchanged while the transcript evidence fingerprint changes.
+    fixture.refinement.output_fingerprint = "changed-after-planning"
+    session.flush()
+
+    handoff = build_execution_handoff(session, fixture.candidate.id)
+    assert handoff is not None
+    assert handoff["final_clip_refinement_available"] is True
+    assert handoff["same_refinement_identity"] is False
+    assert handoff["planning_refinement"]["output_fingerprint"] == stored_fingerprint
+    assert handoff["execution_readiness"] == "REQUIRES_FINAL_REFINEMENT_COMPATIBILITY_CHECK"
+
+    # The planning-refinement output fingerprint is part of the selection input
+    # fingerprint, so the stored selection is no longer effective.
+    read_view = read_selection(session, fixture.candidate.id)
+    assert read_view is not None
+    assert read_view.effective is False
+
+
+def test_selection_input_fingerprint_covers_planning_refinement_output_fingerprint() -> None:
+    from app.transformation.selection.fingerprints import (
+        build_selection_input_payload,
+        selection_input_fingerprint,
+    )
+
+    base: dict[str, Any] = {
+        "candidate_id": "candidate",
+        "candidate_key": "key",
+        "source_id": "source",
+        "disposition": "CANDIDATE",
+        "is_current": True,
+        "analysis_fingerprint": "analysis-fp",
+        "handoff": {},
+        "plan_rows": [],
+    }
+    first = selection_input_fingerprint(
+        build_selection_input_payload(
+            **base, planning_refinement_output_fingerprint="planning-fingerprint-a"
+        )
+    )
+    second = selection_input_fingerprint(
+        build_selection_input_payload(
+            **base, planning_refinement_output_fingerprint="planning-fingerprint-b"
+        )
+    )
+    assert first != second
+
+
 def test_selection_never_queues_refinement_work(session: Session, monkeypatch: Any) -> None:
     settings = FakeGovernanceSettings()
     install_selection_settings(monkeypatch, settings)

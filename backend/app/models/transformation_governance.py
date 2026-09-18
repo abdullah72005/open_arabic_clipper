@@ -50,7 +50,7 @@ class TransformationGovernanceSet(Base):
     __tablename__ = "transformation_governance_sets"
     __table_args__ = (
         CheckConstraint(
-            "cache_eligible IN (0, 1)",
+            "cache_eligible IN (true, false)",
             name="ck_transformation_governance_sets_cache_eligible_bool",
         ),
     )
@@ -208,12 +208,12 @@ class TransformationGovernanceResult(Base):
             name="uq_transformation_governance_results_set_plan",
         ),
         CheckConstraint(
-            "eligible_for_stage4_3 IN (0, 1)",
+            "eligible_for_stage4_3 IN (true, false)",
             name="ck_transformation_governance_results_eligible_bool",
         ),
         CheckConstraint(
-            f"(eligible_for_stage4_3 = 1 AND status IN {_ELIGIBLE_STATUSES}) "
-            f"OR (eligible_for_stage4_3 = 0 AND status NOT IN {_ELIGIBLE_STATUSES})",
+            f"(eligible_for_stage4_3 AND status IN {_ELIGIBLE_STATUSES}) "
+            f"OR (NOT eligible_for_stage4_3 AND status NOT IN {_ELIGIBLE_STATUSES})",
             name="ck_transformation_governance_results_status_eligibility",
         ),
     )

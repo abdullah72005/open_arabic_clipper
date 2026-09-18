@@ -92,6 +92,7 @@ from app.transformation.queue import (
 )
 from app.transformation.selection.handoff import build_execution_handoff
 from app.transformation.selection.service import (
+    get_current_selection,
     get_selection,
     read_selection,
     select_transformation_plan,
@@ -1325,10 +1326,14 @@ def create_app(
         row = get_selection(database, selection_id)
         if row is None:
             raise HTTPException(status_code=404, detail="transformation selection not found")
+        # Always serialize the requested row and compute its own state. A
+        # historical row must never be replaced by the candidate's current row.
+        current = get_current_selection(database, row.clip_candidate_id)
         view = read_selection(database, row.clip_candidate_id)
-        if view is not None and view.row.id == row.id:
-            return _selection_response(row, view.live_freshness, view.effective)
-        return _selection_response(row, "NOT_CURRENT", False)
+        live_freshness = view.live_freshness if view is not None else "NOT_CURRENT"
+        is_current_row = current is not None and current.id == row.id
+        effective = bool(is_current_row and view is not None and view.effective)
+        return _selection_response(row, live_freshness, effective)
 
     @app.get(
         "/api/candidates/{candidate_id}/execution-handoff",

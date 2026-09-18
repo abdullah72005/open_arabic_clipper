@@ -188,6 +188,9 @@ def _build_decision(
             analysis_fingerprint=candidate.analysis_fingerprint or "",
             handoff=handoff,
             plan_rows=plan_rows,
+            planning_refinement_output_fingerprint=(
+                (refinement.output_fingerprint or "") if refinement is not None else ""
+            ),
         )
     )
     decision = _evaluate(
@@ -206,6 +209,7 @@ def _current_input_fingerprint(session: Session, candidate: ClipCandidate) -> tu
     plan_set = get_plan_set_for_candidate(session, candidate.id)
     plan_rows = [row for row in (list_plans(session, plan_set.id) if plan_set else [])]
     plan_rows = [row for row in plan_rows if row.is_current]
+    refinement = _refinement(session, handoff)
     payload = build_selection_input_payload(
         candidate_id=str(candidate.id),
         candidate_key=candidate.candidate_key,
@@ -215,6 +219,9 @@ def _current_input_fingerprint(session: Session, candidate: ClipCandidate) -> tu
         analysis_fingerprint=candidate.analysis_fingerprint or "",
         handoff=handoff,
         plan_rows=plan_rows,
+        planning_refinement_output_fingerprint=(
+            (refinement.output_fingerprint or "") if refinement is not None else ""
+        ),
     )
     governance_set = handoff.get("governance_set")
     freshness = (

@@ -69,12 +69,20 @@ class TransformationPlanSelection(Base):
             postgresql_where=text("is_current"),
             sqlite_where=text("is_current"),
         ),
+        Index(
+            "ix_plan_selections_transformation_governance_set_id",
+            "transformation_governance_set_id",
+        ),
+        Index(
+            "ix_plan_selections_selected_governance_result_id",
+            "selected_governance_result_id",
+        ),
         CheckConstraint(
-            "is_current IN (0, 1)",
+            "is_current IN (true, false)",
             name="ck_transformation_plan_selections_current_bool",
         ),
         CheckConstraint(
-            "selected_with_caution IN (0, 1)",
+            "selected_with_caution IN (true, false)",
             name="ck_transformation_plan_selections_caution_bool",
         ),
         CheckConstraint(
@@ -88,8 +96,8 @@ class TransformationPlanSelection(Base):
             name="ck_transformation_plan_selections_status_selected",
         ),
         CheckConstraint(
-            f"(selected_with_caution = 1 AND status = '{_CAUTION_STATUS}') "
-            f"OR (selected_with_caution = 0 AND status != '{_CAUTION_STATUS}')",
+            f"(selected_with_caution AND status = '{_CAUTION_STATUS}') "
+            f"OR (NOT selected_with_caution AND status != '{_CAUTION_STATUS}')",
             name="ck_transformation_plan_selections_caution_status",
         ),
     )
@@ -108,13 +116,13 @@ class TransformationPlanSelection(Base):
         ForeignKey("transformation_plan_sets.id", ondelete="SET NULL"), index=True
     )
     transformation_governance_set_id: Mapped[UUID | None] = mapped_column(
-        ForeignKey("transformation_governance_sets.id", ondelete="SET NULL"), index=True
+        ForeignKey("transformation_governance_sets.id", ondelete="SET NULL")
     )
     selected_plan_id: Mapped[UUID | None] = mapped_column(
         ForeignKey("transformation_plans.id", ondelete="SET NULL"), index=True
     )
     selected_governance_result_id: Mapped[UUID | None] = mapped_column(
-        ForeignKey("transformation_governance_results.id", ondelete="SET NULL"), index=True
+        ForeignKey("transformation_governance_results.id", ondelete="SET NULL")
     )
     refinement_id: Mapped[UUID | None] = mapped_column(
         ForeignKey("candidate_refinements.id", ondelete="SET NULL"), index=True

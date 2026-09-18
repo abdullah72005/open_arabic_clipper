@@ -137,11 +137,11 @@ def upgrade() -> None:
             name="uq_transformation_plan_selections_candidate_input",
         ),
         sa.CheckConstraint(
-            "is_current IN (0, 1)",
+            "is_current IN (true, false)",
             name="ck_transformation_plan_selections_current_bool",
         ),
         sa.CheckConstraint(
-            "selected_with_caution IN (0, 1)",
+            "selected_with_caution IN (true, false)",
             name="ck_transformation_plan_selections_caution_bool",
         ),
         sa.CheckConstraint(
@@ -155,8 +155,8 @@ def upgrade() -> None:
             name="ck_transformation_plan_selections_status_selected",
         ),
         sa.CheckConstraint(
-            f"(selected_with_caution = 1 AND status = '{_CAUTION_STATUS}') "
-            f"OR (selected_with_caution = 0 AND status != '{_CAUTION_STATUS}')",
+            f"(selected_with_caution AND status = '{_CAUTION_STATUS}') "
+            f"OR (NOT selected_with_caution AND status != '{_CAUTION_STATUS}')",
             name="ck_transformation_plan_selections_caution_status",
         ),
     )
@@ -181,7 +181,7 @@ def upgrade() -> None:
         ["transformation_plan_set_id"],
     )
     op.create_index(
-        "ix_transformation_plan_selections_transformation_governance_set_id",
+        "ix_plan_selections_transformation_governance_set_id",
         "transformation_plan_selections",
         ["transformation_governance_set_id"],
     )
@@ -191,7 +191,7 @@ def upgrade() -> None:
         ["selected_plan_id"],
     )
     op.create_index(
-        "ix_transformation_plan_selections_selected_governance_result_id",
+        "ix_plan_selections_selected_governance_result_id",
         "transformation_plan_selections",
         ["selected_governance_result_id"],
     )
@@ -226,9 +226,9 @@ def downgrade() -> None:
         "ix_transformation_plan_selections_is_current",
         "ix_transformation_plan_selections_status",
         "ix_transformation_plan_selections_refinement_id",
-        "ix_transformation_plan_selections_selected_governance_result_id",
+        "ix_plan_selections_selected_governance_result_id",
         "ix_transformation_plan_selections_selected_plan_id",
-        "ix_transformation_plan_selections_transformation_governance_set_id",
+        "ix_plan_selections_transformation_governance_set_id",
         "ix_transformation_plan_selections_transformation_plan_set_id",
         "ix_transformation_plan_selections_transformation_analysis_id",
         "ix_transformation_plan_selections_clip_candidate_id",

@@ -59,6 +59,7 @@ def build_selection_input_payload(
     analysis_fingerprint: str,
     handoff: Mapping[str, object],
     plan_rows: Sequence[_PlanRow],
+    planning_refinement_output_fingerprint: str = "",
 ) -> dict[str, object]:
     stage40 = _mapping(handoff.get("stage40"))
     stage41 = _mapping(handoff.get("stage41"))
@@ -120,6 +121,7 @@ def build_selection_input_payload(
             "id": selected_refinement.get("id"),
             "priority": selected_refinement.get("priority"),
             "quality_level": selected_refinement.get("quality_level"),
+            "output_fingerprint": planning_refinement_output_fingerprint,
         },
         "plans": plans,
         "governance": governance,

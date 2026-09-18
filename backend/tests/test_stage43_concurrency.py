@@ -38,7 +38,6 @@ pytestmark = pytest.mark.skipif(
 def engine() -> Iterator[Engine]:
     assert _URL is not None
     test_engine = create_engine(_URL)
-    _drop_non_portable_boolean_checks()
     Base.metadata.drop_all(test_engine)
     Base.metadata.create_all(test_engine)
     try:
@@ -46,28 +45,6 @@ def engine() -> Iterator[Engine]:
     finally:
         Base.metadata.drop_all(test_engine)
         test_engine.dispose()
-
-
-def _drop_non_portable_boolean_checks() -> None:
-    """Remove SQLite-style ``boolean IN (0, 1)`` checks before PostgreSQL DDL.
-
-    The frozen Stage 4.0/4.2 models declare booleans with SQLite-style
-    ``IN (0, 1)`` checks that PostgreSQL rejects. This is a test-only DDL
-    accommodation so the PostgreSQL partial-unique-index and row-locking
-    behavior can be validated; it changes no production model or migration.
-    """
-
-    import re
-
-    from sqlalchemy import CheckConstraint
-
-    boolean_int = re.compile(r"(?<![<>!=])=\s*[01]\b|IN\s*\(\s*0\s*,\s*1\s*\)")
-    for table in Base.metadata.tables.values():
-        for constraint in list(table.constraints):
-            if not isinstance(constraint, CheckConstraint):
-                continue
-            if boolean_int.search(str(constraint.sqltext)):
-                table.constraints.discard(constraint)
 
 
 def test_concurrent_selection_converges_on_one_current_row(

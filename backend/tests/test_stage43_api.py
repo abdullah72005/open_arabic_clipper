@@ -91,6 +91,44 @@ def test_create_and_read_selection(api: ApiFixture) -> None:
     assert direct.json()["effective"] is True
 
 
+def test_historical_selection_get_returns_requested_row(api: ApiFixture) -> None:
+    client, factory, settings = api
+    candidate_id = _seed(factory, settings)
+    first = client.post(f"/api/candidates/{candidate_id}/transformation-selection").json()
+    assert first["status"] == "PLAN_SELECTED"
+    original_plan_id = first["selected_plan_id"]
+
+    from app.models import TransformationPlan
+    from app.transformation.planning.queue import get_plan_set_for_candidate
+
+    with factory() as session:
+        plan_set = get_plan_set_for_candidate(session, candidate_id)
+        assert plan_set is not None
+        plan = session.query(TransformationPlan).filter_by(plan_set_id=plan_set.id).first()
+        assert plan is not None
+        plan.blocks = [dict(block) for block in (plan.blocks or [])] + [
+            {"index": 99, "block_type": "TRANSITION", "estimated_duration": 1.0}
+        ]
+        session.commit()
+
+    second = client.post(f"/api/candidates/{candidate_id}/transformation-selection").json()
+    assert second["id"] != first["id"]
+
+    response = client.get(f"/api/transformation-selections/{first['id']}")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["id"] == first["id"]
+    assert payload["status"] == "PLAN_SELECTED"
+    assert payload["selected_plan_id"] == original_plan_id
+    assert payload["selected_governance_snapshot"] == first["selected_governance_snapshot"]
+    assert payload["effective"] is False
+    assert payload["is_current"] is False
+
+    current = client.get(f"/api/transformation-selections/{second['id']}").json()
+    assert current["id"] == second["id"]
+    assert current["is_current"] is True
+
+
 def test_create_selection_unknown_candidate_is_404(api: ApiFixture) -> None:
     client, _factory, _settings = api
     response = client.post(f"/api/candidates/{uuid.uuid4()}/transformation-selection")

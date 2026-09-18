@@ -44,7 +44,7 @@ def build_execution_handoff(
     stage43 = build_stage4_3_handoff(session, candidate.id) or {}
     plan_set = get_plan_set_for_candidate(session, candidate.id)
     plan_set_row = session.get(TransformationPlanSet, plan_set.id) if plan_set is not None else None
-    planning_refinement = _planning_refinement(plan_set_row)
+    planning_refinement = _planning_refinement(session, plan_set_row, selection)
     final_refinement = _usable_final_refinement(session, candidate.id)
 
     selected_plan_id = selection.selected_plan_id if selection is not None else None
@@ -55,11 +55,7 @@ def build_execution_handoff(
         dict(selection.selected_governance_snapshot or {}) if selection is not None else {}
     )
 
-    same_identity = bool(
-        final_refinement is not None
-        and planning_refinement is not None
-        and final_refinement.id == as_uuid(planning_refinement.get("id"))
-    )
+    same_identity = _same_refinement_identity(planning_refinement, final_refinement)
     effective = bool(view.effective) if view is not None else False
     live_freshness = view.live_freshness if view is not None else "NOT_CURRENT"
 
@@ -69,7 +65,7 @@ def build_execution_handoff(
         effective=effective,
         live_freshness=live_freshness,
         final_refinement=final_refinement,
-        planning_refinement=planning_refinement,
+        same_identity=same_identity,
         governance_snapshot=governance_snapshot,
     )
 
@@ -250,15 +246,51 @@ def _usable_final_refinement(
     return None
 
 
-def _planning_refinement(plan_set: TransformationPlanSet | None) -> dict[str, object] | None:
+def _planning_refinement(
+    session: Session,
+    plan_set: TransformationPlanSet | None,
+    selection: Any,
+) -> dict[str, object] | None:
+    """Expose the exact planning refinement used by the selected plan/governance.
+
+    The selection row stores the planning refinement identity and output
+    fingerprint captured at selection time. Stage 3.5 updates a
+    ``(candidate, priority)`` refinement row in place, so the live row's output
+    fingerprint can change while its ID stays the same; the stored planning
+    fingerprint must therefore be exposed instead of a live re-read.
+    """
+
+    if selection is not None and selection.refinement_id is not None:
+        return {
+            "id": str(selection.refinement_id),
+            "priority": selection.refinement_priority,
+            "quality_level": selection.refinement_quality_level,
+            "output_fingerprint": selection.refinement_output_fingerprint or "",
+        }
     if plan_set is None or plan_set.refinement_id is None:
         return None
+    row = session.get(CandidateRefinement, plan_set.refinement_id)
     return {
         "id": str(plan_set.refinement_id),
         "priority": plan_set.refinement_priority,
         "quality_level": plan_set.refinement_quality_level,
-        "output_fingerprint": "",
+        "output_fingerprint": (row.output_fingerprint or "") if row is not None else "",
     }
+
+
+def _same_refinement_identity(
+    planning_refinement: dict[str, object] | None,
+    final_refinement: CandidateRefinement | None,
+) -> bool:
+    """Compare FINAL_CLIP identity *and* output fingerprint, never ID alone."""
+
+    if final_refinement is None or planning_refinement is None:
+        return False
+    if str(planning_refinement.get("id") or "") != str(final_refinement.id):
+        return False
+    planning_fingerprint = str(planning_refinement.get("output_fingerprint") or "")
+    final_fingerprint = str(final_refinement.output_fingerprint or "")
+    return bool(planning_fingerprint) and planning_fingerprint == final_fingerprint
 
 
 def _readiness(
@@ -268,7 +300,7 @@ def _readiness(
     effective: bool,
     live_freshness: str,
     final_refinement: CandidateRefinement | None,
-    planning_refinement: dict[str, object] | None,
+    same_identity: bool,
     governance_snapshot: dict[str, object],
 ) -> str:
     if selection is None or selected_plan is None:
@@ -282,11 +314,6 @@ def _readiness(
     verification = governance_snapshot.get("verification")
     if isinstance(verification, dict) and verification.get("unresolved"):
         return "BLOCKED"
-    same_identity = bool(
-        final_refinement is not None
-        and planning_refinement is not None
-        and final_refinement.id == as_uuid(planning_refinement.get("id"))
-    )
     if final_refinement is not None and same_identity:
         if not effective or live_freshness != FRESHNESS_VERIFIED_CURRENT:
             return "BLOCKED"

@@ -155,17 +155,23 @@ Selection and execution readiness are separate. Selection may be made from
 readiness enum is:
 
 - `READY_FOR_EXECUTION_PREP`: the selected plan is based on the same current
-  usable `FINAL_CLIP` (`FINAL_TRANSCRIPT_READY`, non-empty final transcript) and
-  the selection is still effective.
+  usable `FINAL_CLIP` (`FINAL_TRANSCRIPT_READY`, non-empty final transcript) with
+  the same refinement ID **and** output fingerprint as the stored planning
+  evidence, and the selection is still effective.
 - `READY_FOR_FINAL_REFINEMENT`: the selected plan is based on `CANDIDATE`
   evidence with no usable `FINAL_CLIP`.
 - `REQUIRES_FINAL_REFINEMENT_COMPATIBILITY_CHECK`: a newer usable `FINAL_CLIP`
-  exists after `CANDIDATE`-grade planning, so a later execution boundary must
-  fail closed if it materially contradicts planning evidence. This is reported
-  even when the new `FINAL_CLIP` truthfully invalidates the frozen upstream
-  fingerprint chain.
+  exists after `CANDIDATE`-grade planning, or the same `(candidate, priority)`
+  row's output fingerprint changed since planning (Stage 3.5 updates rows in
+  place), so a later execution boundary must fail closed if it materially
+  contradicts planning evidence. This is reported even when the new `FINAL_CLIP`
+  truthfully invalidates the frozen upstream fingerprint chain.
 - `BLOCKED`: no selected plan, stale/unverifiable governance, stale selection,
   unresolved verification, or inconsistent evidence.
+
+The planning refinement output fingerprint used by the selected plan/governance
+is preserved on the selection row and exposed truthfully in the execution
+handoff; readiness never compares row identity alone.
 
 A newly created `FINAL_CLIP` that makes the frozen Stage 4.0/4.1/4.2 input chain
 stale is reported truthfully (`upstream_chain_stale=true`); Stage 4.3 never
@@ -213,21 +219,28 @@ compatibility requirements; readiness; fingerprints; and
 If there is no selected plan, the handoff returns the selection outcome and
 reasons with `selected_plan=null`; it never fabricates blocks or readiness.
 
-## PostgreSQL concurrency validation
+## PostgreSQL validation
 
-SQLite cannot meaningfully validate the partial unique index or row locking. Run
-the gated concurrency tests against the repository's compose PostgreSQL:
+SQLite cannot meaningfully validate the partial unique index or row locking, and
+Alembic DDL must be proven on the real engine. Run the gated PostgreSQL
+migration and concurrency tests against the repository's compose PostgreSQL:
 
 ```bash
 docker run --rm --network oac_default \
   -v "$PWD/backend":/app -w /app \
   -e CLIPFACTORY_TEST_POSTGRES_URL='postgresql+psycopg://clipfactory:clipfactory@postgres:5432/clipfactory' \
-  <backend-test-image> python -m pytest tests/test_stage43_concurrency.py -q
+  <backend-test-image> python -m pytest \
+    tests/test_stage43_concurrency.py \
+    tests/test_stage43_migration.py::test_stage_4_3_postgresql_alembic_upgrade -q
 ```
 
-The test-only fixture strips SQLite-style `boolean IN (0, 1)` checks so
-PostgreSQL DDL can be created for the concurrency probe; no production model or
-migration is changed.
+The migration test creates a throwaway database, runs the real Alembic chain to
+head (including the frozen Stage 4.0/4.1/4.2 revisions and the Stage 4.3
+revision), verifies the selection constraints and index names on PostgreSQL,
+downgrades to `20260917_0018`, upgrades again, and drops the database. It uses no
+DDL rewriting and alters or removes no production constraint. Boolean columns use
+portable `true`/`false` predicates (and PostgreSQL-safe identifier lengths)
+rather than SQLite-style integer comparisons.
 
 ## Explicit exclusions
 

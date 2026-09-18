@@ -77,10 +77,11 @@ researches, refines transcripts, or renders.
 - **Versions.** Policy `stage4.3-v1`, schema `stage4.3-schema-v1`, fingerprint
   version `1`; migration `20260918_0019`.
 
-Deterministic verification: 63 focused Stage 4.3 tests (selection, arbitration,
-eligibility, freshness, FINAL_CLIP readiness, API/CLI, model constraints,
-migration) plus the full backend suite in Docker Python 3.12; Stage 4.3
-PostgreSQL concurrency/partial-unique validation is gated on
+Deterministic verification: 68 focused Stage 4.3 tests (65 default plus 3
+PostgreSQL-gated) covering selection, arbitration, eligibility, freshness,
+FINAL_CLIP identity/output-fingerprint readiness, historical GET, API/CLI, model
+constraints, and migration, plus the full backend suite in Docker Python 3.12;
+the 3 gated tests (real PostgreSQL Alembic upgrade and concurrency) require
 `CLIPFACTORY_TEST_POSTGRES_URL`. No live provider calls in the automated suite.
 See [docs/STAGE_4_3_OPERATIONS.md](docs/STAGE_4_3_OPERATIONS.md).
 

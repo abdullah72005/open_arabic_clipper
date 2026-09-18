@@ -188,7 +188,7 @@ def upgrade() -> None:
             "updated_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()
         ),
         sa.CheckConstraint(
-            "cache_eligible IN (0, 1)",
+            "cache_eligible IN (true, false)",
             name="ck_transformation_analyses_cache_eligible_bool",
         ),
     )

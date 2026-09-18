@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 from pathlib import Path
 from typing import Any
 
+import pytest
 from alembic.config import Config
 from sqlalchemy import create_engine, inspect, text
+from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session
 
 from alembic import command
@@ -20,6 +23,12 @@ from app.core.enums import (
 )
 from app.core.settings import get_settings
 from app.models import ClipCandidate, SourceVideo, TransformationPlanSelection
+
+_POSTGRES_URL = os.environ.get("CLIPFACTORY_TEST_POSTGRES_URL")
+
+
+def _database_url(url: str, database: str) -> str:
+    return str(make_url(url).set(database=database).render_as_string(hide_password=False))
 
 
 def _load_migration() -> Any:
@@ -129,3 +138,63 @@ def test_selection_constraints_exist() -> None:
     assert any("selected_plan_id" in sqltext for sqltext in checks)
     assert any("PLAN_SELECTED" in sqltext for sqltext in checks)
     assert any("selected_with_caution" in sqltext for sqltext in checks)
+
+
+@pytest.mark.skipif(  # type: ignore[untyped-decorator]
+    not _POSTGRES_URL,
+    reason="CLIPFACTORY_TEST_POSTGRES_URL is required for PostgreSQL migration validation",
+)
+def test_stage_4_3_postgresql_alembic_upgrade(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Real Alembic upgrade/downgrade on PostgreSQL with no DDL accommodation.
+
+    The whole migration chain (including the frozen Stage 4.0/4.1/4.2 revisions)
+    must execute against a real PostgreSQL database so the Stage 4.3 boolean
+    predicates are proven valid. No production constraint is altered or removed.
+    """
+
+    assert _POSTGRES_URL is not None
+    admin_url = _database_url(_POSTGRES_URL, "postgres")
+    database = "clipfactory_stage43_migration_test"
+    admin = create_engine(admin_url, isolation_level="AUTOCOMMIT")
+    config = Config()
+    config.set_main_option("script_location", str(Path(__file__).parents[1] / "alembic"))
+    engine = None
+    try:
+        with admin.connect() as connection:
+            connection.execute(text(f'DROP DATABASE IF EXISTS "{database}" WITH (FORCE)'))
+            connection.execute(text(f'CREATE DATABASE "{database}"'))
+        target_url = _database_url(_POSTGRES_URL, database)
+        monkeypatch.setenv("CLIPFACTORY_DATABASE_URL", target_url)
+        get_settings.cache_clear()
+        try:
+            command.upgrade(config, "head")
+            engine = create_engine(target_url)
+            inspector = inspect(engine)
+            assert "transformation_plan_selections" in inspector.get_table_names()
+            checks = {
+                str(constraint["sqltext"]).upper()
+                for constraint in inspector.get_check_constraints("transformation_plan_selections")
+            }
+            assert any("SELECTED_PLAN_ID" in sqltext for sqltext in checks)
+            assert any("SELECTED_WITH_CAUTION" in sqltext for sqltext in checks)
+            # No SQLite-style boolean-to-integer comparison may remain, because
+            # PostgreSQL has no such operator.
+            assert not any("IN (0, 1)" in sqltext or "IN (0,1)" in sqltext for sqltext in checks)
+            assert not any("= 0" in sqltext or "= 1" in sqltext for sqltext in checks)
+
+            command.downgrade(config, "20260917_0018")
+            assert "transformation_plan_selections" not in inspect(engine).get_table_names()
+            command.upgrade(config, "head")
+            assert "transformation_plan_selections" in inspect(engine).get_table_names()
+        finally:
+            get_settings.cache_clear()
+    finally:
+        if engine is not None:
+            engine.dispose()
+        admin.dispose()
+        cleanup = create_engine(admin_url, isolation_level="AUTOCOMMIT")
+        try:
+            with cleanup.connect() as connection:
+                connection.execute(text(f'DROP DATABASE IF EXISTS "{database}" WITH (FORCE)'))
+        finally:
+            cleanup.dispose()
