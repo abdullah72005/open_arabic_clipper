@@ -15,7 +15,7 @@ from typing import Any
 
 import pytest
 from alembic.config import Config
-from sqlalchemy import Engine, create_engine, inspect, select
+from sqlalchemy import Engine, create_engine, inspect, select, text
 from sqlalchemy.orm import sessionmaker
 from stage43_support import FakeGovernanceSettings, install_selection_settings
 from stage50_support import FakeProber, seed_stage50
@@ -47,12 +47,32 @@ def _alembic_config() -> Config:
     return config
 
 
+def _reset_public_schema(engine: Engine) -> None:
+    """Drop and recreate the PostgreSQL ``public`` schema deterministically.
+
+    ``Base.metadata.drop_all`` (the concurrency fixture teardown) removes ORM
+    tables but never the Alembic ``alembic_version`` marker, so a second run
+    against the same database would see the schema already at ``head`` and the
+    migration ``upgrade`` would be a no-op. Dropping the whole schema also
+    removes ``alembic_version`` and any other object outside ``Base.metadata``,
+    so each test starts from a known-empty schema independent of prior runs.
+    """
+
+    with engine.connect() as connection:
+        connection.execution_options(isolation_level="AUTOCOMMIT")
+        connection.execute(text("DROP SCHEMA public CASCADE"))
+        connection.execute(text("CREATE SCHEMA public"))
+
+
 def test_stage_5_0_migration_upgrade_and_downgrade_on_postgres() -> None:
     assert _URL is not None
     config = _alembic_config()
-    command.upgrade(config, "20260918_0020")
     engine = create_engine(_URL)
     try:
+        # Idempotent start: clear any leftover schema/alembic_version from a
+        # prior run before applying migrations from a known-empty state.
+        _reset_public_schema(engine)
+        command.upgrade(config, "20260918_0020")
         tables_at_0020 = set(inspect(engine).get_table_names())
         assert "render_contracts" in tables_at_0020
         assert "transformation_plan_selections" in tables_at_0020
@@ -63,6 +83,7 @@ def test_stage_5_0_migration_upgrade_and_downgrade_on_postgres() -> None:
         # The downgrade removes only Stage 5.0 and preserves Stage 4.3.
         assert "transformation_plan_selections" in tables_at_0019
     finally:
+        # Leave the disposable database at head for a later module/test.
         command.upgrade(config, "head")
         engine.dispose()
 
@@ -71,12 +92,14 @@ def test_stage_5_0_migration_upgrade_and_downgrade_on_postgres() -> None:
 def engine() -> Iterator[Engine]:
     assert _URL is not None
     test_engine = create_engine(_URL)
-    Base.metadata.drop_all(test_engine)
+    _reset_public_schema(test_engine)
     Base.metadata.create_all(test_engine)
     try:
         yield test_engine
     finally:
-        Base.metadata.drop_all(test_engine)
+        # Reset (not just drop_all) so no alembic_version or other leftover
+        # state can break a subsequent run against the same database.
+        _reset_public_schema(test_engine)
         test_engine.dispose()
 
 
