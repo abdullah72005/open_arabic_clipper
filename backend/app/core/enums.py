@@ -40,6 +40,8 @@ class JobKind(str, Enum):
     CANDIDATE_ANALYSIS = "CANDIDATE_ANALYSIS"
     CANDIDATE_REFINEMENT = "CANDIDATE_REFINEMENT"
     TRANSFORMATION_ELIGIBILITY = "TRANSFORMATION_ELIGIBILITY"
+    TRANSFORMATION_PLANNING = "TRANSFORMATION_PLANNING"
+    TRANSFORMATION_GOVERNANCE = "TRANSFORMATION_GOVERNANCE"
 
 
 class JobStatus(str, Enum):
@@ -370,3 +372,275 @@ class ExternalFactRequirement(str, Enum):
 
     NOT_REQUIRED = "NOT_REQUIRED"
     REQUIRES_EXTERNAL_FACT_VERIFICATION = "REQUIRES_EXTERNAL_FACT_VERIFICATION"
+
+
+class PlanExecutionStatus(str, Enum):
+    """Stage 4.1 processing lifecycle, separate from the planning outcome.
+
+    A truthfully deferred or provider-unavailable plan set is a successful
+    semantic result; it is never a source/pipeline failure.
+    """
+
+    QUEUED = "QUEUED"
+    PLANNING = "PLANNING"
+    COMPLETE = "COMPLETE"
+    PROVIDER_DEGRADED = "PROVIDER_DEGRADED"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+
+
+class PlanSemanticOutcome(str, Enum):
+    """Stage 4.1 semantic result of one candidate-scoped planning run."""
+
+    PLANS_GENERATED = "PLANS_GENERATED"
+    PLANS_GENERATED_WITH_VERIFICATION_REQUIRED = "PLANS_GENERATED_WITH_VERIFICATION_REQUIRED"
+    PLANNING_DEFERRED = "PLANNING_DEFERRED"
+    NO_VALID_PLAN_FROM_STRATEGY = "NO_VALID_PLAN_FROM_STRATEGY"
+    PROVIDER_UNAVAILABLE = "PROVIDER_UNAVAILABLE"
+
+
+class PlanStatus(str, Enum):
+    """Persisted status of one validated transformation plan."""
+
+    PLAN_GENERATED = "PLAN_GENERATED"
+    PLAN_GENERATED_WITH_VERIFICATION_REQUIRED = "PLAN_GENERATED_WITH_VERIFICATION_REQUIRED"
+
+
+class PlanBlockType(str, Enum):
+    """Smallest useful closed Stage 4.1 block vocabulary."""
+
+    SOURCE_EXCERPT = "SOURCE_EXCERPT"
+    ORIGINAL_VALUE = "ORIGINAL_VALUE"
+    TRANSITION = "TRANSITION"
+    TEXTUAL_ANNOTATION = "TEXTUAL_ANNOTATION"
+    FACT_VERIFICATION_PLACEHOLDER = "FACT_VERIFICATION_PLACEHOLDER"
+
+
+class SourceExcerptRole(str, Enum):
+    """Structural role of one source excerpt inside a plan."""
+
+    HERO = "HERO"
+    HOOK = "HOOK"
+    PAYOFF = "PAYOFF"
+    SUPPORT = "SUPPORT"
+
+
+class NarrationNeed(str, Enum):
+    """Abstract Stage 4.1 narration requirement level (never auto-required)."""
+
+    NONE = "NONE"
+    OPTIONAL = "OPTIONAL"
+    RECOMMENDED = "RECOMMENDED"
+    REQUIRED = "REQUIRED"
+
+
+class NarrationPurpose(str, Enum):
+    """What a future narration communicates; never how it sounds."""
+
+    CONTEXT = "CONTEXT"
+    ANALYSIS = "ANALYSIS"
+    COUNTERPOINT = "COUNTERPOINT"
+    EXPLANATION = "EXPLANATION"
+    TAKEAWAY = "TAKEAWAY"
+    HOOK = "HOOK"
+    TRANSITION = "TRANSITION"
+
+
+class DeliveryIntent(str, Enum):
+    """How an original-value block is intended to be delivered (abstract only)."""
+
+    ON_SCREEN_TEXT = "ON_SCREEN_TEXT"
+    NARRATION = "NARRATION"
+    FLEXIBLE = "FLEXIBLE"
+
+
+class GovernanceExecutionStatus(str, Enum):
+    """Stage 4.2 processing lifecycle, separate from the semantic outcome.
+
+    A semantic rejection, revision, verification block, all-plans-ineligible
+    result, or provider deferral is a successful semantic result, never a
+    pipeline/server failure.
+    """
+
+    QUEUED = "QUEUED"
+    GOVERNING = "GOVERNING"
+    COMPLETE = "COMPLETE"
+    PROVIDER_DEGRADED = "PROVIDER_DEGRADED"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+
+
+class GovernancePlanStatus(str, Enum):
+    """Independent Stage 4.2 result for one current Stage 4.1 plan."""
+
+    APPROVED_FOR_SELECTION = "APPROVED_FOR_SELECTION"
+    APPROVED_WITH_CAUTION = "APPROVED_WITH_CAUTION"
+    BLOCKED_PENDING_VERIFICATION = "BLOCKED_PENDING_VERIFICATION"
+    REVISION_REQUIRED = "REVISION_REQUIRED"
+    REJECTED_BY_GOVERNOR = "REJECTED_BY_GOVERNOR"
+    GOVERNANCE_DEFERRED = "GOVERNANCE_DEFERRED"
+
+
+class GovernanceSemanticOutcome(str, Enum):
+    """Stage 4.2 candidate-level semantic summary."""
+
+    PLANS_ELIGIBLE_FOR_SELECTION = "PLANS_ELIGIBLE_FOR_SELECTION"
+    NO_GOVERNOR_APPROVED_PLAN = "NO_GOVERNOR_APPROVED_PLAN"
+    GOVERNANCE_DEFERRED = "GOVERNANCE_DEFERRED"
+
+
+class GovernanceSeverityClass(str, Enum):
+    """Explicit severity classes used by deterministic status precedence."""
+
+    HARD_FAIL = "HARD_FAIL"
+    BLOCKING_CONDITION = "BLOCKING_CONDITION"
+    REVISION = "REVISION"
+    WARNING = "WARNING"
+    ADVISORY = "ADVISORY"
+
+
+class GovernanceLevel(str, Enum):
+    """Generic bounded LOW/MODERATE/HIGH/UNKNOWN dimension level."""
+
+    LOW = "LOW"
+    MODERATE = "MODERATE"
+    HIGH = "HIGH"
+    UNKNOWN = "UNKNOWN"
+
+
+class GovernanceEvidenceStrength(str, Enum):
+    """Generic bounded strength for a value/source-dimension finding."""
+
+    STRONG = "STRONG"
+    ADEQUATE = "ADEQUATE"
+    WEAK = "WEAK"
+    NONE = "NONE"
+    UNKNOWN = "UNKNOWN"
+
+
+class ClaimGroundingState(str, Enum):
+    """Deterministic state of a claim's grounding."""
+
+    GROUNDED_IN_SOURCE = "GROUNDED_IN_SOURCE"
+    EXTERNAL_REQUIRED_UNRESOLVED = "EXTERNAL_REQUIRED_UNRESOLVED"
+    UNSUPPORTED_OR_FABRICATED = "UNSUPPORTED_OR_FABRICATED"
+    NOT_APPLICABLE = "NOT_APPLICABLE"
+    # The claim cites real source evidence but the deterministic lexical check
+    # cannot confirm support; requires selective semantic review (never a silent
+    # approval).
+    SUPPORT_UNVERIFIED = "SUPPORT_UNVERIFIED"
+
+
+class NarrationBurdenFinding(str, Enum):
+    """Deterministic narration-burden finding (never a TTS decision)."""
+
+    APPROPRIATE = "APPROPRIATE"
+    EXCESSIVE = "EXCESSIVE"
+    REDUNDANT = "REDUNDANT"
+    POSITION_DAMAGING = "POSITION_DAMAGING"
+    NOT_NEEDED = "NOT_NEEDED"
+    UNKNOWN = "UNKNOWN"
+
+
+class SemanticFidelityFinding(str, Enum):
+    """Provider semantic-fidelity finding (closed)."""
+
+    PASS = "PASS"
+    CONCERN = "CONCERN"
+    FAIL = "FAIL"
+    UNKNOWN = "UNKNOWN"
+
+
+class SubstantiveValueFinding(str, Enum):
+    """Provider substantive-value distinctness finding (closed)."""
+
+    DISTINCT = "DISTINCT"
+    ADEQUATE = "ADEQUATE"
+    REDUNDANT = "REDUNDANT"
+    GENERIC = "GENERIC"
+    NONE = "NONE"
+    UNKNOWN = "UNKNOWN"
+
+
+class RetentionEffectFinding(str, Enum):
+    """Provider source-moment retention-effect finding (closed)."""
+
+    PRESERVED = "PRESERVED"
+    MIXED = "MIXED"
+    DAMAGED = "DAMAGED"
+    UNKNOWN = "UNKNOWN"
+
+
+class CoherenceFinding(str, Enum):
+    """Provider plan coherence/watchability finding (closed)."""
+
+    COHERENT = "COHERENT"
+    MIXED = "MIXED"
+    INCOHERENT = "INCOHERENT"
+    UNKNOWN = "UNKNOWN"
+
+
+class UnsupportedClaimFinding(str, Enum):
+    """Provider unsupported-claim signal (closed)."""
+
+    NONE = "NONE"
+    POSSIBLE = "POSSIBLE"
+    CLEAR = "CLEAR"
+    UNKNOWN = "UNKNOWN"
+
+
+class GovernanceRemediationPriority(str, Enum):
+    """Bounded remediation priority for a revision-required plan."""
+
+    REQUIRED = "REQUIRED"
+    RECOMMENDED = "RECOMMENDED"
+    ADVISORY = "ADVISORY"
+
+
+class GovernanceRemediationAction(str, Enum):
+    """Closed remediation actions; never a rewritten block or new script."""
+
+    REMOVE_REDUNDANT_INTRO = "REMOVE_REDUNDANT_INTRO"
+    SHORTEN_PREAMBLE = "SHORTEN_PREAMBLE"
+    MOVE_EXPLANATION_AFTER_HERO = "MOVE_EXPLANATION_AFTER_HERO"
+    REMOVE_PARAPHRASE = "REMOVE_PARAPHRASE"
+    REDUCE_NARRATION = "REDUCE_NARRATION"
+    PRESERVE_PAYOFF = "PRESERVE_PAYOFF"
+    RESOLVE_VERIFICATION = "RESOLVE_VERIFICATION"
+    REPLACE_GENERIC_TAKEAWAY = "REPLACE_GENERIC_TAKEAWAY"
+
+
+class GovernanceReasonCode(str, Enum):
+    """Closed Stage 4.2 reason codes."""
+
+    PLAN_INTEGRITY_INVALID = "PLAN_INTEGRITY_INVALID"
+    NO_SUBSTANTIVE_VALUE = "NO_SUBSTANTIVE_VALUE"
+    PRESENTATION_ONLY_TRANSFORMATION = "PRESENTATION_ONLY_TRANSFORMATION"
+    REDUNDANT_PARAPHRASE_ONLY = "REDUNDANT_PARAPHRASE_ONLY"
+    GENERIC_FILLER_ONLY = "GENERIC_FILLER_ONLY"
+    SEMANTIC_DISTORTION = "SEMANTIC_DISTORTION"
+    CONTEXT_REVERSAL = "CONTEXT_REVERSAL"
+    FALSE_ATTRIBUTION = "FALSE_ATTRIBUTION"
+    SARCASM_LITERALIZED = "SARCASM_LITERALIZED"
+    SPECULATION_PRESENTED_AS_FACT = "SPECULATION_PRESENTED_AS_FACT"
+    UNRELATED_SOURCE_EVIDENCE = "UNRELATED_SOURCE_EVIDENCE"
+    FAKE_OR_MISLEADING_HOOK = "FAKE_OR_MISLEADING_HOOK"
+    UNSUPPORTED_CRITICAL_CLAIM = "UNSUPPORTED_CRITICAL_CLAIM"
+    EXTERNAL_VERIFICATION_REQUIRED = "EXTERNAL_VERIFICATION_REQUIRED"
+    SOURCE_MOMENT_SEVERELY_DAMAGED = "SOURCE_MOMENT_SEVERELY_DAMAGED"
+    PAYOFF_INTERRUPTED = "PAYOFF_INTERRUPTED"
+    EXCESSIVE_PREAMBLE = "EXCESSIVE_PREAMBLE"
+    OVER_FRAGMENTED = "OVER_FRAGMENTED"
+    NARRATION_EXCESSIVE = "NARRATION_EXCESSIVE"
+    NARRATION_REDUNDANT = "NARRATION_REDUNDANT"
+    NARRATION_POSITION_DAMAGING = "NARRATION_POSITION_DAMAGING"
+    SOURCE_DOMINANCE_CONCERN = "SOURCE_DOMINANCE_CONCERN"
+    TEMPLATE_MASS_PRODUCED_FEEL = "TEMPLATE_MASS_PRODUCED_FEEL"
+    PLATFORM_REUSE_RISK = "PLATFORM_REUSE_RISK"
+    PROVIDER_SEMANTIC_REVIEW_UNAVAILABLE = "PROVIDER_SEMANTIC_REVIEW_UNAVAILABLE"
+    PROVIDER_OUTPUT_INVALID = "PROVIDER_OUTPUT_INVALID"
+    PLATFORM_EVASION_TACTIC = "PLATFORM_EVASION_TACTIC"
+    TTS_IDENTITY_FORBIDDEN = "TTS_IDENTITY_FORBIDDEN"
+    SEMANTIC_FIDELITY_CONCERN = "SEMANTIC_FIDELITY_CONCERN"
+    PLAN_INCOHERENT = "PLAN_INCOHERENT"
+    TRANSFORMATION_OVER_EDIT = "TRANSFORMATION_OVER_EDIT"

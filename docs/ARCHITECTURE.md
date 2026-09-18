@@ -52,3 +52,75 @@ never overrides a hard blocker. Rights/provenance risk and
 originality/transformation risk stay separate; the platform-risk snapshot is
 decision support, never a legal or monetization guarantee. Stage 4.1 receives a
 typed read-only handoff only.
+
+## Stage 4.1 transformation plan generation
+
+Stage 4.1 lives in `app/transformation/planning/` and is explicit,
+candidate-scoped work after a current, non-stale Stage 4.0 analysis with at least
+one current recommended strategy. It consumes only that handoff, accepts a usable
+`CANDIDATE` Stage 3.5 refinement (never requires `FINAL_CLIP`), and produces zero
+to three concrete validated plans — normally at most one per current recommended
+strategy. It does not select, approve, authorize, or mark a winning plan, and it
+adds **no** `PipelineStage`, **no** `PipelineRun`, **no** `_NEXT_STAGE` entry,
+and no source lifecycle change. It extends the existing Celery/`ProcessingJob`
+platform with a `TRANSFORMATION_PLANNING` job kind and a nullable
+`processing_jobs.transformation_plan_set_id` FK. `transformation_plan_sets` (one
+durable planning envelope per candidate) and `transformation_plans` (one stable
+row per `(plan_set, strategy_candidate)`) persist the result; a zero-plan,
+deferred, degraded, or provider-unavailable plan set is recorded truthfully
+without fake plan rows. Bounded structured blocks are stored as validated JSON on
+the plan rather than a block table.
+
+Deterministic logic owns readiness, input bounds, routing, source-span
+resolution, hero placement, duration arithmetic, substantive-value validation,
+paraphrase/cosmetic rejection, narration/TTS separation, verification dependency
+enforcement, material distinction, persistence eligibility, and cache/fingerprint
+composition. An optional planning provider (hosted Gemini routine/strong tiers or
+an explicit `local_only` Qwen) may only turn an already-approved strategy into a
+concrete plan; the provider selects source spans by indexed word references or a
+full-window sentinel and never supplies timestamps, quotes, TTS choices, or
+rendering instructions. Hosted calls are batched per tier (at most one call per
+tier and two per plan-set run) through the shared HIGH admission gate with
+temperature 0 and strict structured validation. A missing key/outage/429/quota/
+safety refusal/malformed output never fails the source: accepted per-strategy
+checkpoints survive, only unfinished work stays non-cache-eligible, and a later
+normal request retries it. Narration is an abstract semantic requirement; Stage
+4.1 decides WHAT narration communicates, channel configuration will decide WHO
+the persistent narrator is, and Stage 6 generates speech.
+
+## Stage 4.2 retention, originality, and platform-risk governance
+
+Stage 4.2 lives in `app/transformation/governance/` and is explicit,
+candidate-scoped work after a current, non-stale, complete Stage 4.1 plan set
+with at least one current plan. It independently governs every current plan and
+answers whether it is good and safe enough to be considered by Stage 4.3. It is
+a critic/governor: it never generates, mutates, repairs, or selects a plan, adds
+**no** `PipelineStage`, **no** `PipelineRun`, **no** `_NEXT_STAGE` entry, and no
+source lifecycle change. It extends the existing Celery/`ProcessingJob` platform
+with a `TRANSFORMATION_GOVERNANCE` job kind and a nullable
+`processing_jobs.transformation_governance_set_id` FK. `transformation_governance_sets`
+(one durable envelope per Stage 4.1 plan set) and
+`transformation_governance_results` (one stable row per `(set, plan)`) persist
+independent per-plan results without touching the immutable Stage 4.1 plan.
+
+Deterministic logic owns integrity revalidation, evidence derivation, independent
+categorical dimensions (no overall score), hard gates, status precedence,
+platform-risk interpretation, reason/remediation codes, and fingerprint
+composition. Each plan becomes `APPROVED_FOR_SELECTION`,
+`APPROVED_WITH_CAUTION`, `BLOCKED_PENDING_VERIFICATION`, `REVISION_REQUIRED`,
+`REJECTED_BY_GOVERNOR`, or `GOVERNANCE_DEFERRED`, with an explicit
+`eligible_for_stage4_3` boolean that is a filter, not a ranking. Semantic
+fidelity, presentation-only transformation, fabricated critical claims, and
+misleading hooks are hard failures no other dimension offsets. An optional
+provider (hosted Gemini routine/strong, or explicit `local_only` Qwen) supplies
+only bounded observable semantic findings and can never assign a final status or
+platform classification. Every raw hosted call acquires the shared HIGH
+admission gate; at most two raw calls per governance run. Accepted per-plan
+critiques are checkpointed per provider-input fingerprint and reused on exact
+dependency match. The candidate summary is `PLANS_ELIGIBLE_FOR_SELECTION`,
+`NO_GOVERNOR_APPROVED_PLAN`, or `GOVERNANCE_DEFERRED`. Rights, platform
+originality, and spam/repetition stay separate; account/channel repetition is
+deferred to Stage 7. Stage 4.3 selection
+is not implemented and the read-only Stage 4.3 handoff contains no winner,
+`selected_plan_id`, render-ready state, or publication approval. See
+`docs/STAGE_4_2_OPERATIONS.md`.

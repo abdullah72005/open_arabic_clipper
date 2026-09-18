@@ -88,8 +88,8 @@ shared Redis priority/budget controller. Deterministic entity/ambiguity and
 boundary refinement produce `CANDIDATE_REFINED`, `FINAL_TRANSCRIPT_READY`,
 `NEEDS_MANUAL_TRANSCRIPT_REVIEW`, `PROVIDER_DEGRADED`, `REFINEMENT_FAILED`, or
 `CANCELLED`. `FINAL_TRANSCRIPT_READY` is transcript readiness, not publishing
-readiness. Stage 4 receives a typed read-only Stage 3.5 handoff; Stage 4.0 is
-implemented and Stage 4.1 is not. See
+readiness. Stage 4 receives a typed read-only Stage 3.5 handoff; Stage 4.0 and
+Stage 4.1 are implemented and Stage 4.2 is not. See
 `docs/STAGE_3_5_OPERATIONS.md`.
 
 ## Stage 4.0 transformation eligibility
@@ -118,3 +118,68 @@ or `UNRESOLVED_POLICY_OR_PROVENANCE_RISK`. Zero recommended directions is a vali
 success. Stage 4.1 receives a typed read-only handoff and is responsible for
 planning; Stage 4.0 produces directions, not scripts. See
 `docs/STAGE_4_0_OPERATIONS.md`.
+
+## Stage 4.1 transformation plan generation
+
+Stage 4.1 is explicit, candidate-scoped work after a current, non-stale Stage 4.0
+analysis with at least one current recommended strategy. It is **not** part of
+the automatic `_NEXT_STAGE` chain and never advances every candidate. It accepts
+a usable `CANDIDATE` Stage 3.5 refinement and never requires `FINAL_CLIP`. It
+produces zero to three concrete plans (normally at most one per recommended
+strategy) and never selects or approves a winner.
+
+Every valid plan has exactly one hero source excerpt placed as block 0 or 1;
+source spans are selected by indexed Stage 3.5 word references (or a safe
+full-window sentinel when word coverage is insufficient), and actual timestamps
+and excerpt text are resolved deterministically, never trusted from the provider.
+Authored material before the hero is capped (a stricter 1.5 s cap for short,
+dense, joke, or payoff-first moments), blocks are capped at eight, and the source
+hook/payoff is preserved. Original-value blocks must state what the viewer learns
+beyond the excerpt; presentation-only edits, paraphrase scaffolding, fake hooks,
+distortion, unsupported facts, and value kinds inconsistent with the Stage 4.0
+strategy are rejected before persistence. External facts are carried as
+verification placeholders that block dependent blocks; nothing is fabricated.
+Narration is an abstract semantic requirement only (need, purpose, language,
+register, duration, placement, dependencies) and never selects a TTS provider,
+model, or voice. The result is `PLANS_GENERATED`,
+`PLANS_GENERATED_WITH_VERIFICATION_REQUIRED`, `PLANNING_DEFERRED`,
+`NO_VALID_PLAN_FROM_STRATEGY`, or `PROVIDER_UNAVAILABLE`; a deferred,
+provider-unavailable, or zero-plan outcome is a successful semantic result, not a
+source/pipeline failure. Stage 6 will generate speech; channel configuration will
+decide the persistent narrator. See `docs/STAGE_4_1_OPERATIONS.md`.
+
+## Stage 4.2 retention, originality, and platform-risk governance
+
+Stage 4.2 is explicit, candidate-scoped work after a current, non-stale,
+complete Stage 4.1 plan set with at least one current plan. It is **not** part of
+the automatic `_NEXT_STAGE` chain and never advances every candidate. It
+independently governs every current plan and never generates, mutates, repairs,
+or selects one.
+
+Deterministic logic revalidates plan integrity and derives independent
+categorical dimensions — retention preservation, source-moment damage,
+substantive originality, source dominance, semantic fidelity, generic filler and
+redundant commentary, narration burden, verification completeness, plan-level
+template/mass-produced feel, observable YouTube/Facebook reuse/spam risk,
+coherence, and transformation proportionality — with no overall score. Hard
+failures (semantic distortion, context reversal, false attribution, literalized
+sarcasm, speculation-as-fact, unrelated source evidence, fake hooks, fabricated
+claims, presentation-only transformation, no substantive value) are never offset
+by another dimension. Essential unresolved external verification blocks a plan.
+Repairable retention/narration/filler/template/proportionality damage requires
+revision. Semantic-evidence deferral never falsely approves or rejects. Each plan
+becomes `APPROVED_FOR_SELECTION`, `APPROVED_WITH_CAUTION`,
+`BLOCKED_PENDING_VERIFICATION`, `REVISION_REQUIRED`, `REJECTED_BY_GOVERNOR`, or
+`GOVERNANCE_DEFERRED`, with `eligible_for_stage4_3` a filter, not a ranking. The
+candidate outcome is `PLANS_ELIGIBLE_FOR_SELECTION`, `NO_GOVERNOR_APPROVED_PLAN`,
+or `GOVERNANCE_DEFERRED`, preserving separate verification-blocked,
+revision-required, and rejected counts.
+
+The platform-policy profile is immutable and code-defined
+(`stage4.2-platform-policy-2026-09-17-v1`, checked 2026-09-17); it encodes durable
+YouTube reused/inauthentic/spam concepts and Facebook original/unoriginal/spam
+concepts and never claims algorithm safety or monetization. Copyright/rights,
+platform originality, and spam/repetition remain separate. Account/channel-level
+repetition is `DEFERRED_TO_STAGE_7`. Stage 4.3 selection is not implemented and
+the read-only handoff contains no winner. See
+`docs/STAGE_4_2_OPERATIONS.md`.

@@ -32,6 +32,12 @@ class ProcessingJob(Base):
     transformation_analysis_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("transformation_eligibility_analyses.id", ondelete="SET NULL"), index=True
     )
+    transformation_plan_set_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("transformation_plan_sets.id", ondelete="SET NULL"), index=True
+    )
+    transformation_governance_set_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("transformation_governance_sets.id", ondelete="SET NULL"), index=True
+    )
     kind: Mapped[JobKind] = mapped_column(
         Enum(JobKind, name="job_kind", native_enum=False, create_constraint=True),
         nullable=False,
@@ -45,10 +51,19 @@ class ProcessingJob(Base):
         index=True,
     )
     retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Durable per-execution ownership token. Every successful claim advances it,
+    # so a superseded worker can never persist, cancel, fail, or finalize a run
+    # that a newer claim owns.
+    claim_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
     task_id: Mapped[str | None] = mapped_column(String(255), index=True)
     error_code: Mapped[str | None] = mapped_column(String(128))
     error_message: Mapped[str | None] = mapped_column(String(2048))
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Durable renewable liveness signal. A worker actively executing refreshes
+    # it; stale reclaim requires an abandoned heartbeat, not an old started_at.
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()

@@ -250,7 +250,10 @@ def test_handoff_is_ready_when_current(api: ApiFixture) -> None:
     response = client.get(f"/api/candidates/{candidate_id}/stage4-1-handoff")
     assert response.status_code == 200
     payload = response.json()
-    assert payload["stage4_1_implemented"] is False
+    assert payload["stage4_1_implemented"] is True
+    assert payload["source_moment"]
+    assert payload["assessments"]
+    assert payload["candidate"]["coarse_start"] is not None
     assert payload["stale"] is False
     assert payload["ready_for_stage4_1"] is True
     assert payload["effective_transcript"]
@@ -394,7 +397,8 @@ def test_cli_transformation_commands(
     handoff = runner.invoke(cli_module.app, ["transformation-handoff", str(candidate_id)])
     assert handoff.exit_code == 0
     parsed = json.loads(handoff.stdout)
-    assert parsed["stage4_1_implemented"] is False
+    assert parsed["stage4_1_implemented"] is True
+    assert parsed["source_moment"]
 
 
 def test_no_new_pipeline_stage_or_next_stage_entry() -> None:

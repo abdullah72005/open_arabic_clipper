@@ -15,8 +15,15 @@ whole source. Stage 4.0 then decides, per refined candidate, whether a credible
 substantive transformation path exists and emits a small bounded set of strategy
 directions for Stage 4.1, returning
 `NO_TRANSFORMATION_STRATEGY_WORTH_USING` as a normal successful outcome when none
-does. It does not reframe, render, publish, or automatically authorize content;
-Stage 4.1 transformation planning is not implemented.
+does. Stage 4.1 then turns each current recommended direction into zero to three
+concrete structured transformation plans (source hero plus substantive value),
+without selecting a winner. Stage 4.2 then independently governs every current
+plan — retention preservation, substantive originality, source dominance,
+semantic fidelity, filler/redundancy, narration burden, verification, and
+observable YouTube/Facebook reuse/spam risk — marking each plan eligible,
+cautioned, blocked, revision-required, rejected, or deferred, without selecting a
+winner. It does not reframe, render, synthesize speech, publish, or automatically
+authorize content; Stage 4.3 and later are not implemented.
 
 Only process material you own or are explicitly authorized to process. URL
 ingest downloads permitted public sources directly; an optional outbound proxy
@@ -266,7 +273,8 @@ reports `CANDIDATE_REFINED`, `FINAL_TRANSCRIPT_READY`,
 `NEEDS_MANUAL_TRANSCRIPT_REVIEW`, `PROVIDER_DEGRADED`, `REFINEMENT_FAILED`, or
 `CANCELLED`. It never retranscribes or uploads a whole source, is never added to
 the automatic stage chain, and `FINAL_TRANSCRIPT_READY` is not publishing
-readiness; Stage 4.0 is implemented and Stage 4.1 is not. Queue and inspect refinements:
+readiness; Stage 4.0, Stage 4.1, and Stage 4.2 are implemented and Stage 4.3 is
+not. Queue and inspect refinements:
 
 ```bash
 python -m app.cli candidate-refine CANDIDATE_ID --priority CANDIDATE
@@ -308,6 +316,85 @@ API: `POST /api/candidates/{id}/transformation-analyses`, `GET
 /api/candidates/{id}/stage4-1-handoff`. See
 [Stage 4.0 operations](docs/STAGE_4_0_OPERATIONS.md) for the full design, gates,
 provider tiers, and handoff.
+
+### Stage 4.1 transformation plan generation
+
+Stage 4.1 (`TRANSFORMATION_PLANNING`) is explicit, candidate-scoped work that
+consumes only a current, non-stale Stage 4.0 handoff with at least one current
+recommended strategy, and accepts a usable `CANDIDATE` Stage 3.5 refinement
+(`FINAL_CLIP` is never required). It produces zero to three concrete plans,
+normally at most one per current recommended strategy, and never manufactures
+alternatives or selects/approves a winner. Every valid plan has exactly one hero
+source excerpt placed as block 0 or 1, deterministically resolved source
+timestamps and text from Stage 3.5 evidence (the provider never supplies either),
+and deterministic source/original/narration duration arithmetic. The hero must
+appear early by true elapsed duration (including any preceding source support
+excerpt), every source excerpt must meet a minimum duration, and partially
+overlapping excerpts are rejected. Original-value
+blocks must state what the viewer learns beyond the excerpt; presentation-only
+edits, paraphrase, fake hooks, distortion, unsupported facts, and value kinds
+inconsistent with the Stage 4.0 strategy are rejected before persistence, as are
+TTS/voice selection, rendering instructions, and platform-evasion tactics in any
+provider-controlled field.
+Narration is described as an abstract semantic requirement only (need, purpose,
+language, register, duration, placement, dependencies) and never selects a TTS
+provider, model, or voice. External facts become verification placeholders that
+link to real dependent blocks by index and block execution until verified; no
+fact is fabricated. Stage 4.1 is not added to the
+automatic stage chain, adds no `PipelineStage`/`PipelineRun`/`_NEXT_STAGE` entry,
+and never touches the source lifecycle.
+
+```bash
+python -m app.cli transformation-plan-generate CANDIDATE_ID
+python -m app.cli transformation-plans CANDIDATE_ID
+python -m app.cli transformation-plan-handoff CANDIDATE_ID
+```
+
+API: `POST /api/candidates/{id}/transformation-plans`, `GET
+/api/candidates/{id}/transformation-plans`, `GET
+/api/transformation-plan-sets/{id}`, and `GET
+/api/candidates/{id}/stage4-2-handoff`. See
+[Stage 4.1 operations](docs/STAGE_4_1_OPERATIONS.md) for the plan schema, block
+contract, source/dialect rules, narration abstraction, provider behavior,
+fingerprints, and handoff.
+
+### Stage 4.2 governance
+
+Stage 4.2 (`TRANSFORMATION_GOVERNANCE`) is explicit, candidate-scoped work that
+independently governs every current Stage 4.1 plan and answers whether it is good
+and safe enough for Stage 4.3 to consider. It is a critic/governor: it never
+generates, mutates, repairs, or selects a plan, adds no pipeline stage or run,
+and never advances the source lifecycle. Deterministic logic owns integrity,
+evidence, independent categorical dimensions (retention preservation, source-moment
+damage, substantive originality, source dominance, semantic fidelity, filler,
+redundancy, narration burden, verification, template feel, coherence,
+proportionality, and observable YouTube/Facebook reuse/spam risk), hard gates,
+status precedence, platform-risk interpretation, and fingerprints; an optional
+Gemini provider supplies only bounded observable semantic findings and can never
+assign a status or platform classification. Each plan becomes
+`APPROVED_FOR_SELECTION`, `APPROVED_WITH_CAUTION`,
+`BLOCKED_PENDING_VERIFICATION`, `REVISION_REQUIRED`, `REJECTED_BY_GOVERNOR`, or
+`GOVERNANCE_DEFERRED`; the candidate summary is `PLANS_ELIGIBLE_FOR_SELECTION`,
+`NO_GOVERNOR_APPROVED_PLAN`, or `GOVERNANCE_DEFERRED`. Semantic fidelity,
+presentation-only transformation, fabricated claims, and misleading hooks are
+hard failures that no dimension offsets. Narration `NONE` is valid and no TTS
+provider/model/voice is ever selected. Rights, platform originality, and
+spam/repetition stay separate; account/channel repetition is deferred to Stage 7.
+Stage 4.3 remains unimplemented and no winner is selected.
+
+```bash
+python -m app.cli transformation-govern CANDIDATE_ID
+python -m app.cli transformation-governance CANDIDATE_ID
+python -m app.cli transformation-governance-handoff CANDIDATE_ID
+```
+
+API: `POST /api/candidates/{id}/transformation-governance`, `GET
+/api/candidates/{id}/transformation-governance`, `GET
+/api/transformation-governance-sets/{id}`, and `GET
+/api/candidates/{id}/stage4-3-handoff`. See
+[Stage 4.2 operations](docs/STAGE_4_2_OPERATIONS.md) for statuses, hard gates,
+dimensions, the platform-policy profile and official sources, provider behavior,
+cache/fingerprints, concurrency, and the read-only Stage 4.3 handoff.
 
 Stage 3 semantic mode defaults to `deterministic`: zero Gemini calls and zero
 Qwen model loads. `adaptive` uses Gemini only when a key is configured, and

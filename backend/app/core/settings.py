@@ -23,6 +23,8 @@ from app.transcription.reconstruction.providers import (
 )
 from app.transcription.reconstruction.routing import AdaptiveRoutingConfig, RoutingMode
 from app.transcription.service import TranscriptionOptions
+from app.transformation.governance.policy import Stage42Config
+from app.transformation.planning.policy import Stage41Config
 from app.transformation.policy import Stage40Config
 from app.transformation.providers import TransformationProvider
 
@@ -165,6 +167,29 @@ class Settings(BaseSettings):
     transformation_strong_model: str = Field(default="gemini-3.8-flash", max_length=256)
     transformation_max_output_tokens: int = Field(default=2_048, gt=0, le=8_192)
     transformation_strong_thinking_level: Literal["low", "medium", "high"] = "low"
+    # Stage 4.1 planning. Separately configurable and default adaptive so that
+    # changing planning configuration never invalidates frozen Stage 4.0
+    # analyses (and vice versa). adaptive uses Gemini or safe deterministic
+    # behavior and never silently falls back to Qwen; local_only uses Qwen only
+    # when CLIPFACTORY_LOCAL_QWEN_ENABLED=true.
+    transformation_planning_mode: Literal["deterministic", "adaptive", "local_only"] = "adaptive"
+    transformation_planning_routine_model: str = Field(
+        default="gemini-3.5-flash-lite", max_length=256
+    )
+    transformation_planning_strong_model: str = Field(default="gemini-3.8-flash", max_length=256)
+    transformation_planning_max_output_tokens: int = Field(default=4_096, gt=0, le=8_192)
+    transformation_planning_strong_thinking_level: Literal["low", "medium", "high"] = "low"
+    # Stage 4.2 governance. Separately configurable so Stage 4.2 changes never
+    # invalidate frozen Stage 4.0/4.1 caches. adaptive uses Gemini or safe
+    # deterministic behavior and never silently falls back to Qwen; local_only
+    # uses Qwen only when CLIPFACTORY_LOCAL_QWEN_ENABLED=true.
+    transformation_governance_mode: Literal["deterministic", "adaptive", "local_only"] = "adaptive"
+    transformation_governance_routine_model: str = Field(
+        default="gemini-3.5-flash-lite", max_length=256
+    )
+    transformation_governance_strong_model: str = Field(default="gemini-3.8-flash", max_length=256)
+    transformation_governance_max_output_tokens: int = Field(default=3_072, gt=0, le=8_192)
+    transformation_governance_strong_thinking_level: Literal["low", "medium", "high"] = "low"
     transcription_queue_concurrency: int = Field(default=1, gt=0)
     cors_origins: list[str] = ["http://localhost:3301"]
 
@@ -429,6 +454,182 @@ class Settings(BaseSettings):
         return Stage40Config(
             provider_max_output_tokens=self.transformation_max_output_tokens,
             provider_strong_thinking_level=self.transformation_strong_thinking_level,
+        )
+
+    def stage41_config(self) -> Stage41Config:
+        """Build bounded Stage 4.1 transformation-planning configuration."""
+
+        return Stage41Config(
+            provider_max_output_tokens=self.transformation_planning_max_output_tokens,
+            provider_strong_thinking_level=self.transformation_planning_strong_thinking_level,
+        )
+
+    def transformation_planning_semantic_mode(self) -> SemanticProviderMode:
+        return SemanticProviderMode(self.transformation_planning_mode)
+
+    def transformation_planning_provider(self) -> object | None:
+        """Return the Stage 4.1 provider for the configured mode, if any."""
+
+        from app.core.enums import SemanticProviderMode as _Mode
+
+        mode = self.transformation_planning_semantic_mode()
+        if mode is _Mode.DETERMINISTIC:
+            return None
+        if mode is _Mode.ADAPTIVE:
+            return self.gemini_transformation_planning_provider_instance()
+        if not self.local_qwen_enabled:
+            return None
+        return self.local_transformation_planning_provider_instance()
+
+    def transformation_planning_provider_identity(self) -> dict[str, object]:
+        """Stable configured Stage 4.1 provider identity, independent of availability."""
+
+        from app.core.enums import SemanticProviderMode as _Mode
+        from app.transformation.planning.providers import DeterministicPlanningProvider
+
+        mode = self.transformation_planning_semantic_mode()
+        if mode is _Mode.ADAPTIVE:
+            from app.transformation.planning.gemini import GeminiPlanningProvider
+
+            return GeminiPlanningProvider(
+                api_key=None,
+                routine_model=self.transformation_planning_routine_model,
+                strong_model=self.transformation_planning_strong_model,
+                timeout_seconds=self.gemini_timeout_seconds,
+                retry_attempts=0,
+                max_output_tokens=self.transformation_planning_max_output_tokens,
+                thinking_level=self.transformation_planning_strong_thinking_level,
+                temperature=self.gemini_temperature,
+                api_version=self.gemini_api_version,
+                max_raw_calls=self.stage41_config().max_hosted_raw_calls,
+            ).runtime_identity()
+        if mode is _Mode.LOCAL_ONLY:
+            configured = self.local_transformation_planning_provider_instance()
+            if configured is not None:
+                return dict(configured.runtime_identity())
+        return DeterministicPlanningProvider().runtime_identity()
+
+    def gemini_transformation_planning_provider_instance(self) -> object | None:
+        key = self.gemini_api_key
+        if key is None or not key.get_secret_value():
+            return None
+        from app.transformation.planning.gemini import GeminiPlanningProvider
+
+        return GeminiPlanningProvider(
+            api_key=key.get_secret_value(),
+            routine_model=self.transformation_planning_routine_model,
+            strong_model=self.transformation_planning_strong_model,
+            timeout_seconds=self.gemini_timeout_seconds,
+            retry_attempts=0,
+            max_output_tokens=self.transformation_planning_max_output_tokens,
+            thinking_level=self.transformation_planning_strong_thinking_level,
+            temperature=self.gemini_temperature,
+            api_version=self.gemini_api_version,
+            max_raw_calls=self.stage41_config().max_hosted_raw_calls,
+        )
+
+    def local_transformation_planning_provider_instance(self) -> object | None:
+        if self.reconstruction_provider == "disabled" or not self.local_qwen_enabled:
+            return None
+        if not self.reconstruction_provider_base_url or not self.reconstruction_provider_model:
+            return None
+        from app.transformation.planning.local import LocalPlanningProvider
+
+        return LocalPlanningProvider(
+            base_url=self.reconstruction_provider_base_url,
+            model=self.reconstruction_provider_model,
+            timeout_seconds=self.reconstruction_provider_timeout_seconds,
+            max_output_tokens=self.transformation_planning_max_output_tokens,
+            temperature=0.0,
+        )
+
+    def stage42_config(self) -> Stage42Config:
+        """Build bounded Stage 4.2 governance configuration."""
+
+        return Stage42Config(
+            provider_max_output_tokens=self.transformation_governance_max_output_tokens,
+            provider_strong_thinking_level=self.transformation_governance_strong_thinking_level,
+        )
+
+    def transformation_governance_semantic_mode(self) -> SemanticProviderMode:
+        return SemanticProviderMode(self.transformation_governance_mode)
+
+    def transformation_governance_provider(self) -> object | None:
+        """Return the Stage 4.2 provider for the configured mode, if any."""
+
+        from app.core.enums import SemanticProviderMode as _Mode
+
+        mode = self.transformation_governance_semantic_mode()
+        if mode is _Mode.DETERMINISTIC:
+            return None
+        if mode is _Mode.ADAPTIVE:
+            return self.gemini_transformation_governance_provider_instance()
+        if not self.local_qwen_enabled:
+            return None
+        return self.local_transformation_governance_provider_instance()
+
+    def transformation_governance_provider_identity(self) -> dict[str, object]:
+        """Stable configured Stage 4.2 provider identity, independent of availability."""
+
+        from app.core.enums import SemanticProviderMode as _Mode
+        from app.transformation.governance.providers import (
+            DeterministicGovernanceProvider,
+        )
+
+        mode = self.transformation_governance_semantic_mode()
+        if mode is _Mode.ADAPTIVE:
+            from app.transformation.governance.gemini import GeminiGovernanceProvider
+
+            return GeminiGovernanceProvider(
+                api_key=None,
+                routine_model=self.transformation_governance_routine_model,
+                strong_model=self.transformation_governance_strong_model,
+                timeout_seconds=self.gemini_timeout_seconds,
+                retry_attempts=0,
+                max_output_tokens=self.transformation_governance_max_output_tokens,
+                thinking_level=self.transformation_governance_strong_thinking_level,
+                temperature=self.gemini_temperature,
+                api_version=self.gemini_api_version,
+                max_raw_calls=self.stage42_config().max_hosted_raw_calls,
+            ).runtime_identity()
+        if mode is _Mode.LOCAL_ONLY:
+            configured = self.local_transformation_governance_provider_instance()
+            if configured is not None:
+                return dict(configured.runtime_identity())
+        return DeterministicGovernanceProvider().runtime_identity()
+
+    def gemini_transformation_governance_provider_instance(self) -> object | None:
+        key = self.gemini_api_key
+        if key is None or not key.get_secret_value():
+            return None
+        from app.transformation.governance.gemini import GeminiGovernanceProvider
+
+        return GeminiGovernanceProvider(
+            api_key=key.get_secret_value(),
+            routine_model=self.transformation_governance_routine_model,
+            strong_model=self.transformation_governance_strong_model,
+            timeout_seconds=self.gemini_timeout_seconds,
+            retry_attempts=0,
+            max_output_tokens=self.transformation_governance_max_output_tokens,
+            thinking_level=self.transformation_governance_strong_thinking_level,
+            temperature=self.gemini_temperature,
+            api_version=self.gemini_api_version,
+            max_raw_calls=self.stage42_config().max_hosted_raw_calls,
+        )
+
+    def local_transformation_governance_provider_instance(self) -> object | None:
+        if self.reconstruction_provider == "disabled" or not self.local_qwen_enabled:
+            return None
+        if not self.reconstruction_provider_base_url or not self.reconstruction_provider_model:
+            return None
+        from app.transformation.governance.local import LocalGovernanceProvider
+
+        return LocalGovernanceProvider(
+            base_url=self.reconstruction_provider_base_url,
+            model=self.reconstruction_provider_model,
+            timeout_seconds=self.reconstruction_provider_timeout_seconds,
+            max_output_tokens=self.transformation_governance_max_output_tokens,
+            temperature=0.0,
         )
 
     def transformation_semantic_mode(self) -> SemanticProviderMode:

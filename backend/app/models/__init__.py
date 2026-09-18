@@ -13,6 +13,11 @@ from app.models.transformation_eligibility import (
     TransformationEligibilityAnalysis,
     TransformationStrategyCandidate,
 )
+from app.models.transformation_governance import (
+    TransformationGovernanceResult,
+    TransformationGovernanceSet,
+)
+from app.models.transformation_plan import TransformationPlan, TransformationPlanSet
 
 __all__ = [
     "AudioAnalysis",
@@ -27,5 +32,9 @@ __all__ = [
     "Transcript",
     "TranscriptChunk",
     "TransformationEligibilityAnalysis",
+    "TransformationGovernanceResult",
+    "TransformationGovernanceSet",
+    "TransformationPlan",
+    "TransformationPlanSet",
     "TransformationStrategyCandidate",
 ]
