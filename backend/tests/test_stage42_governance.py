@@ -158,7 +158,7 @@ def test_funny_source_led_plan_with_no_narration_passes():
             source_block(0),
             original_block(
                 1,
-                intent="Give the missing context about the comedian's setup",
+                intent="Give the missing context about why promotion rates fell",
                 kind="MISSING_CONTEXT",
             ),
         ],
@@ -177,7 +177,9 @@ def test_educational_clip_with_concise_explanation_passes():
         blocks=[
             source_block(0),
             original_block(
-                1, intent="Explain the underlying economic mechanism concisely", kind="EXPLANATION"
+                1,
+                intent="Explain how mentorship gaps caused promotion rates to fall",
+                kind="EXPLANATION",
             ),
         ],
         strategy_type="EXPLANATORY",
@@ -493,53 +495,112 @@ def test_ungrounded_non_numeric_external_claim_cannot_be_approved():
     assert "EXTERNAL_VERIFICATION_REQUIRED" in governance.reason_codes
 
 
-def test_grounded_non_numeric_external_claim_still_passes():
+def test_structural_citation_to_unrelated_evidence_is_not_grounded():
     plan = make_plan(
         blocks=[
-            source_block(0),
+            source_block(0, text="The source speaker discussed the weather and sports."),
             original_block(
                 1,
                 intent="The merger closes next Monday",
                 kind="EXPLANATION",
-                grounding=("source:21-27",),
+                grounding=("block:0", "source:21-27"),
             ),
         ],
         original_value_kinds=("EXPLANATION",),
     )
     governance = _governance(plan)
-    assert governance.status is GovernancePlanStatus.APPROVED_FOR_SELECTION
-    assert governance.verification["claim_state"] == "GROUNDED_IN_SOURCE"
+    assert governance.verification["claim_state"] != "GROUNDED_IN_SOURCE"
+    assert governance.status is GovernancePlanStatus.BLOCKED_PENDING_VERIFICATION
+    assert governance.eligible_for_stage4_3 is False
 
 
-def test_block_and_quote_grounding_refs_resolve():
+def test_factual_statement_supported_by_cited_wording_is_grounded():
     plan = make_plan(
         blocks=[
-            source_block(0),
+            source_block(0, text="The merger closes next Monday according to the filing."),
             original_block(
                 1,
-                intent="Explain what the speaker meant",
+                intent="The merger closes next Monday",
                 kind="EXPLANATION",
                 grounding=("block:0",),
             ),
         ],
         original_value_kinds=("EXPLANATION",),
     )
-    assert _governance(plan).status is GovernancePlanStatus.APPROVED_FOR_SELECTION
+    governance = _governance(plan)
+    assert governance.verification["claim_state"] == "GROUNDED_IN_SOURCE"
+    assert governance.status is GovernancePlanStatus.APPROVED_FOR_SELECTION
 
-    quoted = make_plan(
-        fingerprint="plan-fingerprint-quoted",
+
+def test_direct_quote_supported_by_cited_source_passes():
+    plan = make_plan(
+        blocks=[
+            source_block(0, text="We will double production by 2030."),
+            original_block(
+                1,
+                intent='The speaker said "we will double production by 2030"',
+                kind="SOURCE_AS_EVIDENCE",
+                grounding=("block:0",),
+            ),
+        ],
+        original_value_kinds=("SOURCE_AS_EVIDENCE",),
+    )
+    governance = _governance(plan)
+    assert governance.verification["claim_state"] == "GROUNDED_IN_SOURCE"
+    assert governance.status in {
+        GovernancePlanStatus.APPROVED_FOR_SELECTION,
+        GovernancePlanStatus.APPROVED_WITH_CAUTION,
+    }
+
+
+def test_non_factual_explanation_tied_to_cited_evidence_passes():
+    plan = make_plan(
         blocks=[
             source_block(0),
             original_block(
                 1,
-                intent="Explain what the speaker meant",
+                intent="Infer that mentorship gaps explain the promotion rates decline",
+                kind="INFERENCE",
+                grounding=("block:0",),
+            ),
+        ],
+        original_value_kinds=("INFERENCE",),
+    )
+    governance = _governance(plan)
+    assert governance.verification["claim_state"] == "GROUNDED_IN_SOURCE"
+    assert governance.status is GovernancePlanStatus.APPROVED_FOR_SELECTION
+    assert "EXTERNAL_VERIFICATION_REQUIRED" not in governance.reason_codes
+
+
+def test_ambiguous_claim_support_without_provider_never_approves():
+    plan = make_plan(
+        blocks=[
+            source_block(0, text="The team discussed the annual plan in a closed meeting."),
+            original_block(
+                1,
+                intent="Explain how the plan reflects broader strategy",
                 kind="EXPLANATION",
-                grounding=("the source speaker said something",),
+                grounding=("block:0",),
             ),
         ],
         original_value_kinds=("EXPLANATION",),
     )
-    assert _governance(quoted).verification["claim_state"] == "GROUNDED_IN_SOURCE"
+    inputs = make_inputs([plan])
+    evaluation = evaluate_plan(plan, inputs, DEFAULT_CONFIG, provider_mode_deterministic=False)
+    assert evaluation.requires_semantic_review is True
+    governance = _governance(plan, provider_mode_deterministic=False)
+    assert governance.status is GovernancePlanStatus.GOVERNANCE_DEFERRED
+    assert governance.status not in {
+        GovernancePlanStatus.APPROVED_FOR_SELECTION,
+        GovernancePlanStatus.APPROVED_WITH_CAUTION,
+    }
+
+
+def test_supported_claim_requires_no_semantic_review():
+    plan = make_plan()
+    inputs = make_inputs([plan])
+    evaluation = evaluate_plan(plan, inputs, DEFAULT_CONFIG, provider_mode_deterministic=False)
+    assert evaluation.requires_semantic_review is False
 
 
 def test_arbitrary_grounding_labels_do_not_approve_external_claim():

@@ -507,22 +507,180 @@ _WORD_REF_PREFIXES = ("word:", "words:")
 _SPAN_REF_PREFIXES = ("source:", "span:", "time:")
 _MIN_QUOTE_CHARS = 4
 
+# Claim-support classification (deterministic, conservative, non-NLP).
+_SUPPORT_SUPPORTED = "SUPPORTED"
+_SUPPORT_AMBIGUOUS = "AMBIGUOUS"
+_SUPPORT_UNSUPPORTED = "UNSUPPORTED"
 
-def _source_evidence(
-    plan: PlanEvidence,
-) -> tuple[set[int], list[tuple[float, float]], list[tuple[int, int]], list[str]]:
-    """Real, relevant source evidence declared by the immutable plan itself."""
+_SUPPORT_STOPWORDS: frozenset[str] = frozenset(
+    {
+        "the",
+        "and",
+        "for",
+        "that",
+        "this",
+        "with",
+        "from",
+        "into",
+        "about",
+        "their",
+        "there",
+        "here",
+        "what",
+        "when",
+        "where",
+        "which",
+        "while",
+        "would",
+        "could",
+        "should",
+        "will",
+        "shall",
+        "have",
+        "has",
+        "had",
+        "are",
+        "was",
+        "were",
+        "been",
+        "being",
+        "they",
+        "them",
+        "his",
+        "her",
+        "its",
+        "our",
+        "your",
+        "who",
+        "why",
+        "how",
+        "not",
+        "but",
+        "because",
+        "than",
+        "then",
+        "also",
+        "more",
+        "most",
+        "some",
+        "such",
+        "very",
+        "only",
+        "just",
+        "over",
+        "under",
+        "after",
+        "before",
+        "between",
+        "من",
+        "في",
+        "على",
+        "إلى",
+        "التي",
+        "الذي",
+        "هذا",
+        "هذه",
+        "ذلك",
+        "أن",
+        "إن",
+        "كان",
+        "كانت",
+        "هو",
+        "هي",
+        "مع",
+        "عن",
+        "كما",
+        "لكن",
+        "حتى",
+        "بين",
+        "بعد",
+        "قبل",
+    }
+)
 
-    indexes: set[int] = set()
-    spans: list[tuple[float, float]] = []
-    word_ranges: list[tuple[int, int]] = []
+_TEMPORAL_MARKERS: frozenset[str] = frozenset(
+    {
+        "next",
+        "last",
+        "tomorrow",
+        "today",
+        "tonight",
+        "yesterday",
+        "week",
+        "month",
+        "year",
+        "monday",
+        "tuesday",
+        "wednesday",
+        "thursday",
+        "friday",
+        "saturday",
+        "sunday",
+        "january",
+        "february",
+        "march",
+        "april",
+        "may",
+        "june",
+        "july",
+        "august",
+        "september",
+        "october",
+        "november",
+        "december",
+        "غدا",
+        "أمس",
+        "اليوم",
+        "الأسبوع",
+        "الشهر",
+        "السنة",
+    }
+)
+
+_QUOTE_MARKERS: tuple[str, ...] = (
+    "said",
+    "says",
+    "stated",
+    "according to",
+    "quoted",
+    "quoting",
+    "in his words",
+    "in her words",
+    "قال",
+    "يقول",
+    "صرح",
+    "نقلا",
+    "بحسب",
+)
+
+
+@dataclass(frozen=True)
+class _SourceEvidence:
+    blocks: dict[int, str]
+    spans: list[tuple[float, float, str]]
+    words: list[tuple[int, int, str]]
+    all_text: str
+    refined_start: float
+    refined_end: float
+
+
+def _build_source_evidence(plan: PlanEvidence, inputs: GovernanceInputs) -> _SourceEvidence:
+    """Real source evidence declared by the immutable plan itself."""
+
+    blocks: dict[int, str] = {}
+    spans: list[tuple[float, float, str]] = []
+    words: list[tuple[int, int, str]] = []
     texts: list[str] = []
     for block in _blocks(plan):
         if _block_type(block) != PlanBlockType.SOURCE_EXCERPT.value:
             continue
         index = _int(block.get("index"))
+        text = block.get("source_text")
+        text_value = text if isinstance(text, str) else ""
         if index >= 0:
-            indexes.add(index)
+            blocks[index] = text_value
+        if text_value.strip():
+            texts.append(text_value)
         start = block.get("source_start")
         end = block.get("source_end")
         if (
@@ -531,7 +689,7 @@ def _source_evidence(
             and isinstance(end, (int, float))
             and not isinstance(end, bool)
         ):
-            spans.append((float(start), float(end)))
+            spans.append((float(start), float(end), text_value))
         word_start = block.get("word_start_index")
         word_end = block.get("word_end_index")
         if (
@@ -540,11 +698,15 @@ def _source_evidence(
             and isinstance(word_end, int)
             and not isinstance(word_end, bool)
         ):
-            word_ranges.append((word_start, word_end))
-        text = block.get("source_text")
-        if isinstance(text, str) and text.strip():
-            texts.append(text.casefold())
-    return indexes, spans, word_ranges, texts
+            words.append((word_start, word_end, text_value))
+    return _SourceEvidence(
+        blocks=blocks,
+        spans=spans,
+        words=words,
+        all_text=" ".join(texts),
+        refined_start=inputs.refined_start,
+        refined_end=inputs.refined_end,
+    )
 
 
 def _first_int(value: str) -> int | None:
@@ -559,33 +721,28 @@ def _float_range(value: str) -> tuple[float, float] | None:
     return float(match.group(1)), float(match.group(2))
 
 
-def _ref_resolves(
-    ref: object,
-    indexes: set[int],
-    spans: list[tuple[float, float]],
-    word_ranges: list[tuple[int, int]],
-    texts: list[str],
-    refined_start: float,
-    refined_end: float,
-) -> bool:
-    """Resolve one grounding reference against real plan source evidence.
+def _resolve_ref(ref: object, evidence: _SourceEvidence) -> str | None:
+    """Resolve one grounding reference and return its cited source text.
 
     Provider-declared labels such as ``strategy`` or ``source_excerpt`` are
     never proof: only a reference that addresses an existing source-excerpt
-    block/word/time span or quotes real source excerpt text counts.
+    block/word/time span or quotes real source excerpt text resolves. A
+    structural citation alone is necessary but not sufficient for grounding.
     """
 
     if not isinstance(ref, str):
-        return False
+        return None
     value = ref.strip()
     if not value:
-        return False
+        return None
     lowered = value.casefold()
 
     for prefix in _BLOCK_REF_PREFIXES:
         if lowered.startswith(prefix):
             index = _first_int(lowered[len(prefix) :])
-            return index is not None and index in indexes
+            if index is not None and index in evidence.blocks:
+                return evidence.blocks[index]
+            return None
 
     for prefix in _WORD_REF_PREFIXES:
         if lowered.startswith(prefix):
@@ -593,9 +750,17 @@ def _ref_resolves(
             span = _float_range(body)
             if span is not None:
                 low, high = span
-                return any(not (high < start or low > end) for start, end in word_ranges)
+                for start, end, text in evidence.words:
+                    if not (high < start or low > end):
+                        return text
+                return None
             index = _first_int(body)
-            return index is not None and any(start <= index <= end for start, end in word_ranges)
+            if index is None:
+                return None
+            for start, end, text in evidence.words:
+                if start <= index <= end:
+                    return text
+            return None
 
     for prefix in _SPAN_REF_PREFIXES:
         if lowered.startswith(prefix):
@@ -603,58 +768,146 @@ def _ref_resolves(
             span = _float_range(body)
             if span is not None:
                 low, high = span
-                if any(not (high < start or low > end) for start, end in spans):
-                    return True
-                return low >= refined_start and high <= refined_end
+                for span_start, span_end, span_text in evidence.spans:
+                    if not (high < span_start or low > span_end):
+                        return span_text
+                if low >= evidence.refined_start and high <= evidence.refined_end:
+                    return evidence.all_text
+                return None
             point = _FLOAT_RE.search(body)
             if point is not None:
                 value_f = float(point.group(0))
-                if any(start <= value_f <= end for start, end in spans):
-                    return True
-                return refined_start <= value_f <= refined_end
-            return False
+                for span_start, span_end, span_text in evidence.spans:
+                    if span_start <= value_f <= span_end:
+                        return span_text
+                if evidence.refined_start <= value_f <= evidence.refined_end:
+                    return evidence.all_text
+            return None
 
     if value.isdigit():
-        return int(value) in indexes
+        number = int(value)
+        return evidence.blocks.get(number)
 
-    if len(lowered) >= _MIN_QUOTE_CHARS and any(lowered in text for text in texts):
+    if len(lowered) >= _MIN_QUOTE_CHARS and lowered in evidence.all_text.casefold():
+        return value
+    return None
+
+
+def _support_tokens(text: str) -> list[str]:
+    tokens: list[str] = []
+    for token in _content_tokens(text):
+        if token in _SUPPORT_STOPWORDS:
+            continue
+        if re.search(r"[\u0600-\u06ff]", token):
+            if len(token) >= 3:
+                tokens.append(token)
+        elif len(token) >= 3:
+            tokens.append(token)
+    return tokens
+
+
+def _has_factual_signal(text: str) -> bool:
+    if _numeric_tokens(text):
         return True
+    tokens = set(_tokens(text))
+    if tokens & _TEMPORAL_MARKERS:
+        return True
+    for index, word in enumerate(text.split()):
+        if index == 0:
+            continue
+        core = word.strip(".,;:!?()[]{}\"'«»")
+        if (
+            len(core) >= 2
+            and core[0].isupper()
+            and core.isascii()
+            and any(character.isalpha() for character in core)
+        ):
+            return True
     return False
 
 
-def _ungrounded_substantive_indexes(
+def _quote_framing(text: str) -> bool:
+    if any(marker in text for marker in ('"', "«", "»", "“", "”")):
+        return True
+    folded = text.casefold()
+    return any(marker in folded for marker in _QUOTE_MARKERS)
+
+
+def _shared_phrase(claim_text: str, evidence_text: str) -> bool:
+    tokens = _support_tokens(claim_text)
+    folded = evidence_text.casefold()
+    return any(f"{tokens[index]} {tokens[index + 1]}" in folded for index in range(len(tokens) - 1))
+
+
+def _claim_support(block: dict[str, object], evidence: _SourceEvidence) -> str:
+    """Conservative deterministic claim-to-evidence support classification."""
+
+    refs = block.get("grounding_refs")
+    matched: list[str] = []
+    cited = False
+    if isinstance(refs, list):
+        for ref in refs:
+            resolved = _resolve_ref(ref, evidence)
+            if resolved is not None:
+                cited = True
+                if resolved.strip():
+                    matched.append(resolved)
+    claim_text = _text(block.get("semantic_intent"))
+    claim_tokens = _support_tokens(claim_text)
+
+    if not cited:
+        return _SUPPORT_UNSUPPORTED if _has_factual_signal(claim_text) else _SUPPORT_AMBIGUOUS
+    if not claim_tokens:
+        return _SUPPORT_AMBIGUOUS
+    evidence_text = " ".join(matched).strip() or evidence.all_text
+    evidence_tokens = set(_support_tokens(evidence_text))
+    if not evidence_tokens:
+        return _SUPPORT_AMBIGUOUS
+
+    shared = [token for token in claim_tokens if token in evidence_tokens]
+    if not shared:
+        return _SUPPORT_UNSUPPORTED if _has_factual_signal(claim_text) else _SUPPORT_AMBIGUOUS
+    if _quote_framing(claim_text) or _shared_phrase(claim_text, evidence_text):
+        return _SUPPORT_SUPPORTED
+    if len(shared) >= 2 or len(claim_tokens) <= 3:
+        return _SUPPORT_SUPPORTED
+    if any(len(token) >= 6 for token in shared):
+        return _SUPPORT_SUPPORTED
+    return _SUPPORT_AMBIGUOUS
+
+
+def _external_verification_essential(plan: PlanEvidence) -> bool:
+    if plan.verification_dependencies:
+        return True
+    snapshot = plan.strategy_snapshot
+    requirement = str(snapshot.get("external_verification_requirement", "")).upper()
+    return requirement == "REQUIRES_EXTERNAL_FACT_VERIFICATION"
+
+
+def _classify_substantive_support(
     plan: PlanEvidence, inputs: GovernanceInputs
-) -> tuple[int, ...]:
-    """Substantive blocks whose grounding does not resolve to real evidence.
+) -> tuple[list[int], list[int], list[int]]:
+    """Partition substantive blocks into supported/ambiguous/unsupported."""
 
-    An authored factual claim with no resolvable source grounding is an
-    unresolved verification dependency, never silently grounded.
-    """
-
-    indexes, spans, word_ranges, texts = _source_evidence(plan)
-    ungrounded: list[int] = []
+    evidence = _build_source_evidence(plan, inputs)
+    supported: list[int] = []
+    ambiguous: list[int] = []
+    unsupported: list[int] = []
     for block in _blocks(plan):
         if _block_type(block) not in {
             PlanBlockType.ORIGINAL_VALUE.value,
             PlanBlockType.TEXTUAL_ANNOTATION.value,
         }:
             continue
-        refs = block.get("grounding_refs")
-        grounded = isinstance(refs, list) and any(
-            _ref_resolves(
-                ref,
-                indexes,
-                spans,
-                word_ranges,
-                texts,
-                inputs.refined_start,
-                inputs.refined_end,
-            )
-            for ref in refs
-        )
-        if not grounded:
-            ungrounded.append(_int(block.get("index")))
-    return tuple(ungrounded)
+        index = _int(block.get("index"))
+        state = _claim_support(block, evidence)
+        if state == _SUPPORT_SUPPORTED:
+            supported.append(index)
+        elif state == _SUPPORT_AMBIGUOUS:
+            ambiguous.append(index)
+        else:
+            unsupported.append(index)
+    return supported, ambiguous, unsupported
 
 
 def _template_level(evidence: dict[str, object], plan: PlanEvidence) -> str:
@@ -743,18 +996,39 @@ def _verification(
                 }
             ]
         else:
-            # A substantive authored block is grounded only when it demonstrably
-            # cites source evidence. Absence of a placeholder is never proof of
-            # grounding: an ungrounded authored claim (numeric or not) is an
-            # unresolved verification dependency, so it can never silently pass.
-            ungrounded = _ungrounded_substantive_indexes(plan, inputs)
-            if ungrounded:
+            # A substantive authored block is grounded only when it cites real
+            # source evidence *and* the cited wording supports the claim. A
+            # structural citation alone is never proof: unrelated spans, generic
+            # source text, or merely adjacent timing cannot make a factual claim
+            # grounded.
+            _supported, ambiguous, unsupported = _classify_substantive_support(plan, inputs)
+            if unsupported:
                 state = ClaimGroundingState.EXTERNAL_REQUIRED_UNRESOLVED.value
                 claims = [
                     {
                         "claim_id": None,
                         "state": state,
-                        "dependent_block_indexes": list(ungrounded),
+                        "dependent_block_indexes": list(unsupported),
+                        "must_verify_before_execution": False,
+                    }
+                ]
+            elif ambiguous and _external_verification_essential(plan):
+                state = ClaimGroundingState.EXTERNAL_REQUIRED_UNRESOLVED.value
+                claims = [
+                    {
+                        "claim_id": None,
+                        "state": state,
+                        "dependent_block_indexes": list(ambiguous),
+                        "must_verify_before_execution": False,
+                    }
+                ]
+            elif ambiguous:
+                state = ClaimGroundingState.SUPPORT_UNVERIFIED.value
+                claims = [
+                    {
+                        "claim_id": None,
+                        "state": state,
+                        "dependent_block_indexes": list(ambiguous),
                         "must_verify_before_execution": False,
                     }
                 ]
@@ -769,6 +1043,7 @@ def _verification(
         in {
             ClaimGroundingState.EXTERNAL_REQUIRED_UNRESOLVED.value,
             ClaimGroundingState.UNSUPPORTED_OR_FABRICATED.value,
+            ClaimGroundingState.SUPPORT_UNVERIFIED.value,
         },
         "reason_codes": (
             [_R.EXTERNAL_VERIFICATION_REQUIRED.value]
@@ -1377,6 +1652,9 @@ def evaluate_plan(
     _caution_dimensions(plan, evidence, evaluation)
 
     evaluation.verification = _verification(plan, inputs, evidence)
+    support_unverified = (
+        evaluation.verification["claim_state"] == ClaimGroundingState.SUPPORT_UNVERIFIED.value
+    )
     if (
         evaluation.verification["claim_state"]
         == ClaimGroundingState.EXTERNAL_REQUIRED_UNRESOLVED.value
@@ -1399,7 +1677,9 @@ def evaluate_plan(
         )
 
     if not (evaluation.hard_failures or evaluation.blocking or evaluation.revisions):
-        evaluation.requires_semantic_review = _requires_semantic_review(
+        # A claim whose claim-to-evidence support is lexically unverifiable must
+        # be semantically reviewed; it can never be silently approved.
+        evaluation.requires_semantic_review = support_unverified or _requires_semantic_review(
             plan, evidence, evaluation, config, provider_mode_deterministic
         )
     evaluation.semantic_state = (

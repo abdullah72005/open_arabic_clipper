@@ -525,6 +525,10 @@ class ClaimGroundingState(str, Enum):
     EXTERNAL_REQUIRED_UNRESOLVED = "EXTERNAL_REQUIRED_UNRESOLVED"
     UNSUPPORTED_OR_FABRICATED = "UNSUPPORTED_OR_FABRICATED"
     NOT_APPLICABLE = "NOT_APPLICABLE"
+    # The claim cites real source evidence but the deterministic lexical check
+    # cannot confirm support; requires selective semantic review (never a silent
+    # approval).
+    SUPPORT_UNVERIFIED = "SUPPORT_UNVERIFIED"
 
 
 class NarrationBurdenFinding(str, Enum):

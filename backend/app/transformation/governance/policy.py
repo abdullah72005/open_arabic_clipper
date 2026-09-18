@@ -28,10 +28,11 @@ from app.transformation.planning.policy import (  # noqa: F401  (re-exported mar
     VOICE_SELECTION_CONTEXT_MARKERS,
 )
 
-# v1: initial Stage 4.2 governor.
-GOVERNOR_POLICY_VERSION = "stage4.2-v1"
+# v2: conservative claim-to-source lexical support policy (a structural citation
+# alone is no longer sufficient for GROUNDED_IN_SOURCE).
+GOVERNOR_POLICY_VERSION = "stage4.2-v2"
 GOVERNOR_SCHEMA_VERSION = "stage4.2-schema-v1"
-GOVERNOR_VALIDATION_VERSION = "stage4.2-validation-v1"
+GOVERNOR_VALIDATION_VERSION = "stage4.2-validation-v2"
 INPUT_FINGERPRINT_VERSION = "1"
 OUTPUT_FINGERPRINT_VERSION = "1"
 PLAN_GOVERNANCE_FINGERPRINT_VERSION = "1"

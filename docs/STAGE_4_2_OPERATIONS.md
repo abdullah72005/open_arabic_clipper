@@ -204,24 +204,42 @@ Claim state is explicit:
 
 - `GROUNDED_IN_SOURCE` — every substantive authored block declares at least one
   grounding reference that deterministically resolves to real plan source
-  evidence (an existing source-excerpt block index, a word-index range, a
-  source/time span inside the refined window, or a quote of real source-excerpt
-  text); may proceed;
+  evidence **and** the cited source wording supplies conservative lexical support
+  for the claim (shared claim-specific content tokens, a contiguous shared phrase,
+  or direct-quote/reference framing); may proceed;
 - `EXTERNAL_REQUIRED_UNRESOLVED` — an essential correctly linked external
-  dependency, or an authored substantive block whose grounding references do
-  **not** resolve (including provider-declared labels such as `strategy` or
-  `source_excerpt`, numeric or non-numeric external claims such as "The merger
-  closes next Monday"), → `BLOCKED_PENDING_VERIFICATION` when the rest is sound;
+  dependency, an unresolvable grounding reference (including provider-declared
+  labels such as `strategy` or `source_excerpt`), or an unsupported factual claim
+  whose citation is real but unrelated (e.g. "The merger closes next Monday"
+  citing a source that contains no merger information); →
+  `BLOCKED_PENDING_VERIFICATION` when the rest is sound;
+- `SUPPORT_UNVERIFIED` — the citation resolves but the deterministic lexical
+  check cannot confirm claim support; requires semantic review (defer or block,
+  never a silent approval);
 - `UNSUPPORTED_OR_FABRICATED` → `REJECTED_BY_GOVERNOR`;
 - `NOT_APPLICABLE`.
 
-Provider-declared grounding labels are never proof. Absence of a verification
-placeholder is never proof of grounding. A plan with substantive authored
-material but no resolvable grounding is treated as an unresolved verification
-dependency, so it can never silently reach `APPROVED_FOR_SELECTION` without
-valid grounding/verification. Legitimate source-grounded
-explanation/source-as-evidence plans that reference real source evidence are
-unaffected.
+Provider-declared grounding labels are never proof, and a structural citation
+alone is never proof. Absence of a verification placeholder is never proof of
+grounding. Because no deterministic system can prove semantic entailment, the
+support check is deliberately conservative and three-way:
+
+- **supported** → `GROUNDED_IN_SOURCE`;
+- **ambiguous** (weak/partial lexical overlap, or no factual signal) → semantic
+  judgment: the selective provider may assess observable claim-to-source
+  support/fidelity when available; when unavailable the plan stays truthful
+  (`GOVERNANCE_DEFERRED`, or `BLOCKED_PENDING_VERIFICATION` when external fact
+  verification is essential) and is never approved;
+- **unsupported** (no meaningful claim-to-evidence overlap or a factual signal
+  with an unrelated citation) → `EXTERNAL_REQUIRED_UNRESOLVED` /
+  `BLOCKED_PENDING_VERIFICATION`.
+
+Deterministic code owns the final status and hard gates; Gemini is
+non-authoritative, may only report bounded observable support/fidelity findings,
+and is never a fact-checking or web-lookup system. Clearly-supported claims are
+resolved deterministically without any hosted call. Legitimate source-grounded
+explanation, inference, quotation, and source-as-evidence plans that reference
+real supporting evidence are unaffected.
 
 Stage 4.2 never creates missing placeholders, never claims verification occurred,
 never browses at runtime, and adds no research/fact-checking infrastructure.
@@ -232,9 +250,9 @@ not change its truthful state.
 
 Immutable, code-defined profile (never a dynamic engine, never runtime scraping):
 
-- governor policy: `stage4.2-v1`
+- governor policy: `stage4.2-v2`
 - schema: `stage4.2-schema-v1`
-- validation: `stage4.2-validation-v1`
+- validation: `stage4.2-validation-v2`
 - platform profile: `stage4.2-platform-policy-2026-09-17-v1`
 - checked date: `2026-09-17`
 
@@ -570,3 +588,15 @@ regime.
    fingerprint, unresolved inputs, or a fingerprint recomputation error is
    `UNVERIFIABLE` and forces every handoff plan `eligible_for_stage4_3=false`.
    `stage4_3_implemented` stays `false` and no winner is selected.
+9. **Claim-to-source support resolution (P1).** A structural citation alone is
+   no longer sufficient for `GROUNDED_IN_SOURCE`. A conservative deterministic
+   lexical check classifies each substantive block as supported, ambiguous, or
+   unsupported against its actually-cited source wording; unrelated citations,
+   generic source text, and merely adjacent timing cannot ground a factual claim.
+   Unsupported factual claims are `BLOCKED_PENDING_VERIFICATION`; ambiguous
+   support routes to the selective provider when available and otherwise stays
+   truthfully `GOVERNANCE_DEFERRED`/blocked, never approved. Supported factual
+   statements, direct quotes, and non-factual explanation/inference tied to cited
+   evidence remain grounded. Gemini stays non-authoritative and no web
+   lookup/fact-checking is added. Policy/validation versions advanced to
+   `stage4.2-v2`/`stage4.2-validation-v2` so prior governance is invalidated.

@@ -253,6 +253,12 @@ def make_critique(
     )
 
 
+SOURCE_TEXT = (
+    "The guest argues that remote work collapsed productivity because managers lost "
+    "the ability to mentor junior staff and promotion rates fell sharply."
+)
+
+
 def source_block(
     index: int,
     *,
@@ -260,6 +266,7 @@ def source_block(
     duration: float = 6.0,
     start: float = 21.0,
     interrupts: bool = False,
+    text: str = SOURCE_TEXT,
 ) -> dict[str, object]:
     return {
         "index": index,
@@ -275,7 +282,7 @@ def source_block(
         "word_end_index": 10,
         "source_start": start,
         "source_end": start + duration,
-        "source_text": "the source speaker said something",
+        "source_text": text,
         "continuity_rationale": "keeps context",
     }
 

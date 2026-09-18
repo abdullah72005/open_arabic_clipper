@@ -313,3 +313,36 @@ def test_second_strong_call_failure_stays_truthfully_deferred():
     assert outcome.semantic_outcome is GovernanceSemanticOutcome.GOVERNANCE_DEFERRED
     # The first accepted critique remains checkpointed for a later retry.
     assert outcome.attempts[-1].checkpoint is not None
+
+
+def test_ambiguous_claim_support_without_provider_defers_not_approves():
+    plan = make_plan(
+        plan_id="l" * 8,
+        fingerprint="fp-l",
+        blocks=[
+            source_block(0, text="The team discussed the annual plan in a closed meeting."),
+            original_block(
+                1,
+                intent="Explain how the plan reflects broader strategy",
+                kind="EXPLANATION",
+                grounding=("block:0",),
+            ),
+        ],
+        original_value_kinds=("EXPLANATION",),
+    )
+    service = GovernanceService(
+        config=DEFAULT_CONFIG,
+        provider=None,
+        provider_identity={"provider": "deterministic"},
+        mode=SemanticProviderMode.ADAPTIVE,
+    )
+    outcome = service.govern(_inputs([plan]), input_fingerprint="in")
+    assert outcome.semantic_outcome is GovernanceSemanticOutcome.GOVERNANCE_DEFERRED
+    assert all(
+        item.status
+        not in {
+            GovernancePlanStatus.APPROVED_FOR_SELECTION,
+            GovernancePlanStatus.APPROVED_WITH_CAUTION,
+        }
+        for item in outcome.plans
+    )
