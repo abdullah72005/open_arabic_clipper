@@ -103,6 +103,7 @@ def seed_stage50(
     planning_on_final: bool = True,
     settings: Any = None,
     source_only: bool = False,
+    first_provider_plan_factory: Any | None = None,
 ) -> Stage50Fixture:
     specs = result_specs or [make_result_spec()]
     fixture = seed_selection_fixture(
@@ -114,6 +115,7 @@ def seed_stage50(
         refinement_status=refinement_status,
         final_transcript=final_transcript,
         source_only=source_only,
+        first_provider_plan_factory=first_provider_plan_factory,
     )
     if clear_hook_payoff:
         for plan in fixture.plans:
@@ -193,6 +195,121 @@ def make_final(
         dialect_profile=dialect_profile,
         dialect_confidence=0.9,
         output_fingerprint=output_fingerprint,
+    )
+
+
+def make_textual_annotation_plan(strategy_id: str, strategy_key: str) -> Any:
+    """A Stage 4.1-valid provider plan whose substantive block is TEXTUAL_ANNOTATION.
+
+    ``TEXTUAL_ANNOTATION`` is validated as a substantive block: an additive
+    ``substantive_value_kind`` allowed by the strategy, a semantic intent of at
+    least 12 characters, a non-empty ``why_unavailable``, and no presentation-only
+    phrasing.
+    """
+
+    from app.core.enums import (
+        DeliveryIntent,
+        NarrationNeed,
+        PlanBlockType,
+        SourceExcerptRole,
+        SubstantiveValueKind,
+    )
+    from app.transformation.planning.types import (
+        NarrationRequirement,
+        PlanProviderBlock,
+        PlanProviderPlan,
+    )
+
+    return PlanProviderPlan(
+        strategy_id=strategy_id,
+        strategy_key=strategy_key,
+        confidence=0.7,
+        blocks=(
+            PlanProviderBlock(
+                block_type=PlanBlockType.SOURCE_EXCERPT,
+                purpose="Hero source moment",
+                use_full_window=True,
+                source_role=SourceExcerptRole.HERO,
+            ),
+            PlanProviderBlock(
+                block_type=PlanBlockType.TEXTUAL_ANNOTATION,
+                purpose="On-screen context annotation",
+                estimated_duration=4.0,
+                substantive_value_kind=SubstantiveValueKind.AUTHORED_THESIS,
+                semantic_intent=(
+                    "Surface the baseline promotion rate the excerpt omits for contrast"
+                ),
+                why_unavailable=(
+                    "The raw excerpt states the drop but not the baseline it is measured against"
+                ),
+                grounding_refs=("block:0",),
+                delivery_intent=DeliveryIntent.ON_SCREEN_TEXT,
+            ),
+        ),
+        narration=NarrationRequirement(need=NarrationNeed.NONE),
+    )
+
+
+def make_verification_required_plan(strategy_id: str, strategy_key: str) -> Any:
+    """A Stage 4.1-valid plan whose status requires external verification.
+
+    The plan's authored block carries a dependency on a real verification
+    placeholder, so Stage 4.1 persists it as
+    ``PLAN_GENERATED_WITH_VERIFICATION_REQUIRED`` with a
+    ``must_verify_before_execution`` external dependency.
+    """
+
+    from app.core.enums import (
+        DeliveryIntent,
+        NarrationNeed,
+        PlanBlockType,
+        SourceExcerptRole,
+        SubstantiveValueKind,
+    )
+    from app.transformation.planning.types import (
+        NarrationRequirement,
+        PlanProviderBlock,
+        PlanProviderPlan,
+    )
+
+    return PlanProviderPlan(
+        strategy_id=strategy_id,
+        strategy_key=strategy_key,
+        confidence=0.7,
+        blocks=(
+            PlanProviderBlock(
+                block_type=PlanBlockType.SOURCE_EXCERPT,
+                purpose="Hero source moment",
+                use_full_window=True,
+                source_role=SourceExcerptRole.HERO,
+            ),
+            PlanProviderBlock(
+                block_type=PlanBlockType.ORIGINAL_VALUE,
+                purpose="Authored contribution",
+                estimated_duration=4.0,
+                substantive_value_kind=SubstantiveValueKind.SOURCE_AS_EVIDENCE,
+                semantic_intent=(
+                    "Frame the promotion-rate drop as evidence for the remote-work debate"
+                ),
+                why_unavailable=(
+                    "The raw excerpt states the drop but not why it matters for the debate"
+                ),
+                grounding_refs=("block:0",),
+                delivery_intent=DeliveryIntent.ON_SCREEN_TEXT,
+                dependency_ids=("claim-1",),
+            ),
+            PlanProviderBlock(
+                block_type=PlanBlockType.FACT_VERIFICATION_PLACEHOLDER,
+                purpose="Verification placeholder",
+                estimated_duration=0.0,
+                claim_dependency="claim-1",
+                verification_rationale="External baseline is required before execution",
+                intended_use="support the authored claim",
+                must_verify_before_execution=True,
+                dependent_block_ids=(1,),
+            ),
+        ),
+        narration=NarrationRequirement(need=NarrationNeed.NONE),
     )
 
 
@@ -286,6 +403,8 @@ __all__ = [
     "corrupt_prober",
     "install_selection_settings",
     "make_final",
+    "make_textual_annotation_plan",
+    "make_verification_required_plan",
     "managed_source",
     "no_video_prober",
     "seed_stage50",

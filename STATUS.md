@@ -65,11 +65,24 @@ plan, enqueues `FINAL_CLIP` refinement, or advances the source lifecycle.
   handoff surfaces `contract.live_freshness` and `contract.effective`.
 - **Persistence.** One table `render_contracts` (one row per candidate + input
   fingerprint, one database-current row per candidate via a partial unique
-  index), migration `20260918_0020`. Policy `stage5.0-v2`, compatibility policy
-  `stage5.0-compatibility-v2`. API endpoints and CLI commands expose the
+  index), migration `20260918_0020`. Policy `stage5.0-v3`, compatibility policy
+  `stage5.0-compatibility-v3`. API endpoints and CLI commands expose the
   contract and the read-only Stage 5.1 handoff
   (`stage5_1_implemented=false`, `stage5_2_implemented=false`,
   `stage6_implemented=false`). See `docs/STAGE_5_0_OPERATIONS.md`.
+- **Sealing patch (2026-09-18).** The boundary/timing classification was
+  previously unreachable (a no-wording-change verdict was absorbed as a minor
+  wording change); it now owns the per-block verdict whenever wording is
+  unchanged. Required-test completion covers bounded drift
+  (`TIMING_DRIFT_BOUNDED`), boundary adjustment (`BOUNDARY_ADJUSTED`), material
+  timing drift, cut/clipped thought (`EXCERPT_CUTS_THOUGHT` /
+  `EXCERPT_CLIPPED_BY_WINDOW`), zero-byte/corrupt source media, negative/reversed
+  planning spans, `TEXTUAL_ANNOTATION` -> `AUTHORED_TEXT` materialization, and
+  the unresolved-required-verification gate. Deterministic verification: 103
+  focused Stage 5.0 tests pass (101 default plus 2 PostgreSQL-gated). Both
+  PostgreSQL tests pass against the compose database with
+  `CLIPFACTORY_TEST_POSTGRES_URL` set (real Alembic upgrade/downgrade and
+  concurrent-current-row convergence).
 
 ## Stage 4.3 deterministic final-plan selection (2026-09-18)
 

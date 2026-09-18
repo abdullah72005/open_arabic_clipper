@@ -21,6 +21,7 @@ from stage43_support import FakeGovernanceSettings, install_selection_settings
 from stage50_support import FakeProber, seed_stage50
 
 from alembic import command
+from app.core.settings import get_settings
 from app.db.base import Base
 from app.models import RenderContract
 from app.render.service import create_render_contract
@@ -33,6 +34,12 @@ pytestmark = pytest.mark.skipif(
 
 
 def _alembic_config() -> Config:
+    # The shared autouse test fixture forces a per-test SQLite URL and clears
+    # the settings cache; alembic's env.py reads ``get_settings()``, so the
+    # PostgreSQL target must be re-established for the migration run.
+    if _URL:
+        os.environ["CLIPFACTORY_DATABASE_URL"] = _URL
+        get_settings.cache_clear()
     backend_root = Path(__file__).parents[1]
     config = Config()
     config.set_main_option("script_location", str(backend_root / "alembic"))

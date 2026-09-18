@@ -199,10 +199,10 @@ recomputation failure; anything other than `CURRENT` yields `effective=false`
 
 ## Versions
 
-- policy `stage5.0-v2`
+- policy `stage5.0-v3`
 - schema `stage5.0-schema-v1`
 - fingerprint `1`
-- compatibility policy `stage5.0-compatibility-v2`
+- compatibility policy `stage5.0-compatibility-v3`
 - render profile `stage5.0-render-profile-v1`
 - profile `SHORTS_1080X1920` (9:16, 1080×1920, `SOURCE_COMPATIBLE` fps, 30 fallback)
 
@@ -211,3 +211,18 @@ recomputation failure; anything other than `CURRENT` yields `effective=false`
 `tests/stage50_support.py` plus `test_stage50_{readiness,compatibility,binding,materialization,fingerprints,contract,api,migration,scope}.py`.
 All ffprobe is faked; no provider, rendering, caption, TTS, or face-tracking
 path is exercised.
+
+Sealing patch completion: the required-test list is fully covered, including the
+boundary/timing bands (`TIMING_DRIFT_BOUNDED`, `BOUNDARY_ADJUSTED`, material
+timing drift, `EXCERPT_CUTS_THOUGHT`, `EXCERPT_CLIPPED_BY_WINDOW`), zero-byte and
+corrupt managed source media, negative/reversed planning spans, a
+`TEXTUAL_ANNOTATION` block mapped to a required `AUTHORED_TEXT` slot (no
+ASS/caption file), and the unresolved-required-verification `BLOCKED` gate (unit
+matrix plus a post-selection governance-snapshot mutation). These outcomes are
+reachable only when wording is unchanged; a no-wording-change comparison defers
+to the deterministic boundary/timing classification instead of being absorbed as
+a minor wording change. Focused Stage 5.0 verification: 103 tests pass (101
+default plus the 2 PostgreSQL-gated tests). `test_stage50_postgres.py` was run
+against the compose PostgreSQL with `CLIPFACTORY_TEST_POSTGRES_URL` pointing at a
+disposable database; both the migration upgrade/downgrade test and the
+concurrent-current-row test pass.

@@ -14,13 +14,16 @@ from stage50_support import (
     caption_fingerprint_for,
     clip_words,
     make_final,
+    make_textual_annotation_plan,
     seed_stage50,
     source_block,
 )
 
+from app.core.enums import RenderContractStatus
 from app.db.base import Base
 from app.render.compatibility import evaluate_compatibility
 from app.render.fingerprints import build_caption_source_payload
+from app.render.policy import AUTHORED_TEXT_MATERIALIZATION_REQUIRED
 from app.render.service import create_render_contract
 
 BIDI_CONTROLS = {
@@ -182,3 +185,49 @@ def test_mixed_arabic_english_text_is_preserved_byte_for_byte() -> None:
     )
     assert payload["final_transcript"] == MIXED
     assert unicodedata.normalize("NFC", payload["final_transcript"]) == MIXED
+
+
+def test_textual_annotation_is_a_required_authored_text_slot(
+    session: Session, monkeypatch: Any
+) -> None:
+    settings = _install(monkeypatch)
+    fixture = seed_stage50(
+        session,
+        settings=settings,
+        first_provider_plan_factory=make_textual_annotation_plan,
+    )
+    view = create_render_contract(
+        session, fixture.selection.candidate.id, storage=fixture.storage, prober=fixture.prober
+    )
+    assert view is not None
+    assert view.row.status is RenderContractStatus.MATERIALIZATION_REQUIRED
+    payload = view.row.contract_payload
+    assert payload["materialization"]["required"] is True
+
+    annotations = [
+        block for block in payload["blocks"] if block["block_type"] == "TEXTUAL_ANNOTATION"
+    ]
+    assert annotations
+    block = annotations[0]
+    assert block["slot_kind"] == "AUTHORED_TEXT"
+    materialization = block["materialization"]
+    assert materialization["reason_code"] == AUTHORED_TEXT_MATERIALIZATION_REQUIRED
+    assert materialization["semantic_intent"] == (
+        "Surface the baseline promotion rate the excerpt omits for contrast"
+    )
+    assert materialization["grounding_refs"] == ["block:0"]
+    assert materialization["required_information"]["why_unavailable"]
+
+    slots = [
+        slot for slot in payload["materialization"]["slots"] if slot["slot_kind"] == "AUTHORED_TEXT"
+    ]
+    assert slots
+    assert slots[0]["required"] is True
+    assert slots[0]["reason_code"] == AUTHORED_TEXT_MATERIALIZATION_REQUIRED
+
+    # TEXTUAL_ANNOTATION is a future render requirement, never a rendered artifact.
+    assert payload["caption_input"]["rendered"] is False
+    assert payload["caption_input"]["rendered_assets"] is None
+    serialized = str(payload).casefold()
+    for forbidden in (".ass", "libass", "subtitle_file", "caption_file"):
+        assert forbidden not in serialized

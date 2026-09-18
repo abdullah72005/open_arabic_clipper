@@ -218,6 +218,7 @@ def seed_selection_fixture(
     planning_on_final: bool = False,
     plan_narration: str = "NONE",
     source_only: bool = False,
+    first_provider_plan_factory: Any | None = None,
     rights_risk: Any = None,
     originality_risk: Any = None,
     rights_status: Any = None,
@@ -293,13 +294,14 @@ def seed_selection_fixture(
     provider_plans: list[Any] = []
     for index, strategy in enumerate(strategies[: len(result_specs)]):
         if index == 0:
-            first_plan = (
-                _source_only_provider_plan(str(strategy.id), strategy.strategy_key)
-                if source_only
-                else make_source_value_plan(
+            if first_provider_plan_factory is not None:
+                first_plan = first_provider_plan_factory(str(strategy.id), strategy.strategy_key)
+            elif source_only:
+                first_plan = _source_only_provider_plan(str(strategy.id), strategy.strategy_key)
+            else:
+                first_plan = make_source_value_plan(
                     str(strategy.id), strategy.strategy_key, narration_need=plan_narration
                 )
-            )
             if plan_narration == "RECOMMENDED":
                 first_plan = with_review_narration(first_plan)
             provider_plans.append(first_plan)

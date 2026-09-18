@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -12,19 +13,30 @@ from stage43_support import FakeGovernanceSettings, install_selection_settings
 from stage50_support import (
     FakeProber,
     add_final,
+    corrupt_prober,
+    make_verification_required_plan,
+    managed_source,
     no_video_prober,
     seed_stage50,
 )
 
-from app.core.enums import RenderContractStatus
+from app.core.enums import PlanStatus, RenderContractStatus
 from app.core.settings import Settings
 from app.core.settings import get_settings as core_get_settings
 from app.db.base import Base
 from app.media.ffprobe import MediaMetadata
 from app.models import RenderContract, TransformationPlanSelection
 from app.render.handoff import build_stage5_1_handoff
-from app.render.policy import MATERIALIZATION_REQUIRED, READY_FOR_RENDER_PLANNING
+from app.render.policy import (
+    EXCERPT_OUT_OF_BOUNDS,
+    MATERIALIZATION_REQUIRED,
+    READY_FOR_RENDER_PLANNING,
+    SOURCE_MEDIA_CORRUPT,
+    SOURCE_MEDIA_ZERO_BYTES,
+    UNRESOLVED_REQUIRED_VERIFICATION,
+)
 from app.render.service import (
+    _required_verification_unresolved,
     create_render_contract,
     get_current_render_contract,
     read_render_contract,
@@ -389,3 +401,191 @@ def test_unusable_final_status_requires_refinement(session: Session, monkeypatch
     )
     assert view is not None
     assert view.row.status is RenderContractStatus.FINAL_CLIP_REFINEMENT_REQUIRED
+
+
+def test_zero_byte_source_media_is_unavailable(session: Session, monkeypatch: Any) -> None:
+    settings = _install(monkeypatch)
+    fixture = seed_stage50(session, settings=settings)
+    # The managed-source helper writes a zero-byte artifact inside the managed dir.
+    managed_source(fixture.selection.source, size=0)
+    session.flush()
+    view = create_render_contract(
+        session, fixture.selection.candidate.id, storage=fixture.storage, prober=fixture.prober
+    )
+    assert view is not None
+    assert view.row.status is RenderContractStatus.SOURCE_MEDIA_UNAVAILABLE
+    assert view.row.contract_ready is False
+    assert SOURCE_MEDIA_ZERO_BYTES in view.row.reason_codes
+
+
+def test_corrupt_source_media_is_unavailable(session: Session, monkeypatch: Any) -> None:
+    settings = _install(monkeypatch)
+    fixture = seed_stage50(session, settings=settings, prober=corrupt_prober())
+    view = create_render_contract(
+        session,
+        fixture.selection.candidate.id,
+        storage=fixture.storage,
+        prober=fixture.prober,
+    )
+    assert view is not None
+    assert view.row.status is RenderContractStatus.SOURCE_MEDIA_UNAVAILABLE
+    assert view.row.contract_ready is False
+    assert SOURCE_MEDIA_CORRUPT in view.row.reason_codes
+
+
+def test_reversed_persisted_plan_block_span_is_invalid_source_binding(
+    session: Session, monkeypatch: Any
+) -> None:
+    settings = _install(monkeypatch)
+    fixture = seed_stage50(session, settings=settings)
+    plan = fixture.selection.plans[0]
+    blocks = [dict(block) for block in plan.blocks]
+    blocks[0]["source_start"] = 30.0
+    blocks[0]["source_end"] = 25.0
+    plan.blocks = blocks
+    session.flush()
+    # A mutated plan is caught by the fail-closed upstream freshness gate unless
+    # the current governance/selection boundaries are re-established first, so
+    # refresh the governance input fingerprint and re-run selection to make the
+    # reversed plan the truthful current upstream and exercise Stage 5.0 binding.
+    from app.transformation.governance.executor import (
+        build_transformation_governance_executor,
+    )
+    from app.transformation.selection.service import select_transformation_plan
+
+    governance = fixture.selection.governance_set
+    executor = build_transformation_governance_executor(session, settings)
+    governance.input_fingerprint = executor.input_fingerprint(governance)
+    session.flush()
+    assert select_transformation_plan(session, fixture.selection.candidate.id) is not None
+
+    view = create_render_contract(
+        session, fixture.selection.candidate.id, storage=fixture.storage, prober=fixture.prober
+    )
+    assert view is not None
+    assert view.row.status is RenderContractStatus.INVALID_SOURCE_BINDING
+    assert view.row.contract_ready is False
+    # The public path reports the structural excerpt failure. The internal
+    # SPAN_REVERSED_OR_NEGATIVE media-bound code is unreachable: a reversed span
+    # never yields the ordered rebound range that media-bound validation checks.
+    assert EXCERPT_OUT_OF_BOUNDS in view.row.reason_codes
+
+
+def _verification_plan(
+    *,
+    status: PlanStatus = PlanStatus.PLAN_GENERATED,
+    dependencies: list[dict[str, object]] | None = None,
+    blocks: list[dict[str, object]] | None = None,
+) -> Any:
+    return SimpleNamespace(
+        status=status,
+        external_fact_dependencies=list(dependencies or []),
+        blocks=list(blocks or []),
+    )
+
+
+_RESOLVED_GOVERNANCE: dict[str, object] = {
+    "verification": {"claim_state": "GROUNDED_IN_SOURCE", "unresolved": False}
+}
+_UNRESOLVED_GOVERNANCE: dict[str, object] = {
+    "verification": {"claim_state": "EXTERNAL_REQUIRED_UNRESOLVED", "unresolved": True}
+}
+
+
+def test_required_verification_unresolved_unit_matrix() -> None:
+    required_status = PlanStatus.PLAN_GENERATED_WITH_VERIFICATION_REQUIRED
+    dependency = [{"dependency": "claim-1", "must_verify_before_execution": True}]
+    essential_placeholder = [
+        {"block_type": "FACT_VERIFICATION_PLACEHOLDER", "must_verify_before_execution": True}
+    ]
+    optional_placeholder = [
+        {"block_type": "FACT_VERIFICATION_PLACEHOLDER", "must_verify_before_execution": False}
+    ]
+
+    # No requirement trigger: never blocks, even when verification is unresolved.
+    assert _required_verification_unresolved(_verification_plan(), _UNRESOLVED_GOVERNANCE) is False
+    assert _required_verification_unresolved(_verification_plan(), _RESOLVED_GOVERNANCE) is False
+    assert _required_verification_unresolved(_verification_plan(), {}) is False
+
+    # PLAN_GENERATED_WITH_VERIFICATION_REQUIRED: blocks only when unresolved.
+    assert (
+        _required_verification_unresolved(
+            _verification_plan(status=required_status), _RESOLVED_GOVERNANCE
+        )
+        is False
+    )
+    assert (
+        _required_verification_unresolved(
+            _verification_plan(status=required_status), _UNRESOLVED_GOVERNANCE
+        )
+        is True
+    )
+    # Missing verification evidence fails closed.
+    assert _required_verification_unresolved(_verification_plan(status=required_status), {}) is True
+
+    # must_verify_before_execution dependency.
+    assert (
+        _required_verification_unresolved(
+            _verification_plan(dependencies=dependency), _RESOLVED_GOVERNANCE
+        )
+        is False
+    )
+    assert (
+        _required_verification_unresolved(
+            _verification_plan(dependencies=dependency), _UNRESOLVED_GOVERNANCE
+        )
+        is True
+    )
+
+    # Essential verification placeholder.
+    assert (
+        _required_verification_unresolved(
+            _verification_plan(blocks=essential_placeholder), _RESOLVED_GOVERNANCE
+        )
+        is False
+    )
+    assert (
+        _required_verification_unresolved(
+            _verification_plan(blocks=essential_placeholder), _UNRESOLVED_GOVERNANCE
+        )
+        is True
+    )
+    # A non-essential placeholder is not a requirement.
+    assert (
+        _required_verification_unresolved(
+            _verification_plan(blocks=optional_placeholder), _UNRESOLVED_GOVERNANCE
+        )
+        is False
+    )
+
+
+def test_unresolved_required_verification_after_selection_is_blocked(
+    session: Session, monkeypatch: Any
+) -> None:
+    settings = _install(monkeypatch)
+    fixture = seed_stage50(
+        session,
+        settings=settings,
+        first_provider_plan_factory=make_verification_required_plan,
+    )
+    plan = fixture.selection.plans[0]
+    assert plan.status.value == "PLAN_GENERATED_WITH_VERIFICATION_REQUIRED"
+    # The selected-governance snapshot is mutated to unresolved after selection;
+    # the snapshot is not part of the upstream freshness fingerprint, so the
+    # truthful Stage 5.0 verification gate (not a stale-input gate) must fire.
+    selection = session.query(TransformationPlanSelection).one()
+    snapshot = dict(selection.selected_governance_snapshot or {})
+    verification = dict(snapshot.get("verification") or {})
+    verification["claim_state"] = "EXTERNAL_REQUIRED_UNRESOLVED"
+    verification["unresolved"] = True
+    snapshot["verification"] = verification
+    selection.selected_governance_snapshot = snapshot
+    session.flush()
+
+    view = create_render_contract(
+        session, fixture.selection.candidate.id, storage=fixture.storage, prober=fixture.prober
+    )
+    assert view is not None
+    assert view.row.status is RenderContractStatus.BLOCKED
+    assert view.row.contract_ready is False
+    assert UNRESOLVED_REQUIRED_VERIFICATION in view.row.reason_codes

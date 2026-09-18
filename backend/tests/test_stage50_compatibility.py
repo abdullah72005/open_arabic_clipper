@@ -12,11 +12,15 @@ from stage50_support import (
 
 from app.render.compatibility import evaluate_compatibility
 from app.render.policy import (
+    BOUNDARY_ADJUSTED,
     COMPATIBLE_NON_MATERIAL_CHANGE,
     EXACT_MATCH,
+    EXCERPT_CLIPPED_BY_WINDOW,
+    EXCERPT_CUTS_THOUGHT,
     MATERIAL_SEMANTIC_CHANGE,
     MATERIAL_TIMING_CHANGE,
     SOURCE_SPAN_NO_LONGER_VALID,
+    TIMING_DRIFT_BOUNDED,
     UNRESOLVED_COMPATIBILITY,
 )
 
@@ -245,3 +249,112 @@ def test_bounded_alignment_rebinds_word_indexes() -> None:
 def test_small_wording_change_is_compatible(plan: str, final: str, expected: str) -> None:
     result = evaluate(plan, final)
     assert result.outcome == expected
+
+
+TIMING_TEXT = "alpha beta gamma delta epsilon"
+
+
+def _drifted_final(shift: float) -> object:
+    """Identical aligned words shifted by ``shift`` seconds around the plan span."""
+
+    words = clip_words(TIMING_TEXT, start=20.5 + shift, end=44.5 + shift)
+    block = source_block(
+        TIMING_TEXT,
+        source_start=20.5,
+        source_end=44.5,
+        word_start_index=0,
+        word_end_index=len(words) - 1,
+    )
+    final = make_final(
+        TIMING_TEXT,
+        words=words,
+        refined_start=min(20.5, words[0].start),
+        refined_end=max(44.5, words[-1].end),
+    )
+    return evaluate(TIMING_TEXT, "", blocks=[block], final=final)
+
+
+@pytest.mark.parametrize("shift", [1.0, -1.0])
+def test_bounded_timestamp_drift_is_compatible_non_material(shift: float) -> None:
+    result = _drifted_final(shift)
+    assert result.outcome == COMPATIBLE_NON_MATERIAL_CHANGE
+    verdict = result.per_block[0]
+    assert verdict.reason_codes == (TIMING_DRIFT_BOUNDED,)
+    assert verdict.timing_drift_seconds is not None
+    assert abs(verdict.timing_drift_seconds - abs(shift)) < 1e-6
+
+
+@pytest.mark.parametrize("shift", [2.0, 3.0])
+def test_boundary_adjusted_timestamp_drift_is_compatible(shift: float) -> None:
+    result = _drifted_final(shift)
+    assert result.outcome == COMPATIBLE_NON_MATERIAL_CHANGE
+    verdict = result.per_block[0]
+    assert verdict.reason_codes == (BOUNDARY_ADJUSTED,)
+    assert verdict.timing_drift_seconds is not None
+    assert abs(verdict.timing_drift_seconds - shift) < 1e-6
+
+
+def test_material_timestamp_drift_is_material_timing_change() -> None:
+    result = _drifted_final(3.5)
+    assert result.outcome == MATERIAL_TIMING_CHANGE
+    assert result.per_block[0].outcome == MATERIAL_TIMING_CHANGE
+
+
+def test_small_boundary_drift_preserving_complete_thought_is_compatible() -> None:
+    text = "the rate fell sharply."
+    words = clip_words(text, start=21.0, end=44.0)
+    block = source_block(
+        text,
+        source_start=21.0,
+        source_end=words[-1].end,
+        word_start_index=0,
+        word_end_index=len(words) - 1,
+    )
+    # The FINAL_CLIP window boundary sits 1.0 s past the aligned sentence-final
+    # word, so the thought stays complete.
+    final = make_final(text, words=words, refined_start=21.0, refined_end=words[-1].end + 1.0)
+    result = evaluate(text, "", blocks=[block], final=final)
+    assert result.outcome == COMPATIBLE_NON_MATERIAL_CHANGE
+    assert result.per_block[0].outcome == COMPATIBLE_NON_MATERIAL_CHANGE
+    assert result.per_block[0].rebound_text == text
+
+
+def test_material_boundary_drift_cutting_thought_is_material_timing_change() -> None:
+    text = "the rate fell sharply."
+    full = "the rate fell sharply because hiring froze"
+    words = clip_words(full, start=21.0, end=44.0)
+    block = source_block(
+        text,
+        source_start=21.0,
+        source_end=words[3].end,
+        word_start_index=0,
+        word_end_index=3,
+    )
+    final = make_final(full, words=words)
+    result = evaluate(text, "", blocks=[block], final=final, planning_end=words[3].end)
+    assert result.outcome == MATERIAL_TIMING_CHANGE
+    assert result.per_block[0].reason_codes == (EXCERPT_CUTS_THOUGHT,)
+
+
+def test_excerpt_clipped_by_final_clip_window_is_material_timing_change() -> None:
+    text = "alpha beta gamma delta."
+    words = clip_words(text, start=21.0, end=44.0)
+    # The plan declared a span 5 s past where the current FINAL_CLIP window ends.
+    block = source_block(text, source_start=21.0, source_end=49.0)
+    final = make_final(text, words=words, refined_start=21.0, refined_end=44.0)
+    result = evaluate(text, "", blocks=[block], final=final, planning_end=49.0)
+    assert result.outcome == MATERIAL_TIMING_CHANGE
+    assert result.per_block[0].reason_codes == (EXCERPT_CLIPPED_BY_WINDOW,)
+
+
+@pytest.mark.parametrize(
+    "source_start,source_end",
+    [(-1.0, 10.0), (20.5, 20.5), (30.0, 25.0)],
+)
+def test_negative_or_reversed_planning_span_is_invalid(
+    source_start: float, source_end: float
+) -> None:
+    block = source_block(BASE_TEXT, source_start=source_start, source_end=source_end)
+    result = evaluate(BASE_TEXT, BASE_TEXT, blocks=[block])
+    assert result.outcome == SOURCE_SPAN_NO_LONGER_VALID
+    assert result.exact_match is False

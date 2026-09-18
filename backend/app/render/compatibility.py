@@ -326,6 +326,14 @@ def _semantic_verdict(
 ) -> BlockCompatibility | None:
     changed = [token for token in [*added, *removed] if token]
 
+    # No wording/operator/number/entity change at all: wording comparison is a
+    # no-op, so the deterministic boundary/timing classification owns the
+    # verdict (bounded drift, boundary adjustment, cut/clipped thought, or
+    # material timing change). Returning a MINOR_WORDING_CHANGE here would make
+    # every timing outcome permanently unreachable.
+    if not changed:
+        return None
+
     if any(token in PROTECTED_SEMANTIC_OPERATORS for token in changed):
         return BlockCompatibility(
             block_index=block_index,
