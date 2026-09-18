@@ -247,3 +247,41 @@ probe facts are reused for an unchanged media identity. `input_fingerprint`
 excludes TTS voice/provider/model, caption font/animation, crop, B-roll, codec
 tuning, publishing metadata, and final render artifact hashes. See
 `docs/STAGE_5_0_OPERATIONS.md`.
+
+## Stage 5.1 visual composition, framing, and caption plan
+
+Stage 5.1 is explicit, candidate-scoped, CPU-local, and provider-free. It
+consumes only a current, live-effective, executable Stage 5.0 render contract
+(`READY_FOR_RENDER_PLANNING`/`MATERIALIZATION_REQUIRED`, `contract_ready=true`,
+`live_freshness=CURRENT`, `effective=true`) and produces one durable plan per
+candidate/input fingerprint: anonymous per-scene face tracks, one deterministic
+framing mode, a compact cropped-keyframe path, FINAL_CLIP-only caption events,
+one ASS document, and materialization-required overlay placements. Statuses are
+`READY_FOR_VISUAL_EXECUTION`, `BLOCKED`, and `FAILED`; execution lifecycle
+(`QUEUED`/`ANALYZING`/`COMPLETE`/`FAILED`/`CANCELLED`) is separate, and only
+`READY_FOR_VISUAL_EXECUTION` is cache-eligible. It produces a plan, not a
+rendered video.
+
+It decodes only the union of selected bound source spans plus a bounded 0.5 s
+cut-alignment margin (never emitted), enforces selected-span/frame/fps caps with
+deterministic fps reduction, and runs a vendored, sha256-verified CPU YuNet
+detector with anonymous box-only output. Framing modes (`SOURCE_AS_IS`,
+`STATIC_CROP`, `TRACKED_CROP`, `MULTI_SUBJECT_FIT`, `BACKGROUND_FILL`,
+`CENTER_FALLBACK`) are selected by deterministic precedence; `TRACKED_CROP`
+uses smoothing, a dead zone, bounded pan/zoom, detection-loss fallback, and hero
+protection. Captions use FINAL_CLIP word evidence in canonical logical order;
+mixed Arabic/English/numbers BiDi is shaped by the real libass/FriBidi/HarfBuzz
+renderer (proven by real rendered ASS regression tests), and ASS escaping
+neutralizes source braces, `N`/`n`/`h` backslashes, and Unicode bidi controls.
+The safe zone is top 0.12 / bottom 0.25 / left 0.05 / right 0.15 of 1080x1920
+(230/480/54/162 px) with 24 px caption gaps.
+
+It extends the Celery/`ProcessingJob` platform with a `VISUAL_COMPOSITION` job
+kind (migration `20260918_0021`) and one table `visual_composition_plans` (one
+row per candidate + input fingerprint, one database-current row per candidate),
+and adds no `PipelineStage`, `PipelineRun`, or `_NEXT_STAGE` entry. The input
+fingerprint excludes TTS provider/model/voice, future narration, publishing
+metadata, codec settings, final render artifacts, and analytics. Stage 5.2 and
+Stage 6 remain unimplemented, and a plan is not render or publishing readiness.
+See `docs/STAGE_5_1_OPERATIONS.md`.
+

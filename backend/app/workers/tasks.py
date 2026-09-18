@@ -349,6 +349,67 @@ def run_transformation_planning(
 
 
 @celery_app.task(  # type: ignore[untyped-decorator]
+    bind=True, autoretry_for=(), name="clipfactory.run_visual_composition"
+)
+def run_visual_composition(
+    self: Task,
+    plan_id: str,
+    job_id: str | None = None,
+    force: bool = False,
+) -> dict[str, str | bool | None]:
+    """Run one explicit candidate-scoped Stage 5.1 visual-composition plan.
+
+    This extends the existing job system, not the pipeline: it creates no
+    ``PipelineRun``, schedules no next stage, and never touches the whole-source
+    stage chain.
+    """
+
+    from uuid import UUID as _UUID
+
+    from app.composition.executor import build_visual_composition_executor
+
+    parsed_plan = _UUID(plan_id)
+    parsed_job = _UUID(job_id) if job_id else None
+    session = create_session_factory()()
+    try:
+        settings = get_settings()
+        storage = StorageService(settings.storage_root)
+        if parsed_job is not None:
+            job = session.get(ProcessingJob, parsed_job)
+            if job is not None and job.status is JobStatus.CANCELLED:
+                return {"plan_id": str(parsed_plan), "cancelled": True}
+        executor = build_visual_composition_executor(session, storage, settings)
+        executor.set_active_job(parsed_job)
+        try:
+            # The executor owns the durable QUEUED -> RUNNING claim and job
+            # finalization, so a duplicate/redelivered invocation of this same
+            # job performs no planning work and does not overwrite job state.
+            executor.execute(parsed_plan, force=force)
+        except StageCancelled:
+            return {"plan_id": str(parsed_plan), "cancelled": True}
+        except Exception as error:
+            # The executor owns durable claim fencing and records sanitized
+            # diagnostics on its own failure paths; a never-claimed job is
+            # failed here in the same fenced, sanitized way.
+            if parsed_job is not None and not getattr(executor, "skipped_duplicate", False):
+                executor.record_failure(error)
+            if getattr(error, "retryable", False):
+                raise self.retry(
+                    args=[plan_id, job_id, force],
+                    exc=error,
+                    max_retries=MAX_RETRIES,
+                ) from error
+            raise
+        return {
+            "plan_id": str(parsed_plan),
+            "job_id": str(parsed_job) if parsed_job else None,
+            "skipped": bool(getattr(executor, "skipped_duplicate", False)),
+        }
+    finally:
+        session.close()
+
+
+@celery_app.task(  # type: ignore[untyped-decorator]
     bind=True, autoretry_for=(), name="clipfactory.run_transformation_governance"
 )
 def run_transformation_governance(

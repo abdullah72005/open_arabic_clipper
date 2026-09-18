@@ -63,7 +63,7 @@ def test_render_contract_status_cli_is_read_only(cli_candidate: str) -> None:
 def test_stage5_1_handoff_cli_flags_false(cli_candidate: str) -> None:
     _invoke(["render-contract", cli_candidate])
     handoff = _invoke(["stage5-1-handoff", cli_candidate])
-    assert handoff["stage5_1_implemented"] is False
+    assert handoff["stage5_1_implemented"] is True
     assert handoff["stage5_2_implemented"] is False
     assert handoff["stage6_implemented"] is False
     assert handoff["contract"]["effective"] is True

@@ -14,6 +14,14 @@ import typer
 
 from app.candidates.novelty import NoveltyItem
 from app.candidates.service import CandidateAnalysisService
+from app.composition.geometry import FFprobeDisplayProbe
+from app.composition.handoff import build_stage5_2_handoff
+from app.composition.queue import (
+    CompositionQueueError,
+    queue_visual_composition,
+    validate_candidate_for_composition,
+)
+from app.composition.service import read_visual_composition
 from app.core.enums import (
     CandidateDisposition,
     JobKind,
@@ -838,6 +846,115 @@ def stage5_1_handoff(candidate_id: UUID) -> None:
 
     with create_session_factory()() as session:
         handoff = build_stage5_1_handoff(session, candidate_id)
+        if handoff is None:
+            raise typer.BadParameter("candidate does not exist")
+    typer.echo(json.dumps(handoff, ensure_ascii=False, default=str))
+
+
+def _visual_composition_payload(row: object) -> dict[str, object]:
+    return {
+        "id": str(getattr(row, "id")),
+        "source_video_id": str(getattr(row, "source_video_id")),
+        "clip_candidate_id": str(getattr(row, "clip_candidate_id")),
+        "render_contract_id": (
+            str(getattr(row, "render_contract_id")) if getattr(row, "render_contract_id") else None
+        ),
+        "transformation_selection_id": (
+            str(getattr(row, "transformation_selection_id"))
+            if getattr(row, "transformation_selection_id")
+            else None
+        ),
+        "selected_plan_id": (
+            str(getattr(row, "selected_plan_id")) if getattr(row, "selected_plan_id") else None
+        ),
+        "final_refinement_id": (
+            str(getattr(row, "final_refinement_id"))
+            if getattr(row, "final_refinement_id")
+            else None
+        ),
+        "status": getattr(row, "status").value,
+        "execution_status": getattr(row, "execution_status").value,
+        "plan_ready": bool(getattr(row, "plan_ready")),
+        "is_current": bool(getattr(row, "is_current")),
+        "reason_codes": list(getattr(row, "reason_codes") or []),
+        "input_fingerprint": getattr(row, "input_fingerprint"),
+        "output_fingerprint": getattr(row, "output_fingerprint"),
+        "contract_input_fingerprint": getattr(row, "contract_input_fingerprint"),
+        "contract_output_fingerprint": getattr(row, "contract_output_fingerprint"),
+        "caption_source_fingerprint": getattr(row, "caption_source_fingerprint"),
+        "source_media_fingerprint": getattr(row, "source_media_fingerprint"),
+        "analysis_fingerprint": getattr(row, "analysis_fingerprint"),
+        "framing_fingerprint": getattr(row, "framing_fingerprint"),
+        "ass_fingerprint": getattr(row, "ass_fingerprint"),
+        "policy_version": getattr(row, "policy_version"),
+        "schema_version": getattr(row, "schema_version"),
+        "fingerprint_version": getattr(row, "fingerprint_version"),
+        "plan_payload": dict(getattr(row, "plan_payload") or {}),
+        "readiness": dict(getattr(row, "readiness") or {}),
+        "metrics": dict(getattr(row, "metrics") or {}),
+        "cache_eligible": bool(getattr(row, "cache_eligible")),
+    }
+
+
+@app.command("visual-composition")
+def visual_composition(
+    candidate_id: UUID,
+    force: bool = typer.Option(False, "--force/--no-force"),
+) -> None:
+    """Queue one explicit candidate-scoped Stage 5.1 visual-composition run."""
+
+    with create_session_factory()() as session:
+        try:
+            candidate = validate_candidate_for_composition(session, candidate_id)
+        except CompositionQueueError as error:
+            raise typer.BadParameter(str(error)) from error
+        outcome = queue_visual_composition(session, candidate, force=force)
+    typer.echo(
+        json.dumps(
+            {
+                "plan_id": str(outcome.plan_id),
+                "job_id": str(outcome.job_id) if outcome.job_id else None,
+                "status": outcome.status,
+                "queued": outcome.queued,
+                "cached": outcome.cached,
+                "active": outcome.active,
+            }
+        )
+    )
+
+
+@app.command("visual-composition-status")
+def visual_composition_status(candidate_id: UUID) -> None:
+    """Print the current Stage 5.1 visual-composition plan without mutating anything."""
+
+    settings = get_settings()
+    with create_session_factory()() as session:
+        view = read_visual_composition(
+            session,
+            candidate_id,
+            display_probe=FFprobeDisplayProbe(binary=settings.ffprobe_binary),
+            config=settings.stage51_config(),
+        )
+        if view is None:
+            raise typer.BadParameter("visual composition does not exist")
+        payload = _visual_composition_payload(view.row)
+        payload["live_freshness"] = view.live_freshness
+        payload["effective"] = view.effective
+    typer.echo(json.dumps(payload, ensure_ascii=False, default=str))
+
+
+@app.command("stage5-2-handoff")
+def stage5_2_handoff(candidate_id: UUID) -> None:
+    """Print the read-only Stage 5.1 -> Stage 5.2 handoff."""
+
+    settings = get_settings()
+    with create_session_factory()() as session:
+        handoff = build_stage5_2_handoff(
+            session,
+            candidate_id,
+            display_probe=FFprobeDisplayProbe(binary=settings.ffprobe_binary),
+            config=settings.stage51_config(),
+        )
         if handoff is None:
             raise typer.BadParameter("candidate does not exist")
     typer.echo(json.dumps(handoff, ensure_ascii=False, default=str))

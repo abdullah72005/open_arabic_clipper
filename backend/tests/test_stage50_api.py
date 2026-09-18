@@ -87,7 +87,7 @@ def test_non_executable_preflight_is_persisted_and_reused(
     handoff = client.get(f"/api/candidates/{candidate_id}/stage5-1-handoff")
     assert handoff.status_code == 200
     payload = handoff.json()
-    assert payload["stage5_1_implemented"] is False
+    assert payload["stage5_1_implemented"] is True
     assert payload["stage5_2_implemented"] is False
     assert payload["stage6_implemented"] is False
     assert payload["contract"]["status"] == "BLOCKED"
