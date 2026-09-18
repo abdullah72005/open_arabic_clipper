@@ -36,14 +36,19 @@ from app.transformation.planning.types import PlanningContext
 
 
 def make_source_value_plan(*args: object, **kwargs: object) -> object:
-    """Stage 4.1 source-value plan with real resolvable source grounding.
+    """Stage 4.1 source-value plan with real resolvable, source-tied grounding.
 
-    Stage 4.2 no longer treats arbitrary labels such as ``strategy`` as proof, so
+    Stage 4.2 no longer treats arbitrary labels or mere shared topics as proof, so
     Stage 4.2 end-to-end tests declare a grounding reference that resolves to the
-    plan's own hero source-excerpt block.
+    plan's own hero source-excerpt block and a claim whose wording is tied to the
+    cited source transcript.
     """
 
     kwargs.setdefault("grounding", ("block:0",))
+    kwargs.setdefault(
+        "intent",
+        "Explain the promotion rates fell sharply as evidence for the remote-work debate",
+    )
     return _make_source_value_plan(*args, **kwargs)
 
 
@@ -290,7 +295,7 @@ def source_block(
 def original_block(
     index: int,
     *,
-    intent: str = "Explain the promotion-rate drop as evidence for the remote-work debate",
+    intent: str = "Explain the promotion rates fell sharply as evidence for the remote-work debate",
     kind: str = "SOURCE_AS_EVIDENCE",
     duration: float = 5.0,
     interrupts: bool = False,

@@ -102,12 +102,12 @@ repairs, or selects a plan, adds **no** `PipelineStage`, **no** `PipelineRun`,
   handoff exposes per-plan governance with `stage4_3_implemented=false` and no
   winner/selected plan/render-ready/publication state.
 
-Deterministic verification: 94 focused Stage 4.2 tests (governor, providers,
+Deterministic verification: 98 focused Stage 4.2 tests (governor, providers,
 service, executor/queue/cache/concurrency/cancellation, API/CLI/handoff/migration)
 plus the full backend suite in Docker Python 3.12 with the repository compose/.env
 files mounted, with no live provider calls in the automated suite. Versions:
-governor `stage4.2-v2`, schema `stage4.2-schema-v1`, validation
-`stage4.2-validation-v2`. See [docs/STAGE_4_2_OPERATIONS.md](docs/STAGE_4_2_OPERATIONS.md).
+governor `stage4.2-v3`, schema `stage4.2-schema-v1`, validation
+`stage4.2-validation-v3`. See [docs/STAGE_4_2_OPERATIONS.md](docs/STAGE_4_2_OPERATIONS.md).
 
 ### Stage 4.2 corrective patch (2026-09-17)
 
@@ -142,17 +142,20 @@ governor `stage4.2-v2`, schema `stage4.2-schema-v1`, validation
   excerpt text). Provider labels such as `strategy`, `source_excerpt`, or any
   arbitrary string are not proof.
 - **Claim-to-source support resolution (P1).** A structural citation alone is
-  never sufficient: deterministic conservative lexical support classifies each
-  substantive block as supported, ambiguous, or unsupported. Unsupported factual
-  claims (e.g. "The merger closes next Monday" citing unrelated source) become
-  `BLOCKED_PENDING_VERIFICATION`; ambiguous claim-to-evidence support requires
-  selective semantic review and, when the provider is unavailable, becomes
-  `GOVERNANCE_DEFERRED` (or blocked when external verification is essential).
-  Supported factual statements, direct quotes, and non-factual
-  explanation/inference tied to cited evidence remain `GROUNDED_IN_SOURCE`. No
-  deterministic NLP entailment is claimed; Gemini stays non-authoritative and no
+  never sufficient, and lexical overlap establishes relevance only, never factual
+  entailment. For factual claims, deterministic `SUPPORTED` is limited to a
+  supported direct quotation or a near-exact restatement whose content tokens are
+  all present in the cited wording; a clearly-tied non-factual interpretation
+  whose only non-cited tokens are framing words is also supported. Shared
+  entity/topic alone, a changed predicate, partial overlap, or inferred factual
+  conclusions are `AMBIGUOUS` → selective semantic review, and when the provider
+  is unavailable `GOVERNANCE_DEFERRED` (or blocked when external verification is
+  essential) — never approved. Unrelated citations to factual claims are
+  `BLOCKED_PENDING_VERIFICATION`. A claim like "Microsoft files bankruptcy" cited
+  to "Microsoft announced a new product launch" is not grounded and not eligible.
+  No deterministic entailment is claimed; Gemini stays non-authoritative and no
   web lookup/fact-checking is added. Support policy version
-  `stage4.2-v2`/`stage4.2-validation-v2` invalidates prior governance.
+  `stage4.2-v3`/`stage4.2-validation-v3` invalidates prior governance.
 - **Fail-closed Stage 4.3 handoff freshness (P1).** The handoff exposes
   `freshness` ∈ {`VERIFIED_CURRENT`, `STALE`, `NOT_CURRENT`, `UNVERIFIABLE`}.
   Only `VERIFIED_CURRENT` may retain per-plan `eligible_for_stage4_3`; a missing

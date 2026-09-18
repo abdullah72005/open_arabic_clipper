@@ -653,6 +653,62 @@ _QUOTE_MARKERS: tuple[str, ...] = (
     "بحسب",
 )
 
+# Interpretive/framing vocabulary. A non-factual claim whose only non-cited
+# tokens are framing words adds no new factual predicate and may remain grounded.
+_INTERPRETIVE_FRAMING: frozenset[str] = frozenset(
+    {
+        "explain",
+        "explains",
+        "explaining",
+        "explanation",
+        "infer",
+        "inference",
+        "inferred",
+        "frame",
+        "frames",
+        "framing",
+        "framed",
+        "evidence",
+        "context",
+        "implies",
+        "imply",
+        "suggests",
+        "suggest",
+        "reflects",
+        "reflect",
+        "meaning",
+        "matters",
+        "compare",
+        "comparison",
+        "counterpoint",
+        "counter",
+        "synthesis",
+        "synthesize",
+        "takeaway",
+        "thesis",
+        "debate",
+        "shows",
+        "show",
+        "indicates",
+        "indicate",
+        "analysis",
+        "analyze",
+        "analyse",
+        "overview",
+        "summary",
+        "summarize",
+        "summarise",
+        "purpose",
+        "significance",
+        "demonstrates",
+        "demonstrate",
+        "illustrate",
+        "illustrates",
+        "missing",
+        "key",
+    }
+)
+
 
 @dataclass(frozen=True)
 class _SourceEvidence:
@@ -833,14 +889,41 @@ def _quote_framing(text: str) -> bool:
     return any(marker in folded for marker in _QUOTE_MARKERS)
 
 
-def _shared_phrase(claim_text: str, evidence_text: str) -> bool:
-    tokens = _support_tokens(claim_text)
-    folded = evidence_text.casefold()
-    return any(f"{tokens[index]} {tokens[index + 1]}" in folded for index in range(len(tokens) - 1))
+def _quoted_spans(text: str) -> list[str]:
+    spans: list[str] = []
+    for opener, closer in (('"', '"'), ("“", "”"), ("«", "»"), ("'", "'")):
+        start = text.find(opener)
+        while start != -1:
+            end = text.find(closer, start + 1)
+            if end == -1:
+                break
+            quoted = text[start + 1 : end].strip()
+            if quoted:
+                spans.append(quoted)
+            start = text.find(opener, end + 1)
+    return spans
+
+
+def _contiguous_ngram(tokens: list[str], folded_text: str, size: int) -> bool:
+    if len(tokens) < size:
+        return False
+    return any(
+        " ".join(tokens[index : index + size]) in folded_text
+        for index in range(len(tokens) - size + 1)
+    )
 
 
 def _claim_support(block: dict[str, object], evidence: _SourceEvidence) -> str:
-    """Conservative deterministic claim-to-evidence support classification."""
+    """Conservative deterministic claim-to-evidence support classification.
+
+    Lexical overlap establishes relevance only, never factual entailment. A claim
+    is deterministically SUPPORTED only for a supported direct quotation or a
+    near-exact restatement whose content tokens are all present in the cited
+    wording; a clearly-tied, non-factual interpretation with no new content
+    predicate is also supported. Every other factual claim is AMBIGUOUS (semantic
+    review / truthful defer-block), and a factual claim with no shared evidence is
+    UNSUPPORTED.
+    """
 
     refs = block.get("grounding_refs")
     matched: list[str] = []
@@ -864,15 +947,40 @@ def _claim_support(block: dict[str, object], evidence: _SourceEvidence) -> str:
     if not evidence_tokens:
         return _SUPPORT_AMBIGUOUS
 
+    folded_evidence = evidence_text.casefold()
     shared = [token for token in claim_tokens if token in evidence_tokens]
+    factual = _has_factual_signal(claim_text)
+
+    # 1. Supported direct quotation with the quoted wording present in the source.
+    if _quote_framing(claim_text):
+        if any(
+            len(quoted) >= 4 and quoted.casefold() in folded_evidence
+            for quoted in _quoted_spans(claim_text)
+        ):
+            return _SUPPORT_SUPPORTED
+        if _contiguous_ngram(claim_tokens, folded_evidence, 3):
+            return _SUPPORT_SUPPORTED
+        return _SUPPORT_AMBIGUOUS
+
+    # 2. Near-exact restatement: every claim content token is present in the
+    #    cited wording (a changed predicate leaves a non-shared token behind).
+    if len(claim_tokens) >= 2 and len(shared) == len(claim_tokens):
+        return _SUPPORT_SUPPORTED
+
+    # 3. Clearly-tied, non-factual interpretation with no new content predicate:
+    #    the only non-shared tokens are interpretive framing words.
+    if (
+        not factual
+        and len(shared) >= 2
+        and len(shared) / len(claim_tokens) >= 0.6
+        and all(
+            token in _INTERPRETIVE_FRAMING for token in claim_tokens if token not in evidence_tokens
+        )
+    ):
+        return _SUPPORT_SUPPORTED
+
     if not shared:
-        return _SUPPORT_UNSUPPORTED if _has_factual_signal(claim_text) else _SUPPORT_AMBIGUOUS
-    if _quote_framing(claim_text) or _shared_phrase(claim_text, evidence_text):
-        return _SUPPORT_SUPPORTED
-    if len(shared) >= 2 or len(claim_tokens) <= 3:
-        return _SUPPORT_SUPPORTED
-    if any(len(token) >= 6 for token in shared):
-        return _SUPPORT_SUPPORTED
+        return _SUPPORT_UNSUPPORTED if factual else _SUPPORT_AMBIGUOUS
     return _SUPPORT_AMBIGUOUS
 
 

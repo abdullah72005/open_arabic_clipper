@@ -346,3 +346,30 @@ def test_ambiguous_claim_support_without_provider_defers_not_approves():
         }
         for item in outcome.plans
     )
+
+
+def test_clearly_supported_restatement_makes_zero_hosted_calls():
+    plan = make_plan(
+        plan_id="m" * 8,
+        fingerprint="fp-m",
+        blocks=[
+            source_block(0, text="The merger closes next Monday according to the filing."),
+            original_block(
+                1,
+                intent="The merger closes next Monday",
+                kind="EXPLANATION",
+                grounding=("block:0",),
+            ),
+        ],
+        original_value_kinds=("EXPLANATION",),
+    )
+    provider = FakeGovernanceProvider(auto=True)
+    service = GovernanceService(
+        config=DEFAULT_CONFIG,
+        provider=provider,
+        provider_identity={"provider": "fake"},
+        mode=SemanticProviderMode.ADAPTIVE,
+    )
+    outcome = service.govern(_inputs([plan]), input_fingerprint="in")
+    assert provider.calls == 0
+    assert outcome.plans[0].status is GovernancePlanStatus.APPROVED_FOR_SELECTION

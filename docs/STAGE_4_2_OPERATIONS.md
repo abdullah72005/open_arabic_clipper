@@ -221,25 +221,40 @@ Claim state is explicit:
 
 Provider-declared grounding labels are never proof, and a structural citation
 alone is never proof. Absence of a verification placeholder is never proof of
-grounding. Because no deterministic system can prove semantic entailment, the
-support check is deliberately conservative and three-way:
+grounding. Lexical overlap establishes **relevance only, never factual
+entailment**. Because no deterministic system can prove entailment, the support
+check is deliberately conservative and three-way:
 
-- **supported** → `GROUNDED_IN_SOURCE`;
-- **ambiguous** (weak/partial lexical overlap, or no factual signal) → semantic
-  judgment: the selective provider may assess observable claim-to-source
+- **supported** → `GROUNDED_IN_SOURCE` only for:
+  - a genuine direct quotation whose quoted wording is present in the cited
+    excerpt, or reliable quote framing with a matching multi-token quote; or
+  - a near-exact restatement whose content tokens are all present in the cited
+    wording (no changed/additional factual predicate); or
+  - a clearly-tied **non-factual** interpretation whose only non-cited tokens are
+    interpretive framing words (no new content predicate);
+- **ambiguous** → `SUPPORT_UNVERIFIED` (semantic review): shared entity/topic
+  only, a changed predicate over shared entities/dates, partial overlap, inferred
+  factual conclusions, or any factual signal beyond what the cited wording
+  directly supports. The selective provider may assess observable
   support/fidelity when available; when unavailable the plan stays truthful
   (`GOVERNANCE_DEFERRED`, or `BLOCKED_PENDING_VERIFICATION` when external fact
   verification is essential) and is never approved;
-- **unsupported** (no meaningful claim-to-evidence overlap or a factual signal
-  with an unrelated citation) → `EXTERNAL_REQUIRED_UNRESOLVED` /
+- **unsupported** (a factual-signal claim with no shared evidence, i.e. an
+  unrelated citation) → `EXTERNAL_REQUIRED_UNRESOLVED` /
   `BLOCKED_PENDING_VERIFICATION`.
+
+Examples: `"Microsoft announced a new product launch"` → `"Microsoft files
+bankruptcy"` and `"The merger delays Friday"` → `"The merger closes Friday"` are
+both ambiguous (shared entity/date with a changed predicate), never grounded;
+`"The merger closes next Monday"` cited to wording that contains that exact
+statement is a near-exact restatement and may be grounded.
 
 Deterministic code owns the final status and hard gates; Gemini is
 non-authoritative, may only report bounded observable support/fidelity findings,
-and is never a fact-checking or web-lookup system. Clearly-supported claims are
-resolved deterministically without any hosted call. Legitimate source-grounded
-explanation, inference, quotation, and source-as-evidence plans that reference
-real supporting evidence are unaffected.
+and is never a fact-checking or web-lookup system. Clearly-supported quotes and
+restatements are resolved deterministically without any hosted call. Legitimate
+source-grounded explanation, inference, quotation, and source-as-evidence plans
+that reference real supporting evidence are unaffected.
 
 Stage 4.2 never creates missing placeholders, never claims verification occurred,
 never browses at runtime, and adds no research/fact-checking infrastructure.
@@ -250,9 +265,9 @@ not change its truthful state.
 
 Immutable, code-defined profile (never a dynamic engine, never runtime scraping):
 
-- governor policy: `stage4.2-v2`
+- governor policy: `stage4.2-v3`
 - schema: `stage4.2-schema-v1`
-- validation: `stage4.2-validation-v2`
+- validation: `stage4.2-validation-v3`
 - platform profile: `stage4.2-platform-policy-2026-09-17-v1`
 - checked date: `2026-09-17`
 
@@ -588,15 +603,21 @@ regime.
    fingerprint, unresolved inputs, or a fingerprint recomputation error is
    `UNVERIFIABLE` and forces every handoff plan `eligible_for_stage4_3=false`.
    `stage4_3_implemented` stays `false` and no winner is selected.
-9. **Claim-to-source support resolution (P1).** A structural citation alone is
-   no longer sufficient for `GROUNDED_IN_SOURCE`. A conservative deterministic
-   lexical check classifies each substantive block as supported, ambiguous, or
-   unsupported against its actually-cited source wording; unrelated citations,
-   generic source text, and merely adjacent timing cannot ground a factual claim.
-   Unsupported factual claims are `BLOCKED_PENDING_VERIFICATION`; ambiguous
-   support routes to the selective provider when available and otherwise stays
-   truthfully `GOVERNANCE_DEFERRED`/blocked, never approved. Supported factual
-   statements, direct quotes, and non-factual explanation/inference tied to cited
-   evidence remain grounded. Gemini stays non-authoritative and no web
-   lookup/fact-checking is added. Policy/validation versions advanced to
-   `stage4.2-v2`/`stage4.2-validation-v2` so prior governance is invalidated.
+9. **Claim-to-source support resolution (P1).** Lexical overlap establishes
+   relevance only, never factual entailment. Deterministic `GROUNDED_IN_SOURCE`
+   is limited to a supported direct quotation, a near-exact restatement whose
+   content tokens are all present in the cited wording, or a clearly-tied
+   non-factual interpretation whose only non-cited tokens are framing words.
+   Shared entity/topic alone, a changed predicate over shared entities/dates,
+   partial overlap, and inferred factual conclusions are ambiguous and route to
+   the selective provider when available, otherwise staying truthfully
+   `GOVERNANCE_DEFERRED`/blocked and never approved. Unrelated citations to
+   factual-signal claims are `BLOCKED_PENDING_VERIFICATION`. Gemini stays
+   non-authoritative and no web lookup/fact-checking is added. Policy/validation
+   versions advanced to `stage4.2-v3`/`stage4.2-validation-v3` so prior
+   governance is invalidated.
+10. **False-support correction (P1).** Contradictory predicates over shared
+    entities/dates (e.g. "Microsoft announced a new product launch" → "Microsoft
+    files bankruptcy", "The merger delays Friday" → "The merger closes Friday")
+    can no longer become `GROUNDED_IN_SOURCE` or eligible; clearly supported
+    quotes/restatements make zero hosted calls.

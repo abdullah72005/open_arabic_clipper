@@ -28,11 +28,12 @@ from app.transformation.planning.policy import (  # noqa: F401  (re-exported mar
     VOICE_SELECTION_CONTEXT_MARKERS,
 )
 
-# v2: conservative claim-to-source lexical support policy (a structural citation
-# alone is no longer sufficient for GROUNDED_IN_SOURCE).
-GOVERNOR_POLICY_VERSION = "stage4.2-v2"
+# v3: factual claim support is conservative — lexical overlap never establishes
+# entailment; only supported quotes, near-exact restatements, or clearly-tied
+# non-factual interpretations are deterministically grounded.
+GOVERNOR_POLICY_VERSION = "stage4.2-v3"
 GOVERNOR_SCHEMA_VERSION = "stage4.2-schema-v1"
-GOVERNOR_VALIDATION_VERSION = "stage4.2-validation-v2"
+GOVERNOR_VALIDATION_VERSION = "stage4.2-validation-v3"
 INPUT_FINGERPRINT_VERSION = "1"
 OUTPUT_FINGERPRINT_VERSION = "1"
 PLAN_GOVERNANCE_FINGERPRINT_VERSION = "1"

@@ -99,7 +99,7 @@ def test_five_second_explanation_after_hero_preserves_retention():
             source_block(0),
             original_block(
                 1,
-                intent="Explain why the promotion-rate drop matters for the remote-work debate",
+                intent="Explain why the promotion rates fell sharply for the remote-work debate",
                 kind="EXPLANATION",
                 duration=5.0,
             ),
@@ -158,7 +158,7 @@ def test_funny_source_led_plan_with_no_narration_passes():
             source_block(0),
             original_block(
                 1,
-                intent="Give the missing context about why promotion rates fell",
+                intent="Explain the context for the promotion rates fell sharply",
                 kind="MISSING_CONTEXT",
             ),
         ],
@@ -178,7 +178,7 @@ def test_educational_clip_with_concise_explanation_passes():
             source_block(0),
             original_block(
                 1,
-                intent="Explain how mentorship gaps caused promotion rates to fall",
+                intent="Explain why the promotion rates fell sharply",
                 kind="EXPLANATION",
             ),
         ],
@@ -532,6 +532,75 @@ def test_factual_statement_supported_by_cited_wording_is_grounded():
     assert governance.status is GovernancePlanStatus.APPROVED_FOR_SELECTION
 
 
+def test_faithful_near_exact_restatement_passes():
+    plan = make_plan(
+        blocks=[
+            source_block(
+                0,
+                text="Remote work collapsed productivity as promotion rates fell sharply.",
+            ),
+            original_block(
+                1,
+                intent="Remote work collapsed productivity as promotion rates fell sharply",
+                kind="EXPLANATION",
+                grounding=("block:0",),
+            ),
+        ],
+        original_value_kinds=("EXPLANATION",),
+    )
+    governance = _governance(plan)
+    assert governance.verification["claim_state"] == "GROUNDED_IN_SOURCE"
+    # Grounding is established; a near-exact restatement may still be flagged as
+    # paraphrase by the independent redundancy dimension.
+    assert governance.status not in {
+        GovernancePlanStatus.BLOCKED_PENDING_VERIFICATION,
+        GovernancePlanStatus.GOVERNANCE_DEFERRED,
+        GovernancePlanStatus.REJECTED_BY_GOVERNOR,
+    }
+
+
+def test_shared_entity_with_changed_predicate_is_not_grounded():
+    plan = make_plan(
+        blocks=[
+            source_block(0, text="Microsoft announced a new product launch."),
+            original_block(
+                1,
+                intent="Microsoft files bankruptcy",
+                kind="EXPLANATION",
+                grounding=("block:0",),
+            ),
+        ],
+        original_value_kinds=("EXPLANATION",),
+    )
+    evaluation = evaluate_plan(
+        plan, make_inputs([plan]), DEFAULT_CONFIG, provider_mode_deterministic=False
+    )
+    assert evaluation.requires_semantic_review is True
+    governance = _governance(plan, provider_mode_deterministic=False)
+    assert governance.verification["claim_state"] != "GROUNDED_IN_SOURCE"
+    assert governance.status is not GovernancePlanStatus.APPROVED_FOR_SELECTION
+    assert governance.eligible_for_stage4_3 is False
+
+
+def test_changed_predicate_with_same_entities_is_not_grounded():
+    plan = make_plan(
+        blocks=[
+            source_block(0, text="The merger delays Friday."),
+            original_block(
+                1,
+                intent="The merger closes Friday",
+                kind="EXPLANATION",
+                grounding=("block:0",),
+            ),
+        ],
+        original_value_kinds=("EXPLANATION",),
+    )
+    governance = _governance(plan, provider_mode_deterministic=False)
+    assert governance.verification["claim_state"] != "GROUNDED_IN_SOURCE"
+    assert governance.status is not GovernancePlanStatus.APPROVED_FOR_SELECTION
+    assert governance.eligible_for_stage4_3 is False
+
+
 def test_direct_quote_supported_by_cited_source_passes():
     plan = make_plan(
         blocks=[
@@ -559,7 +628,7 @@ def test_non_factual_explanation_tied_to_cited_evidence_passes():
             source_block(0),
             original_block(
                 1,
-                intent="Infer that mentorship gaps explain the promotion rates decline",
+                intent="Infer why the promotion rates fell sharply",
                 kind="INFERENCE",
                 grounding=("block:0",),
             ),
