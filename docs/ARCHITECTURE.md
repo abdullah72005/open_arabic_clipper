@@ -120,7 +120,42 @@ critiques are checkpointed per provider-input fingerprint and reused on exact
 dependency match. The candidate summary is `PLANS_ELIGIBLE_FOR_SELECTION`,
 `NO_GOVERNOR_APPROVED_PLAN`, or `GOVERNANCE_DEFERRED`. Rights, platform
 originality, and spam/repetition stay separate; account/channel repetition is
-deferred to Stage 7. Stage 4.3 selection
-is not implemented and the read-only Stage 4.3 handoff contains no winner,
-`selected_plan_id`, render-ready state, or publication approval. See
+deferred to Stage 7. The read-only Stage 4.2 -> 4.3 handoff contains no winner,
+`selected_plan_id`, render-ready state, or publication approval; deterministic
+selection is implemented separately by Stage 4.3 (below). See
 `docs/STAGE_4_2_OPERATIONS.md`.
+
+## Stage 4.3 deterministic final-plan selection
+
+Stage 4.3 lives in `app/transformation/selection/` and is explicit,
+candidate-scoped, synchronous, transaction-safe, and provider-free. It consumes
+the authoritative `build_stage4_3_handoff()` freshness contract plus the current
+Stage 4.1 plan rows and commits each candidate to exactly zero or one current
+survivor. It never replans, re-governs, rewrites, researches, refines
+transcripts, or renders; it adds **no** Celery task, `ProcessingJob` kind,
+queue/executor, `PipelineStage`, `PipelineRun`, or `_NEXT_STAGE` entry.
+
+`policy.py` owns the closed statuses (`PLAN_SELECTED`,
+`PLAN_SELECTED_WITH_CAUTION`, `NO_SELECTABLE_PLAN`, `SELECTION_DEFERRED`,
+`STALE_SELECTION_INPUT`), the conservative caution allowlist, resolved
+verification states, explicit categorical order maps, and the lexicographic
+comparison vector (no weighted aggregate score). Only `VERIFIED_CURRENT`
+governance may select; clean approvals arbitrate before cautions; internally
+inconsistent approved evidence fails closed as deferred and is never repaired.
+`fingerprints.py` canonically covers candidate/stage40/stage41/stage42 identity,
+refinement identity, every current plan and governance result, and the Stage 4.3
+policy, while excluding TTS voice/provider/model, render configuration, and
+publishing configuration. `service.py` performs verdict extraction, arbitration,
+and transactional persistence; `handoff.py` exposes a read-only execution handoff
+with live readiness (`READY_FOR_FINAL_REFINEMENT`,
+`REQUIRES_FINAL_REFINEMENT_COMPATIBILITY_CHECK`, `READY_FOR_EXECUTION_PREP`,
+`BLOCKED`) that is never persisted.
+
+Persistence is one new table, `transformation_plan_selections` (one row per
+candidate + input fingerprint, nullable `selected_plan_id`, one database-current
+row per candidate via a partial unique index). Concurrent POSTs converge through
+candidate-row locking, savepoint uniqueness recovery, and post-lock freshness
+revalidation. The selected Stage 4.2 evidence is snapshotted immutably because
+governance rows may be refreshed later; Stage 4.1 plans and Stage 4.2 rows are
+never mutated. Selection is not render or publication readiness, and narration
+remains semantic only. See `docs/STAGE_4_3_OPERATIONS.md`.

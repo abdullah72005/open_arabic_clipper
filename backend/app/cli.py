@@ -31,6 +31,7 @@ from app.models import (
     ProcessingJob,
     SourceVideo,
     Transcript,
+    TransformationPlanSelection,
 )
 from app.refinement.handoff import build_stage4_handoff
 from app.refinement.queue import (
@@ -83,6 +84,8 @@ from app.transformation.queue import (
     queue_transformation_analysis,
     validate_candidate_for_transformation,
 )
+from app.transformation.selection.handoff import build_execution_handoff
+from app.transformation.selection.service import select_transformation_plan
 from app.workers.tasks import run_pipeline_stage
 
 app = typer.Typer(no_args_is_help=True)
@@ -713,6 +716,57 @@ def transformation_governance_handoff(candidate_id: UUID) -> None:
 
     with create_session_factory()() as session:
         handoff = build_stage4_3_handoff(session, candidate_id)
+        if handoff is None:
+            raise typer.BadParameter("candidate does not exist")
+    typer.echo(json.dumps(handoff, ensure_ascii=False, default=str))
+
+
+def _selection_payload(row: TransformationPlanSelection) -> dict[str, object]:
+    return {
+        "id": str(row.id),
+        "clip_candidate_id": str(row.clip_candidate_id),
+        "status": row.status.value,
+        "is_current": row.is_current,
+        "selected_with_caution": row.selected_with_caution,
+        "selected_plan_id": str(row.selected_plan_id) if row.selected_plan_id else None,
+        "selected_governance_result_id": (
+            str(row.selected_governance_result_id) if row.selected_governance_result_id else None
+        ),
+        "selection_reason_codes": list(row.selection_reason_codes or []),
+        "arbitration_evidence": dict(row.arbitration_evidence or {}),
+        "selected_governance_snapshot": dict(row.selected_governance_snapshot or {}),
+        "alternative_dispositions": list(row.alternative_dispositions or []),
+        "selected_plan_fingerprint": row.selected_plan_fingerprint,
+        "governance_input_fingerprint": row.governance_input_fingerprint,
+        "governance_output_fingerprint": row.governance_output_fingerprint,
+        "input_fingerprint": row.input_fingerprint,
+        "output_fingerprint": row.output_fingerprint,
+        "policy_version": row.policy_version,
+        "schema_version": row.schema_version,
+    }
+
+
+@app.command("transformation-selection")
+def transformation_selection(candidate_id: UUID) -> None:
+    """Synchronously select or reuse one current Stage 4.3 plan outcome."""
+
+    with create_session_factory()() as session:
+        view = select_transformation_plan(session, candidate_id)
+        if view is None:
+            raise typer.BadParameter("candidate does not exist")
+        payload = _selection_payload(view.row)
+        payload["live_freshness"] = view.live_freshness
+        payload["effective"] = view.effective
+        session.commit()
+    typer.echo(json.dumps(payload, ensure_ascii=False, default=str))
+
+
+@app.command("transformation-selection-handoff")
+def transformation_selection_handoff(candidate_id: UUID) -> None:
+    """Print the read-only Stage 4.3 execution handoff (one plan or none)."""
+
+    with create_session_factory()() as session:
+        handoff = build_execution_handoff(session, candidate_id)
         if handoff is None:
             raise typer.BadParameter("candidate does not exist")
     typer.echo(json.dumps(handoff, ensure_ascii=False, default=str))

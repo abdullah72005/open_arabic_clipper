@@ -44,6 +44,7 @@ from app.models import (
     SourceVideo,
     Transcript,
     TranscriptChunk,
+    TransformationPlanSelection,
 )
 from app.refinement.handoff import build_stage4_handoff
 from app.refinement.queue import (
@@ -88,6 +89,12 @@ from app.transformation.queue import (
     list_strategies,
     queue_transformation_analysis,
     validate_candidate_for_transformation,
+)
+from app.transformation.selection.handoff import build_execution_handoff
+from app.transformation.selection.service import (
+    get_selection,
+    read_selection,
+    select_transformation_plan,
 )
 from app.workers.tasks import run_pipeline_stage
 
@@ -476,6 +483,55 @@ class Stage43HandoffResponse(BaseModel):
     governance_set: dict[str, object] | None
     plans: list[dict[str, object]]
     stage4_3_implemented: bool
+    model_config = {"extra": "allow"}
+
+
+class TransformationSelectionResponse(BaseModel):
+    id: UUID
+    source_video_id: UUID
+    clip_candidate_id: UUID
+    transformation_analysis_id: UUID | None
+    transformation_plan_set_id: UUID | None
+    transformation_governance_set_id: UUID | None
+    selected_plan_id: UUID | None
+    selected_governance_result_id: UUID | None
+    refinement_id: UUID | None
+    refinement_priority: str
+    refinement_quality_level: str
+    refinement_output_fingerprint: str
+    status: str
+    is_current: bool
+    selected_with_caution: bool
+    selection_reason_codes: list[str]
+    arbitration_evidence: dict[str, object]
+    selected_governance_snapshot: dict[str, object]
+    alternative_dispositions: list[dict[str, object]]
+    governance_input_fingerprint: str
+    governance_output_fingerprint: str
+    governor_policy_version: str
+    governor_validation_version: str
+    platform_policy_profile_version: str
+    selected_plan_fingerprint: str
+    input_fingerprint: str
+    output_fingerprint: str
+    policy_version: str
+    schema_version: str
+    fingerprint_version: str
+    live_freshness: str
+    effective: bool
+    created_at: datetime
+    updated_at: datetime
+    model_config = {"extra": "allow"}
+
+
+class ExecutionHandoffResponse(BaseModel):
+    candidate: dict[str, object]
+    selection: dict[str, object] | None
+    rights_and_provenance: dict[str, object]
+    selected_plan: dict[str, object] | None
+    execution_readiness: str
+    stage5_implemented: bool
+    stage6_tts_implemented: bool
     model_config = {"extra": "allow"}
 
 
@@ -1231,6 +1287,61 @@ def create_app(
             raise HTTPException(status_code=404, detail="candidate not found")
         return Stage43HandoffResponse(**handoff)
 
+    @app.post(
+        "/api/candidates/{candidate_id}/transformation-selection",
+        response_model=TransformationSelectionResponse,
+    )
+    def create_transformation_selection(
+        candidate_id: UUID, database: Session = Depends(session)
+    ) -> TransformationSelectionResponse:
+        """Synchronously select or reuse one current Stage 4.3 plan outcome."""
+
+        view = select_transformation_plan(database, candidate_id)
+        if view is None:
+            raise HTTPException(status_code=404, detail="candidate not found")
+        response = _selection_response(view.row, view.live_freshness, view.effective)
+        database.commit()
+        return response
+
+    @app.get(
+        "/api/candidates/{candidate_id}/transformation-selection",
+        response_model=TransformationSelectionResponse,
+    )
+    def get_candidate_transformation_selection(
+        candidate_id: UUID, database: Session = Depends(session)
+    ) -> TransformationSelectionResponse:
+        view = read_selection(database, candidate_id)
+        if view is None:
+            raise HTTPException(status_code=404, detail="transformation selection not found")
+        return _selection_response(view.row, view.live_freshness, view.effective)
+
+    @app.get(
+        "/api/transformation-selections/{selection_id}",
+        response_model=TransformationSelectionResponse,
+    )
+    def get_transformation_selection(
+        selection_id: UUID, database: Session = Depends(session)
+    ) -> TransformationSelectionResponse:
+        row = get_selection(database, selection_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="transformation selection not found")
+        view = read_selection(database, row.clip_candidate_id)
+        if view is not None and view.row.id == row.id:
+            return _selection_response(row, view.live_freshness, view.effective)
+        return _selection_response(row, "NOT_CURRENT", False)
+
+    @app.get(
+        "/api/candidates/{candidate_id}/execution-handoff",
+        response_model=ExecutionHandoffResponse,
+    )
+    def get_execution_handoff(
+        candidate_id: UUID, database: Session = Depends(session)
+    ) -> ExecutionHandoffResponse:
+        handoff = build_execution_handoff(database, candidate_id)
+        if handoff is None:
+            raise HTTPException(status_code=404, detail="candidate not found")
+        return ExecutionHandoffResponse(**handoff)
+
     @app.patch("/api/sources/{source_id}/provenance", response_model=SourceResponse)
     def update_source_provenance(
         source_id: UUID,
@@ -1656,6 +1767,49 @@ def _governance_set_response(database: Session, governance_set: object) -> Gover
             _governance_result_response(row)
             for row in list_results(database, governance_set.id)  # type: ignore[attr-defined]
         ],
+    )
+
+
+def _selection_response(
+    row: TransformationPlanSelection, live_freshness: str, effective: bool
+) -> TransformationSelectionResponse:
+    return TransformationSelectionResponse(
+        id=row.id,
+        source_video_id=row.source_video_id,
+        clip_candidate_id=row.clip_candidate_id,
+        transformation_analysis_id=row.transformation_analysis_id,
+        transformation_plan_set_id=row.transformation_plan_set_id,
+        transformation_governance_set_id=row.transformation_governance_set_id,
+        selected_plan_id=row.selected_plan_id,
+        selected_governance_result_id=row.selected_governance_result_id,
+        refinement_id=row.refinement_id,
+        refinement_priority=row.refinement_priority,
+        refinement_quality_level=row.refinement_quality_level,
+        refinement_output_fingerprint=row.refinement_output_fingerprint,
+        status=row.status.value,
+        is_current=bool(row.is_current),
+        selected_with_caution=bool(row.selected_with_caution),
+        selection_reason_codes=list(row.selection_reason_codes or []),
+        arbitration_evidence=_without_secrets(dict(row.arbitration_evidence or {})),
+        selected_governance_snapshot=_without_secrets(dict(row.selected_governance_snapshot or {})),
+        alternative_dispositions=[
+            _public_metadata_value(item) for item in (row.alternative_dispositions or [])
+        ],
+        governance_input_fingerprint=row.governance_input_fingerprint,
+        governance_output_fingerprint=row.governance_output_fingerprint,
+        governor_policy_version=row.governor_policy_version,
+        governor_validation_version=row.governor_validation_version,
+        platform_policy_profile_version=row.platform_policy_profile_version,
+        selected_plan_fingerprint=row.selected_plan_fingerprint,
+        input_fingerprint=row.input_fingerprint,
+        output_fingerprint=row.output_fingerprint,
+        policy_version=row.policy_version,
+        schema_version=row.schema_version,
+        fingerprint_version=row.fingerprint_version,
+        live_freshness=live_freshness,
+        effective=effective,
+        created_at=row.created_at,
+        updated_at=row.updated_at,
     )
 
 

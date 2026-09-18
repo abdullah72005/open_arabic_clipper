@@ -644,3 +644,32 @@ class GovernanceReasonCode(str, Enum):
     SEMANTIC_FIDELITY_CONCERN = "SEMANTIC_FIDELITY_CONCERN"
     PLAN_INCOHERENT = "PLAN_INCOHERENT"
     TRANSFORMATION_OVER_EDIT = "TRANSFORMATION_OVER_EDIT"
+
+
+class TransformationSelectionStatus(str, Enum):
+    """Stage 4.3 deterministic final-plan selection outcome.
+
+    Every outcome is a successful semantic result once the candidate exists and
+    the input can be represented truthfully. ``NO_SELECTABLE_PLAN`` and
+    ``SELECTION_DEFERRED`` are answers, never pipeline/server failures.
+    """
+
+    PLAN_SELECTED = "PLAN_SELECTED"
+    PLAN_SELECTED_WITH_CAUTION = "PLAN_SELECTED_WITH_CAUTION"
+    NO_SELECTABLE_PLAN = "NO_SELECTABLE_PLAN"
+    SELECTION_DEFERRED = "SELECTION_DEFERRED"
+    STALE_SELECTION_INPUT = "STALE_SELECTION_INPUT"
+
+
+class TransformationExecutionReadiness(str, Enum):
+    """Live Stage 4.3 execution-readiness state, separate from selection.
+
+    Selection is not render readiness: a plan authored and governed from
+    CANDIDATE-grade Stage 3.5 evidence may be selected while still requiring
+    final-clip refinement before any Stage 5/6 execution.
+    """
+
+    READY_FOR_FINAL_REFINEMENT = "READY_FOR_FINAL_REFINEMENT"
+    REQUIRES_FINAL_REFINEMENT_COMPATIBILITY_CHECK = "REQUIRES_FINAL_REFINEMENT_COMPATIBILITY_CHECK"
+    READY_FOR_EXECUTION_PREP = "READY_FOR_EXECUTION_PREP"
+    BLOCKED = "BLOCKED"

@@ -151,7 +151,7 @@ def test_stage4_3_handoff_has_no_winner_or_selection(api: ApiFixture) -> None:
     assert response.status_code == 200
     payload = response.json()
     serialized = json.dumps(payload)
-    assert payload["stage4_3_implemented"] is False
+    assert payload["stage4_3_implemented"] is True
     assert "selected_plan_id" not in serialized
     assert "winner" not in serialized
     assert "render_ready" not in serialized

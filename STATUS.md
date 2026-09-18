@@ -1,5 +1,89 @@
 # Runtime status
 
+## Stage 4.3 deterministic final-plan selection (2026-09-18)
+
+Stage 4.3 deterministically commits each current Stage 4.2 governance set to
+exactly zero or one current survivor. It is explicit, candidate-scoped,
+synchronous, transaction-safe, and **provider-free**: no Celery task, no
+`ProcessingJob` kind, no executor/queue, no `PipelineStage`, no `PipelineRun`,
+and **no** `_NEXT_STAGE` entry. It never replans, re-governs, rewrites,
+researches, refines transcripts, or renders.
+
+- **Authoritative input.** `build_stage4_3_handoff()` (frozen Stage 4.2 -> 4.3
+  contract) plus the current Stage 4.1 plan rows. Only governance freshness
+  `VERIFIED_CURRENT` may produce a selected plan; `STALE` is
+  `STALE_SELECTION_INPUT`; `NOT_CURRENT`/`UNVERIFIABLE` are `SELECTION_DEFERRED`.
+- **Closed outcomes.** `PLAN_SELECTED`, `PLAN_SELECTED_WITH_CAUTION`,
+  `NO_SELECTABLE_PLAN`, `SELECTION_DEFERRED`, `STALE_SELECTION_INPUT`. Every
+  outcome is a successful semantic result once the candidate exists;
+  candidate-not-found stays 404. Completed verification-blocked/revision/
+  rejected mixes are `NO_SELECTABLE_PLAN`; deferred semantic governance keeps
+  the answer open (`SELECTION_DEFERRED`).
+- **Eligibility and caution.** Clean selection requires
+  `APPROVED_FOR_SELECTION`, `eligible_for_stage4_3=true`, empty hard gates, a
+  matching plan fingerprint, resolved verification
+  (`GROUNDED_IN_SOURCE`/`NOT_APPLICABLE`, `unresolved=false`), and strong
+  semantic fidelity. `APPROVED_WITH_CAUTION` is auto-selectable only when every
+  warning is in the conservative allowlist (`SOURCE_DOMINANCE_CONCERN` with a
+  MODERATE source-dominance dimension; `TEMPLATE_MASS_PRODUCED_FEEL` with a
+  MODERATE template dimension), retention is not damaged/mixed, coherence is
+  acceptable, and there is no unsupported-claim or unknown warning. Clean
+  approvals always arbitrate before cautions. Internally inconsistent approved
+  evidence (non-empty hard gates, fingerprint mismatch, unresolved essential
+  verification, missing decision-critical fields) fails closed as deferred and
+  is never "repaired".
+- **Deterministic hierarchy, no aggregate score.** Lexicographic comparison over
+  persisted evidence: semantic fidelity, retention/damage, substantive
+  originality, platform reuse risk (worst level then HIGH/MODERATE count),
+  coherence, filler/redundancy, narration burden, proportionality/intensity (when
+  value is not worse), then Stage 4.1 generation rank, planner confidence, and
+  stable plan identity. Planner rank/confidence never override Stage 4.2
+  evidence. The first material distinction, approval tier, eligible/excluded
+  plan IDs, and per-alternative dispositions are persisted as explainability
+  evidence.
+- **Persistence and concurrency.** One new table `transformation_plan_selections`
+  (one row per candidate + selection input fingerprint; nullable
+  `selected_plan_id`, never a plan copy), a unique
+  `(clip_candidate_id, input_fingerprint)`, and a PostgreSQL/SQLite partial
+  unique index allowing at most one `is_current=true` row per candidate.
+  Concurrent POSTs converge through candidate-row locking, savepoint uniqueness
+  recovery, and post-lock freshness revalidation. The selected governance
+  evidence is snapshotted immutably; Stage 4.1 plans and Stage 4.2 rows are never
+  mutated. A changed Stage 4.2 fingerprint, Stage 4.1 plan fingerprint,
+  verification state, warning, governor policy/profile, relevant target context,
+  or Stage 4.3 policy version creates a new current row and marks the prior one
+  historical. TTS voice/provider/model, render configuration, and publishing
+  configuration never invalidate selection.
+- **Selection vs execution readiness.** Readiness is live, never persisted:
+  `READY_FOR_FINAL_REFINEMENT`, `REQUIRES_FINAL_REFINEMENT_COMPATIBILITY_CHECK`,
+  `READY_FOR_EXECUTION_PREP`, `BLOCKED`. A CANDIDATE-grade plan is selectable and
+  requires final refinement; a current usable `FINAL_CLIP` on the same identity
+  is execution-prep ready; a newer usable `FINAL_CLIP` forces a compatibility
+  check rather than render readiness. Stage 4.3 never enqueues Stage 3.5 work and
+  selection is not render/publication readiness.
+- **Handoff.** `GET /api/candidates/{id}/execution-handoff` returns one selected
+  plan or none with exact unchanged ordered blocks, hero span, preservation
+  constraints, original-value kinds/reasons, abstract narration semantics (never
+  a TTS provider/model/voice), source dialect, verification, platform-risk
+  snapshots, refinement identities, compatibility requirement, and
+  `stage5_implemented=false`/`stage6_tts_implemented=false`. It never emits
+  platform-safety or monetization guarantees.
+- **API/CLI.** `POST`/`GET /api/candidates/{id}/transformation-selection`,
+  `GET /api/transformation-selections/{id}`, and
+  `GET /api/candidates/{id}/execution-handoff`; CLI `transformation-selection`
+  and `transformation-selection-handoff`. Both are synchronous and provider-free.
+  The Stage 4.2 -> 4.3 handoff metadata now truthfully reports
+  `stage4_3_implemented=true` without changing its evidence semantics.
+- **Versions.** Policy `stage4.3-v1`, schema `stage4.3-schema-v1`, fingerprint
+  version `1`; migration `20260918_0019`.
+
+Deterministic verification: 63 focused Stage 4.3 tests (selection, arbitration,
+eligibility, freshness, FINAL_CLIP readiness, API/CLI, model constraints,
+migration) plus the full backend suite in Docker Python 3.12; Stage 4.3
+PostgreSQL concurrency/partial-unique validation is gated on
+`CLIPFACTORY_TEST_POSTGRES_URL`. No live provider calls in the automated suite.
+See [docs/STAGE_4_3_OPERATIONS.md](docs/STAGE_4_3_OPERATIONS.md).
+
 ## Stage 4.2 retention/originality/platform-risk governor (2026-09-17)
 
 Stage 4.2 independently governs every current Stage 4.1 transformation plan and
@@ -13,8 +97,9 @@ repairs, or selects a plan, adds **no** `PipelineStage`, **no** `PipelineRun`,
   `processing_jobs.transformation_governance_set_id` FK. New persistence is
   `transformation_governance_sets` (one envelope per Stage 4.1 plan set) and
   `transformation_governance_results` (one stable row per plan), with check
-  constraints binding `eligible_for_stage4_3` to the approved statuses. Stage 4.3
-  is not implemented and there is no selected-plan field anywhere.
+  constraints binding `eligible_for_stage4_3` to the approved statuses. Stage 4.2
+  is critic-only and never selects a plan; Stage 4.3 performs deterministic
+  selection separately in `transformation_plan_selections`.
 - **Immutable input.** Queueing requires a current retained candidate, a usable
   `CANDIDATE`/`FINAL_CLIP` Stage 3.5 refinement (never requires `FINAL_CLIP`), a
   current non-stale complete/degraded Stage 4.1 plan set with at least one current
@@ -196,8 +281,8 @@ refinement, and is **never** added to the automatic `_NEXT_STAGE` chain.
 - **No lifecycle change.** It extends the existing Celery/`ProcessingJob`
   platform with a `TRANSFORMATION_PLANNING` job kind and a nullable
   `processing_jobs.transformation_plan_set_id` FK. It adds no `PipelineStage`,
-  no `PipelineRun`, and never advances the source lifecycle. Stage 4.2 and 4.3
-  are not implemented.
+  no `PipelineRun`, and never advances the source lifecycle. Stage 4.2 and Stage
+  4.3 are implemented as separate explicit, candidate-scoped work.
 - **Input gate.** Queueing requires a current retained candidate, a usable
   Stage 3.5 refinement, and a current, non-stale Stage 4.0 handoff
   (`ready_for_stage4_1=true`) with at least one current recommended strategy. A
@@ -460,7 +545,7 @@ transcript and boundary refinement (candidate 5/5 s, final 8/8 s context, max
 150 s) through the existing job system, with optional selective Gemini
 transcription/adjudication behind a shared priority/budget gate. Rendering,
 publishing, review UI, and authorization remain out of scope; Stage 4.0 is
-implemented (explicit, candidate-scoped); Stage 4.1 is implemented and Stage 4.2 is not.
+implemented (explicit, candidate-scoped); Stage 4.1, Stage 4.2, and Stage 4.3 are implemented.
 
 ## Stage 3.5 candidate-scoped refinement (2026-09-12)
 
@@ -533,8 +618,9 @@ expensive compute only on requested candidates/final clips:
   candidate-grade batch (score-ordered, default 5, max 10, no bulk FINAL_CLIP),
   submit manual text/resolutions, and fetch a typed read-only Stage 4 handoff
   (refined transcript/exact bounds + Stage 3 evidence; never mislabels
-  candidate-grade output as final-ready). Stage 4.0 and Stage 4.1 are implemented and Stage 4.2 is not,
-  and `FINAL_TRANSCRIPT_READY` is not publishing readiness.
+  candidate-grade output as final-ready). Stage 4.0, Stage 4.1, Stage 4.2, and
+  Stage 4.3 are implemented, and `FINAL_TRANSCRIPT_READY` is not publishing
+  readiness.
 
 Deterministic verification adds Stage 3.5 tests plus the full existing suite:
 780 backend tests pass (Docker Python 3.12), coverage 87% (gate 79%). Stage 3.5
