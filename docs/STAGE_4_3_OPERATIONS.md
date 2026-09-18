@@ -172,6 +172,12 @@ readiness enum is:
 The planning refinement output fingerprint used by the selected plan/governance
 is preserved on the selection row and exposed truthfully in the execution
 handoff; readiness never compares row identity alone.
+`final_clip_refinement_required` is true only when no usable `FINAL_CLIP`
+refinement exists. When a usable `FINAL_CLIP` exists but differs from planning
+evidence, refinement is already complete:
+`final_clip_refinement_available=true`, `final_clip_refinement_required=false`,
+`compatibility_recheck_required=true`, and readiness is
+`REQUIRES_FINAL_REFINEMENT_COMPATIBILITY_CHECK`.
 
 A newly created `FINAL_CLIP` that makes the frozen Stage 4.0/4.1/4.2 input chain
 stale is reported truthfully (`upstream_chain_stale=true`); Stage 4.3 never

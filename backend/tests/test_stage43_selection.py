@@ -599,6 +599,7 @@ def test_candidate_planning_is_selectable_but_needs_final_refinement(
     assert handoff["selected_plan"] is not None
     assert handoff["final_clip_refinement_available"] is False
     assert handoff["final_clip_refinement_required"] is True
+    assert handoff["compatibility_recheck_required"] is False
     assert handoff["selection_based_on_final_clip"] is False
     assert handoff["execution_readiness"] == "READY_FOR_FINAL_REFINEMENT"
 
@@ -615,7 +616,9 @@ def test_current_valid_final_clip_is_detected(session: Session, monkeypatch: Any
     handoff = build_execution_handoff(session, fixture.candidate.id)
     assert handoff is not None
     assert handoff["final_clip_refinement_available"] is True
+    assert handoff["final_clip_refinement_required"] is False
     assert handoff["same_refinement_identity"] is True
+    assert handoff["compatibility_recheck_required"] is False
     assert handoff["execution_readiness"] == "READY_FOR_EXECUTION_PREP"
 
 
@@ -631,6 +634,8 @@ def test_newer_final_clip_requires_compatibility_check(session: Session, monkeyp
     assert handoff is not None
     assert handoff["final_clip_refinement_available"] is True
     assert handoff["same_refinement_identity"] is False
+    assert handoff["final_clip_refinement_required"] is False
+    assert handoff["compatibility_recheck_required"] is True
     assert handoff["execution_readiness"] == "REQUIRES_FINAL_REFINEMENT_COMPATIBILITY_CHECK"
 
 
@@ -676,6 +681,8 @@ def test_same_refinement_id_changed_output_fingerprint_requires_compatibility(
     assert handoff["final_clip_refinement_available"] is True
     assert handoff["same_refinement_identity"] is False
     assert handoff["planning_refinement"]["output_fingerprint"] == stored_fingerprint
+    assert handoff["final_clip_refinement_required"] is False
+    assert handoff["compatibility_recheck_required"] is True
     assert handoff["execution_readiness"] == "REQUIRES_FINAL_REFINEMENT_COMPATIBILITY_CHECK"
 
     # The planning-refinement output fingerprint is part of the selection input

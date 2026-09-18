@@ -155,7 +155,10 @@ def build_execution_handoff(
             else None
         ),
         "final_clip_refinement_available": final_refinement is not None,
-        "final_clip_refinement_required": not (final_refinement is not None and same_identity),
+        # Required means "no usable FINAL_CLIP evidence exists yet". A usable but
+        # incompatible FINAL_CLIP is not a refinement requirement: refinement is
+        # complete and the later execution boundary must revalidate compatibility.
+        "final_clip_refinement_required": final_refinement is None,
         "selection_based_on_final_clip": bool(
             planning_refinement is not None
             and planning_refinement.get("priority") == RefinementPriority.FINAL_CLIP.value
