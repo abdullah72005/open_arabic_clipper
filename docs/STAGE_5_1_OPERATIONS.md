@@ -518,11 +518,13 @@ re-verified under it. Preview rendering composes the plan's real framing
 `BACKGROUND_FILL`, bounded scale/pad for `SOURCE_AS_IS`) rather than a fixed
 center crop. No test makes a live provider, network, TTS, or final-render call.
 
-Known limitations: the `CaptionStyle` `max_reading_chars_per_second` value is
-defined but not yet consumed by the planner; preview rendering has no API/CLI
-entry point. Real validation observed that a very short scene at a hard cut
-(below the tracking-persistence threshold) can fall to `CENTER_FALLBACK` and
-lose both subjects, and that FFmpeg input seeking on an AV1 source is not
-always frame-accurate (~0.5 s keyframe lead). Stage 5.2 and Stage 6 are
+A scene that has face detections but no track meeting the persistence threshold
+now uses `BACKGROUND_FILL` (keeping every subject visible); `CENTER_FALLBACK` is
+reserved for zero-detection/no-evidence scenes and invalid geometry. FFmpeg
+input seeking (`-ss` before `-i`) was verified byte-identical to output seeking
+at 66/68/80 s on the AV1 validation source, so seeking is not a limitation.
+
+Known limitations: preview rendering has no API/CLI entry point. Stage 5.2 and
+Stage 6 are
 not implemented, and a Stage 5.1 plan is not a rendered video, a transcript, or
 publishing readiness.

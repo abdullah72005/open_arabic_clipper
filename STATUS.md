@@ -209,9 +209,8 @@ frame with headroom, and zero caption/face overlaps.
 Versions: policy `stage5.1-v1`, schema `stage5.1-schema-v1`, framing
 `stage5.1-framing-v1`, caption layout `stage5.1-caption-layout-v1`, ASS
 `stage5.1-ass-v1`, safe zone `shorts-reels-safe-zone-v1`. Known limitations:
-`CLIPFACTORY_VISUAL_COMPOSITION_ENABLED` is enforced by the queue (a disabled
-flag fails closed with a queue error); the `CaptionStyle`
-`max_reading_chars_per_second` value is defined but not yet consumed, and
+`CLIPFACTORY_VISUAL_COMPOSITION_ENABLED` is enforced by both the queue and the
+executor (a disabled flag fails closed with a queue/executor error), and
 preview rendering has no API/CLI entry point. See
 [docs/STAGE_5_1_OPERATIONS.md](docs/STAGE_5_1_OPERATIONS.md).
 

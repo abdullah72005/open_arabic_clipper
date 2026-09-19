@@ -653,8 +653,97 @@ def test_unstable_track_is_never_tracked_crop() -> None:
         geometry=geometry,
     )
     assert decision.mode != FramingMode.TRACKED_CROP.value
-    assert decision.mode == FramingMode.CENTER_FALLBACK.value
+    # Detections exist but no track met the persistence threshold: keep every
+    # subject visible with background-fill rather than a center crop.
+    assert decision.mode == FramingMode.BACKGROUND_FILL.value
     assert FramingEvidence.FACE_TRACK_UNSTABLE.value in decision.evidence
+
+    keyframes = build_crop_keyframes(
+        mode=decision.mode,
+        scene_start=0.0,
+        scene_end=2.5,
+        tracks=(track,),
+        config=config,
+        geometry=geometry,
+    )
+    assert len(keyframes) == 2
+    assert keyframes[0].height_fraction == pytest.approx(1.0)
+    _assert_inside_bounds(keyframes, geometry)
+
+
+def test_detections_without_persistent_track_use_background_fill_keeping_all_subjects() -> None:
+    """Two short-lived detections at a cut must keep both subjects (finding fix)."""
+
+    geometry = _geometry(1920, 1080)
+    config = _config(track_min_persistence_samples=3, track_min_persistence_seconds=1.0)
+    short = [
+        _track(1, [_sample(0.0, 0.25, 0.5, w=0.12, h=0.18)], stable=False),
+        _track(2, [_sample(0.1, 0.75, 0.5, w=0.12, h=0.18)], stable=False),
+    ]
+
+    decision = select_framing_mode(
+        block_index=0,
+        scene_start=0.0,
+        scene_end=0.44,
+        tracks=tuple(short),
+        config=config,
+        geometry=geometry,
+    )
+    assert decision.mode == FramingMode.BACKGROUND_FILL.value
+    assert decision.fallback_parameters.get("reason") == "NO_PERSISTENT_TRACK"
+
+    keyframes = build_crop_keyframes(
+        mode=decision.mode,
+        scene_start=0.0,
+        scene_end=0.44,
+        tracks=tuple(short),
+        config=config,
+        geometry=geometry,
+    )
+    # Background-fill keeps the full frame, so neither subject is cropped out.
+    assert keyframes[0].height_fraction == pytest.approx(1.0)
+    assert keyframes[1].height_fraction == pytest.approx(1.0)
+    assert keyframes[0].center_x == pytest.approx(0.5)
+
+
+def test_zero_detections_use_center_fallback() -> None:
+    geometry = _geometry(1920, 1080)
+    config = _config()
+
+    decision = select_framing_mode(
+        block_index=0,
+        scene_start=0.0,
+        scene_end=2.0,
+        tracks=(),
+        config=config,
+        geometry=geometry,
+    )
+    assert decision.mode == FramingMode.CENTER_FALLBACK.value
+    assert decision.fallback_parameters.get("reason") == "NO_DETECTIONS"
+    assert FramingEvidence.FACE_TRACK_UNSTABLE.value not in decision.evidence
+
+
+def test_invalid_geometry_uses_center_fallback() -> None:
+    config = _config()
+    broken = DisplayGeometry(
+        encoded_width=0,
+        encoded_height=0,
+        rotation_degrees=0,
+        display_width=0,
+        display_height=0,
+    )
+    samples = [_sample(index * 0.5, 0.5, 0.5) for index in range(4)]
+
+    decision = select_framing_mode(
+        block_index=0,
+        scene_start=0.0,
+        scene_end=2.0,
+        tracks=(_track(1, samples),),
+        config=config,
+        geometry=broken,
+    )
+    assert decision.mode == FramingMode.CENTER_FALLBACK.value
+    assert decision.fallback_parameters.get("reason") == "INVALID_GEOMETRY"
 
 
 # ---------------------------------------------------------------------------

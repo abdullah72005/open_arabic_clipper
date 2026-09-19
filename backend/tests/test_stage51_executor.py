@@ -194,3 +194,20 @@ def test_failed_planner_persists_truthful_failure(session: Session, monkeypatch:
     session.refresh(job)
     assert result is not None
     assert job.status is JobStatus.SUCCEEDED
+
+
+def test_disabled_flag_fails_closed_in_executor(session: Session, monkeypatch: Any) -> None:
+    fixture = seed_stage51(session, monkeypatch)
+    fixture.settings.visual_composition_enabled = False
+    row = get_or_create_plan_row(session, fixture.stage50.selection.candidate)
+    job = _job(session, fixture, row.id)
+    executor = _executor(session, fixture)
+    executor.set_active_job(job.id)
+
+    with pytest.raises(CompositionInputError):
+        executor.execute(row.id)
+
+    session.refresh(job)
+    session.refresh(row)
+    assert job.status is JobStatus.FAILED
+    assert row.execution_status is VisualCompositionExecutionStatus.FAILED

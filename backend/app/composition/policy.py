@@ -252,7 +252,6 @@ class CaptionStyle:
     pause_split_seconds: float = 0.45
     max_words_per_event: int = 12
     tail_after_last_word: float = 0.30
-    max_reading_chars_per_second: float = 17.0
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -274,7 +273,6 @@ class CaptionStyle:
             "pause_split_seconds": self.pause_split_seconds,
             "max_words_per_event": self.max_words_per_event,
             "tail_after_last_word": self.tail_after_last_word,
-            "max_reading_chars_per_second": self.max_reading_chars_per_second,
         }
 
 

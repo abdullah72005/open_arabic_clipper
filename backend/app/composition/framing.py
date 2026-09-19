@@ -456,25 +456,41 @@ def _select_framing_mode(
         evidence = list(hero_evidence)
         if not config.detector_enabled:
             evidence.append(FramingEvidence.DETECTOR_UNAVAILABLE.value)
-        evidence.append(
-            FramingEvidence.FACE_TRACK_UNSTABLE.value if tracks else FramingEvidence.NO_FACE.value
-        )
         if _screen_content_requested(screen_content_evidence):
+            evidence.append(FramingEvidence.SCREEN_CONTENT.value)
             return FramingDecision(
                 mode=FramingMode.BACKGROUND_FILL.value,
-                evidence=(*evidence, FramingEvidence.SCREEN_CONTENT.value),
+                evidence=tuple(evidence),
                 fallback_parameters={
                     "persistent_face_count": 0,
                     "track_count": len(tracks),
+                    "reason": "SCREEN_CONTENT",
                 },
                 protected=is_hero,
             )
+        if tracks:
+            # Faces were detected but none met the persistence threshold. Keep
+            # every subject visible with a contain-over-blur composition instead
+            # of a center crop that may cut out all subjects.
+            evidence.append(FramingEvidence.FACE_TRACK_UNSTABLE.value)
+            return FramingDecision(
+                mode=FramingMode.BACKGROUND_FILL.value,
+                evidence=tuple(evidence),
+                fallback_parameters={
+                    "persistent_face_count": 0,
+                    "track_count": len(tracks),
+                    "reason": "NO_PERSISTENT_TRACK",
+                },
+                protected=is_hero,
+            )
+        evidence.append(FramingEvidence.NO_FACE.value)
         return FramingDecision(
             mode=FramingMode.CENTER_FALLBACK.value,
             evidence=tuple(evidence),
             fallback_parameters={
                 "persistent_face_count": 0,
-                "track_count": len(tracks),
+                "track_count": 0,
+                "reason": "NO_DETECTIONS",
             },
             protected=is_hero,
         )

@@ -396,6 +396,14 @@ class VisualCompositionExecutor:
             return StageExecutionResult(row.output_fingerprint, row)
         heartbeat = self._start_heartbeat()
         try:
+            if not getattr(self._settings, "visual_composition_enabled", True):
+                # Defence in depth: the queue already blocks dispatch when
+                # disabled, but a job that reached the executor must fail closed
+                # and never analyze.
+                disabled_error = CompositionInputError("Stage 5.1 visual composition is disabled")
+                self._mark_failed(row, disabled_error)
+                self._finish_job(JobStatus.FAILED, disabled_error)
+                raise disabled_error
             inputs: PlannerInputs | None
             try:
                 inputs = resolve_planner_inputs(
