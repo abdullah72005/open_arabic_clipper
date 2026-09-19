@@ -76,6 +76,8 @@ def validate_candidate_for_composition(
     candidate = session.get(ClipCandidate, _as_uuid(candidate_id))
     if candidate is None:
         raise CompositionQueueError("candidate does not exist")
+    if not get_settings().visual_composition_enabled:
+        raise CompositionQueueError("Stage 5.1 visual composition is disabled")
     if not candidate.is_current:
         raise CompositionQueueError("candidate is stale and cannot be composed")
     if candidate.disposition not in _VALID_DISPOSITIONS:
@@ -215,6 +217,8 @@ def queue_visual_composition(
     """Queue (or reuse) one deterministic Stage 5.1 visual-composition run."""
 
     resolved = settings or get_settings()
+    if not resolved.visual_composition_enabled:
+        raise CompositionQueueError("Stage 5.1 visual composition is disabled")
     config = resolved.stage51_config()
     row = get_or_create_plan_row(session, candidate)
     for _attempt in range(2):

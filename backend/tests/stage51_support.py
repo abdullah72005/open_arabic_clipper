@@ -141,6 +141,7 @@ class FakeStage51Settings:
         self.storage_root = storage_root or get_settings().storage_root
         self.ffmpeg_binary = ffmpeg_binary
         self.ffprobe_binary = ffprobe_binary
+        self.visual_composition_enabled = True
 
     def stage51_config(self) -> Stage51Config:
         return self.config

@@ -191,19 +191,27 @@ probe, and the CPU ONNX detector.
   `storage/benchmarks/visual-composition/{candidate_id}/{contract_id}` (there is
   no API/CLI preview entry point yet).
 
-Deterministic verification: focused Stage 5.1 suite **244 passed, 1 skipped**
-(the PostgreSQL-gated migration test) in Docker Python 3.12; the migration test
-passes (3 passed) with `CLIPFACTORY_TEST_POSTGRES_URL` pointed at the compose
-PostgreSQL, covering the real Alembic upgrade/downgrade. The 22 Stage 5.1 test
-files cover analysis, framing, tracking, detector decode/model, captions, ASS,
-a real libass render proof, overlays, planner, service, queue, executor,
-fingerprints, handoff, API/CLI, models, migration, concurrency, and scope.
+Deterministic verification: the full backend suite passes **1590 passed, 9
+skipped** in Docker Python 3.12. The PostgreSQL-gated suites (migration,
+models, and the new real live-contract end-to-end test) pass **11 passed, 1
+skipped** against a disposable PostgreSQL, covering the real Alembic
+upgrade/downgrade plus the full live path (migration → seeded selection and
+FINAL_CLIP rows → real `create_render_contract` on real media → queue → executor
+with the real FFprobe/FFmpeg/YuNet seams → Stage 5.2 handoff → faithful preview
+PNGs). The 24 Stage 5.1 test files cover analysis, framing, tracking, detector
+decode/model, captions, ASS, a real libass render proof, preview composition,
+overlays, planner, service, queue, executor, live contract, fingerprints,
+handoff, API/CLI, models, migration, concurrency, and scope. The project image
+installs `fonts-noto-core`; `Noto Sans Arabic` resolves and the real libass BiDi
+renders were re-verified under it. Real selected-span validation on spans with
+detected faces confirmed 1080x1920 faithful previews, 52/52 faces inside the
+frame with headroom, and zero caption/face overlaps.
 Versions: policy `stage5.1-v1`, schema `stage5.1-schema-v1`, framing
 `stage5.1-framing-v1`, caption layout `stage5.1-caption-layout-v1`, ASS
 `stage5.1-ass-v1`, safe zone `shorts-reels-safe-zone-v1`. Known limitations:
-`CLIPFACTORY_VISUAL_COMPOSITION_ENABLED`,
-`CLIPFACTORY_VISUAL_ANALYSIS_DENSE_FPS`, and the `CaptionStyle`
-`max_reading_chars_per_second` value are defined but not yet consumed, and
+`CLIPFACTORY_VISUAL_COMPOSITION_ENABLED` is enforced by the queue (a disabled
+flag fails closed with a queue error); the `CaptionStyle`
+`max_reading_chars_per_second` value is defined but not yet consumed, and
 preview rendering has no API/CLI entry point. See
 [docs/STAGE_5_1_OPERATIONS.md](docs/STAGE_5_1_OPERATIONS.md).
 

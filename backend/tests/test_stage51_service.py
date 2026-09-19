@@ -297,7 +297,7 @@ def test_preview_is_gated_and_never_produces_video(session: Session, monkeypatch
         source_path=fixture.stage50.source_path,
         source_time=21.0,
         output_path=fixture.stage50.source_path.parent / "preview-0000.png",
-        ass_filename=None,
+        filtergraph=None,
     )
     _assert_no_video_arguments(arguments)
     assert arguments[-1].endswith(".png")

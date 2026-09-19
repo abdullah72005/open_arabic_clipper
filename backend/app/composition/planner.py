@@ -85,6 +85,7 @@ from app.composition.policy import (
     SafeZoneProfile,
     Stage51Config,
     VisualCompositionStatus,
+    config_fingerprint_dict,
     safe_zone_for,
 )
 from app.composition.tracking import build_tracks
@@ -530,7 +531,7 @@ def _finalize(
             "scenes": scenes_list,
             "display_geometry": inputs.display_geometry.as_dict(),
             "framing_policy_version": FRAMING_POLICY_VERSION,
-            "config": config.as_dict(),
+            "config": config_fingerprint_dict(config),
             "detector_identity": dict(detector_identity),
         }
     )

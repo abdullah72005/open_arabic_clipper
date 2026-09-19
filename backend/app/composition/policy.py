@@ -286,7 +286,6 @@ class Stage51Config:
     """Bounded Stage 5.1 configuration derived from runtime Settings."""
 
     analysis_fps: float = 2.0
-    dense_fps: float = 6.0
     max_analysis_frames: int = 1500
     max_analysis_seconds: float = 600.0
     analysis_frame_max_dimension: int = 640
@@ -328,6 +327,18 @@ class Stage51Config:
         return payload
 
 
+def config_fingerprint_dict(config: Stage51Config) -> dict[str, object]:
+    """Config values that participate in fingerprints.
+
+    A machine-specific deployment path is not identity (the detector sha256 is),
+    so ``detector_model_path`` is always excluded.
+    """
+
+    payload = config.as_dict()
+    payload.pop("detector_model_path", None)
+    return payload
+
+
 def stage51_config_payload(config: Stage51Config) -> dict[str, object]:
     """Deterministic fingerprint payload for all output-affecting policy.
 
@@ -336,10 +347,7 @@ def stage51_config_payload(config: Stage51Config) -> dict[str, object]:
     artifacts, and analytics config: none of those are Stage 5.1 inputs.
     """
 
-    config_payload = config.as_dict()
-    # A machine-specific deployment path is not detector identity (the sha256
-    # in DETECTOR_IDENTITY is), so it must never enter the fingerprint.
-    config_payload.pop("detector_model_path", None)
+    config_payload = config_fingerprint_dict(config)
     return {
         "policy_version": VISUAL_COMPOSITION_POLICY_VERSION,
         "schema_version": SCHEMA_VERSION,
@@ -400,6 +408,7 @@ __all__ = [
     "VISUAL_COMPOSITION_POLICY_VERSION",
     "VisualCompositionExecutionStatus",
     "VisualCompositionStatus",
+    "config_fingerprint_dict",
     "framing_for_bounded_distance",
     "safe_zone_for",
     "stage51_config_payload",

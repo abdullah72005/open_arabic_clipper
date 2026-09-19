@@ -203,7 +203,6 @@ class Settings(BaseSettings):
     # alongside the composition package.
     visual_composition_enabled: bool = True
     visual_analysis_fps: float = Field(default=2.0, gt=0, le=60)
-    visual_analysis_dense_fps: float = Field(default=6.0, gt=0, le=120)
     visual_analysis_max_frames: int = Field(default=1_500, gt=0, le=100_000)
     visual_analysis_max_seconds: float = Field(default=600.0, gt=0, le=86_400)
     visual_analysis_frame_max_dimension: int = Field(default=640, gt=0, le=4_096)
@@ -598,7 +597,6 @@ class Settings(BaseSettings):
 
         return Stage51Config(
             analysis_fps=self.visual_analysis_fps,
-            dense_fps=self.visual_analysis_dense_fps,
             max_analysis_frames=self.visual_analysis_max_frames,
             max_analysis_seconds=self.visual_analysis_max_seconds,
             analysis_frame_max_dimension=self.visual_analysis_frame_max_dimension,

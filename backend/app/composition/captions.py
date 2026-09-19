@@ -57,6 +57,22 @@ _WIDTH_SAFETY_FACTOR = 1.12
 _LINE_HEIGHT_FACTOR = 1.25
 _MIN_BAND_HEIGHT_PX = 1.0
 
+#: Degenerate captions shorter than this are never emitted (e.g. an event fully
+#: swallowed by overlap trimming). This is deliberately far below
+#: ``CaptionStyle.min_event_duration`` so a legitimately tail-clamped event that
+#: is still readable survives.
+_MIN_EVENT_SECONDS = 0.1
+
+
+class CaptionConstructionError(ValueError):
+    """A bound span's caption evidence is structurally invalid (fail closed).
+
+    Raised instead of asserting so the check cannot be stripped under ``-O``.
+    ``build_caption_plan`` isolates it per span and records
+    ``CAPTION_EVIDENCE_MISSING`` rather than fabricating or aborting the plan.
+    """
+
+
 _ARABIC_RANGES: tuple[tuple[int, int], ...] = (
     (0x0600, 0x06FF),
     (0x0750, 0x077F),
@@ -344,14 +360,15 @@ def _word_range_inside_span(word: _Word, span: _Span) -> bool:
 
 def _select_span_words(span: _Span, words: Mapping[int, _Word]) -> tuple[_Word, ...] | None:
     if span.word_start_index is not None and span.word_end_index is not None:
-        assert span.word_start_index <= span.word_end_index, (
-            "bound span word indexes must be ordered"
-        )
+        if span.word_start_index > span.word_end_index:
+            raise CaptionConstructionError("bound span word indexes are not ordered")
         selected: list[_Word] = []
         for index in range(span.word_start_index, span.word_end_index + 1):
             word = words.get(index)
-            assert word is not None, "bound span references a missing word index"
-            assert _word_range_inside_span(word, span), "word index falls outside its bound span"
+            if word is None:
+                raise CaptionConstructionError("bound span references a missing word index")
+            if not _word_range_inside_span(word, span):
+                raise CaptionConstructionError("word index falls outside its bound span")
             selected.append(word)
         return tuple(selected) if selected else None
 
@@ -605,7 +622,10 @@ def _build_event_drafts(
         span = _coerce_span(raw_span, hero_block_index)
         block_index = span.block_index
         source_role = span.source_role
-        selected = _select_span_words(span, words)
+        try:
+            selected = _select_span_words(span, words)
+        except CaptionConstructionError:
+            selected = None
         if selected is None:
             markers.append(
                 MissingEvidenceMarker(
@@ -766,10 +786,19 @@ def build_caption_plan(
         drafts,
         previous_scene_zones or {},
     )
+    # Fail closed on degenerate events: never emit an empty, zero-length, or
+    # sub-readable caption (e.g. one fully swallowed by overlap trimming).
+    kept_events = tuple(
+        event
+        for event in events
+        if event.text.strip()
+        and (event.end - event.start) > _FLOAT_EPSILON
+        and (event.end - event.start) >= _MIN_EVENT_SECONDS - _FLOAT_EPSILON
+    )
     all_reasons = sorted({*reasons, *event_reasons})
     return CaptionPlan(
         policy_version=CAPTION_LAYOUT_POLICY_VERSION,
-        events=tuple(events),
+        events=kept_events,
         missing_evidence=tuple(markers),
         scene_zones=zones,
         reason_codes=tuple(all_reasons),
@@ -781,6 +810,7 @@ __all__ = [
     "CAPTION_COLLISION_UNRESOLVED",
     "CAPTION_EVIDENCE_MISSING",
     "COLLISION_AREA_THRESHOLD",
+    "CaptionConstructionError",
     "CaptionPlan",
     "MissingEvidenceMarker",
     "SceneFaceBox",

@@ -265,14 +265,18 @@ def test_canonical_text_preserves_tokens_and_bidi_controls() -> None:
     assert BIDI_CONTROL_NEUTRALIZED in plan.reason_codes
 
 
-def test_unordered_explicit_indexes_are_rejected() -> None:
-    with pytest.raises(AssertionError):
-        _plan([(0, 0.0, 0.9, 2, 0, "HERO")], _words(["a", "b", "c"]))
+def test_unordered_explicit_indexes_fail_closed_to_missing_evidence() -> None:
+    plan = _plan([(0, 0.0, 0.9, 2, 0, "HERO")], _words(["a", "b", "c"]))
+    assert plan.events == ()
+    assert any(marker.block_index == 0 for marker in plan.missing_evidence)
+    assert CAPTION_EVIDENCE_MISSING in plan.reason_codes
 
 
-def test_explicit_index_missing_from_timestamps_is_rejected() -> None:
-    with pytest.raises(AssertionError):
-        _plan([(0, 0.0, 0.9, 0, 5, "HERO")], _words(["a", "b"]))
+def test_explicit_index_missing_from_timestamps_fails_closed() -> None:
+    plan = _plan([(0, 0.0, 0.9, 0, 5, "HERO")], _words(["a", "b"]))
+    assert plan.events == ()
+    assert any(marker.block_index == 0 for marker in plan.missing_evidence)
+    assert CAPTION_EVIDENCE_MISSING in plan.reason_codes
 
 
 def test_wrap_text_greedily_wraps_and_reports_overflow() -> None:

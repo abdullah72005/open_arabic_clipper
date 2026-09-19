@@ -460,9 +460,8 @@ constraints shown; see `.env.example` for the comments.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `CLIPFACTORY_VISUAL_COMPOSITION_ENABLED` | `true` | Declared Stage 5.1 enable flag. It is currently not consulted by the queue/executor path. |
+| `CLIPFACTORY_VISUAL_COMPOSITION_ENABLED` | `true` | Stage 5.1 enable flag. When `false`, `validate_candidate_for_composition` and `queue_visual_composition` fail closed with a queue error. |
 | `CLIPFACTORY_VISUAL_ANALYSIS_FPS` | `2.0` | Nominal analysis frame rate (reduced deterministically if needed). |
-| `CLIPFACTORY_VISUAL_ANALYSIS_DENSE_FPS` | `6.0` | Configured dense-rate value (currently carried but not consulted by the planner). |
 | `CLIPFACTORY_VISUAL_ANALYSIS_MAX_FRAMES` | `1500` | Hard analysis frame budget per plan. |
 | `CLIPFACTORY_VISUAL_ANALYSIS_MAX_SECONDS` | `600.0` | Hard selected-span seconds cap. |
 | `CLIPFACTORY_VISUAL_ANALYSIS_FRAME_MAX_DIMENSION` | `640` | Max decoded frame dimension. |
@@ -505,16 +504,25 @@ docker run --rm --network oac_default \
 ruff format app tests alembic && ruff check app tests alembic
 ```
 
-Focused result: 244 passed, 1 skipped (the PostgreSQL-gated migration test) in
-the default run; the migration test passes (3 passed) with
-`CLIPFACTORY_TEST_POSTGRES_URL` pointed at the compose PostgreSQL. The real
+Full backend result: **1590 passed, 9 skipped** in Docker Python 3.12. The
+PostgreSQL-gated suites (migration, models, and the real live-contract
+end-to-end test) pass **11 passed, 1 skipped** against a disposable PostgreSQL;
+the live-contract run exercises migration → seeded selection/FINAL_CLIP rows →
+real `create_render_contract` on real media → queue → executor with the real
+FFprobe/FFmpeg/YuNet seams → Stage 5.2 handoff → faithful preview PNGs, and
+asserts a cache hit on re-queue and `STALE` after a media stat change. The real
 libass render tests run in the project image, which ships `ffmpeg` and
-`fonts-noto-core`. No test makes a live provider, network, TTS, or final-render
-call.
+`fonts-noto-core`; `Noto Sans Arabic` resolves and the BiDi renders were
+re-verified under it. Preview rendering composes the plan's real framing
+(interpolated crop keyframes per mode, planned contain-over-blurred-self for
+`BACKGROUND_FILL`, bounded scale/pad for `SOURCE_AS_IS`) rather than a fixed
+center crop. No test makes a live provider, network, TTS, or final-render call.
 
-Known limitations: `CLIPFACTORY_VISUAL_COMPOSITION_ENABLED`,
-`CLIPFACTORY_VISUAL_ANALYSIS_DENSE_FPS`, and the `CaptionStyle`
-`max_reading_chars_per_second` value are defined but not yet consumed by the
-planner; preview rendering has no API/CLI entry point. Stage 5.2 and Stage 6 are
+Known limitations: the `CaptionStyle` `max_reading_chars_per_second` value is
+defined but not yet consumed by the planner; preview rendering has no API/CLI
+entry point. Real validation observed that a very short scene at a hard cut
+(below the tracking-persistence threshold) can fall to `CENTER_FALLBACK` and
+lose both subjects, and that FFmpeg input seeking on an AV1 source is not
+always frame-accurate (~0.5 s keyframe lead). Stage 5.2 and Stage 6 are
 not implemented, and a Stage 5.1 plan is not a rendered video, a transcript, or
 publishing readiness.

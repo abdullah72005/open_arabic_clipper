@@ -1,8 +1,8 @@
-"""Stage 5.1 preview caption-timing regression (Defect 2 guard).
+"""Stage 5.1 preview tests: faithful plan composition + caption timing.
 
-A preview frame rendered at a source-local time after 0 must show the caption
-event active at that time. Input seeking without ``-copyts`` rebases the frame
-PTS and silently drops every late caption, so this test proves the real render.
+Preview frames must render the plan's *real* composition (interpolated crop
+keyframes, planned background-fill, bounded scale/pad), and a caption active at a
+source-local time after 0 must still be burned in (``-copyts``).
 """
 
 from __future__ import annotations
@@ -13,9 +13,164 @@ from pathlib import Path
 
 import pytest
 
-from app.composition.preview import _frame_arguments
+from app.composition.geometry import clamp_crop, normalized_crop_to_display
+from app.composition.policy import (
+    OUTPUT_HEIGHT,
+    OUTPUT_WIDTH,
+    FramingMode,
+    framing_for_bounded_distance,
+)
+from app.composition.preview import (
+    _frame_arguments,
+    preview_filtergraph,
+    resolve_preview_crop,
+)
+from app.composition.types import DisplayGeometry
 
 ffmpeg = pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg unavailable")
+
+_GEOMETRY = {
+    "encoded_width": 1920,
+    "encoded_height": 1080,
+    "rotation_degrees": 0,
+    "display_width": 1920,
+    "display_height": 1080,
+}
+
+
+def _crop_scene(
+    *,
+    index: int,
+    start: float,
+    end: float,
+    mode: str,
+    keyframes: list[dict[str, object]],
+) -> dict[str, object]:
+    return {
+        "scene_index": index,
+        "block_index": index,
+        "source_start": start,
+        "source_end": end,
+        "framing_mode": mode,
+        "crop_keyframes": keyframes,
+        "interpolation_policy": "smoothstep-ease",
+    }
+
+
+def _keyframe(t: float, cx: float, cy: float, hf: float) -> dict[str, object]:
+    return {"t": t, "cx": cx, "cy": cy, "height_fraction": hf, "mode": "TRACKED_CROP"}
+
+
+# geometry: 1920x1080 display; a 0.5-height crop is 540 tall x 303.75 wide.
+
+
+def _expected_crop(cx: float, cy: float, hf: float) -> tuple[int, int, int, int]:
+    geometry = DisplayGeometry(
+        encoded_width=1920,
+        encoded_height=1080,
+        rotation_degrees=0,
+        display_width=1920,
+        display_height=1080,
+    )
+    raw = normalized_crop_to_display(cx, cy, hf, geometry)
+    clamped = clamp_crop(raw["x"], raw["y"], raw["width"], raw["height"], 1920.0, 1080.0)
+    return (
+        int(round(clamped[0])),
+        int(round(clamped[1])),
+        max(2, int(round(clamped[2]))),
+        max(2, int(round(clamped[3]))),
+    )
+
+
+def test_preview_crop_matches_plan_geometry_at_interpolated_time() -> None:
+    payload = {
+        "geometry": dict(_GEOMETRY),
+        "scenes": [
+            _crop_scene(
+                index=0,
+                start=0.0,
+                end=10.0,
+                mode=FramingMode.TRACKED_CROP.value,
+                keyframes=[_keyframe(0.0, 0.3, 0.5, 0.5), _keyframe(10.0, 0.7, 0.5, 0.5)],
+            )
+        ],
+    }
+    # At t=5 the eased ratio is 0.5 -> cx=0.5.
+    resolved = resolve_preview_crop(payload, 5.0)
+    expected = _expected_crop(0.5, 0.5, 0.5)
+    assert (resolved.crop_x, resolved.crop_y, resolved.crop_width, resolved.crop_height) == (
+        expected
+    )
+    assert resolved.mode == FramingMode.TRACKED_CROP.value
+    assert resolved.center_x == pytest.approx(0.5)
+    # Interpolation is smoothstep-eased, not linear.
+    assert framing_for_bounded_distance(0.5) == pytest.approx(0.5)
+
+    at_start = resolve_preview_crop(payload, 0.0)
+    assert (at_start.crop_x, at_start.crop_y) == _expected_crop(0.3, 0.5, 0.5)[:2]
+
+    graph = preview_filtergraph(payload, 5.0)
+    x, y, w, h = expected
+    assert f"crop={w}:{h}:{x}:{y}" in graph
+    assert graph.endswith(f"scale={OUTPUT_WIDTH}:{OUTPUT_HEIGHT}")
+
+
+def test_preview_crop_smoothstep_between_keyframes() -> None:
+    payload = {
+        "geometry": dict(_GEOMETRY),
+        "scenes": [
+            _crop_scene(
+                index=0,
+                start=0.0,
+                end=10.0,
+                mode=FramingMode.TRACKED_CROP.value,
+                keyframes=[_keyframe(0.0, 0.0, 0.5, 0.5), _keyframe(10.0, 1.0, 0.5, 0.5)],
+            )
+        ],
+    }
+    # smoothstep(0.25) = 0.15625, not 0.25.
+    quarter = resolve_preview_crop(payload, 2.5)
+    assert quarter.center_x == pytest.approx(0.15625)
+
+
+def test_background_fill_filtergraph_uses_blur_contain_overlay() -> None:
+    payload = {
+        "geometry": dict(_GEOMETRY),
+        "scenes": [
+            _crop_scene(
+                index=0,
+                start=0.0,
+                end=4.0,
+                mode=FramingMode.BACKGROUND_FILL.value,
+                keyframes=[_keyframe(0.0, 0.5, 0.5, 1.0), _keyframe(4.0, 0.5, 0.5, 1.0)],
+            )
+        ],
+    }
+    graph = preview_filtergraph(payload, 2.0)
+    assert "split=2[bg][fg]" in graph
+    assert "boxblur=20:1" in graph
+    assert "[bgc][fgs]overlay=(W-w)/2:(H-h)/2" in graph
+
+
+def test_source_as_is_filtergraph_uses_bounded_scale_and_pad() -> None:
+    payload = {
+        "geometry": dict(_GEOMETRY),
+        "scenes": [
+            _crop_scene(
+                index=0,
+                start=0.0,
+                end=4.0,
+                mode=FramingMode.SOURCE_AS_IS.value,
+                keyframes=[_keyframe(0.0, 0.5, 0.5, 1.0), _keyframe(4.0, 0.5, 0.5, 1.0)],
+            )
+        ],
+    }
+    graph = preview_filtergraph(payload, 1.0)
+    assert "force_original_aspect_ratio=decrease" in graph
+    assert "pad=1080:1920" in graph
+
+
+# --- caption timing through the real render ---------------------------------
 
 _ASS_STYLE_FORMAT = (
     "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, "
@@ -108,7 +263,7 @@ def test_late_caption_is_visible_with_copyts(tmp_path: Path) -> None:
         source_path=video,
         source_time=2.0,
         output_path=png,
-        ass_filename=ass_path.name,
+        filtergraph=f"scale={OUTPUT_WIDTH}:{OUTPUT_HEIGHT},ass={ass_path.name}",
     )
     assert "-copyts" in arguments
     subprocess.run(arguments, check=True, cwd=str(tmp_path))
@@ -121,3 +276,72 @@ def test_late_caption_is_visible_with_copyts(tmp_path: Path) -> None:
     naive[naive.index(str(png))] = str(png_naive)
     subprocess.run(naive, check=True, cwd=str(tmp_path))
     assert _ink_pixels(png_naive) < _ink_pixels(png), "without -copyts the caption is inactive"
+
+
+@ffmpeg
+def test_preview_renders_real_plan_crop(tmp_path: Path) -> None:
+    """The rendered frame is cropped to the plan's crop, not a fixed center crop."""
+
+    video = tmp_path / "src.mp4"
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=black:s=1920x1080:d=3:r=10",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-y",
+            str(video),
+        ],
+        check=True,
+    )
+    payload = {
+        "geometry": dict(_GEOMETRY),
+        "scenes": [
+            _crop_scene(
+                index=0,
+                start=0.0,
+                end=3.0,
+                mode=FramingMode.STATIC_CROP.value,
+                keyframes=[_keyframe(0.0, 0.2, 0.5, 0.5), _keyframe(3.0, 0.2, 0.5, 0.5)],
+            )
+        ],
+    }
+    graph = preview_filtergraph(payload, 1.5)
+    png = tmp_path / "plan-frame.png"
+    arguments = _frame_arguments(
+        executable="ffmpeg",
+        source_path=video,
+        source_time=1.5,
+        output_path=png,
+        filtergraph=graph,
+    )
+    subprocess.run(arguments, check=True, cwd=str(tmp_path))
+    assert png.is_file()
+    # The render must be the target profile size, proving the crop+scale ran.
+    probe = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height",
+            "-of",
+            "csv=p=0",
+            str(png),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert probe.stdout.strip() == f"{OUTPUT_WIDTH},{OUTPUT_HEIGHT}"
