@@ -22,8 +22,9 @@ VISUAL_COMPOSITION_POLICY_VERSION = "stage5.1-v1"
 SCHEMA_VERSION = "stage5.1-schema-v1"
 FINGERPRINT_VERSION = "1"
 FRAMING_POLICY_VERSION = "stage5.1-framing-v1"
-CAPTION_LAYOUT_POLICY_VERSION = "stage5.1-caption-layout-v1"
-ASS_POLICY_VERSION = "stage5.1-ass-v1"
+CAPTION_LAYOUT_POLICY_VERSION = "stage5.1-caption-layout-v3"
+ASS_POLICY_VERSION = "stage5.1-ass-v3"
+BACKGROUND_FILL_POLICY_VERSION = "stage5.1-background-fill-v1"
 SAFE_ZONE_PROFILE_VERSION = "shorts-reels-safe-zone-v1"
 
 # Coarse deterministic output dimensions for the target Shorts/Reels profile.
@@ -235,13 +236,14 @@ class CaptionStyle:
     """Config-driven caption style with conservative Shorts/Reels defaults."""
 
     font_family: str = "Noto Sans Arabic"
-    font_size: int = 56
+    font_size: int = 88
     primary_color: str = "&H00FFFFFF"
     secondary_color: str = "&H000000FF"
     outline_color: str = "&H00000000"
-    outline_width: int = 4
-    shadow: int = 0
-    shadow_offset: int = 0
+    outline_width: int = 7
+    shadow: int = 3
+    active_color: str = "&H0000FFFF"
+    active_emphasis: bool = True
     max_lines: int = 2
     max_line_width_fraction: float = 0.86
     spacing: int = 0
@@ -250,7 +252,7 @@ class CaptionStyle:
     max_event_duration: float = 3.6
     min_event_duration: float = 0.7
     pause_split_seconds: float = 0.45
-    max_words_per_event: int = 12
+    max_words_per_event: int = 7
     tail_after_last_word: float = 0.30
 
     def as_dict(self) -> dict[str, object]:
@@ -262,7 +264,8 @@ class CaptionStyle:
             "outline_color": self.outline_color,
             "outline_width": self.outline_width,
             "shadow": self.shadow,
-            "shadow_offset": self.shadow_offset,
+            "active_color": self.active_color,
+            "active_emphasis": self.active_emphasis,
             "max_lines": self.max_lines,
             "max_line_width_fraction": self.max_line_width_fraction,
             "spacing": self.spacing,
@@ -310,6 +313,9 @@ class Stage51Config:
     max_keyframes_per_scene: int = 40
     caption_font_family: str = "Noto Sans Arabic"
     caption_max_lines: int = 2
+    caption_active_color: str = "&H0000FFFF"
+    caption_dynamic_emphasis: bool = True
+    caption_max_words_per_event: int = 7
     safe_zone_profile_key: str = "SHORTS_VERTICAL_SAFE_ZONE_V1"
     preview_enabled: bool = True
     preview_max_frames: int = 6
@@ -353,6 +359,7 @@ def stage51_config_payload(config: Stage51Config) -> dict[str, object]:
         "framing_policy_version": FRAMING_POLICY_VERSION,
         "caption_layout_policy_version": CAPTION_LAYOUT_POLICY_VERSION,
         "ass_policy_version": ASS_POLICY_VERSION,
+        "background_fill_policy_version": BACKGROUND_FILL_POLICY_VERSION,
         "safe_zone_profile_version": SAFE_ZONE_PROFILE_VERSION,
         "output": {
             "width": OUTPUT_WIDTH,
@@ -363,6 +370,9 @@ def stage51_config_payload(config: Stage51Config) -> dict[str, object]:
         "caption_style": CaptionStyle(
             font_family=config.caption_font_family,
             max_lines=config.caption_max_lines,
+            active_color=config.caption_active_color,
+            active_emphasis=config.caption_dynamic_emphasis,
+            max_words_per_event=config.caption_max_words_per_event,
         ).as_dict(),
         "safe_zone": safe_zone_for(config.safe_zone_profile_key).as_dict(),
         "detector_identity": dict(DETECTOR_IDENTITY),
@@ -381,6 +391,7 @@ def framing_for_bounded_distance(distance: float) -> float:
 
 __all__ = [
     "ASS_POLICY_VERSION",
+    "BACKGROUND_FILL_POLICY_VERSION",
     "CAPTION_LAYOUT_POLICY_VERSION",
     "CaptionPlacementZone",
     "CaptionStyle",

@@ -40,6 +40,10 @@ _FORBIDDEN_ARGUMENTS = (
     "mpeg4",
 )
 
+BACKGROUND_FILL_BLUR_FILTER = "gblur=sigma=36:steps=2"
+BACKGROUND_FILL_TONE_FILTER = "eq=brightness=-0.18:saturation=0.70"
+BACKGROUND_FILL_BACKGROUND_FILTER = f"{BACKGROUND_FILL_BLUR_FILTER},{BACKGROUND_FILL_TONE_FILTER}"
+
 _CROP_MODES = frozenset(
     {
         FramingMode.STATIC_CROP.value,
@@ -235,7 +239,7 @@ def preview_filtergraph(
         return (
             "split=2[bg][fg];"
             f"[bg]scale={OUTPUT_WIDTH}:{OUTPUT_HEIGHT}:force_original_aspect_ratio=increase,"
-            f"crop={OUTPUT_WIDTH}:{OUTPUT_HEIGHT},boxblur=20:1[bgc];"
+            f"crop={OUTPUT_WIDTH}:{OUTPUT_HEIGHT},{BACKGROUND_FILL_BACKGROUND_FILTER}[bgc];"
             f"[fg]scale={OUTPUT_WIDTH}:{OUTPUT_HEIGHT}:force_original_aspect_ratio=decrease[fgs];"
             f"[bgc][fgs]overlay=(W-w)/2:(H-h)/2{tail}"
         )

@@ -17,10 +17,13 @@ from app.composition.geometry import clamp_crop, normalized_crop_to_display
 from app.composition.policy import (
     OUTPUT_HEIGHT,
     OUTPUT_WIDTH,
+    CaptionStyle,
     FramingMode,
     framing_for_bounded_distance,
+    safe_zone_for,
 )
 from app.composition.preview import (
+    BACKGROUND_FILL_BACKGROUND_FILTER,
     _frame_arguments,
     preview_filtergraph,
     resolve_preview_crop,
@@ -148,8 +151,11 @@ def test_background_fill_filtergraph_uses_blur_contain_overlay() -> None:
     }
     graph = preview_filtergraph(payload, 2.0)
     assert "split=2[bg][fg]" in graph
-    assert "boxblur=20:1" in graph
+    assert BACKGROUND_FILL_BACKGROUND_FILTER in graph
+    assert "gblur=sigma=36" in graph
+    assert "eq=brightness=-0.18" in graph
     assert "[bgc][fgs]overlay=(W-w)/2:(H-h)/2" in graph
+    assert "boxblur" not in graph
 
 
 def test_source_as_is_filtergraph_uses_bounded_scale_and_pad() -> None:
@@ -177,9 +183,16 @@ _ASS_STYLE_FORMAT = (
     "BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, "
     "BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding"
 )
+_CAPTION_STYLE = CaptionStyle()
+_SAFE_ZONE = safe_zone_for("SHORTS_VERTICAL_SAFE_ZONE_V1")
 _ASS_STYLE_LINE = (
-    "Style: CaptionLower,{font},56,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,"
-    "0,0,0,0,100,100,0,0,1,4,0,2,54,162,504,1"
+    f"Style: CaptionLower,{{font}},{_CAPTION_STYLE.font_size},"
+    f"{_CAPTION_STYLE.primary_color},{_CAPTION_STYLE.secondary_color},"
+    f"{_CAPTION_STYLE.outline_color},&H00000000,"
+    f"0,0,0,0,100,100,{_CAPTION_STYLE.spacing},0,1,"
+    f"{_CAPTION_STYLE.outline_width},{_CAPTION_STYLE.shadow},2,"
+    f"{_SAFE_ZONE.left_px()},{_SAFE_ZONE.right_px()},"
+    f"{_SAFE_ZONE.bottom_px() + _SAFE_ZONE.caption_bottom_gap_px},1"
 )
 _ASS_TEMPLATE = f"""[Script Info]
 ScriptType: v4.00+

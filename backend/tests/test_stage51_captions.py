@@ -71,16 +71,14 @@ def _event_texts(plan: CaptionPlan) -> list[str]:
     return [event.text for event in plan.events]
 
 
-def test_words_in_explicit_range_form_one_exact_logical_event() -> None:
+def test_words_in_explicit_range_are_consumed_in_order_within_two_lines() -> None:
     plan = _plan([(0, 0.0, 1.4, 0, 2, "HERO")], _words(["hello", "world", "again"]))
 
-    assert len(plan.events) == 1
-    event = plan.events[0]
-    assert event.text == "hello world again"
-    assert event.lines == ("hello world again",)
-    assert event.word_start_index == 0
-    assert event.word_end_index == 2
-    assert event.start == 0.0
+    assert " ".join(_event_texts(plan)) == "hello world again"
+    assert plan.events[0].word_start_index == 0
+    assert plan.events[-1].word_end_index == 2
+    assert plan.events[0].start == 0.0
+    assert all(len(event.lines) <= 2 for event in plan.events)
 
 
 def test_fallback_selects_words_whose_times_fall_inside_span() -> None:
@@ -136,7 +134,17 @@ def test_max_words_per_event_is_enforced() -> None:
     assert len(plan.events) >= 2
     for event in plan.events:
         word_count = event.word_end_index - event.word_start_index + 1
-        assert word_count <= 12
+        assert word_count <= 7
+
+
+def test_events_carry_canonical_final_clip_word_timings() -> None:
+    plan = _plan([(0, 0.0, 1.4, 0, 2, "HERO")], _words(["hello", "world", "again"]))
+
+    timings = [word for event in plan.events for word in event.word_timings]
+    assert [word.index for word in timings] == [0, 1, 2]
+    assert [word.text for word in timings] == ["hello", "world", "again"]
+    assert timings[0].start == 0.0
+    assert all(word.end > word.start for word in timings)
 
 
 def test_event_end_is_clamped_to_span_tail() -> None:
@@ -321,7 +329,7 @@ def test_plan_as_dict_is_json_friendly() -> None:
     plan = _plan([(0, 0.0, 0.9, 0, 1, "HERO")], _words(["hello", "world"]))
 
     payload = plan.as_dict()
-    assert payload["policy_version"] == "stage5.1-caption-layout-v1"
+    assert payload["policy_version"] == "stage5.1-caption-layout-v3"
     events = payload["events"]
     assert isinstance(events, list)
     assert events[0]["text"] == "hello world"

@@ -19,6 +19,7 @@ Escaping is proven against the installed libass rather than assumed:
 from __future__ import annotations
 
 import hashlib
+import math
 from pathlib import Path
 
 from app.composition.captions import CaptionPlan
@@ -148,6 +149,77 @@ def _event_text(event: CaptionEvent) -> str:
     return override + "\\N".join(escaped_lines)
 
 
+#: A spoken word must be active this long to be emphasized; shorter spans
+#: degrade the whole event to one static phrase line rather than flicker.
+_ACTIVE_MIN_STATE_SECONDS = 0.05
+_TIMING_TOLERANCE = 1e-4
+
+
+def _placement_override(event: CaptionEvent) -> str:
+    if event.placement_zone == CaptionPlacementZone.UPPER.value:
+        return "{\\an8}"
+    return "{\\an2}"
+
+
+def _dynamic_event_text(event: CaptionEvent, style: CaptionStyle, active_index: int) -> str:
+    """Render one event with exactly one word wrapped in the active color.
+
+    Only a color override is emitted around the active token, so glyph metrics,
+    line wrapping, BiDi ordering, and the block position are byte-for-byte
+    unchanged from the static render.
+    """
+
+    accent = f"{{\\c{style.active_color}&}}"
+    restore = f"{{\\c{style.primary_color}&}}"
+    token_index = 0
+    rendered_lines: list[str] = []
+    for line in _event_lines(event):
+        rendered_tokens: list[str] = []
+        for token in line.split(" "):
+            escaped = escape_ass_text(token)
+            if token_index == active_index:
+                rendered_tokens.append(f"{accent}{escaped}{restore}")
+            else:
+                rendered_tokens.append(escaped)
+            token_index += 1
+        rendered_lines.append(" ".join(rendered_tokens))
+    return _placement_override(event) + "\\N".join(rendered_lines)
+
+
+def _active_word_states(event: CaptionEvent, style: CaptionStyle) -> list[tuple[float, float, str]]:
+    """Resolve one stationary Dialogue state per spoken word.
+
+    Returns ``[(start, end, text), ...]`` tiling ``[event.start, event.end]``
+    with non-overlapping intervals; the active word changes at the exact
+    FINAL_CLIP word boundary. Emphasis degrades to a single static phrase
+    state whenever per-word timing is missing, degenerate, out of range, or too
+    short to render cleanly, so unreliable timing is never turned into
+    fabricated highlighting.
+    """
+
+    words = event.word_timings
+    static = [(event.start, event.end, _event_text(event))]
+    if not style.active_emphasis or len(words) < 2:
+        return static
+    if len(words) != len(event.text.split(" ")):
+        return static
+    if any(not math.isfinite(word.start) or not math.isfinite(word.end) for word in words):
+        return static
+    if any(word.end <= word.start for word in words):
+        return static
+    if abs(words[0].start - event.start) > _TIMING_TOLERANCE:
+        return static
+
+    boundaries: list[float] = [event.start, *(word.start for word in words[1:]), event.end]
+    for earlier, later in zip(boundaries, boundaries[1:]):
+        if later - earlier < _ACTIVE_MIN_STATE_SECONDS:
+            return static
+    return [
+        (boundaries[index], boundaries[index + 1], _dynamic_event_text(event, style, index))
+        for index in range(len(words))
+    ]
+
+
 def _style_name(event: CaptionEvent) -> str:
     if event.placement_zone == CaptionPlacementZone.UPPER.value:
         return "CaptionUpper"
@@ -181,11 +253,13 @@ def build_ass_text(plan: CaptionPlan, style: CaptionStyle, safe_zone: SafeZonePr
         key=lambda event: (event.start, event.word_start_index, event.block_index),
     )
     for event in ordered:
-        lines.append(
-            "Dialogue: 0,"
-            f"{_format_ass_time(event.start)},{_format_ass_time(event.end)},"
-            f"{_style_name(event)},,0,0,0,,{_event_text(event)}"
-        )
+        style_name = _style_name(event)
+        for state_start, state_end, state_text in _active_word_states(event, style):
+            lines.append(
+                "Dialogue: 0,"
+                f"{_format_ass_time(state_start)},{_format_ass_time(state_end)},"
+                f"{style_name},,0,0,0,,{state_text}"
+            )
     return "\n".join(lines) + "\n"
 
 

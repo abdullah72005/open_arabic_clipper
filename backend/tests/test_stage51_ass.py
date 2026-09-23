@@ -25,7 +25,7 @@ from app.composition.policy import (
     Stage51Config,
     safe_zone_for,
 )
-from app.composition.types import CaptionEvent
+from app.composition.types import CaptionEvent, CaptionWordTiming
 from app.services.storage import StorageService
 
 SOURCE_ID = "11111111-1111-1111-1111-111111111111"
@@ -147,13 +147,14 @@ def test_serialize_ass_uses_style_configuration() -> None:
         font_size=64,
         primary_color="&H00112233",
         outline_width=7,
+        shadow=4,
         alignment_lower=2,
         alignment_upper=8,
     )
     text = serialize_ass(_plan(), style, _safe_zone()).decode("utf-8")
 
     assert "CaptionLower,DejaVu Sans,64,&H00112233" in text
-    assert ",1,7,0,2,54,162,504,1" in text
+    assert ",1,7,4,2,54,162,504,1" in text
 
 
 def test_serialize_ass_sorts_events_by_start_then_word_index() -> None:
@@ -170,6 +171,85 @@ def test_serialize_ass_sorts_events_by_start_then_word_index() -> None:
     assert len(dialogue_lines) == 2
     assert dialogue_lines[0].endswith("first")
     assert dialogue_lines[1].endswith("second")
+
+
+def _dynamic_event(
+    *,
+    timings: tuple[tuple[str, float, float], ...] = (
+        ("hello", 0.0, 0.4),
+        ("world", 0.5, 0.9),
+        ("again", 1.0, 1.4),
+    ),
+) -> CaptionEvent:
+    return CaptionEvent(
+        event_id="caption-0-0-2",
+        block_index=0,
+        word_start_index=0,
+        word_end_index=len(timings) - 1,
+        start=0.0,
+        end=1.5,
+        text=" ".join(token for token, _, _ in timings),
+        lines=(" ".join(token for token, _, _ in timings),),
+        placement_zone=CaptionPlacementZone.LOWER.value,
+        placement_reason="DEFAULT_LOWER_ZONE",
+        word_timings=tuple(
+            CaptionWordTiming(index=index, text=token, start=start, end=end)
+            for index, (token, start, end) in enumerate(timings)
+        ),
+    )
+
+
+def _dialogue_lines(text: str) -> list[str]:
+    return [line for line in text.splitlines() if line.startswith("Dialogue:")]
+
+
+def test_serialize_ass_emits_one_stationary_state_per_spoken_word() -> None:
+    plan = CaptionPlan(policy_version="test", events=(_dynamic_event(),))
+    dialogues = _dialogue_lines(serialize_ass(plan, CaptionStyle(), _safe_zone()).decode("utf-8"))
+
+    assert len(dialogues) == 3
+    assert "0:00:00.00,0:00:00.50" in dialogues[0]
+    assert "0:00:00.50,0:00:01.00" in dialogues[1]
+    assert "0:00:01.00,0:00:01.50" in dialogues[2]
+    for dialogue in dialogues:
+        assert dialogue.count("&H0000FFFF") == 1
+        assert ",CaptionLower,,0,0,0,," in dialogue
+    assert "{\\c&H0000FFFF&}hello{\\c&H00FFFFFF&}" in dialogues[0]
+    assert "{\\c&H0000FFFF&}world{\\c&H00FFFFFF&}" in dialogues[1]
+    assert "{\\c&H0000FFFF&}again{\\c&H00FFFFFF&}" in dialogues[2]
+
+
+def test_serialize_ass_active_color_and_emphasis_are_configurable() -> None:
+    plan = CaptionPlan(policy_version="test", events=(_dynamic_event(),))
+
+    custom = CaptionStyle(active_color="&H00FF00FF")
+    dialogues = _dialogue_lines(serialize_ass(plan, custom, _safe_zone()).decode("utf-8"))
+    assert "{\\c&H00FF00FF&}hello{\\c&H00FFFFFF&}" in dialogues[0]
+
+    disabled = _dialogue_lines(
+        serialize_ass(plan, CaptionStyle(active_emphasis=False), _safe_zone()).decode("utf-8")
+    )
+    assert len(disabled) == 1
+    assert "\\c&H0000FFFF" not in disabled[0]
+
+
+@pytest.mark.parametrize(  # type: ignore[untyped-decorator]
+    "timings",
+    [
+        (("only", 0.0, 0.4),),
+        (("a", 0.5, 0.9), ("b", 0.0, 0.4)),
+        (("a", 0.0, 0.4), ("b", 0.02, 0.5)),
+        (("a", 0.0, 0.0), ("b", 0.5, 0.9)),
+    ],
+)
+def test_serialize_ass_degrades_to_static_on_unreliable_timing(
+    timings: tuple[tuple[str, float, float], ...],
+) -> None:
+    plan = CaptionPlan(policy_version="test", events=(_dynamic_event(timings=timings),))
+    dialogues = _dialogue_lines(serialize_ass(plan, CaptionStyle(), _safe_zone()).decode("utf-8"))
+
+    assert len(dialogues) == 1
+    assert "\\c&H0000FFFF" not in dialogues[0]
 
 
 def test_serialize_ass_places_upper_zone_with_an8() -> None:

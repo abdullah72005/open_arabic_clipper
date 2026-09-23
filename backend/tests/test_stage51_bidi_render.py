@@ -249,7 +249,7 @@ def _dialogue_payloads(ass_text: str) -> list[str]:
 
 
 def _visible_text(payload: str) -> str:
-    text = payload.replace("{\\an2}", "").replace("{\\an8}", "")
+    text = re.sub(r"(?<!\\)\{[^}]*\}", "", payload)
     text = text.replace("\\N", " ").replace("\\n", " ")
     text = text.replace("\\{", "{").replace("\\}", "}")
     return text.replace(_WORD_JOINER, "")
@@ -260,6 +260,7 @@ def _assert_no_bidi_controls(text: str) -> None:
 
 
 def _naive_ass_document(raw_text: str) -> bytes:
+    style = CaptionStyle()
     header = (
         "[Script Info]\n"
         "ScriptType: v4.00+\n"
@@ -271,8 +272,11 @@ def _naive_ass_document(raw_text: str) -> bytes:
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, "
         "BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, "
         "BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
-        f"Style: CaptionLower,{FONT_FAMILY},56,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,"
-        "0,0,0,0,100,100,0,0,1,4,0,2,54,162,504,1\n"
+        f"Style: CaptionLower,{FONT_FAMILY},{style.font_size},{style.primary_color},"
+        f"{style.secondary_color},{style.outline_color},&H00000000,"
+        f"0,0,0,0,100,100,{style.spacing},0,1,{style.outline_width},{style.shadow},"
+        f"2,{_safe_zone().left_px()},{_safe_zone().right_px()},"
+        f"{_safe_zone().bottom_px() + _safe_zone().caption_bottom_gap_px},1\n"
         "\n"
         "[Events]\n"
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
@@ -294,7 +298,9 @@ def test_real_libass_renders_fixture_with_ink_and_determinism(name: str, tmp_pat
 
     assert " ".join(event.text for event in plan.events) == text
     payloads = list(_iter_dialogue_payloads(ass_text))
-    assert [_visible_text(payload) for payload in payloads] == [event.text for event in plan.events]
+    visible = [_visible_text(payload) for payload in payloads]
+    assert visible
+    assert set(visible) == {event.text for event in plan.events}
 
     first = tmp_path / f"{name}-1.png"
     second = tmp_path / f"{name}-2.png"
@@ -309,8 +315,9 @@ def test_real_libass_renders_fixture_with_ink_and_determinism(name: str, tmp_pat
 
 def test_representative_mixed_string_renders_ink(tmp_path: Path) -> None:
     ass_bytes, plan, _ = _build_render_inputs(REPRESENTATIVE)
-    assert len(plan.events) == 1
-    assert plan.events[0].text == REPRESENTATIVE
+    assert " ".join(event.text for event in plan.events) == REPRESENTATIVE
+    assert plan.events[0].word_start_index == 0
+    assert plan.events[-1].word_end_index == len(REPRESENTATIVE.split(" ")) - 1
 
     destination = tmp_path / "representative.png"
     _render_png(ass_bytes, destination)
@@ -346,3 +353,122 @@ def test_escaped_drawing_command_does_not_execute(tmp_path: Path) -> None:
 
     assert escaped_ink > 0
     assert naive_ink > escaped_ink * 4
+
+
+def _render_png_at(ass_bytes: bytes, source_time: float, destination: Path) -> None:
+    ass_path = destination.with_suffix(".ass")
+    ass_path.write_bytes(ass_bytes)
+    command = [
+        "ffmpeg",
+        "-y",
+        "-v",
+        "error",
+        "-copyts",
+        "-ss",
+        f"{source_time:.4f}",
+        "-f",
+        "lavfi",
+        "-i",
+        f"color=c=black:s={WIDTH}x{HEIGHT}:d=8:r=10,format=rgb24",
+        "-frames:v",
+        "1",
+        "-vf",
+        f"ass={ass_path},format=rgb24",
+        "-pix_fmt",
+        "rgb24",
+        str(destination),
+    ]
+    subprocess.run(command, check=True, capture_output=True)
+
+
+def _rgb(data: bytes) -> "npt.NDArray[np.int32]":
+    width, height, channels, pixels = _decode_png(data)
+    array = cast(
+        "npt.NDArray[np.uint8]",
+        np.frombuffer(pixels, dtype=np.uint8).reshape(height, width, channels),
+    )
+    return array[:, :, :3].astype(np.int32)
+
+
+def _ink_mask(data: bytes) -> "npt.NDArray[np.bool_]":
+    rgb = _rgb(data)
+    return np.abs(rgb - rgb[0, 0]).max(axis=2) > 30
+
+
+def _accent_mask(data: bytes) -> "npt.NDArray[np.bool_]":
+    rgb = _rgb(data)
+    return (rgb[:, :, 0] > 180) & (rgb[:, :, 1] > 180) & (rgb[:, :, 2] < 120)
+
+
+def _mask_bbox(mask: "npt.NDArray[np.bool_]") -> tuple[int, int, int, int] | None:
+    ys, xs = np.nonzero(mask)
+    if len(xs) == 0:
+        return None
+    return (int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max()))
+
+
+@pytest.mark.parametrize(  # type: ignore[untyped-decorator]
+    "name",
+    [
+        "arabic_only",
+        "english_only",
+        "arabic_with_embedded_english",
+        "arabic_english_numbers",
+        "english_with_arabic_phrase",
+        "representative",
+    ],
+)
+def test_real_libass_dynamic_highlight_moves_without_reflow_or_reshaping(
+    name: str, tmp_path: Path
+) -> None:
+    text = FIXTURES[name]
+    ass_bytes, plan, _ = _build_render_inputs(text)
+    event = max(plan.events, key=lambda candidate: len(candidate.word_timings))
+    if len(event.word_timings) < 2:
+        pytest.skip("fixture produced no multi-word caption event")
+
+    bounds = [event.start, *[word.start for word in event.word_timings[1:]], event.end]
+    midpoints = [
+        (bounds[index] + bounds[index + 1]) / 2.0 for index in range(len(event.word_timings))
+    ]
+    static_ass = serialize_ass(
+        plan, CaptionStyle(font_family=FONT_FAMILY, active_emphasis=False), _safe_zone()
+    )
+    # Same per-word state lines, but with the "active" color set to the base
+    # primary color, so the only difference from a plain static render is the
+    # override-tag syntax itself.
+    no_op_ass = serialize_ass(
+        plan,
+        CaptionStyle(font_family=FONT_FAMILY, active_color=CaptionStyle().primary_color),
+        _safe_zone(),
+    )
+
+    accent_masks: list[npt.NDArray[np.bool_]] = []
+    boxes: list[tuple[int, int, int, int] | None] = []
+    for index, midpoint in enumerate(midpoints):
+        png = tmp_path / f"{name}-{index}.png"
+        _render_png_at(ass_bytes, midpoint, png)
+        ink, _ = _ink_stats(png.read_bytes())
+        assert ink > 0
+        accent_masks.append(_accent_mask(png.read_bytes()))
+        boxes.append(_mask_bbox(_ink_mask(png.read_bytes())))
+
+        # The override tags must not reflow, reorder, or reshape the script:
+        # with a no-op color they render pixel-identically to the plain static
+        # render of the same event.
+        no_op_png = tmp_path / f"{name}-{index}-noop.png"
+        static_png = tmp_path / f"{name}-{index}-static.png"
+        _render_png_at(no_op_ass, midpoint, no_op_png)
+        _render_png_at(static_ass, midpoint, static_png)
+        assert np.array_equal(_rgb(no_op_png.read_bytes()), _rgb(static_png.read_bytes()))
+
+    # The caption block never moves (within a couple of pixels of antialias
+    # noise at the caption edge; a bouncing block would move by tens of pixels).
+    reference_box = boxes[0]
+    assert reference_box is not None
+    for box in boxes:
+        assert box is not None
+        assert all(abs(box[edge] - reference_box[edge]) <= 2 for edge in range(4))
+    # Every state shows exactly one accent, and the accent advances.
+    assert all(bool(mask.any()) for mask in accent_masks)
+    assert len({mask.tobytes() for mask in accent_masks}) >= 2

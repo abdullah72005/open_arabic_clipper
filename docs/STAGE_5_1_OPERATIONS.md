@@ -180,9 +180,10 @@ fabricates text.
   (period, exclamation, question, comma, semicolon, colon, ellipsis, and the
   Arabic comma/semicolon/question-mark/full-stop) or an inter-word pause of at
   least 0.45 s; respects maximum
-  event duration 3.6 s, minimum event duration 0.7 s, at most 12 words per
-  event, and script-aware estimated width with greedy wrapping into at most two
-  lines. Short fragments are merged when the result still fits.
+  event duration 3.6 s, minimum event duration 0.7 s, at most 7 words per
+  event (configurable; compact 3-7 word chunks when phrase boundaries allow),
+  and script-aware estimated width with greedy wrapping into at most two lines.
+  Short fragments are merged when the result still fits.
 - **Layout.** Estimated per-character advance (Arabic 0.55 em, alphanumeric
   0.56 em, space 0.28 em, punctuation 0.30 em, other 0.50 em) with a 1.12
   safety factor; usable width is the smaller of 0.86 x 1080 and the frame width
@@ -197,6 +198,18 @@ fabricates text.
   completely collision-free. If both bands collide, the plan records
   `CAPTION_COLLISION_UNRESOLVED` and the hero picks the lesser collision;
   captions are never dropped for a face.
+- **Active-word emphasis.** Each caption event carries the exact FINAL_CLIP
+  word timings copied verbatim (logical Unicode order). `ass.py` emits one
+  stationary Dialogue state per spoken word tiling `[event.start, event.end]`,
+  with the word currently being spoken wrapped in a configurable ASS color
+  override and every other word left at the style's primary color. The active
+  word changes exactly at the word boundary; the whole block keeps the same
+  style, alignment, margins, and text, so it never bounces or reflows. If any
+  per-word timing is missing, degenerate, non-increasing, starts after the
+  event, or shorter than 0.05 s, the event degrades to a single static phrase
+  line instead of inventing precise highlighting. There are no karaoke wipes,
+  random animations, emoji, content rewriting, provider calls, or synthesized
+  timing.
 
 `ass.py` serializes exactly one ASS document per caption plan.
 
@@ -234,7 +247,13 @@ block-relative `timeline_hint`; no global timeline is frozen.
   determinism for Arabic-only, English-only, embedded-English, mixed
   numeric/Arabic, mixed-punctuation, and representative mixed strings. It also
   renders a naive character-reversed document as a negative control and
-  asserts the images differ. The tests skip only when ffmpeg, the libass `ass`
+  asserts the images differ. The same suite proves dynamic active-word
+  emphasis: for each fixture it renders every word state of one event at its
+  real time, asserts the block bounding box is stationary, asserts that the
+  per-word state lines with a no-op color render pixel-identically to the plain
+  static render (so the override tags cause no reflow, reorder, or reshaping),
+  and asserts the accent mask is present in every state and advances between
+  states. The tests skip only when ffmpeg, the libass `ass`
   filter, or a usable installed font is genuinely absent; the project Docker
   test image provides all three.
 - Frontend `<bdi>` handling is unrelated to video subtitles and does not solve
@@ -292,6 +311,20 @@ uses the configured family; libass resolves it through fontconfig, which falls
 back to another Arabic-capable installed family (ultimately `DejaVu Sans` in the
 render test) if the exact family is absent. A missing font never fails a plan;
 it only affects the eventual renderer.
+
+## Caption style defaults
+
+The default `CaptionStyle` is shared by the real plan ASS and the standalone
+BiDi/black fixtures, so a validation fixture cannot look good while the real
+composition uses a different size. Defaults: font size 88, white primary text,
+black outline width 7, shadow 3, at most 2 lines, at 1080 x 1920 (a 1.25 line
+factor, 110 px line pitch). That keeps captions immediately readable on a
+360 x 640 preview without covering the subject. Dynamic emphasis is on by
+default: the active word uses the accent color `&H0000FFFF` (yellow) while
+inactive words stay white. The style (including active color, dynamic-emphasis
+enable, and max words per event) is part of the `stage51_config_payload()`
+fingerprint, so any value change invalidates prior plans at the correct
+boundary. TTS voice/provider/model are never fingerprint inputs.
 
 ## Detector
 
@@ -365,7 +398,8 @@ Canonical fingerprints are composed with `canonical_fingerprint`:
 **What invalidates a plan:** any change to the executable Stage 5.0 contract
 (status, fingerprints, currentness/effectiveness), source media identity,
 display geometry/rotation, bound source spans, live caption source, output
-profile, safe zone, Stage 5.1 policy/config/schema, detector identity, or the
+profile, safe zone, Stage 5.1 policy/config/schema (including the caption style,
+active-word color/emphasis policy, and chunk size), detector identity, or the
 candidate/analysis identity.
 
 **What does NOT invalidate a plan:** TTS provider/model/voice, future narration
@@ -445,6 +479,12 @@ PNG per frame. It never encodes a video: a denylist refuses `libx264`, `libx265`
 gated by `CLIPFACTORY_VISUAL_PREVIEW_ENABLED`; when disabled, or when FFmpeg is
 missing, they raise `PreviewError` and never fall back to video.
 
+`BACKGROUND_FILL` renders the source scaled to cover, then a strong blur plus a
+modest dim/desaturation (`gblur=sigma=36:steps=2`, then
+`eq=brightness=-0.18:saturation=0.70`) so the background reads as a background
+rather than a second copy of the scene, with the sharp contained foreground
+overlaid on top. No external imagery or B-roll is ever introduced.
+
 The default preview directory is
 `storage/benchmarks/visual-composition/{candidate_id}/{contract_id}` (the
 storage `benchmarks/` category). Callers may pass an explicit
@@ -472,6 +512,9 @@ constraints shown; see `.env.example` for the comments.
 | `CLIPFACTORY_VISUAL_DETECTOR_SCORE_THRESHOLD` | `0.6` | Detection score threshold. |
 | `CLIPFACTORY_VISUAL_CAPTION_FONT_FAMILY` | `Noto Sans Arabic` | ASS caption font family. |
 | `CLIPFACTORY_VISUAL_CAPTION_MAX_LINES` | `2` | Maximum caption lines per event. |
+| `CLIPFACTORY_VISUAL_CAPTION_ACTIVE_COLOR` | `&H0000FFFF` | ASS `AABBGGRR` color for the actively spoken word. |
+| `CLIPFACTORY_VISUAL_CAPTION_DYNAMIC_EMPHASIS` | `true` | Highlight the actively spoken word; false renders plain static captions. |
+| `CLIPFACTORY_VISUAL_CAPTION_MAX_WORDS_PER_EVENT` | `7` | Maximum words per caption chunk. |
 | `CLIPFACTORY_VISUAL_PREVIEW_ENABLED` | `true` | Allow PNG validation previews. |
 
 ## Versions
@@ -480,8 +523,9 @@ constraints shown; see `.env.example` for the comments.
 - schema `stage5.1-schema-v1`
 - fingerprint `1`
 - framing policy `stage5.1-framing-v1`
-- caption layout policy `stage5.1-caption-layout-v1`
-- ASS policy `stage5.1-ass-v1`
+- caption layout policy `stage5.1-caption-layout-v3`
+- ASS policy `stage5.1-ass-v3`
+- background fill policy `stage5.1-background-fill-v1`
 - safe-zone profile `shorts-reels-safe-zone-v1`
 - output geometry `1080 x 1920` (9:16; `SHORTS_1080X1920` is the Stage 5.0
   render profile whose contract Stage 5.1 consumes)
@@ -504,7 +548,9 @@ docker run --rm --network oac_default \
 ruff format app tests alembic && ruff check app tests alembic
 ```
 
-Full backend result: **1590 passed, 9 skipped** in Docker Python 3.12. The
+Full backend result: **1608 passed, 9 skipped** in Docker Python 3.12 (mount the
+repository root, not only `backend/`, so the couple of tests that read
+`compose.yaml` resolve). The
 PostgreSQL-gated suites (migration, models, and the real live-contract
 end-to-end test) pass **11 passed, 1 skipped** against a disposable PostgreSQL;
 the live-contract run exercises migration → seeded selection/FINAL_CLIP rows →

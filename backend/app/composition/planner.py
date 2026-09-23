@@ -672,6 +672,9 @@ def _caption_style(config: Stage51Config) -> CaptionStyle:
     return CaptionStyle(
         font_family=config.caption_font_family,
         max_lines=config.caption_max_lines,
+        active_color=config.caption_active_color,
+        active_emphasis=config.caption_dynamic_emphasis,
+        max_words_per_event=config.caption_max_words_per_event,
     )
 
 

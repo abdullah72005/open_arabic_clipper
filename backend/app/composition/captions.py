@@ -39,7 +39,7 @@ from app.composition.policy import (
     Stage51Config,
     safe_zone_for,
 )
-from app.composition.types import CaptionEvent
+from app.composition.types import CaptionEvent, CaptionWordTiming
 
 SpanInput: TypeAlias = tuple[int, float, float, int | None, int | None, str | None]
 
@@ -561,6 +561,7 @@ class _EventDraft:
     lines: tuple[str, ...]
     source_role: str | None
     is_hero: bool
+    word_timings: tuple[CaptionWordTiming, ...] = ()
     lower_fraction: float = 0.0
     upper_fraction: float = 0.0
     scene_index: int | None = None
@@ -659,6 +660,15 @@ def _build_event_drafts(
                 lines=lines,
                 source_role=source_role,
                 is_hero=span.is_hero,
+                word_timings=tuple(
+                    CaptionWordTiming(
+                        index=word.index,
+                        text=word.text,
+                        start=word.start,
+                        end=word.end,
+                    )
+                    for word in fragment
+                ),
             )
             drafts.append(draft)
             if _contains_bidi_control(text):
@@ -744,6 +754,7 @@ def _emit_events(
                 placement_zone=zone,
                 placement_reason=reason,
                 collision_evidence=evidence,
+                word_timings=draft.word_timings,
             )
         )
     events.sort(key=lambda event: (event.start, event.word_start_index, event.block_index))

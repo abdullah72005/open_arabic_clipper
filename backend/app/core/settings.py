@@ -221,6 +221,9 @@ class Settings(BaseSettings):
     visual_detector_score_threshold: float = Field(default=0.6, ge=0, le=1)
     visual_caption_font_family: str = Field(default="Noto Sans Arabic", max_length=256)
     visual_caption_max_lines: int = Field(default=2, gt=0, le=10)
+    visual_caption_active_color: str = Field(default="&H0000FFFF", pattern=r"^&H[0-9A-Fa-f]{8}$")
+    visual_caption_dynamic_emphasis: bool = True
+    visual_caption_max_words_per_event: int = Field(default=7, gt=0, le=12)
     visual_preview_enabled: bool = True
     transcription_queue_concurrency: int = Field(default=1, gt=0)
     cors_origins: list[str] = ["http://localhost:3301"]
@@ -607,6 +610,9 @@ class Settings(BaseSettings):
             detector_score_threshold=self.visual_detector_score_threshold,
             caption_font_family=self.visual_caption_font_family,
             caption_max_lines=self.visual_caption_max_lines,
+            caption_active_color=self.visual_caption_active_color,
+            caption_dynamic_emphasis=self.visual_caption_dynamic_emphasis,
+            caption_max_words_per_event=self.visual_caption_max_words_per_event,
             preview_enabled=self.visual_preview_enabled,
         )
 

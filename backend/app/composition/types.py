@@ -202,6 +202,28 @@ class Scene:
 
 
 @dataclass(frozen=True)
+class CaptionWordTiming:
+    """One canonical FINAL_CLIP word and its exact spoken timing.
+
+    ``text`` is the unchanged source token (logical Unicode order). Timing is
+    never synthesized: it is copied from the FINAL_CLIP word timestamps.
+    """
+
+    index: int
+    text: str
+    start: float
+    end: float
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "index": self.index,
+            "text": self.text,
+            "start": round(self.start, 4),
+            "end": round(self.end, 4),
+        }
+
+
+@dataclass(frozen=True)
 class CaptionEvent:
     """One FINAL_CLIP caption event referencing exact word indexes."""
 
@@ -216,6 +238,7 @@ class CaptionEvent:
     placement_zone: str
     placement_reason: str
     collision_evidence: Mapping[str, object] = field(default_factory=dict)
+    word_timings: tuple[CaptionWordTiming, ...] = ()
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -230,6 +253,7 @@ class CaptionEvent:
             "placement_zone": self.placement_zone,
             "placement_reason": self.placement_reason,
             "collision_evidence": dict(self.collision_evidence),
+            "word_timings": [word.as_dict() for word in self.word_timings],
         }
 
 
@@ -414,6 +438,7 @@ class VisualCompositionPlan:
 __all__ = [
     "BoundSpan",
     "CaptionEvent",
+    "CaptionWordTiming",
     "CompositionMetrics",
     "CropKeyframe",
     "DisplayGeometry",
