@@ -38,6 +38,9 @@ class ProcessingJob(Base):
     transformation_governance_set_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("transformation_governance_sets.id", ondelete="SET NULL"), index=True
     )
+    visual_composition_plan_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("visual_composition_plans.id", ondelete="SET NULL"), index=True
+    )
     kind: Mapped[JobKind] = mapped_column(
         Enum(JobKind, name="job_kind", native_enum=False, create_constraint=True),
         nullable=False,

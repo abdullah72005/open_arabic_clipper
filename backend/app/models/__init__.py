@@ -20,6 +20,7 @@ from app.models.transformation_governance import (
 )
 from app.models.transformation_plan import TransformationPlan, TransformationPlanSet
 from app.models.transformation_selection import TransformationPlanSelection
+from app.models.visual_composition_plan import VisualCompositionPlan
 
 __all__ = [
     "AudioAnalysis",
@@ -41,4 +42,5 @@ __all__ = [
     "TransformationPlanSelection",
     "TransformationPlanSet",
     "TransformationStrategyCandidate",
+    "VisualCompositionPlan",
 ]

@@ -24,7 +24,10 @@ observable YouTube/Facebook reuse/spam risk — marking each plan eligible,
 cautioned, blocked, revision-required, rejected, or deferred, without selecting a
 winner. It does not reframe, render, synthesize speech, publish, or automatically
 authorize content; Stage 4.3 deterministically selects zero or one current
-survivor, and later stages remain unimplemented.
+survivor. Stage 5.0 then turns the selection into a durable, evidence-bound
+execution/render contract, and Stage 5.1 produces a deterministic visual
+composition, framing, and FINAL_CLIP caption plan (a plan, not a rendered
+video). Stages 5.2 and 6 remain unimplemented.
 
 Only process material you own or are explicitly authorized to process. URL
 ingest downloads permitted public sources directly; an optional outbound proxy
@@ -274,7 +277,8 @@ reports `CANDIDATE_REFINED`, `FINAL_TRANSCRIPT_READY`,
 `NEEDS_MANUAL_TRANSCRIPT_REVIEW`, `PROVIDER_DEGRADED`, `REFINEMENT_FAILED`, or
 `CANCELLED`. It never retranscribes or uploads a whole source, is never added to
 the automatic stage chain, and `FINAL_TRANSCRIPT_READY` is not publishing
-readiness; Stage 4.0, Stage 4.1, Stage 4.2, and Stage 4.3 are implemented.
+readiness; Stage 4.0, Stage 4.1, Stage 4.2, and Stage 4.3 are implemented, as are
+Stage 5.0 and Stage 5.1.
 Queue and inspect refinements:
 
 ```bash
@@ -423,6 +427,52 @@ API: `POST /api/candidates/{id}/transformation-governance`, `GET
 [Stage 4.2 operations](docs/STAGE_4_2_OPERATIONS.md) for statuses, hard gates,
 dimensions, the platform-policy profile and official sources, provider behavior,
 cache/fingerprints, concurrency, and the read-only Stage 4.3 handoff.
+
+### Stage 5.1 visual composition, framing, and caption plan
+
+Stage 5.1 is explicit, candidate-scoped, and **CPU-local and provider-free**. It
+consumes only a current, live-effective, executable Stage 5.0 render contract
+(`READY_FOR_RENDER_PLANNING`/`MATERIALIZATION_REQUIRED`) and produces a durable
+plan with anonymous face tracks, a deterministic per-scene framing mode
+(`SOURCE_AS_IS`, `STATIC_CROP`, `TRACKED_CROP`, `MULTI_SUBJECT_FIT`,
+`BACKGROUND_FILL`, `CENTER_FALLBACK`), a compact crop-keyframe path, FINAL_CLIP
+caption events, one ASS document, and materialization-required overlay
+placements. It never renders a final video, encodes, mixes audio, selects a TTS
+voice, publishes, scans a whole source, or recognizes/identifies people; Gemini
+calls and Qwen loads are zero. It adds no `PipelineStage`, `PipelineRun`, or
+automatic stage-chain entry.
+
+Captions are FINAL_CLIP-only and stay in canonical logical order; shaping and
+mixed Arabic/English/numbers BiDi are handled by the real libass/FriBidi/HarfBuzz
+renderer, never by manual bidi rewriting. Frontend `<bdi>` handling is unrelated
+to video subtitles, so Stage 5.1 is proven by real ASS render regression tests
+(render through libass, decode the PNG, assert ink and determinism, with a
+character-reversed negative control). ASS escaping neutralizes source braces,
+backslashes before `N`/`n`/`h`, and Unicode bidi controls. The default safe zone
+is top 0.12 / bottom 0.25 / left 0.05 / right 0.15 of 1080x1920 (230/480/54/162
+px) with 24 px caption gaps. The backend image installs `fonts-noto-core`, and
+`CLIPFACTORY_VISUAL_CAPTION_FONT_FAMILY` defaults to `Noto Sans Arabic`; for
+native (non-Docker) setup install the `fonts-noto-core` package (or any
+Arabic-capable Noto family) so libass can resolve the configured family.
+
+```bash
+python -m app.cli render-contract CANDIDATE_ID
+python -m app.cli render-contract-status CANDIDATE_ID
+python -m app.cli stage5-1-handoff CANDIDATE_ID
+python -m app.cli visual-composition CANDIDATE_ID [--force]
+python -m app.cli visual-composition-status CANDIDATE_ID
+python -m app.cli stage5-2-handoff CANDIDATE_ID
+```
+
+API: `POST /api/candidates/{id}/visual-composition`, `GET
+/api/candidates/{id}/visual-composition`, `GET /api/visual-compositions/{id}`,
+and `GET /api/candidates/{id}/stage5-2-handoff` (the Stage 5.0 input endpoints
+remain `POST/GET /api/candidates/{id}/render-contract`, `GET
+/api/render-contracts/{id}`, and `GET /api/candidates/{id}/stage5-1-handoff`).
+See [Stage 5.0 operations](docs/STAGE_5_0_OPERATIONS.md) and
+[Stage 5.1 operations](docs/STAGE_5_1_OPERATIONS.md) for boundaries, bounds,
+fingerprints, jobs/concurrency/cancellation, and configuration.
+
 
 Stage 3 semantic mode defaults to `deterministic`: zero Gemini calls and zero
 Qwen model loads. `adaptive` uses Gemini only when a key is configured, and

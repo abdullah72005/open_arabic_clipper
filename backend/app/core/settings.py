@@ -9,6 +9,7 @@ from app.candidates.gemini import GeminiSemanticProvider
 from app.candidates.local import LocalSemanticProvider
 from app.candidates.policy import Stage3Config
 from app.candidates.providers import SemanticProvider
+from app.composition.policy import Stage51Config, stage51_config_payload
 from app.core.enums import SemanticProviderMode
 from app.refinement.policy import AdmissionPolicy, Stage35Config
 from app.render.policy import Stage50Config
@@ -196,6 +197,34 @@ class Settings(BaseSettings):
     render_contract_profile: Literal["SHORTS_1080X1920"] = "SHORTS_1080X1920"
     render_contract_max_frame_rate: float = Field(default=60.0, gt=0, le=240)
     render_contract_probe_reuse_enabled: bool = True
+    # Stage 5.1 deterministic visual-composition plan configuration. CPU-local
+    # and provider-free: no network, no hosted vision API, and no rendered
+    # artifact. The vendored YuNet detector path defaults to the asset shipped
+    # alongside the composition package.
+    visual_composition_enabled: bool = True
+    visual_analysis_fps: float = Field(default=2.0, gt=0, le=60)
+    visual_analysis_max_frames: int = Field(default=1_500, gt=0, le=100_000)
+    visual_analysis_max_seconds: float = Field(default=600.0, gt=0, le=86_400)
+    visual_analysis_frame_max_dimension: int = Field(default=640, gt=0, le=4_096)
+    visual_scene_cut_threshold: float = Field(default=0.35, ge=0, le=1)
+    visual_detector_enabled: bool = True
+    visual_detector_model_path: str = Field(
+        default=str(
+            Path(__file__).resolve().parents[1]
+            / "composition"
+            / "assets"
+            / "face_detection_yunet_2023mar.onnx"
+        ),
+        max_length=4_096,
+    )
+    visual_detector_input_size: int = Field(default=640, gt=0, le=4_096)
+    visual_detector_score_threshold: float = Field(default=0.6, ge=0, le=1)
+    visual_caption_font_family: str = Field(default="Noto Sans Arabic", max_length=256)
+    visual_caption_max_lines: int = Field(default=2, gt=0, le=10)
+    visual_caption_active_color: str = Field(default="&H0000FFFF", pattern=r"^&H[0-9A-Fa-f]{8}$")
+    visual_caption_dynamic_emphasis: bool = True
+    visual_caption_max_words_per_event: int = Field(default=7, gt=0, le=12)
+    visual_preview_enabled: bool = True
     transcription_queue_concurrency: int = Field(default=1, gt=0)
     cors_origins: list[str] = ["http://localhost:3301"]
 
@@ -565,6 +594,33 @@ class Settings(BaseSettings):
             max_frame_rate=self.render_contract_max_frame_rate,
             probe_reuse_enabled=self.render_contract_probe_reuse_enabled,
         )
+
+    def stage51_config(self) -> Stage51Config:
+        """Build bounded Stage 5.1 visual-composition configuration (no providers)."""
+
+        return Stage51Config(
+            analysis_fps=self.visual_analysis_fps,
+            max_analysis_frames=self.visual_analysis_max_frames,
+            max_analysis_seconds=self.visual_analysis_max_seconds,
+            analysis_frame_max_dimension=self.visual_analysis_frame_max_dimension,
+            scene_cut_threshold=self.visual_scene_cut_threshold,
+            detector_enabled=self.visual_detector_enabled,
+            detector_model_path=self.visual_detector_model_path,
+            detector_input_size=self.visual_detector_input_size,
+            detector_score_threshold=self.visual_detector_score_threshold,
+            caption_font_family=self.visual_caption_font_family,
+            caption_max_lines=self.visual_caption_max_lines,
+            caption_active_color=self.visual_caption_active_color,
+            caption_dynamic_emphasis=self.visual_caption_dynamic_emphasis,
+            caption_max_words_per_event=self.visual_caption_max_words_per_event,
+            preview_enabled=self.visual_preview_enabled,
+        )
+
+    def stage51_config_payload(self) -> dict[str, object]:
+        """Build the deterministic Stage 5.1 output-affecting policy fingerprint payload."""
+
+        payload: dict[str, object] = stage51_config_payload(self.stage51_config())
+        return payload
 
     def transformation_governance_semantic_mode(self) -> SemanticProviderMode:
         return SemanticProviderMode(self.transformation_governance_mode)

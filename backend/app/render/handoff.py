@@ -17,7 +17,7 @@ from app.models import ClipCandidate
 from app.render.service import get_current_render_contract, read_render_contract
 
 _STAGE_FLAGS = {
-    "stage5_1_implemented": False,
+    "stage5_1_implemented": True,
     "stage5_2_implemented": False,
     "stage6_implemented": False,
 }

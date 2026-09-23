@@ -19,6 +19,17 @@ from pydantic import BaseModel, Field
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session, sessionmaker
 
+from app.composition.geometry import FFprobeDisplayProbe
+from app.composition.handoff import build_stage5_2_handoff
+from app.composition.queue import (
+    CompositionQueueError,
+    queue_visual_composition,
+    validate_candidate_for_composition,
+)
+from app.composition.service import (
+    read_visual_composition,
+    read_visual_composition_by_id,
+)
 from app.core.enums import (
     CandidateDisposition,
     ContentType,
@@ -46,6 +57,7 @@ from app.models import (
     Transcript,
     TranscriptChunk,
     TransformationPlanSelection,
+    VisualCompositionPlan,
 )
 from app.refinement.handoff import build_stage4_handoff
 from app.refinement.queue import (
@@ -587,6 +599,81 @@ class Stage51HandoffResponse(BaseModel):
     contract: dict[str, object] | None
     readiness: dict[str, object] | None
     stage5_1_implemented: bool
+    stage5_2_implemented: bool
+    stage6_implemented: bool
+    model_config = {"extra": "allow"}
+
+
+class VisualCompositionResponse(BaseModel):
+    id: UUID
+    source_video_id: UUID
+    clip_candidate_id: UUID
+    render_contract_id: UUID | None
+    transformation_selection_id: UUID | None
+    selected_plan_id: UUID | None
+    final_refinement_id: UUID | None
+    status: str
+    execution_status: str
+    plan_ready: bool
+    is_current: bool
+    reason_codes: list[str]
+    input_fingerprint: str
+    output_fingerprint: str
+    contract_input_fingerprint: str
+    contract_output_fingerprint: str
+    caption_source_fingerprint: str
+    source_media_fingerprint: str
+    analysis_fingerprint: str
+    framing_fingerprint: str
+    ass_fingerprint: str
+    policy_version: str
+    schema_version: str
+    fingerprint_version: str
+    plan_payload: dict[str, object]
+    readiness: dict[str, object]
+    metrics: dict[str, object]
+    cache_eligible: bool
+    live_freshness: str
+    effective: bool
+    created_at: datetime
+    updated_at: datetime
+    model_config = {"extra": "allow"}
+
+
+class VisualCompositionQueueResponse(BaseModel):
+    plan_id: UUID
+    job_id: UUID | None
+    status: str
+    queued: bool
+    cached: bool
+    active: bool
+    model_config = {"extra": "allow"}
+
+
+class Stage52HandoffResponse(BaseModel):
+    candidate: dict[str, object]
+    contract: dict[str, object] | None
+    plan: dict[str, object] | None
+    source_media: dict[str, object] | None
+    display_geometry: dict[str, object]
+    frames_per_second: float | None
+    output_profile: dict[str, object]
+    blocks: list[dict[str, object]]
+    bound_source_spans: list[dict[str, object]]
+    scenes: list[dict[str, object]]
+    captions: dict[str, object]
+    ass: dict[str, object]
+    overlays: list[dict[str, object]]
+    materialization: dict[str, object]
+    safe_zone: dict[str, object]
+    protection_markers: list[object]
+    readiness: dict[str, object]
+    reason_codes: list[str]
+    warnings: list[object]
+    metrics: dict[str, object]
+    final_timeline_frozen: bool
+    publication_ready: bool
+    render_ready: bool
     stage5_2_implemented: bool
     stage6_implemented: bool
     model_config = {"extra": "allow"}
@@ -1461,6 +1548,84 @@ def create_app(
             raise HTTPException(status_code=404, detail="candidate not found")
         return Stage51HandoffResponse(**handoff)
 
+    @app.post(
+        "/api/candidates/{candidate_id}/visual-composition",
+        response_model=VisualCompositionQueueResponse,
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    def queue_candidate_visual_composition(
+        candidate_id: UUID,
+        force: bool = False,
+        database: Session = Depends(session),
+    ) -> VisualCompositionQueueResponse:
+        """Explicitly queue one candidate-scoped Stage 5.1 visual-composition run."""
+
+        try:
+            candidate = validate_candidate_for_composition(database, candidate_id)
+            outcome = queue_visual_composition(database, candidate, force=force)
+        except CompositionQueueError as error:
+            raise _composition_http(error) from error
+        return VisualCompositionQueueResponse(
+            plan_id=outcome.plan_id,
+            job_id=outcome.job_id,
+            status=outcome.status,
+            queued=outcome.queued,
+            cached=outcome.cached,
+            active=outcome.active,
+        )
+
+    @app.get(
+        "/api/candidates/{candidate_id}/visual-composition",
+        response_model=VisualCompositionResponse,
+    )
+    def get_candidate_visual_composition(
+        candidate_id: UUID, database: Session = Depends(session)
+    ) -> VisualCompositionResponse:
+        view = read_visual_composition(
+            database,
+            candidate_id,
+            display_probe=FFprobeDisplayProbe(binary=settings.ffprobe_binary),
+            config=settings.stage51_config(),
+        )
+        if view is None:
+            raise HTTPException(status_code=404, detail="visual composition not found")
+        return _visual_composition_response(view.row, view.live_freshness, view.effective)
+
+    @app.get(
+        "/api/visual-compositions/{plan_id}",
+        response_model=VisualCompositionResponse,
+    )
+    def get_visual_composition(
+        plan_id: UUID, database: Session = Depends(session)
+    ) -> VisualCompositionResponse:
+        # Always serialize the requested row with its own current/effective state.
+        view = read_visual_composition_by_id(
+            database,
+            plan_id,
+            display_probe=FFprobeDisplayProbe(binary=settings.ffprobe_binary),
+            config=settings.stage51_config(),
+        )
+        if view is None:
+            raise HTTPException(status_code=404, detail="visual composition not found")
+        return _visual_composition_response(view.row, view.live_freshness, view.effective)
+
+    @app.get(
+        "/api/candidates/{candidate_id}/stage5-2-handoff",
+        response_model=Stage52HandoffResponse,
+    )
+    def get_stage5_2_handoff(
+        candidate_id: UUID, database: Session = Depends(session)
+    ) -> Stage52HandoffResponse:
+        handoff = build_stage5_2_handoff(
+            database,
+            candidate_id,
+            display_probe=FFprobeDisplayProbe(binary=settings.ffprobe_binary),
+            config=settings.stage51_config(),
+        )
+        if handoff is None:
+            raise HTTPException(status_code=404, detail="candidate not found")
+        return Stage52HandoffResponse(**handoff)
+
     @app.patch("/api/sources/{source_id}/provenance", response_model=SourceResponse)
     def update_source_provenance(
         source_id: UUID,
@@ -1968,6 +2133,51 @@ def _render_contract_response(
         schema_version=row.schema_version,
         fingerprint_version=row.fingerprint_version,
         metrics=dict(row.metrics or {}),
+        live_freshness=live_freshness,
+        effective=effective,
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+    )
+
+
+def _composition_http(error: CompositionQueueError) -> HTTPException:
+    detail = str(error)
+    code = 404 if "does not exist" in detail else 409
+    return HTTPException(status_code=code, detail=detail)
+
+
+def _visual_composition_response(
+    row: VisualCompositionPlan, live_freshness: str, effective: bool
+) -> VisualCompositionResponse:
+    return VisualCompositionResponse(
+        id=row.id,
+        source_video_id=row.source_video_id,
+        clip_candidate_id=row.clip_candidate_id,
+        render_contract_id=row.render_contract_id,
+        transformation_selection_id=row.transformation_selection_id,
+        selected_plan_id=row.selected_plan_id,
+        final_refinement_id=row.final_refinement_id,
+        status=row.status.value,
+        execution_status=row.execution_status.value,
+        plan_ready=bool(row.plan_ready),
+        is_current=bool(row.is_current),
+        reason_codes=list(row.reason_codes or []),
+        input_fingerprint=row.input_fingerprint,
+        output_fingerprint=row.output_fingerprint,
+        contract_input_fingerprint=row.contract_input_fingerprint,
+        contract_output_fingerprint=row.contract_output_fingerprint,
+        caption_source_fingerprint=row.caption_source_fingerprint,
+        source_media_fingerprint=row.source_media_fingerprint,
+        analysis_fingerprint=row.analysis_fingerprint,
+        framing_fingerprint=row.framing_fingerprint,
+        ass_fingerprint=row.ass_fingerprint,
+        policy_version=row.policy_version,
+        schema_version=row.schema_version,
+        fingerprint_version=row.fingerprint_version,
+        plan_payload=_without_secrets(dict(row.plan_payload or {})),
+        readiness=dict(row.readiness or {}),
+        metrics=dict(row.metrics or {}),
+        cache_eligible=bool(row.cache_eligible),
         live_freshness=live_freshness,
         effective=effective,
         created_at=row.created_at,

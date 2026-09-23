@@ -84,6 +84,148 @@ plan, enqueues `FINAL_CLIP` refinement, or advances the source lifecycle.
   `CLIPFACTORY_TEST_POSTGRES_URL` set (real Alembic upgrade/downgrade and
   concurrent-current-row convergence).
 
+## Stage 5.1 deterministic visual composition, framing, and caption plan (2026-09-18)
+
+Stage 5.1 turns one current executable Stage 5.0 render contract into a durable,
+deterministic, CPU-local, provider-free **plan**: anonymous face tracks, one
+per-scene framing mode, a compact crop-keyframe path, FINAL_CLIP-only caption
+events, one ASS document, and materialization-required overlay placements. It is
+explicit and candidate-scoped and extends the existing Celery/`ProcessingJob`
+platform with a `VISUAL_COMPOSITION` job kind; it adds no `PipelineStage`, no
+`PipelineRun`, and no `_NEXT_STAGE` entry, and never touches the source
+lifecycle. **It produces a plan, not a rendered video.** There is no final
+FFmpeg render, encoding, audio mix, TTS, Stage 5.2, or Stage 6. Gemini calls =
+0, Qwen loads = 0, network I/O = 0; the only external processes are FFmpeg
+frame-sampling/scene-cut detection, one bounded read-only ffprobe geometry
+probe, and the CPU ONNX detector.
+
+- **Required input.** A current retained `CANDIDATE`/`CANDIDATE_NEEDS_REFINEMENT`
+  candidate plus a current, live-effective, executable Stage 5.0 render contract
+  (`READY_FOR_RENDER_PLANNING`/`MATERIALIZATION_REQUIRED`, `contract_ready=true`,
+  `live_freshness=CURRENT`, `effective=true`). Otherwise queueing fails closed.
+- **Bounded analysis.** Only the union of selected bound source spans plus a
+  bounded 0.5 s scene-context margin is decoded (one FFmpeg child per span,
+  incremental raw RGB). The context is used only for cut alignment and is never
+  emitted in scenes, keyframes, captions, or output ranges. Scope caps: selected
+  spans capped at 600 s, 1500 analysis frames, 640 px max frame dimension,
+  deterministic fps reduction (never below 1.0) before `ANALYSIS_SCOPE_EXCEEDED`
+  becomes a `BLOCKED` plan. Scene cuts come from a bounded FFmpeg scene filter;
+  synthetic fixtures validate the sampler/detector, and the real-model test
+  asserts the vendored YuNet loads and runs without raising.
+- **Framing.** Closed modes `SOURCE_AS_IS`, `STATIC_CROP`, `TRACKED_CROP`,
+  `MULTI_SUBJECT_FIT`, `BACKGROUND_FILL`, `CENTER_FALLBACK` selected by a
+  short-circuiting deterministic precedence (geometry -> already-vertical ->
+  taller source -> no persistent face/screen content -> subject too small ->
+  multi-subject fit -> tracked/static single face). `TRACKED_CROP` uses
+  exponential smoothing, a 0.18 dead zone with hysteresis, bounded pan/zoom
+  rates, a detection-loss hold, clamped 9:16 crops, a 40-keyframe-per-scene cap
+  with path-delta simplification, and hero protection (halved pan, frozen
+  zoom).
+- **Captions.** FINAL_CLIP-only word evidence; no usable evidence emits
+  `CAPTION_EVIDENCE_MISSING` and never fabricates text. Segmentation on
+  punctuation/pauses with max 3.6 s / min 0.7 s / max 12 words / max 2 lines;
+  placement defaults to `LOWER` and switches the whole scene to `UPPER` on
+  persistent protected-face collision in the lower band, with scene hysteresis;
+  captions are never dropped for a face. One deterministic ASS document is
+  serialized per plan.
+- **Arabic/English/mixed BiDi.** Event text stays in canonical logical Unicode
+  order (exact source tokens joined by spaces, no reordering or direction
+  controls). Shaping is delegated to FFmpeg's real libass `ass` filter
+  (FriBidi/HarfBuzz); Stage 5.1 never manually rewrites BiDi. Real rendered ASS
+  regression tests build the production document, render it through libass,
+  decode the PNG, and assert ink plus byte determinism for Arabic-only,
+  English-only, embedded-English, mixed numeric/Arabic, mixed-punctuation, and
+  representative mixed strings, with a naive character-reversed negative control
+  that must differ. Frontend `<bdi>` handling is unrelated to video subtitles.
+- **ASS safety.** Source `{`/`}` are emitted `\{`/`\}`, a backslash before
+  `N`/`n`/`h` gains a word joiner, and Unicode bidi controls U+202A-U+202E /
+  U+2066-U+2069 are removed (`BIDI_CONTROL_NEUTRALIZED`). A real-render test
+  proves a hostile `{\p1}...{\p0}` drawing command cannot execute.
+- **Safe zones/fonts.** Output `SHORTS_1080X1920` (9:16); safe-zone fractions
+  top 0.12 / bottom 0.25 / left 0.05 / right 0.15 -> 230/480/54/162 px with
+  24 px caption gaps (ASS lower/upper margins 504/254). The Dockerfile installs
+  `fonts-noto-core`; `CLIPFACTORY_VISUAL_CAPTION_FONT_FAMILY` defaults to
+  `Noto Sans Arabic`, resolved by libass/fontconfig with an Arabic-capable
+  fallback.
+- **Detector.** Vendored OpenCV Zoo YuNet 2023mar ONNX via the installed
+  `onnxruntime` CPU provider (no OpenCV/MediaPipe/PIL/network), sha256
+  `8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4`, fixed
+  640x640 input, score 0.6, NMS 0.3, 2 intra-op threads. The model is
+  hash-verified before use; a disabled/missing/mismatched detector degrades to
+  an anonymous null detector (`DETECTOR_UNAVAILABLE`, fallback framing) and
+  never raises. Detections are anonymous boxes only: no recognition, embedding,
+  biometrics, or named-person identity, and tracks never cross a hard cut.
+- **Persistence.** One table `visual_composition_plans` (migration
+  `20260918_0021`, `down_revision=20260918_0020`), one row per candidate + input
+  fingerprint with one database-current row per candidate via a partial unique
+  index, plus the `VISUAL_COMPOSITION` job kind and a nullable
+  `processing_jobs.visual_composition_plan_id` FK. Semantic status
+  (`READY_FOR_VISUAL_EXECUTION`/`BLOCKED`/`FAILED`) is separate from execution
+  status; only `READY_FOR_VISUAL_EXECUTION` is cache-eligible.
+- **Fingerprints.** Input/output/analysis/framing/ASS/caption-source/media
+  fingerprints via `canonical_fingerprint`. The input fingerprint covers the
+  executable contract, source media identity, display geometry, bound spans,
+  live caption source, output profile, safe zone, detector identity, and the
+  full versioned `stage51_config_payload()`. TTS provider/model/voice, future
+  narration audio/text, publishing metadata, codec/encoder settings, final
+  render artifacts, and analytics config are never inputs and cannot invalidate
+  a plan.
+- **Jobs/concurrency/cancellation.** Queueing creates a durable envelope and a
+  `VISUAL_COMPOSITION` job with an atomic `active_job_id IS NULL` claim and
+  savepoint uniqueness recovery; cache validation is stat-only (never a probe).
+  The executor fences duplicate deliveries with an atomic `QUEUED -> RUNNING`
+  claim that advances the durable `claim_version`, renews a liveness heartbeat,
+  reclaims only abandoned claims, polls cooperative cancellation before/after
+  planning and before persistence, and releases detector/FFmpeg resources on
+  every exit path (including cache hits). Failures keep sanitized diagnostics.
+- **API/CLI/handoff.** `POST/GET /api/candidates/{id}/visual-composition`,
+  `GET /api/visual-compositions/{id}`, `GET /api/candidates/{id}/stage5-2-handoff`;
+  CLI `visual-composition`, `visual-composition-status`, `stage5-2-handoff`
+  (plus the Stage 5.0 `stage5-1-handoff`, `render-contract`, and
+  `render-contract-status`). Celery `clipfactory.run_visual_composition`. The
+  read-only Stage 5.2 handoff always reports `stage5_2_implemented=false`,
+  `stage6_implemented=false`, `publication_ready=false`, `render_ready=false`,
+  and `final_timeline_frozen=false`.
+- **Preview/ops.** PNG-only validation previews through the FFmpeg `ass` filter
+  with a denylist that refuses any video encoder; default output under
+  `storage/benchmarks/visual-composition/{candidate_id}/{contract_id}` (there is
+  no API/CLI preview entry point yet).
+
+Deterministic verification: the full backend suite passes **1590 passed, 9
+skipped** in Docker Python 3.12. The PostgreSQL-gated suites (migration,
+models, and the new real live-contract end-to-end test) pass **11 passed, 1
+skipped** against a disposable PostgreSQL, covering the real Alembic
+upgrade/downgrade plus the full live path (migration → seeded selection and
+FINAL_CLIP rows → real `create_render_contract` on real media → queue → executor
+with the real FFprobe/FFmpeg/YuNet seams → Stage 5.2 handoff → faithful preview
+PNGs). The 24 Stage 5.1 test files cover analysis, framing, tracking, detector
+decode/model, captions, ASS, a real libass render proof, preview composition,
+overlays, planner, service, queue, executor, live contract, fingerprints,
+handoff, API/CLI, models, migration, concurrency, and scope. The project image
+installs `fonts-noto-core`; `Noto Sans Arabic` resolves and the real libass BiDi
+renders were re-verified under it. Real selected-span validation on spans with
+detected faces confirmed 1080x1920 faithful previews, 52/52 faces inside the
+frame with headroom, and zero caption/face overlaps.
+Versions: policy `stage5.1-v1`, schema `stage5.1-schema-v1`, framing
+`stage5.1-framing-v1`, caption layout `stage5.1-caption-layout-v4`, ASS
+`stage5.1-ass-v5`, caption BiDi `stage5.1-caption-bidi-v2`, background fill
+`stage5.1-background-fill-v1`, safe zone
+`shorts-reels-safe-zone-v1`. The default caption style is phone-first (font size
+88, outline 7, shadow 3, max 2 lines, compact <=7-word chunks) with modern
+active-word emphasis: the word currently being spoken is highlighted in a
+configurable accent color on a stationary block using the exact FINAL_CLIP word
+timings, degrading to static captions on unreliable timing. Because the deployed
+libass build does not reorder mixed-direction text (measured), the derived ASS
+asset carries a deterministic run-level visual order from the pure `bidi.py`
+transform while canonical transcript text stays in logical order; run-aware
+wrapping keeps a Latin phrase such as `content creator` together. `BACKGROUND_FILL`
+uses a strong blur plus modest dim/desaturation so the background reads as
+background. Known limitations:
+`CLIPFACTORY_VISUAL_COMPOSITION_ENABLED` is enforced by both the queue and the
+executor (a disabled flag fails closed with a queue/executor error), and
+preview rendering has no API/CLI entry point. See
+[docs/STAGE_5_1_OPERATIONS.md](docs/STAGE_5_1_OPERATIONS.md).
+
 ## Stage 4.3 deterministic final-plan selection (2026-09-18)
 
 Stage 4.3 deterministically commits each current Stage 4.2 governance set to

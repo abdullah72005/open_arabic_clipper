@@ -1,0 +1,22 @@
+Source: https://github.com/opencv/opencv_zoo/tree/main/models/face_detection_yunet
+Model file: face_detection_yunet_2023mar.onnx
+SHA-256: 8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4
+Retrieved via: https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx
+
+License: Apache License 2.0 (the OpenCV Zoo repository's model license)
+
+Copyright 2023, OpenCV. Licensed under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+License for the specific language governing permissions and limitations under
+the License.
+
+This model is executed anonymously through the already-installed onnxruntime
+CPU execution provider. It performs face detection only; no identity,
+recognition, embedding, or biometric data is produced or persisted.

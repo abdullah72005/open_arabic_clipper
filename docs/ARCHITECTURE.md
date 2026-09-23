@@ -198,3 +198,51 @@ fingerprint, one database-current row per candidate via a partial unique index,
 Stage 5.0 performs no BiDi manipulation and generates no subtitles; **Stage 5.1
 must add real rendered ASS/libass mixed Arabic–English caption regression
 tests**. See `docs/STAGE_5_0_OPERATIONS.md`.
+
+## Stage 5.1 visual composition, framing, and caption plan
+
+Stage 5.1 is a new deterministic, CPU-local, provider-free `app/composition`
+package that turns one current executable Stage 5.0 render contract into one
+durable visual-composition plan per candidate/input fingerprint. It is explicit
+and candidate-scoped and extends the existing Celery/`ProcessingJob` platform
+with a `VISUAL_COMPOSITION` job kind, an executor, and a queue; it adds no
+`PipelineStage`, no `PipelineRun`, and no `_NEXT_STAGE` entry. It never produces
+a final render, encodes a video, mixes audio, synthesizes speech, publishes, or
+advances the source lifecycle.
+
+`policy.py` owns the versions, closed framing/evidence/status/reason enums, the
+safe-zone profiles, caption style, detector identity, and `Stage51Config` /
+`stage51_config_payload()`. `types.py` holds frozen value objects
+(`DisplayGeometry`, `FaceDetection`, `FaceTrack`, `CropKeyframe`, `Scene`,
+`CaptionEvent`, `OverlayRequirement`, `PlannerInputs`,
+`VisualCompositionPlan`). `analysis.py` is the only decoder: it samples only the
+union of selected bound spans plus a bounded cut-alignment margin with one FFmpeg
+child per span, computes a bounded fps-reduced analysis plan, and detects scene
+cuts per span. `geometry.py` does rotation/pixel-aspect display math and one
+bounded read-only ffprobe probe. `detector.py` runs the vendored, sha256-verified
+OpenCV Zoo YuNet ONNX model through the installed `onnxruntime` CPU provider and
+never recognizes or identifies people. `tracking.py` builds anonymous
+per-scene tracks by deterministic geometry-only association. `framing.py`
+selects the per-scene mode by deterministic precedence and builds compact,
+clamped, smoothed crop keyframes. `captions.py` builds FINAL_CLIP-only caption
+events with segmentation/layout/timing and scene-level safe-zone placement.
+`ass.py` serializes exactly one escaped ASS document. `overlays.py` derives
+materialization-required overlay placements. `planner.py` orchestrates the plan;
+`fingerprints.py` composes canonical input/output/analysis/framing/ASS/
+caption-source/media fingerprints that exclude TTS, publishing, codec, final
+render, and analytics inputs; `service.py` resolves inputs, runs the planner, and
+persists/reuses the plan; `queue.py` and `executor.py` provide the durable job
+platform; `preview.py` renders PNG-only validation previews; `handoff.py`
+exposes the read-only Stage 5.2 handoff.
+
+Persistence is one new table, `visual_composition_plans` (unique candidate +
+input fingerprint, one database-current row per candidate via a partial unique
+index), plus the `VISUAL_COMPOSITION` job kind and a nullable
+`processing_jobs.visual_composition_plan_id` FK, added by migration
+`20260918_0021`. `READY_FOR_VISUAL_EXECUTION` plans carry scenes, captions, the
+ASS asset, and overlays; `BLOCKED`/`FAILED` plans persist truthful reason codes
+and are never cache-eligible. Shaping of mixed Arabic/English/numbers captions
+is delegated to the real libass/FriBidi/HarfBuzz renderer with real rendered
+regression tests, never manual BiDi rewriting. See
+`docs/STAGE_5_1_OPERATIONS.md`.
+
