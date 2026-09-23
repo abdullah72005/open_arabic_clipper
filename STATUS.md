@@ -207,13 +207,18 @@ renders were re-verified under it. Real selected-span validation on spans with
 detected faces confirmed 1080x1920 faithful previews, 52/52 faces inside the
 frame with headroom, and zero caption/face overlaps.
 Versions: policy `stage5.1-v1`, schema `stage5.1-schema-v1`, framing
-`stage5.1-framing-v1`, caption layout `stage5.1-caption-layout-v3`, ASS
-`stage5.1-ass-v3`, background fill `stage5.1-background-fill-v1`, safe zone
+`stage5.1-framing-v1`, caption layout `stage5.1-caption-layout-v4`, ASS
+`stage5.1-ass-v5`, caption BiDi `stage5.1-caption-bidi-v2`, background fill
+`stage5.1-background-fill-v1`, safe zone
 `shorts-reels-safe-zone-v1`. The default caption style is phone-first (font size
 88, outline 7, shadow 3, max 2 lines, compact <=7-word chunks) with modern
 active-word emphasis: the word currently being spoken is highlighted in a
 configurable accent color on a stationary block using the exact FINAL_CLIP word
-timings, degrading to static captions on unreliable timing. `BACKGROUND_FILL`
+timings, degrading to static captions on unreliable timing. Because the deployed
+libass build does not reorder mixed-direction text (measured), the derived ASS
+asset carries a deterministic run-level visual order from the pure `bidi.py`
+transform while canonical transcript text stays in logical order; run-aware
+wrapping keeps a Latin phrase such as `content creator` together. `BACKGROUND_FILL`
 uses a strong blur plus modest dim/desaturation so the background reads as
 background. Known limitations:
 `CLIPFACTORY_VISUAL_COMPOSITION_ENABLED` is enforced by both the queue and the

@@ -234,28 +234,57 @@ block-relative `timeline_hint`; no global timeline is frozen.
 
 ## Arabic, English, and mixed BiDi
 
-- Caption text is stored and emitted in **canonical logical Unicode order**: the
-  exact source word tokens joined by single spaces, with no reordering,
-  replacement, or injected direction controls.
-- Shaping and bidirectional layout are delegated to the real renderer:
-  FFmpeg's libass `ass` filter (libass with FriBidi and HarfBuzz). Stage 5.1
-  never performs manual BiDi rewriting.
-- `tests/test_stage51_bidi_render.py` proves this with **real rendered
-  regression testing**, not string inspection: it builds an ASS document with
-  the production serializer, renders it through the actual libass `ass` filter
-  against a lavfi source, decodes the PNG, and asserts ink plus byte
-  determinism for Arabic-only, English-only, embedded-English, mixed
-  numeric/Arabic, mixed-punctuation, and representative mixed strings. It also
-  renders a naive character-reversed document as a negative control and
-  asserts the images differ. The same suite proves dynamic active-word
-  emphasis: for each fixture it renders every word state of one event at its
-  real time, asserts the block bounding box is stationary, asserts that the
-  per-word state lines with a no-op color render pixel-identically to the plain
-  static render (so the override tags cause no reflow, reorder, or reshaping),
-  and asserts the accent mask is present in every state and advances between
-  states. The tests skip only when ffmpeg, the libass `ass`
-  filter, or a usable installed font is genuinely absent; the project Docker
-  test image provides all three.
+- Caption text is stored in **canonical logical Unicode order**: the exact
+  source word tokens joined by single spaces, with no reordering, replacement,
+  or injected direction controls. That canonical text is what the plan,
+  fingerprint, handoff, and evidence always carry; visual order is never written
+  back upstream.
+- **Renderer reality (measured).** The deployed libass build does not reorder
+  mixed-direction text: pure Arabic renders in logical left-to-right order, and
+  Unicode paragraph marks / isolates (`RLM`/`LRM`/`RLI`/`FSI`) and the ffmpeg
+  `ass` filter `shaping=complex` option have no effect on ordering. Delegating
+  BiDi to the renderer therefore produced visually reversed Arabic and a
+  wrong-direction second line.
+- **Derived-asset BiDi (`bidi.py`).** Because the renderer cannot be relied on,
+  the *derived* ASS asset carries the visual order itself. `bidi.py` is a pure,
+  network-free application of the Unicode Bidirectional Algorithm at run level:
+  it classifies each token (`RTL`/`LTR`/neutral/number), resolves neutrals to the
+  surrounding run, and reorders whole runs for the paragraph base direction
+  (right-to-left for an RTL paragraph, left-to-right for LTR; tokens inside an
+  RTL run are reversed, LTR runs keep their order). Characters inside a token
+  are never reversed, so Arabic shaping (HarfBuzz) and letters keep canonical
+  order. The base direction is computed once per event from the first strong
+  character, so every line of a chunk shares one direction and a line starting
+  with Latin can no longer flip the sentence.
+- **Run-aware wrapping.** `wrap_text` treats a contiguous LTR run such as
+  `content creator` as a single wrapping unit and moves it to the next line
+  instead of splitting it when it fits; a run wider than a full line falls back
+  to bounded per-token splitting. Caption segmentation applies the same units
+  (and still honours punctuation and pause boundaries), so a Latin phrase is not
+  split across chunks either.
+- **Structural invariant for dynamic emphasis.** The static render and every
+  active-word state use exactly the same per-token override scaffolding
+  (`{\c<color>}token{\c<primary>}` around every token, same line breaks, same
+  token order); only the active token's color value differs. The static path and
+  the dynamic path share one builder, so the active word can never change the
+  derived visual order, line breaks, or block position. (An earlier revision
+  applied the derived visual order only on the static path and emitted canonical
+  logical order on the dynamic path, which made highlighting a Latin word flip
+  the surrounding Arabic run.)
+- **Proof.** `tests/test_stage51_bidi_order.py` pins the intended human visual
+  reading order for the mixed fixtures as explicit left-to-right token
+  sequences. `tests/test_stage51_bidi_render.py` then renders each fixture
+  through the real libass `ass` filter with the active word accented in turn,
+  recovers each word's on-screen position from the accent centroid, groups by
+  rendered line, and asserts the rendered per-line order equals the intended
+  order — not logical-text equality. It also asserts the `content creator` run
+  stays contiguous and internally ordered. The same suite proves dynamic
+  active-word emphasis: block bounding box stationary, a no-op-color render
+  pixel-identical to the plain static render (override tags cause no reflow,
+  reorder, or reshaping), and the accent present in every state and advancing
+  between states. The tests skip only when ffmpeg, the libass `ass` filter, or a
+  usable installed font is genuinely absent; the project Docker test image
+  provides all three.
 - Frontend `<bdi>` handling is unrelated to video subtitles and does not solve
   subtitle rendering; Stage 5.0 explicitly requires real ASS/libass validation
   in Stage 5.1, which these tests provide.
@@ -399,8 +428,8 @@ Canonical fingerprints are composed with `canonical_fingerprint`:
 (status, fingerprints, currentness/effectiveness), source media identity,
 display geometry/rotation, bound source spans, live caption source, output
 profile, safe zone, Stage 5.1 policy/config/schema (including the caption style,
-active-word color/emphasis policy, and chunk size), detector identity, or the
-candidate/analysis identity.
+active-word color/emphasis policy, chunk size, and caption BiDi policy), detector
+identity, or the candidate/analysis identity.
 
 **What does NOT invalidate a plan:** TTS provider/model/voice, future narration
 audio/text, publishing title/schedule/metadata, codec/encoder settings, final
@@ -523,8 +552,9 @@ constraints shown; see `.env.example` for the comments.
 - schema `stage5.1-schema-v1`
 - fingerprint `1`
 - framing policy `stage5.1-framing-v1`
-- caption layout policy `stage5.1-caption-layout-v3`
-- ASS policy `stage5.1-ass-v3`
+- caption layout policy `stage5.1-caption-layout-v4`
+- ASS policy `stage5.1-ass-v5`
+- caption BiDi policy `stage5.1-caption-bidi-v2`
 - background fill policy `stage5.1-background-fill-v1`
 - safe-zone profile `shorts-reels-safe-zone-v1`
 - output geometry `1080 x 1920` (9:16; `SHORTS_1080X1920` is the Stage 5.0
@@ -548,7 +578,7 @@ docker run --rm --network oac_default \
 ruff format app tests alembic && ruff check app tests alembic
 ```
 
-Full backend result: **1608 passed, 9 skipped** in Docker Python 3.12 (mount the
+Full backend result: **1630 passed, 9 skipped** in Docker Python 3.12 (mount the
 repository root, not only `backend/`, so the couple of tests that read
 `compose.yaml` resolve). The
 PostgreSQL-gated suites (migration, models, and the real live-contract

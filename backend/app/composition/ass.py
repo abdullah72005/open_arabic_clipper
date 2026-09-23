@@ -22,6 +22,7 @@ import hashlib
 import math
 from pathlib import Path
 
+from app.composition import bidi
 from app.composition.captions import CaptionPlan
 from app.composition.policy import (
     OUTPUT_HEIGHT,
@@ -140,13 +141,58 @@ def _event_lines(event: CaptionEvent) -> tuple[str, ...]:
     return (str(event.text),)
 
 
-def _event_text(event: CaptionEvent) -> str:
-    if event.placement_zone == CaptionPlacementZone.UPPER.value:
-        override = "{\\an8}"
-    else:
-        override = "{\\an2}"
-    escaped_lines = [escape_ass_text(line) for line in _event_lines(event)]
-    return override + "\\N".join(escaped_lines)
+def _token_lines(event: CaptionEvent) -> tuple[list[str], list[list[int]]]:
+    """Map canonical tokens to their logical lines as global token indexes.
+
+    Canonical ``event.text`` is never rewritten; each line is a contiguous slice
+    of the same token order, so token index ``i`` always matches
+    ``event.word_timings[i]``.
+    """
+
+    tokens = event.text.split(" ")
+    raw_lines = [str(line) for line in event.lines] if event.lines else [event.text]
+    if " ".join(raw_lines) == event.text:
+        counts = [len(line.split(" ")) for line in raw_lines]
+        if sum(counts) == len(tokens):
+            lines: list[list[int]] = []
+            cursor = 0
+            for count in counts:
+                lines.append(list(range(cursor, cursor + count)))
+                cursor += count
+            return tokens, lines
+    return tokens, [list(range(len(tokens)))]
+
+
+def _visual_line_indexes(tokens: list[str], line: list[int], base: str) -> list[int]:
+    """Reorder one logical line's token indexes into visual left-to-right order."""
+
+    order = bidi.visual_order([tokens[index] for index in line], base)
+    return [line[position] for position in order]
+
+
+def _event_text(event: CaptionEvent, style: CaptionStyle, active_index: int | None = None) -> str:
+    """Render one event with identical per-token scaffolding in every state.
+
+    Every token is wrapped in the same ``{\\c<color>}token{\\c<primary>}``
+    structure regardless of which word is active (or none). Only the color value
+    changes between the active and inactive tokens, so the override-tag
+    boundaries, BiDi run segmentation, glyph metrics, wrapping, and block
+    position are structurally identical across all active-word states and the
+    static state. Tokens are emitted in the derived visual order for the event's
+    base direction; canonical text is never rewritten.
+    """
+
+    tokens, lines = _token_lines(event)
+    base = bidi.paragraph_direction(event.text)
+    restore = f"{{\\c{style.primary_color}&}}"
+    rendered_lines: list[str] = []
+    for line in lines:
+        rendered_tokens: list[str] = []
+        for index in _visual_line_indexes(tokens, line, base):
+            color = style.active_color if index == active_index else style.primary_color
+            rendered_tokens.append(f"{{\\c{color}&}}{escape_ass_text(tokens[index])}{restore}")
+        rendered_lines.append(" ".join(rendered_tokens))
+    return _placement_override(event) + "\\N".join(rendered_lines)
 
 
 #: A spoken word must be active this long to be emphasized; shorter spans
@@ -162,28 +208,14 @@ def _placement_override(event: CaptionEvent) -> str:
 
 
 def _dynamic_event_text(event: CaptionEvent, style: CaptionStyle, active_index: int) -> str:
-    """Render one event with exactly one word wrapped in the active color.
+    """Render one event with the active word colored, structure held constant.
 
-    Only a color override is emitted around the active token, so glyph metrics,
-    line wrapping, BiDi ordering, and the block position are byte-for-byte
-    unchanged from the static render.
+    Delegates to :func:`_event_text` so the active-word state has exactly the
+    same per-token wrapper structure as every other state; only the active
+    token's color value differs.
     """
 
-    accent = f"{{\\c{style.active_color}&}}"
-    restore = f"{{\\c{style.primary_color}&}}"
-    token_index = 0
-    rendered_lines: list[str] = []
-    for line in _event_lines(event):
-        rendered_tokens: list[str] = []
-        for token in line.split(" "):
-            escaped = escape_ass_text(token)
-            if token_index == active_index:
-                rendered_tokens.append(f"{accent}{escaped}{restore}")
-            else:
-                rendered_tokens.append(escaped)
-            token_index += 1
-        rendered_lines.append(" ".join(rendered_tokens))
-    return _placement_override(event) + "\\N".join(rendered_lines)
+    return _event_text(event, style, active_index)
 
 
 def _active_word_states(event: CaptionEvent, style: CaptionStyle) -> list[tuple[float, float, str]]:
@@ -198,7 +230,7 @@ def _active_word_states(event: CaptionEvent, style: CaptionStyle) -> list[tuple[
     """
 
     words = event.word_timings
-    static = [(event.start, event.end, _event_text(event))]
+    static = [(event.start, event.end, _event_text(event, style))]
     if not style.active_emphasis or len(words) < 2:
         return static
     if len(words) != len(event.text.split(" ")):

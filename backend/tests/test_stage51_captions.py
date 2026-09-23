@@ -329,7 +329,7 @@ def test_plan_as_dict_is_json_friendly() -> None:
     plan = _plan([(0, 0.0, 0.9, 0, 1, "HERO")], _words(["hello", "world"]))
 
     payload = plan.as_dict()
-    assert payload["policy_version"] == "stage5.1-caption-layout-v3"
+    assert payload["policy_version"] == "stage5.1-caption-layout-v4"
     events = payload["events"]
     assert isinstance(events, list)
     assert events[0]["text"] == "hello world"

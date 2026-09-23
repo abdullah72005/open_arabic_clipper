@@ -26,8 +26,15 @@ import numpy.typing as npt
 import pytest
 
 from app.composition.ass import serialize_ass
-from app.composition.captions import CaptionPlan, build_caption_plan
+from app.composition.bidi import paragraph_direction, visual_tokens
+from app.composition.captions import (
+    CaptionPlan,
+    _spans_for_max_width,
+    build_caption_plan,
+    wrap_text,
+)
 from app.composition.policy import CaptionStyle, SafeZoneProfile, Stage51Config, safe_zone_for
+from app.composition.types import CaptionEvent, CaptionWordTiming
 
 WIDTH = 1080
 HEIGHT = 1920
@@ -298,9 +305,20 @@ def test_real_libass_renders_fixture_with_ink_and_determinism(name: str, tmp_pat
 
     assert " ".join(event.text for event in plan.events) == text
     payloads = list(_iter_dialogue_payloads(ass_text))
-    visible = [_visible_text(payload) for payload in payloads]
-    assert visible
-    assert set(visible) == {event.text for event in plan.events}
+    # Distinct dialogue texts: every per-word state of one event repeats the same
+    # visual text, so dedupe before checking the token multiset.
+    distinct: list[str] = []
+    for payload in payloads:
+        textline = _visible_text(payload)
+        if textline and textline not in distinct:
+            distinct.append(textline)
+    assert distinct
+    # The derived ASS must be a pure permutation of the canonical tokens: no
+    # fabrication, no loss, no injected controls. (Actual visual order is
+    # asserted separately by rendering the frames.)
+    canonical_tokens = sorted(token for event in plan.events for token in event.text.split(" "))
+    visible_tokens = sorted(token for textline in distinct for token in textline.split(" "))
+    assert visible_tokens == canonical_tokens
 
     first = tmp_path / f"{name}-1.png"
     second = tmp_path / f"{name}-2.png"
@@ -472,3 +490,166 @@ def test_real_libass_dynamic_highlight_moves_without_reflow_or_reshaping(
     # Every state shows exactly one accent, and the accent advances.
     assert all(bool(mask.any()) for mask in accent_masks)
     assert len({mask.tobytes() for mask in accent_masks}) >= 2
+
+
+VISUAL_FIXTURES: list[tuple[str, str]] = [
+    (
+        "أنا كنت content creator لمدة سنتين",
+        "سنتين لمدة content creator كنت أنا",
+    ),
+    (
+        "أنا بستخدم Python و Django كل يوم",
+        "يوم كل Django و Python بستخدم أنا",
+    ),
+    ("السعر 150 EGP بس", "بس 150 EGP السعر"),
+    ("جربت GPT-5 وبعدها رجعت للشغل", "للشغل رجعت وبعدها GPT-5 جربت"),
+    ("This is اختبار بسيط with English", "This is بسيط اختبار with English"),
+    ("أنا سعيد، لأن Python رائع!", "رائع! Python لأن سعيد، أنا"),
+    ("خصم 20% على السعر", "السعر على 20% خصم"),
+]
+
+
+def _single_event_plan(text: str, style: CaptionStyle) -> CaptionPlan:
+    """Test-only: force one caption event to exercise per-line visual ordering.
+
+    Production chunking keeps every event to at most two lines; this helper
+    deliberately holds one event so the order test can inspect each line of the
+    whole sentence in a single render. It is not product output.
+    """
+
+    tokens = text.split(" ")
+    zone = _safe_zone()
+    lines, _ = wrap_text(text, style, _spans_for_max_width(style, zone))
+    timings = tuple(
+        CaptionWordTiming(index=index, text=token, start=index * 0.6, end=index * 0.6 + 0.45)
+        for index, token in enumerate(tokens)
+    )
+    event = CaptionEvent(
+        event_id="visual-fixture",
+        block_index=0,
+        word_start_index=0,
+        word_end_index=len(tokens) - 1,
+        start=0.0,
+        end=len(tokens) * 0.6,
+        text=text,
+        lines=lines,
+        placement_zone="LOWER",
+        placement_reason="DEFAULT_LOWER_ZONE",
+        word_timings=timings,
+    )
+    return CaptionPlan(policy_version="visual-fixture", events=(event,))
+
+
+def _logical_line_tokens(event: CaptionEvent) -> tuple[list[str], list[list[str]]]:
+    tokens = event.text.split(" ")
+    counts = [len(line.split(" ")) for line in event.lines]
+    if event.lines and sum(counts) == len(tokens):
+        lines: list[list[str]] = []
+        cursor = 0
+        for count in counts:
+            lines.append(tokens[cursor : cursor + count])
+            cursor += count
+        return tokens, lines
+    return tokens, [tokens]
+
+
+@pytest.mark.parametrize("text", [case[0] for case in VISUAL_FIXTURES])  # type: ignore[untyped-decorator]
+def test_real_libass_visual_order_matches_intended_reading(text: str, tmp_path: Path) -> None:
+    """Recover the rendered word order from the active-word accent positions.
+
+    Each canonical word becomes active in turn; the accent's horizontal centroid
+    gives its real on-screen position. Words are grouped by rendered line and the
+    per-line rendered order is asserted against the intended visual order (the
+    pure BiDi unit tests pin that order against explicit reading sequences). This
+    proves libass renders the derived order as written and keeps the English run
+    contiguous -- neither of which logical-text equality can prove.
+    """
+
+    style = CaptionStyle(font_family=FONT_FAMILY)
+    plan = _single_event_plan(text, style)
+    event = plan.events[0]
+    ass_bytes = serialize_ass(plan, style, _safe_zone())
+    bounds = [event.start, *[word.start for word in event.word_timings[1:]], event.end]
+
+    centroids: dict[int, tuple[float, float]] = {}
+    for index, word in enumerate(event.word_timings):
+        midpoint = (bounds[index] + bounds[index + 1]) / 2.0
+        png = tmp_path / f"state-{index}.png"
+        _render_png_at(ass_bytes, midpoint, png)
+        accent = _accent_mask(png.read_bytes())
+        assert bool(accent.any()), f"no rendered accent for word {word.text!r}"
+        ys, xs = np.nonzero(accent)
+        centroids[index] = (float(xs.mean()), float(ys.mean()))
+
+    base = paragraph_direction(text)
+    tokens, lines = _logical_line_tokens(event)
+    line_of: dict[int, int] = {}
+    cursor = 0
+    for line_index, line in enumerate(lines):
+        for _ in line:
+            line_of[cursor] = line_index
+            cursor += 1
+
+    for line_index, line in enumerate(lines):
+        indexes = [index for index in range(len(tokens)) if line_of[index] == line_index]
+        ys = [centroids[index][1] for index in indexes]
+        assert max(ys) - min(ys) < 40, f"line {line_index} words are not on one rendered line"
+        rendered = [tokens[index] for index in sorted(indexes, key=lambda i: centroids[i][0])]
+        assert rendered == visual_tokens(line, base)
+
+    # A contiguous Latin phrase must stay contiguous and internally ordered.
+    if "content creator" in tokens:
+        content = tokens.index("content")
+        creator = tokens.index("creator")
+        assert centroids[content][0] < centroids[creator][0]
+        assert abs(centroids[content][1] - centroids[creator][1]) < 40
+
+
+def test_dynamic_states_have_identical_bidi_scaffolding(tmp_path: Path) -> None:
+    """Every active-word state must render identical geometry.
+
+    Rendering each state with the accent color neutralized to the primary color
+    removes the only intended difference. Those neutralized rasters must be
+    pixel-identical to each other and to the static render. The accented render
+    may differ from its neutralized twin only inside the active word's own pixel
+    region. This is a raster comparison, not a text/string comparison.
+    """
+
+    text = "أنا كنت content creator لمدة سنتين"
+    style = CaptionStyle(font_family=FONT_FAMILY)
+    plan = _single_event_plan(text, style)
+    event = plan.events[0]
+    bounds = [event.start, *[word.start for word in event.word_timings[1:]], event.end]
+
+    neutral_style = CaptionStyle(font_family=FONT_FAMILY, active_color=CaptionStyle().primary_color)
+    static_ass = serialize_ass(
+        plan, CaptionStyle(font_family=FONT_FAMILY, active_emphasis=False), _safe_zone()
+    )
+    neutral_ass = serialize_ass(plan, neutral_style, _safe_zone())
+    accent_ass = serialize_ass(plan, style, _safe_zone())
+
+    neutral_rasters: list["npt.NDArray[np.int32]"] = []
+    for index in range(len(event.word_timings)):
+        midpoint = (bounds[index] + bounds[index + 1]) / 2.0
+        neutral_png = tmp_path / f"neutral-{index}.png"
+        static_png = tmp_path / f"static-{index}.png"
+        accent_png = tmp_path / f"accent-{index}.png"
+        _render_png_at(neutral_ass, midpoint, neutral_png)
+        _render_png_at(static_ass, midpoint, static_png)
+        _render_png_at(accent_ass, midpoint, accent_png)
+
+        neutral = _rgb(neutral_png.read_bytes())
+        assert np.array_equal(neutral, _rgb(static_png.read_bytes()))
+        neutral_rasters.append(neutral)
+
+        accent = _rgb(accent_png.read_bytes())
+        accent_mask = _accent_mask(accent_png.read_bytes())
+        assert bool(accent_mask.any())
+        # Geometry/order must be stable: the ink bounding box is identical to the
+        # neutralized render and the accent is localized to the active word.
+        assert _mask_bbox(neutral.max(axis=2) > 30) == _mask_bbox(accent.max(axis=2) > 30)
+        ys, xs = np.nonzero(accent_mask)
+        assert xs.max() - xs.min() < 700
+
+    for raster in neutral_rasters[1:]:
+        assert np.array_equal(raster, neutral_rasters[0])

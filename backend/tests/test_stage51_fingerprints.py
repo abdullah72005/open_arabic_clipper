@@ -237,3 +237,9 @@ def test_input_fingerprint_changes_with_active_word_policy() -> None:
 
     rechunked = stage51_config_payload(Stage51Config(caption_max_words_per_event=12))
     assert _fp() != _fp(stage51_config=rechunked)
+
+
+def test_input_fingerprint_changes_with_caption_bidi_policy() -> None:
+    changed = stage51_config_payload(Stage51Config())
+    changed["caption_bidi_policy_version"] = "stage5.1-caption-bidi-v99"
+    assert _fp() != _fp(stage51_config=changed)

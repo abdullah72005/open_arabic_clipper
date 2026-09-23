@@ -22,8 +22,9 @@ VISUAL_COMPOSITION_POLICY_VERSION = "stage5.1-v1"
 SCHEMA_VERSION = "stage5.1-schema-v1"
 FINGERPRINT_VERSION = "1"
 FRAMING_POLICY_VERSION = "stage5.1-framing-v1"
-CAPTION_LAYOUT_POLICY_VERSION = "stage5.1-caption-layout-v3"
-ASS_POLICY_VERSION = "stage5.1-ass-v3"
+CAPTION_LAYOUT_POLICY_VERSION = "stage5.1-caption-layout-v4"
+ASS_POLICY_VERSION = "stage5.1-ass-v5"
+CAPTION_BIDI_POLICY_VERSION = "stage5.1-caption-bidi-v2"
 BACKGROUND_FILL_POLICY_VERSION = "stage5.1-background-fill-v1"
 SAFE_ZONE_PROFILE_VERSION = "shorts-reels-safe-zone-v1"
 
@@ -359,6 +360,7 @@ def stage51_config_payload(config: Stage51Config) -> dict[str, object]:
         "framing_policy_version": FRAMING_POLICY_VERSION,
         "caption_layout_policy_version": CAPTION_LAYOUT_POLICY_VERSION,
         "ass_policy_version": ASS_POLICY_VERSION,
+        "caption_bidi_policy_version": CAPTION_BIDI_POLICY_VERSION,
         "background_fill_policy_version": BACKGROUND_FILL_POLICY_VERSION,
         "safe_zone_profile_version": SAFE_ZONE_PROFILE_VERSION,
         "output": {
@@ -392,6 +394,7 @@ def framing_for_bounded_distance(distance: float) -> float:
 __all__ = [
     "ASS_POLICY_VERSION",
     "BACKGROUND_FILL_POLICY_VERSION",
+    "CAPTION_BIDI_POLICY_VERSION",
     "CAPTION_LAYOUT_POLICY_VERSION",
     "CaptionPlacementZone",
     "CaptionStyle",

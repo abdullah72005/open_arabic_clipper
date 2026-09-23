@@ -28,6 +28,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TypeAlias
 
+from app.composition import bidi
 from app.composition.policy import (
     CAPTION_LAYOUT_POLICY_VERSION,
     OUTPUT_HEIGHT,
@@ -324,26 +325,48 @@ def estimate_text_width(text: str, style: CaptionStyle) -> float:
 
 
 def wrap_text(text: str, style: CaptionStyle, max_width_px: float) -> tuple[tuple[str, ...], bool]:
-    """Greedy wrap at spaces; returns ``(lines, overflow)``.
+    """Run-aware greedy wrap at spaces; returns ``(lines, overflow)``.
 
-    ``overflow`` is True only when the wrapped result needs more than
-    ``style.max_lines`` lines. An over-wide single word occupies its own line
-    (never split, never hyphenated).
+    A contiguous LTR run (for example ``content creator``) is treated as a
+    single wrapping unit and is moved to the next line instead of being split
+    when it fits on a line, so mixed Arabic/English captions keep the English
+    phrase together. A run wider than a full line falls back to per-token
+    splitting (bounded), and an over-wide single word occupies its own line
+    (never split, never hyphenated). ``overflow`` is True only when the result
+    needs more than ``style.max_lines`` lines.
     """
 
-    lines: list[str] = []
-    current = ""
-    for word in text.split(" "):
-        candidate = word if not current else f"{current} {word}"
-        if estimate_text_width(candidate, style) <= max_width_px:
-            current = candidate
+    tokens = text.split(" ")
+    if not tokens:
+        return (), False
+    base = bidi.paragraph_direction(text)
+    units = bidi.atomic_units(tokens, base)
+
+    def width(indexes: list[int]) -> float:
+        return estimate_text_width(" ".join(tokens[index] for index in indexes), style)
+
+    lines: list[list[int]] = []
+    current: list[int] = []
+    for unit in units:
+        if width(current + unit) <= max_width_px:
+            current = current + unit
             continue
         if current:
+            if len(unit) > 1 and width(unit) <= max_width_px:
+                lines.append(current)
+                current = unit
+                continue
             lines.append(current)
-        current = word
+            current = []
+        for index in unit:
+            if current and width(current + [index]) > max_width_px:
+                lines.append(current)
+                current = []
+            current.append(index)
     if current:
         lines.append(current)
-    return tuple(lines), len(lines) > style.max_lines
+    wrapped = tuple(" ".join(tokens[index] for index in line) for line in lines)
+    return wrapped, len(wrapped) > style.max_lines
 
 
 def _spans_for_max_width(style: CaptionStyle, safe_zone: SafeZoneProfile) -> float:
@@ -399,32 +422,65 @@ def _segment_span_words(
     style: CaptionStyle,
     max_width_px: float,
 ) -> list[tuple[_Word, ...]]:
+    if not words:
+        return []
+    token_texts = [word.text for word in words]
+    base = bidi.paragraph_direction(" ".join(token_texts))
+    units = bidi.atomic_units(token_texts, base)
+    units = _split_units_at_boundaries(units, words, style)
+
+    def fits(fragment: Sequence[_Word], unit: Sequence[_Word]) -> bool:
+        if fragment and _has_boundary(fragment[-1], unit[0], style):
+            return False
+        candidate = list(fragment) + list(unit)
+        text = " ".join(word.text for word in candidate)
+        _, overflow = wrap_text(text, style, max_width_px)
+        duration = candidate[-1].end - candidate[0].start
+        return (
+            not overflow
+            and len(candidate) <= style.max_words_per_event
+            and duration <= style.max_event_duration
+        )
+
     fragments: list[tuple[_Word, ...]] = []
-    total = len(words)
-    start = 0
-    while start < total:
-        end = start
-        fragment: list[_Word] = [words[start]]
-        while end + 1 < total:
-            left = words[end]
-            right = words[end + 1]
-            if _has_boundary(left, right, style):
-                break
-            candidate = fragment + [right]
-            text = " ".join(word.text for word in candidate)
-            _, overflow = wrap_text(text, style, max_width_px)
-            duration = right.end - fragment[0].start
-            if (
-                overflow
-                or len(candidate) > style.max_words_per_event
-                or duration > style.max_event_duration
-            ):
-                break
-            fragment.append(right)
-            end += 1
-        fragments.append(tuple(fragment))
-        start = end + 1
+    current: list[_Word] = []
+    for unit in units:
+        unit_words = [words[index] for index in unit]
+        if current and fits(current, unit_words):
+            current = current + unit_words
+            continue
+        if current and fits([], unit_words):
+            fragments.append(tuple(current))
+            current = unit_words
+            continue
+        if current:
+            fragments.append(tuple(current))
+            current = []
+        for word in unit_words:
+            if current and not fits(current, [word]):
+                fragments.append(tuple(current))
+                current = []
+            current.append(word)
+    if current:
+        fragments.append(tuple(current))
     return _merge_short_fragments(fragments, style, max_width_px)
+
+
+def _split_units_at_boundaries(
+    units: Sequence[Sequence[int]],
+    words: Sequence[_Word],
+    style: CaptionStyle,
+) -> list[list[int]]:
+    split: list[list[int]] = []
+    for unit in units:
+        current = [unit[0]]
+        for position in range(1, len(unit)):
+            if _has_boundary(words[unit[position - 1]], words[unit[position]], style):
+                split.append(current)
+                current = []
+            current.append(unit[position])
+        split.append(current)
+    return split
 
 
 def _merge_short_fragments(

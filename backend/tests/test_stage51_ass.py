@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -169,8 +170,8 @@ def test_serialize_ass_sorts_events_by_start_then_word_index() -> None:
     dialogue_lines = [line for line in text.splitlines() if line.startswith("Dialogue:")]
 
     assert len(dialogue_lines) == 2
-    assert dialogue_lines[0].endswith("first")
-    assert dialogue_lines[1].endswith("second")
+    assert "first" in dialogue_lines[0]
+    assert "second" in dialogue_lines[1]
 
 
 def _dynamic_event(
@@ -219,6 +220,26 @@ def test_serialize_ass_emits_one_stationary_state_per_spoken_word() -> None:
     assert "{\\c&H0000FFFF&}again{\\c&H00FFFFFF&}" in dialogues[2]
 
 
+def test_dynamic_states_share_identical_token_scaffolding() -> None:
+    plan = CaptionPlan(policy_version="test", events=(_dynamic_event(),))
+    dialogues = _dialogue_lines(serialize_ass(plan, CaptionStyle(), _safe_zone()).decode("utf-8"))
+    static_dialogues = _dialogue_lines(
+        serialize_ass(plan, CaptionStyle(active_emphasis=False), _safe_zone()).decode("utf-8")
+    )
+
+    assert len(dialogues) == 3
+    assert len(static_dialogues) == 1
+    # Same visible token structure and same per-token wrapper count in every
+    # state, and the static render is structurally identical too; only the color
+    # value of the active token differs.
+    stripped = [re.sub(r"\{[^}]*\}", "", dialogue.split(",,", 1)[1]) for dialogue in dialogues]
+    static_stripped = re.sub(r"\{[^}]*\}", "", static_dialogues[0].split(",,", 1)[1])
+    assert len(set(stripped)) == 1
+    assert stripped[0] == static_stripped
+    assert len({dialogue.count("{\\c") for dialogue in dialogues}) == 1
+    assert all(dialogue.count("&H0000FFFF") == 1 for dialogue in dialogues)
+
+
 def test_serialize_ass_active_color_and_emphasis_are_configurable() -> None:
     plan = CaptionPlan(policy_version="test", events=(_dynamic_event(),))
 
@@ -260,7 +281,8 @@ def test_serialize_ass_places_upper_zone_with_an8() -> None:
     text = serialize_ass(plan, CaptionStyle(), _safe_zone()).decode("utf-8")
 
     assert "CaptionUpper" in text
-    assert "{\\an8}up" in text
+    assert "{\\an8}" in text
+    assert "up" in text
 
 
 def test_serialize_ass_escapes_source_injection() -> None:
