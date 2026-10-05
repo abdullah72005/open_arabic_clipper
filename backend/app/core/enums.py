@@ -43,6 +43,7 @@ class JobKind(str, Enum):
     TRANSFORMATION_PLANNING = "TRANSFORMATION_PLANNING"
     TRANSFORMATION_GOVERNANCE = "TRANSFORMATION_GOVERNANCE"
     VISUAL_COMPOSITION = "VISUAL_COMPOSITION"
+    RENDER_EXECUTION = "RENDER_EXECUTION"
 
 
 class JobStatus(str, Enum):
@@ -716,3 +717,34 @@ class ExecutionSlotKind(str, Enum):
     AUTHORED_TEXT = "AUTHORED_TEXT"
     TRANSITION = "TRANSITION"
     VERIFICATION_EVIDENCE = "VERIFICATION_EVIDENCE"
+
+
+class RenderArtifactPurpose(str, Enum):
+    """Stage 5.2 artifact purpose.
+
+    ``CORE_SOURCE_VALIDATION`` executes only the ordered ``SOURCE_MEDIA``
+    occurrences; authored material is deliberately omitted and reported. It is a
+    terminal validation output, never a publication-final artifact.
+    """
+
+    CORE_SOURCE_VALIDATION = "CORE_SOURCE_VALIDATION"
+
+
+class RenderExecutionLifecycle(str, Enum):
+    """Stage 5.2 render-execution lifecycle (separate from QC severity)."""
+
+    QUEUED = "QUEUED"
+    RENDERING = "RENDERING"
+    QC_RUNNING = "QC_RUNNING"
+    COMPLETE = "COMPLETE"
+    BLOCKED = "BLOCKED"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+
+
+class RenderQCStatus(str, Enum):
+    """Stage 5.2 technical QC severity (separate from lifecycle)."""
+
+    PASS = "PASS"
+    WARN = "WARN"
+    FAIL = "FAIL"

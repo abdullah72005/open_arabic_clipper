@@ -281,7 +281,25 @@ kind (migration `20260918_0021`) and one table `visual_composition_plans` (one
 row per candidate + input fingerprint, one database-current row per candidate),
 and adds no `PipelineStage`, `PipelineRun`, or `_NEXT_STAGE` entry. The input
 fingerprint excludes TTS provider/model/voice, future narration, publishing
-metadata, codec settings, final render artifacts, and analytics. Stage 5.2 and
-Stage 6 remain unimplemented, and a plan is not render or publishing readiness.
-See `docs/STAGE_5_1_OPERATIONS.md`.
+metadata, codec settings, final render artifacts, and analytics. See
+`docs/STAGE_5_1_OPERATIONS.md`.
+
+## Stage 5.2 render execution, audio, and technical QC
+
+Stage 5.2 is explicit, candidate-scoped, and deterministic. It requires a current
+executable Stage 5.0 render contract and one current ready Stage 5.1 plan. It
+executes the accepted ordered `SOURCE_MEDIA` occurrences at unit speed (explicit
+`trim`/`atrim`, source-local ASS burn, per-scene `setpts`, audio joined only at
+occurrence boundaries), applies all six framing modes, and encodes one final
+video + one final audio output (CPU-only MP4/H.264+AAC, 1080x1920,
+`+faststart`). It runs bounded deterministic technical QC and persists a durable
+`render_executions` row (migration `20260918_0022`) with a `RENDER_EXECUTION` job
+kind; it adds no `PipelineStage`, `PipelineRun`, or `_NEXT_STAGE` entry and never
+touches the source lifecycle.
+
+The current purpose `CORE_SOURCE_VALIDATION` omits authored material and reports
+every omission; artifacts are never publication-final (`publication_ready=false`,
+`stage6_implemented=false`). There is no mandatory intermediate H.264 file and no
+Stage 6 mixing/narration semantics. Stage 6 remains unimplemented. See
+`docs/STAGE_5_2_OPERATIONS.md`.
 

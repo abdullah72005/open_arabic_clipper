@@ -49,6 +49,12 @@ from app.refinement.queue import (
     queue_candidate_refinement,
     validate_candidate_for_refinement,
 )
+from app.render.execution.policy import DEFAULT_DELIVERY_PROFILE_KEY
+from app.render.execution.queue import RenderQueueError, queue_render_execution
+from app.render.execution.service import (
+    get_render_execution,
+    read_render_execution,
+)
 from app.render.handoff import build_stage5_1_handoff
 from app.render.service import create_render_contract, read_render_contract
 from app.runtime.heavy_model_lease import HeavyModelLeaseBusy, HeavyModelUnsafe
@@ -851,6 +857,48 @@ def stage5_1_handoff(candidate_id: UUID) -> None:
     typer.echo(json.dumps(handoff, ensure_ascii=False, default=str))
 
 
+def _render_execution_payload(row: object) -> dict[str, object]:
+    return {
+        "id": str(getattr(row, "id")),
+        "source_video_id": str(getattr(row, "source_video_id")),
+        "clip_candidate_id": str(getattr(row, "clip_candidate_id")),
+        "render_contract_id": (
+            str(getattr(row, "render_contract_id")) if getattr(row, "render_contract_id") else None
+        ),
+        "visual_composition_plan_id": (
+            str(getattr(row, "visual_composition_plan_id"))
+            if getattr(row, "visual_composition_plan_id")
+            else None
+        ),
+        "artifact_purpose": getattr(row, "artifact_purpose").value,
+        "lifecycle": getattr(row, "lifecycle").value,
+        "qc_status": (
+            getattr(row, "qc_status").value if getattr(row, "qc_status") is not None else None
+        ),
+        "is_current": bool(getattr(row, "is_current")),
+        "publication_ready": bool(getattr(row, "publication_ready")),
+        "stage6_implemented": bool(getattr(row, "stage6_implemented")),
+        "cache_eligible": bool(getattr(row, "cache_eligible")),
+        "reason_codes": list(getattr(row, "reason_codes") or []),
+        "error_code": getattr(row, "error_code"),
+        "delivery_profile_key": getattr(row, "delivery_profile_key"),
+        "delivery_profile_version": getattr(row, "delivery_profile_version"),
+        "input_fingerprint": getattr(row, "input_fingerprint"),
+        "output_fingerprint": getattr(row, "output_fingerprint"),
+        "runtime_fingerprint": getattr(row, "runtime_fingerprint"),
+        "compiler_fingerprint": getattr(row, "compiler_fingerprint"),
+        "qc_fingerprint": getattr(row, "qc_fingerprint"),
+        "execution_manifest": dict(getattr(row, "execution_manifest") or {}),
+        "qc_result": dict(getattr(row, "qc_result") or {}),
+        "artifact_reference": dict(getattr(row, "artifact_reference") or {}),
+        "omitted_requirements": list(getattr(row, "omitted_requirements") or []),
+        "metrics": dict(getattr(row, "metrics") or {}),
+        "policy_version": getattr(row, "policy_version"),
+        "schema_version": getattr(row, "schema_version"),
+        "fingerprint_version": getattr(row, "fingerprint_version"),
+    }
+
+
 def _visual_composition_payload(row: object) -> dict[str, object]:
     return {
         "id": str(getattr(row, "id")),
@@ -958,6 +1006,75 @@ def stage5_2_handoff(candidate_id: UUID) -> None:
         if handoff is None:
             raise typer.BadParameter("candidate does not exist")
     typer.echo(json.dumps(handoff, ensure_ascii=False, default=str))
+
+
+@app.command("render-execution")
+def render_execution(
+    candidate_id: UUID,
+    delivery_profile_key: str = typer.Option(DEFAULT_DELIVERY_PROFILE_KEY, "--delivery-profile"),
+    force: bool = typer.Option(False, "--force/--no-force"),
+) -> None:
+    """Queue one explicit candidate-scoped Stage 5.2 source-core render validation."""
+
+    with create_session_factory()() as session:
+        try:
+            outcome = queue_render_execution(
+                session,
+                candidate_id,
+                delivery_profile_key=delivery_profile_key,
+                force=force,
+            )
+        except RenderQueueError as error:
+            raise typer.BadParameter(str(error)) from error
+    typer.echo(
+        json.dumps(
+            {
+                "render_execution_id": str(outcome.render_execution_id),
+                "job_id": str(outcome.job_id) if outcome.job_id else None,
+                "status": outcome.status,
+                "queued": outcome.queued,
+                "cached": outcome.cached,
+                "active": outcome.active,
+                "artifact_purpose": outcome.artifact_purpose,
+                "delivery_profile_key": outcome.delivery_profile_key,
+                "publication_ready": False,
+                "stage6_implemented": False,
+            }
+        )
+    )
+
+
+@app.command("render-execution-status")
+def render_execution_status(candidate_id: UUID) -> None:
+    """Print the current Stage 5.2 render execution without mutating anything."""
+
+    with create_session_factory()() as session:
+        view = read_render_execution(session, candidate_id)
+        if view is None:
+            raise typer.BadParameter("render execution does not exist")
+        payload = _render_execution_payload(view.row)
+        payload["live_freshness"] = view.live_freshness
+        payload["effective"] = view.effective
+    typer.echo(json.dumps(payload, ensure_ascii=False, default=str))
+
+
+@app.command("render-execution-artifact")
+def render_execution_artifact(render_execution_id: UUID) -> None:
+    """Print the managed Stage 5.2 artifact reference without copying the file."""
+
+    with create_session_factory()() as session:
+        row = get_render_execution(session, render_execution_id)
+        if row is None:
+            raise typer.BadParameter("render execution does not exist")
+        payload = {
+            "render_execution_id": str(row.id),
+            "lifecycle": row.lifecycle.value,
+            "qc_status": row.qc_status.value if row.qc_status is not None else None,
+            "cache_eligible": bool(row.cache_eligible),
+            "publication_ready": bool(row.publication_ready),
+            "artifact": dict(row.artifact_reference or {}),
+        }
+    typer.echo(json.dumps(payload, ensure_ascii=False, default=str))
 
 
 @app.command()

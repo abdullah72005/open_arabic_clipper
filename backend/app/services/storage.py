@@ -85,6 +85,42 @@ class StorageService:
         directory.mkdir(parents=True, exist_ok=True)
         return directory
 
+    def render_execution_directory(
+        self, source_id: uuid.UUID | str, render_execution_id: uuid.UUID | str
+    ) -> Path:
+        """Create and return the stable directory for one Stage 5.2 execution."""
+
+        source_directory = self.source_directory(source_id)
+        execution_id = self._validate_uuid(render_execution_id)
+        directory = source_directory / "render-executions" / str(execution_id)
+        self._require_within(directory, source_directory)
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory
+
+    def render_attempt_directory(
+        self,
+        source_id: uuid.UUID | str,
+        render_execution_id: uuid.UUID | str,
+        *,
+        job_id: uuid.UUID | str,
+        claim_version: int,
+    ) -> Path:
+        """Create and return an immutable attempt directory for one claim."""
+
+        execution_directory = self.render_execution_directory(source_id, render_execution_id)
+        validated_job = self._validate_uuid(job_id)
+        attempt = execution_directory / f"{validated_job}-{int(claim_version)}"
+        self._require_within(attempt, execution_directory)
+        attempt.mkdir(parents=True, exist_ok=True)
+        return attempt
+
+    def storage_relative(self, path: Path) -> str:
+        """Return a storage-relative POSIX string for a managed path."""
+
+        resolved = path.expanduser().resolve()
+        self._validate_owned_destination(resolved)
+        return resolved.relative_to(self.storage_root).as_posix()
+
     def resolve(self, category: StorageCategory | str, relative_path: Path | str) -> Path:
         """Resolve a relative path safely within its configured category root."""
 
@@ -193,3 +229,9 @@ class StorageService:
         except ValueError:
             return False
         return True
+
+    def _require_within(self, candidate: Path, root: Path) -> None:
+        try:
+            candidate.resolve().relative_to(root.resolve())
+        except ValueError as error:
+            raise StorageValidationError("path traversal outside storage category") from error

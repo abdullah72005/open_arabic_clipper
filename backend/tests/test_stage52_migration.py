@@ -1,8 +1,4 @@
-"""Stage 5.1 visual-composition migration wiring and reversibility.
-
-Runs against the repository's SQLite default and, when
-``CLIPFACTORY_TEST_POSTGRES_URL`` is configured, against PostgreSQL too.
-"""
+"""Stage 5.2 migration wiring and reversibility (SQLite + gated PostgreSQL)."""
 
 from __future__ import annotations
 
@@ -37,11 +33,10 @@ def _load_migration() -> Any:
         Path(__file__).parents[1]
         / "alembic"
         / "versions"
-        / "20260918_0021_stage_5_1_visual_composition.py"
+        / "20260918_0022_stage_5_2_render_execution.py"
     )
-    specification = importlib.util.spec_from_file_location("stage_5_1_migration", path)
-    assert specification is not None
-    assert specification.loader is not None
+    specification = importlib.util.spec_from_file_location("stage_5_2_migration", path)
+    assert specification is not None and specification.loader is not None
     module = importlib.util.module_from_spec(specification)
     specification.loader.exec_module(module)
     return module
@@ -51,42 +46,41 @@ def _database_url(url: str, database: str) -> str:
     return str(make_url(url).set(database=database).render_as_string(hide_password=False))
 
 
-def test_stage_5_1_migration_declares_revision_metadata() -> None:
+def test_stage_5_2_migration_declares_revision_metadata() -> None:
     module = _load_migration()
-    assert module.revision == "20260918_0021"
-    assert module.down_revision == "20260918_0020"
-    assert "VISUAL_COMPOSITION" in module._JOB_CURRENT
-    assert "VISUAL_COMPOSITION" not in module._JOB_PREVIOUS
+    assert module.revision == "20260918_0022"
+    assert module.down_revision == "20260918_0021"
+    assert "RENDER_EXECUTION" in module._JOB_CURRENT
+    assert "RENDER_EXECUTION" not in module._JOB_PREVIOUS
 
 
-def test_stage_5_1_migration_is_reversible_and_preserves_prior_stages() -> None:
+def test_stage_5_2_migration_is_reversible_and_preserves_prior_stages() -> None:
     backend_root = Path(__file__).parents[1]
     config = Config()
     config.set_main_option("script_location", str(backend_root / "alembic"))
     database_url = get_settings().database_url
-
     command.upgrade(config, "head")
     engine = create_engine(database_url)
     try:
         inspector = inspect(engine)
+        assert "render_executions" in inspector.get_table_names()
         assert "visual_composition_plans" in inspector.get_table_names()
-        assert "render_contracts" in inspector.get_table_names()
         columns = {column["name"] for column in inspector.get_columns("processing_jobs")}
-        assert "visual_composition_plan_id" in columns
-        indexes = {index["name"] for index in inspector.get_indexes("visual_composition_plans")}
-        assert "uq_visual_composition_plans_current" in indexes
+        assert "render_execution_id" in columns
+        indexes = {index["name"] for index in inspector.get_indexes("render_executions")}
+        assert "uq_render_executions_current_scope" in indexes
 
         with Session(engine) as session:
             source = SourceVideo(
-                source_uri="/tmp/stage51-migration.mp4",
-                content_hash="stage51-migration-hash",
+                source_uri="/tmp/stage52-migration.mp4",
+                content_hash="stage52-migration-hash",
             )
             session.add(source)
             session.flush()
             session.add(
                 ClipCandidate(
                     source_video_id=source.id,
-                    candidate_key="stage51-migration-candidate",
+                    candidate_key="stage52-migration-candidate",
                     disposition=CandidateDisposition.CANDIDATE,
                     start_time=0.0,
                     end_time=10.0,
@@ -97,45 +91,35 @@ def test_stage_5_1_migration_is_reversible_and_preserves_prior_stages() -> None:
                     originality_risk=OriginalityRisk.NOT_INDICATED,
                 )
             )
-            job = ProcessingJob(
-                source_video_id=source.id,
-                kind=JobKind.VISUAL_COMPOSITION,
-                status=JobStatus.QUEUED,
+            session.add(
+                ProcessingJob(
+                    source_video_id=source.id,
+                    kind=JobKind.RENDER_EXECUTION,
+                    status=JobStatus.QUEUED,
+                )
             )
-            session.add(job)
             session.commit()
             source_id = str(source.id)
 
-        # The migrated job_kind constraint accepts the Stage 5.1 value.
         with engine.connect() as connection:
             accepted = connection.execute(
-                text("SELECT count(*) FROM processing_jobs WHERE kind = 'VISUAL_COMPOSITION'")
+                text("SELECT count(*) FROM processing_jobs WHERE kind = 'RENDER_EXECUTION'")
             ).scalar_one()
         assert accepted == 1
 
-        # Remove the Stage 5.1 job so the downgrade can legally restore the
-        # prior job_kind constraint over the preserved rows.
         with engine.begin() as connection:
-            connection.execute(
-                text("DELETE FROM processing_jobs WHERE kind = 'VISUAL_COMPOSITION'")
-            )
+            connection.execute(text("DELETE FROM processing_jobs WHERE kind = 'RENDER_EXECUTION'"))
 
-        command.downgrade(config, "20260918_0020")
-
+        command.downgrade(config, "-1")
         inspector = inspect(engine)
-        assert "visual_composition_plans" not in inspector.get_table_names()
-        assert "render_contracts" in inspector.get_table_names()
+        assert "render_executions" not in inspector.get_table_names()
+        assert "visual_composition_plans" in inspector.get_table_names()
         columns = {column["name"] for column in inspector.get_columns("processing_jobs")}
-        assert "visual_composition_plan_id" not in columns
-        job_checks = {
-            str(constraint["sqltext"])
-            for constraint in inspector.get_check_constraints("processing_jobs")
-        }
-        assert all("VISUAL_COMPOSITION" not in sqltext for sqltext in job_checks)
+        assert "render_execution_id" not in columns
         with engine.connect() as connection:
             sources = connection.execute(
                 text("SELECT count(*) FROM source_videos WHERE source_uri = :uri"),
-                {"uri": "/tmp/stage51-migration.mp4"},
+                {"uri": "/tmp/stage52-migration.mp4"},
             ).scalar_one()
             candidates = connection.execute(
                 text("SELECT count(*) FROM clip_candidates WHERE source_video_id = :id"),
@@ -145,11 +129,7 @@ def test_stage_5_1_migration_is_reversible_and_preserves_prior_stages() -> None:
         assert candidates == 1
 
         command.upgrade(config, "head")
-        inspector = inspect(engine)
-        assert "visual_composition_plans" in inspector.get_table_names()
-        assert "visual_composition_plan_id" in {
-            column["name"] for column in inspector.get_columns("processing_jobs")
-        }
+        assert "render_executions" in inspect(engine).get_table_names()
     finally:
         engine.dispose()
 
@@ -158,12 +138,10 @@ def test_stage_5_1_migration_is_reversible_and_preserves_prior_stages() -> None:
     not _POSTGRES_URL,
     reason="CLIPFACTORY_TEST_POSTGRES_URL is required for PostgreSQL migration validation",
 )
-def test_stage_5_1_postgresql_alembic_upgrade(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Whole migration chain runs on PostgreSQL and Stage 5.1 reverses cleanly."""
-
+def test_stage_5_2_postgresql_alembic_upgrade(monkeypatch: pytest.MonkeyPatch) -> None:
     assert _POSTGRES_URL is not None
     admin_url = _database_url(_POSTGRES_URL, "postgres")
-    database = "clipfactory_stage51_migration_test"
+    database = "clipfactory_stage52_migration_test"
     admin = create_engine(admin_url, isolation_level="AUTOCOMMIT")
     config = Config()
     config.set_main_option("script_location", str(Path(__file__).parents[1] / "alembic"))
@@ -179,17 +157,21 @@ def test_stage_5_1_postgresql_alembic_upgrade(monkeypatch: pytest.MonkeyPatch) -
             command.upgrade(config, "head")
             engine = create_engine(target_url)
             inspector = inspect(engine)
-            assert "visual_composition_plans" in inspector.get_table_names()
-            assert "visual_composition_plan_id" in {
+            assert "render_executions" in inspector.get_table_names()
+            assert "render_execution_id" in {
                 column["name"] for column in inspector.get_columns("processing_jobs")
             }
+            indexes = {index["name"] for index in inspector.get_indexes("render_executions")}
+            assert "uq_render_executions_current_scope" in indexes
 
-            command.downgrade(config, "20260918_0020")
+            command.downgrade(config, "-1")
             inspector = inspect(engine)
-            assert "visual_composition_plans" not in inspector.get_table_names()
-            assert "render_contracts" in inspector.get_table_names()
+            assert "render_executions" not in inspector.get_table_names()
+            assert "render_execution_id" not in {
+                column["name"] for column in inspector.get_columns("processing_jobs")
+            }
             command.upgrade(config, "head")
-            assert "visual_composition_plans" in inspect(engine).get_table_names()
+            assert "render_executions" in inspect(engine).get_table_names()
         finally:
             get_settings.cache_clear()
     finally:

@@ -1,5 +1,69 @@
 # Runtime status
 
+## Stage 5.2 render execution, audio, and technical QC (2026-10-05)
+
+Stage 5.2 turns one current executable Stage 5.0 render contract and one current
+ready Stage 5.1 visual-composition plan (with canonical ASS) into an encoded
+artifact, a normalized execution manifest, deterministic technical QC, and a
+durable fenced result. It is explicit and candidate-scoped and extends the
+existing Celery/`ProcessingJob` platform with a `RENDER_EXECUTION` job kind; it
+adds no `PipelineStage`, no `PipelineRun`, and no `_NEXT_STAGE` entry, and never
+touches the source lifecycle. Status: **implemented and technically verified;
+awaiting human manual acceptance. Not frozen.**
+
+- **Purpose.** `CORE_SOURCE_VALIDATION` executes only the ordered `SOURCE_MEDIA`
+  occurrences. Authored material is omitted and every omission is persisted and
+  exposed. `publication_ready=false`, `stage6_implemented=false`, final authored
+  timeline unfrozen. QC_PASS is not publishing eligibility.
+- **Engine.** `app/render/execution/` is DB/provider-independent:
+  `compile_render(spec, runtime_identity)`, `run_compiled_render(compiled,
+  attempt_context)`, `check_render_artifact(artifacts, manifest, qc_policy)`.
+  It uses safe argument arrays (`shell=False`, stdin disabled), generated
+  filtergraph/command files, and never accepts arbitrary provider FFmpeg flags.
+- **Timing.** Contract-ordered occurrences, unit-speed mapping, explicit
+  `trim`/`atrim`, per-scene `setpts`, audio joined only at occurrence
+  boundaries, cumulative frame/sample boundaries. Noncontiguous source gaps are
+  removed from video, audio, and captions. One final video + one final audio
+  encode per render; no mandatory intermediate H.264.
+- **Framing.** All six accepted modes execute. Tracked crop uses a per-frame
+  dynamic scale + per-frame crop because the installed FFmpeg `crop` exposes no
+  runtime width/height commands; smoothstep pan/zoom is real and tested. Native
+  rotation applied once; exotic pixel aspect fails closed.
+- **Captions.** Canonical ASS is burned while source-local, before `setpts`,
+  preserving bytes and dynamic highlight states; never re-planned/re-ordered.
+  Asset must be managed, exist, and match SHA-256.
+- **Delivery.** Versioned MP4/H.264 (`veryfast`, CRF 20, `yuv420p`, 1080x1920,
+  contract FPS via `-r`), AAC 192 kb/s 48 kHz, mono/stereo preserved (wider
+  downmixed), `+faststart`, no publication loudness/narration/Stage 6 mixing.
+- **Persistence.** `render_executions` (migration `20260918_0022`), scoped
+  partial unique current index, `JobKind.RENDER_EXECUTION`, nullable
+  `processing_jobs.render_execution_id`. Lifecycle `QUEUED`/`RENDERING`/
+  `QC_RUNNING`/`COMPLETE`/`BLOCKED`/`FAILED`/`CANCELLED`; QC `PASS`/`WARN`/
+  `FAIL`; only valid current `COMPLETE` is cache-eligible. Request frozen at
+  queue time; retries are new attempts, not new request identities.
+- **Concurrency.** Scoped partial unique index + atomic `active_job_id` claim;
+  atomic `QUEUED/FAILED -> RUNNING` job claim advancing `claim_version`;
+  independent-query cancellation; PostgreSQL session advisory lock on a
+  dedicated connection. Bounded retries (max 3) only for transient failures.
+- **API/CLI.** `POST/GET /api/candidates/{id}/render-execution`,
+  `GET /api/render-executions/{id}`, `GET /api/render-executions/{id}/artifact`;
+  CLI `render-execution`, `render-execution-status`,
+  `render-execution-artifact`; Celery `clipfactory.run_render_execution`. The
+  Stage 5.2 handoff now exposes the authoritative Stage 5.0 output profile
+  (read-only correction).
+- **Verification.** Engine unit tests, real FFmpeg two-span/dynamic-zoom/render
+  and QC tests, injected-seam lifecycle tests (convergence, duplicate delivery,
+  claim fencing, queued cancellation, source-change block, cache reuse),
+  SQLite migration and gated PostgreSQL migration/concurrency/advisory-lock
+  tests, and a handoff regression test pass. Stage 5.0/5.1/models/migrations
+  regression suites remain green. Manual-acceptance MP4s and the production
+  engine path were exercised; see `docs/STAGE_5_2_OPERATIONS.md`.
+- **Limitations.** Full live DB→queue→executor→artifact integration on real
+  media is exercised through the engine plus injected-seam lifecycle tests (the
+  dedicated live-contract render test was not added this pass); tracked-crop
+  zoom uses the documented dynamic-scale equivalent; the current Stage 5.1
+  handoff `output_profile` fix is read-only. Human acceptance pending.
+
 ## Stage 5.0 deterministic execution preflight and render contract (2026-09-18)
 
 Stage 5.0 turns the current Stage 4.3 selection into a durable, evidence-bound
