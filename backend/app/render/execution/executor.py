@@ -1,12 +1,14 @@
 """Stage 5.2 render-execution executor with durable claim fencing.
 
 Duplicate/redelivered Celery invocations are fenced by an atomic
-``QUEUED/FAILED -> RUNNING`` claim that advances ``claim_version``. Every
-worker-owned mutation is fenced on that token and ``status == RUNNING``, so a
-superseded worker can never finalize, cancel, or fail a newer run. Cancellation
-is cooperative and read through a fresh scalar query; the narrow global
-admission lock is held on a dedicated connection for the render/QC lifetime and
-released on every exit path.
+``QUEUED/FAILED -> RUNNING`` claim that advances ``claim_version`` in the same
+statement. Every worker-owned mutation is fenced on the execution row's
+authoritative ``active_job_id`` plus the executing job's ``claim_version`` and
+permitted ``RUNNING`` status, so a superseded worker can never finalize, cancel,
+fail, or release a newer run. Cancellation and lost ownership are read through a
+fresh scalar query and the narrow global admission lock is verified against its
+dedicated connection; both are polled at a fixed cadence and the active FFmpeg
+child is reaped on every exit path.
 """
 
 from __future__ import annotations
@@ -15,9 +17,9 @@ import threading
 import uuid
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
-from sqlalchemy import update
+from sqlalchemy import and_, or_, update
 from sqlalchemy.orm import Session
 
 from app.core.enums import JobStatus, RenderExecutionLifecycle
@@ -40,16 +42,19 @@ from app.render.execution.runner import (
 )
 from app.render.execution.service import (
     RenderExecutionError,
+    begin_attempt,
     build_render_spec,
     cache_hit,
+    cancel_execution,
     finalize_success,
     mark_blocked,
     mark_cancelled,
     mark_failed,
     request_input_fingerprint,
     resolve_runtime_identity,
+    set_lifecycle_fenced,
 )
-from app.render.execution.types import AttemptContext
+from app.render.execution.types import AttemptContext, TechnicalQCResult
 from app.services.storage import StorageService
 
 _STALE_HEARTBEAT_SECONDS = 120.0
@@ -64,11 +69,17 @@ class RenderAdmissionUnavailable(RuntimeError):
 
 class _LivenessHeartbeat:
     def __init__(
-        self, session_factory: Callable[[], Session], job_id: uuid.UUID, claim_version: int
+        self,
+        session_factory: Callable[[], Session],
+        job_id: uuid.UUID,
+        claim_version: int,
+        *,
+        on_lost: Callable[[], None] | None = None,
     ) -> None:
         self._factory = session_factory
         self._job_id = job_id
         self._claim_version = claim_version
+        self._on_lost = on_lost
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
 
@@ -82,10 +93,11 @@ class _LivenessHeartbeat:
     def _run(self) -> None:
         from datetime import datetime, timezone
 
+        failures = 0
         while not self._stop.wait(5.0):
             session = self._factory()
             try:
-                session.execute(
+                result = session.execute(
                     update(ProcessingJob)
                     .where(
                         ProcessingJob.id == self._job_id,
@@ -96,8 +108,17 @@ class _LivenessHeartbeat:
                     .execution_options(synchronize_session=False)
                 )
                 session.commit()
+                if int(result.rowcount) != 1:
+                    if self._on_lost is not None:
+                        self._on_lost()
+                    return
+                failures = 0
             except Exception:
                 session.rollback()
+                failures += 1
+                if failures >= 3 and self._on_lost is not None:
+                    self._on_lost()
+                    return
             finally:
                 session.close()
 
@@ -126,6 +147,8 @@ class RenderExecutionExecutor:
         self._job_id: uuid.UUID | None = None
         self._claim_version: int = -1
         self._row_id: uuid.UUID | None = None
+        self._claimed = False
+        self._ownership_lost = False
         self.skipped_duplicate = False
         self._admission_held = False
         self._compiler = compiler or compile_render
@@ -145,26 +168,36 @@ class RenderExecutionExecutor:
         from datetime import datetime, timezone
 
         now = datetime.now(timezone.utc)
-        stale_before = now.timestamp() - _STALE_HEARTBEAT_SECONDS
+        stale_before = datetime.fromtimestamp(
+            now.timestamp() - _STALE_HEARTBEAT_SECONDS, tz=timezone.utc
+        )
         job = self._session.get(ProcessingJob, self._job_id)
         if job is None:
             return False
-        claimable = job.status in _CLAIMABLE_STATUSES
-        if (
-            not claimable
-            and job.status is JobStatus.RUNNING
-            and (job.heartbeat_at is None or job.heartbeat_at.timestamp() <= stale_before)
-        ):
-            claimable = True
+        observed = int(job.claim_version)
+        claimable = job.status in _CLAIMABLE_STATUSES or (
+            job.status is JobStatus.RUNNING
+            and (job.heartbeat_at is None or job.heartbeat_at <= stale_before)
+        )
         if not claimable:
             self.skipped_duplicate = True
-            self._claim_version = job.claim_version
+            self._claim_version = observed
             return False
         result = self._session.execute(
             update(ProcessingJob)
             .where(
                 ProcessingJob.id == self._job_id,
-                ProcessingJob.claim_version == job.claim_version,
+                ProcessingJob.claim_version == observed,
+                or_(
+                    ProcessingJob.status.in_(_CLAIMABLE_STATUSES),
+                    and_(
+                        ProcessingJob.status == JobStatus.RUNNING,
+                        or_(
+                            ProcessingJob.heartbeat_at.is_(None),
+                            ProcessingJob.heartbeat_at <= stale_before,
+                        ),
+                    ),
+                ),
             )
             .values(
                 status=JobStatus.RUNNING,
@@ -180,8 +213,8 @@ class RenderExecutionExecutor:
             self.skipped_duplicate = True
             return False
         self._session.commit()
-        self._session.refresh(job)
-        self._claim_version = job.claim_version
+        self._claim_version = observed + 1
+        self._claimed = True
         return True
 
     def _claim_is_current(self, *, require_running: bool = True) -> bool:
@@ -190,7 +223,7 @@ class RenderExecutionExecutor:
         job = self._fresh_job()
         if job is None:
             return False
-        if job.claim_version != self._claim_version:
+        if int(job.claim_version) != self._claim_version:
             return False
         if require_running and job.status is not JobStatus.RUNNING:
             return False
@@ -206,6 +239,22 @@ class RenderExecutionExecutor:
         job = self._fresh_job()
         return job is not None and job.status is JobStatus.CANCELLED
 
+    def _ownership_ok(self) -> bool:
+        if not self._claim_is_current(require_running=False):
+            self._ownership_lost = True
+            return False
+        if self._admission_held and not self._admission.held():
+            self._ownership_lost = True
+            return False
+        return True
+
+    def _should_stop(self) -> bool:
+        """Polled by the runner: True on cancellation or lost ownership."""
+
+        if self._job_cancelled():
+            return True
+        return not self._ownership_ok()
+
     def _finish_job(self, status: JobStatus, *, error_code: str | None = None) -> None:
         if self._job_id is None or not self._claim_is_current(require_running=False):
             return
@@ -216,6 +265,7 @@ class RenderExecutionExecutor:
             .where(
                 ProcessingJob.id == self._job_id,
                 ProcessingJob.claim_version == self._claim_version,
+                ProcessingJob.status == JobStatus.RUNNING,
             )
             .values(status=status, completed_at=datetime.now(timezone.utc), error_code=error_code)
             .execution_options(synchronize_session=False)
@@ -227,14 +277,17 @@ class RenderExecutionExecutor:
     def execute(
         self, render_execution_id: uuid.UUID | str, *, force: bool = False
     ) -> RenderExecution:
-        row = self._session.get(RenderExecution, _as_uuid(render_execution_id))
+        row = cast(
+            "RenderExecution | None",
+            self._session.get(RenderExecution, _as_uuid(render_execution_id)),
+        )
         if row is None:
             raise RenderExecutionError("RENDER_EXECUTION_NOT_FOUND")
         self._row_id = row.id
         if self._job_id is not None:
             pending = self._session.get(ProcessingJob, self._job_id)
             if pending is not None and pending.status is JobStatus.CANCELLED:
-                mark_cancelled(self._session, row)
+                cancel_execution(self._session, row.id, job_id=self._job_id)
                 self._session.commit()
                 raise StageCancelled("render cancelled while queued")
         claimed = self._claim_job()
@@ -244,7 +297,10 @@ class RenderExecutionExecutor:
                 return row
             if self._job_id is not None:
                 heartbeat = _LivenessHeartbeat(
-                    self._session_factory, self._job_id, self._claim_version
+                    self._session_factory,
+                    self._job_id,
+                    self._claim_version,
+                    on_lost=self._mark_ownership_lost,
                 )
                 heartbeat.start()
             if (
@@ -256,8 +312,7 @@ class RenderExecutionExecutor:
                 if cached is not None and cached.id == row.id:
                     self._finish_job(JobStatus.SUCCEEDED)
                     return row
-            row = self._run(row)
-            return row
+            return self._run(row)
         except StageCancelled:
             self._mark_cancelled(row)
             raise
@@ -270,6 +325,9 @@ class RenderExecutionExecutor:
                 self._admission.release()
             if heartbeat is not None:
                 heartbeat.stop()
+
+    def _mark_ownership_lost(self) -> None:
+        self._ownership_lost = True
 
     def _run(self, row: RenderExecution) -> RenderExecution:
         if self._job_cancelled():
@@ -336,14 +394,16 @@ class RenderExecutionExecutor:
             self._fail(row, getattr(error, "reason_code", "RENDER_PROCESS_FAILED"))
             raise
 
-        ass_relative = spec.ass.relative_path
-        ass_data = (self._storage.storage_root / ass_relative).read_bytes()
+        ass_data = self._verified_ass_bytes(spec)
 
-        self._set_lifecycle(row, RenderExecutionLifecycle.RENDERING)
+        if not self._begin_attempt(row):
+            self.skipped_duplicate = True
+            return row
         context = AttemptContext(
             attempt_directory=attempt_directory,
-            cancel_check=self._job_cancelled,
+            cancel_check=self._should_stop,
             timeout_seconds=self._config.max_render_seconds,
+            poll_seconds=self._config.cancel_poll_seconds,
             ass_bytes=ass_data,
         )
         try:
@@ -358,7 +418,9 @@ class RenderExecutionExecutor:
             self._mark_cancelled(row)
             raise
 
-        self._set_lifecycle(row, RenderExecutionLifecycle.QC_RUNNING)
+        if not self._set_qc_running(row):
+            self.skipped_duplicate = True
+            return row
         qc = self._qc_checker(
             artifacts,
             artifacts.manifest,
@@ -366,80 +428,246 @@ class RenderExecutionExecutor:
             source_path=Path(source_absolute),
         )
         if qc.status == "FAIL":
-            self._fail(row, qc.reason_codes[0] if qc.reason_codes else "QC_FAILED")
+            self._fail(row, qc.reason_codes[0] if qc.reason_codes else "QC_FAILED", qc=qc)
             return row
 
-        # Revalidate source identity and currentness before publishing.
-        restat = Path(source_absolute).stat()
-        if restat.st_size != spec.source_size_bytes or restat.st_mtime_ns != spec.source_mtime_ns:
-            self._fail(row, "SOURCE_MEDIA_CHANGED")
+        if not self._revalidate_before_publish(row, candidate, source_absolute, spec):
             return row
+
         if self._job_cancelled():
             raise StageCancelled("render cancelled before publish")
-        if not self._claim_is_current():
+        if not self._ownership_ok():
+            if self._job_cancelled():
+                raise StageCancelled("render cancelled before publish")
             self.skipped_duplicate = True
             return row
 
-        finalize_success(
-            self._session,
-            row,
-            artifacts=artifacts,
-            qc=qc,
-            compiled_fingerprint_value=compiled.fingerprint,
-            runtime_fp=_runtime_fp(runtime),
-            storage=self._storage,
-            config=self._config,
-        )
-        self._session.commit()
+        published = self._finalize_success(row, artifacts, qc, compiled.fingerprint, runtime)
+        if not published:
+            self.skipped_duplicate = True
+            return row
         self._finish_job(JobStatus.SUCCEEDED)
         return row
 
+    def _begin_attempt(self, row: RenderExecution) -> bool:
+        if self._job_id is None:
+            row.lifecycle = RenderExecutionLifecycle.RENDERING
+            row.cache_eligible = False
+            row.qc_status = None
+            row.artifact_reference = {}
+            row.execution_manifest = {}
+            row.qc_result = {}
+            row.output_fingerprint = ""
+            row.reason_codes = []
+            row.error_code = None
+            row.error_message = None
+            self._session.flush()
+            self._session.commit()
+            return True
+        claimed = begin_attempt(
+            self._session, row.id, job_id=self._job_id, claim_version=self._claim_version
+        )
+        self._session.commit()
+        if not claimed:
+            self.skipped_duplicate = True
+            return False
+        self._session.expire_all()
+        return True
+
+    def _set_qc_running(self, row: RenderExecution) -> bool:
+        if self._job_id is None:
+            row.lifecycle = RenderExecutionLifecycle.QC_RUNNING
+            self._session.flush()
+            self._session.commit()
+            return True
+        claimed = set_lifecycle_fenced(
+            self._session,
+            row.id,
+            RenderExecutionLifecycle.QC_RUNNING,
+            job_id=self._job_id,
+            claim_version=self._claim_version,
+        )
+        self._session.commit()
+        if not claimed:
+            self.skipped_duplicate = True
+            return False
+        self._session.expire_all()
+        return True
+
+    def _verified_ass_bytes(self, spec: Any) -> bytes:
+        relative = spec.ass.relative_path
+        path = (self._storage.storage_root / relative).resolve()
+        try:
+            path.relative_to(self._storage.storage_root)
+        except ValueError as error:
+            raise RenderExecutionError("ASS_MISSING") from error
+        data = path.read_bytes()
+        expected = (spec.ass.sha256 or "").lower()
+        import hashlib
+
+        actual = hashlib.sha256(data).hexdigest()
+        if not expected or actual != expected:
+            raise RenderExecutionError("ASS_HASH_MISMATCH")
+        return bytes(data)
+
+    def _revalidate_before_publish(
+        self, row: RenderExecution, candidate: Any, source_absolute: str, spec: Any
+    ) -> bool:
+        try:
+            fresh = self._spec_builder(
+                self._session,
+                candidate,
+                artifact_purpose=row.artifact_purpose.value,
+                delivery_profile_key=row.delivery_profile_key,
+                settings=self._settings,
+                storage=self._storage,
+            )
+        except RenderExecutionError as error:
+            if error.blocked:
+                self._block(row, error.reason_code)
+            else:
+                self._fail(row, error.reason_code)
+            return False
+        if request_input_fingerprint(fresh, self._config) != row.input_fingerprint:
+            self._block(row, "REQUEST_INPUT_CHANGED")
+            return False
+        stat = Path(source_absolute).stat()
+        if stat.st_size != spec.source_size_bytes or stat.st_mtime_ns != spec.source_mtime_ns:
+            self._fail(row, "SOURCE_MEDIA_CHANGED")
+            return False
+        return True
+
     # Lifecycle helpers
 
-    def _set_lifecycle(self, row: RenderExecution, lifecycle: RenderExecutionLifecycle) -> None:
-        if not self._claim_is_current():
-            self.skipped_duplicate = True
-            raise StageCancelled("render ownership lost")
-        row.lifecycle = lifecycle
-        self._session.commit()
-
     def _block(self, row: RenderExecution, reason_code: str) -> None:
-        mark_blocked(self._session, row, reason_code)
-        self._session.commit()
-        self._finish_job(JobStatus.FAILED, error_code=reason_code)
-
-    def _fail(self, row: RenderExecution, reason_code: str) -> None:
-        mark_failed(self._session, row, reason_code)
-        self._session.commit()
-        self._finish_job(JobStatus.FAILED, error_code=reason_code)
-
-    def _mark_cancelled(self, row: RenderExecution) -> None:
-        if not self._claim_is_current(require_running=False):
+        if self._job_id is None:
+            mark_blocked(self._session, row, reason_code)
+            self._commit_or_rollback()
             return
-        mark_cancelled(self._session, row)
-        self._session.commit()
-        if self._job_id is not None and self._claim_is_current(require_running=False):
-            self._session.execute(
-                update(ProcessingJob)
-                .where(
-                    ProcessingJob.id == self._job_id,
-                    ProcessingJob.claim_version == self._claim_version,
-                )
-                .values(status=JobStatus.CANCELLED)
-                .execution_options(synchronize_session=False)
+        if not self._claimed:
+            return
+        try:
+            marked = mark_blocked(
+                self._session,
+                row,
+                reason_code,
+                job_id=self._job_id,
+                claim_version=self._claim_version,
             )
             self._session.commit()
+            if not marked:
+                self.skipped_duplicate = True
+                return
+        except Exception:
+            self._safe_rollback()
+            return
+        self._finish_job(JobStatus.FAILED, error_code=reason_code)
+
+    def _fail(
+        self,
+        row: RenderExecution,
+        reason_code: str,
+        *,
+        qc: TechnicalQCResult | None = None,
+    ) -> None:
+        if self._job_id is None:
+            mark_failed(self._session, row, reason_code, qc=qc)
+            self._commit_or_rollback()
+            return
+        if not self._claimed:
+            return
+        try:
+            marked = mark_failed(
+                self._session,
+                row,
+                reason_code,
+                qc=qc,
+                job_id=self._job_id,
+                claim_version=self._claim_version,
+            )
+            self._session.commit()
+            if not marked:
+                self.skipped_duplicate = True
+                return
+        except Exception:
+            self._safe_rollback()
+            return
+        self._finish_job(JobStatus.FAILED, error_code=reason_code)
+
+    def _finalize_success(
+        self,
+        row: RenderExecution,
+        artifacts: Any,
+        qc: TechnicalQCResult,
+        compiled_fingerprint_value: str,
+        runtime: Any,
+    ) -> bool:
+        from app.render.execution.service import runtime_fingerprint
+
+        try:
+            published = finalize_success(
+                self._session,
+                row,
+                artifacts=artifacts,
+                qc=qc,
+                compiled_fingerprint_value=compiled_fingerprint_value,
+                runtime_fp=runtime_fingerprint(runtime),
+                storage=self._storage,
+                config=self._config,
+                job_id=self._job_id,
+                claim_version=self._claim_version,
+            )
+            self._session.commit()
+        except Exception:
+            self._safe_rollback()
+            return False
+        return bool(published)
+
+    def _mark_cancelled(self, row: RenderExecution) -> None:
+        if self._job_id is None:
+            mark_cancelled(self._session, row)
+            self._commit_or_rollback()
+            return
+        if not self._claim_is_current(require_running=False):
+            return
+        try:
+            marked = mark_cancelled(
+                self._session, row, job_id=self._job_id, claim_version=self._claim_version
+            )
+            if marked:
+                self._session.execute(
+                    update(ProcessingJob)
+                    .where(
+                        ProcessingJob.id == self._job_id,
+                        ProcessingJob.claim_version == self._claim_version,
+                    )
+                    .values(status=JobStatus.CANCELLED)
+                    .execution_options(synchronize_session=False)
+                )
+            self._session.commit()
+        except Exception:
+            self._safe_rollback()
+
+    def _commit_or_rollback(self) -> None:
+        try:
+            self._session.commit()
+        except Exception:
+            self._safe_rollback()
+
+    def _safe_rollback(self) -> None:
+        try:
+            self._session.rollback()
+        except Exception:  # pragma: no cover - defensive
+            pass
 
     def record_failure(self, error: Exception) -> None:
-        row = self._session.get(RenderExecution, self._row_id) if self._row_id else None
-        if row is not None:
-            self._fail(row, getattr(error, "reason_code", "RENDER_PROCESS_FAILED"))
-
-
-def _runtime_fp(runtime: Any) -> str:
-    from app.render.execution.service import runtime_fingerprint
-
-    return runtime_fingerprint(runtime)
+        self._safe_rollback()
+        if self._row_id is None or not self._claimed:
+            return
+        row = self._session.get(RenderExecution, self._row_id)
+        if row is None:
+            return
+        self._fail(row, getattr(error, "reason_code", "RENDER_PROCESS_FAILED"))
 
 
 def _as_uuid(value: uuid.UUID | str) -> uuid.UUID:

@@ -17,14 +17,14 @@ from dataclasses import dataclass
 
 # Versions
 
-EXECUTION_POLICY_VERSION = "stage5.2-v1"
-EXECUTION_SCHEMA_VERSION = "stage5.2-schema-v1"
-EXECUTION_FINGERPRINT_VERSION = "1"
-COMPILER_VERSION = "stage5.2-compiler-v1"
-TIMELINE_POLICY_VERSION = "stage5.2-timeline-v1"
-QC_POLICY_VERSION = "stage5.2-qc-v1"
+EXECUTION_POLICY_VERSION = "stage5.2-v2"
+EXECUTION_SCHEMA_VERSION = "stage5.2-schema-v2"
+EXECUTION_FINGERPRINT_VERSION = "2"
+COMPILER_VERSION = "stage5.2-compiler-v2"
+TIMELINE_POLICY_VERSION = "stage5.2-timeline-v2"
+QC_POLICY_VERSION = "stage5.2-qc-v2"
 DELIVERY_PROFILE_VERSION = "stage5.2-delivery-v1"
-CONCURRENCY_POLICY_VERSION = "stage5.2-concurrency-v1"
+CONCURRENCY_POLICY_VERSION = "stage5.2-concurrency-v2"
 
 # Artifact purpose. ``CORE_SOURCE_VALIDATION`` executes the ordered
 # SOURCE_MEDIA occurrences from the Stage 5.0 contract. It is a terminal
@@ -118,6 +118,24 @@ QC_DURATION_DRIFT = "QC_DURATION_DRIFT"
 QC_CUMULATIVE_DRIFT = "QC_CUMULATIVE_DRIFT"
 RENDER_DISABLED = "RENDER_DISABLED"
 
+# Remediation reason codes (close the previously silent failure paths).
+SOURCE_STREAMS_UNSUPPORTED = "SOURCE_STREAMS_UNSUPPORTED"
+SOURCE_START_UNSUPPORTED = "SOURCE_START_UNSUPPORTED"
+SOURCE_DURATION_EXCEEDS_LIMIT = "SOURCE_DURATION_EXCEEDS_LIMIT"
+OUTPUT_DURATION_EXCEEDS_LIMIT = "OUTPUT_DURATION_EXCEEDS_LIMIT"
+ATTEMPT_OWNERSHIP_LOST = "ATTEMPT_OWNERSHIP_LOST"
+RENDER_DISPATCH_FAILED = "RENDER_DISPATCH_FAILED"
+CACHE_ARTIFACT_MISSING = "CACHE_ARTIFACT_MISSING"
+CACHE_ARTIFACT_CORRUPT = "CACHE_ARTIFACT_CORRUPT"
+CACHE_QC_POLICY_CHANGED = "CACHE_QC_POLICY_CHANGED"
+QC_TIMING_MISSING = "QC_TIMING_MISSING"
+QC_AV_TIMING_MISMATCH = "QC_AV_TIMING_MISMATCH"
+QC_STREAM_TIMING_MISMATCH = "QC_STREAM_TIMING_MISMATCH"
+QC_SOURCE_AUDIO_MISMATCH = "QC_SOURCE_AUDIO_MISMATCH"
+QC_SOURCE_AUDIO_UNAVAILABLE = "QC_SOURCE_AUDIO_UNAVAILABLE"
+EXECUTION_ROW_NOT_CURRENT = "EXECUTION_ROW_NOT_CURRENT"
+SEGMENT_LIMIT_EXCEEDED = "SEGMENT_LIMIT_EXCEEDED"
+
 # Resource bounds and QC thresholds. Versioned so a policy change invalidates
 # prior QC verdicts through the QC fingerprint.
 
@@ -130,7 +148,14 @@ DEFAULT_MAX_RENDER_SECONDS = 900.0
 DEFAULT_CANCEL_POLL_SECONDS = 0.5
 DEFAULT_FFMPEG_THREADS = 2
 DEFAULT_FILTER_THREADS = 1
+DEFAULT_FILTER_COMPLEX_THREADS = 1
 DEFAULT_GLOBAL_CONCURRENT_RENDERS = 1
+
+# Source stream-timing tolerance. Frame/sample granularity makes a genuine
+# stream start offset below this indistinguishable from jitter; anything larger
+# is a supported explicit gap the compiler must preserve (never silently shift).
+SOURCE_START_TOLERANCE_SECONDS = 0.02
+QC_AV_DURATION_TOLERANCE_SECONDS = 0.10
 
 # Technical QC thresholds
 
@@ -235,6 +260,7 @@ class Stage52Config:
 
     encoder_threads: int = DEFAULT_FFMPEG_THREADS
     filter_threads: int = DEFAULT_FILTER_THREADS
+    filter_complex_threads: int = DEFAULT_FILTER_COMPLEX_THREADS
     global_concurrent_renders: int = DEFAULT_GLOBAL_CONCURRENT_RENDERS
     ffmpeg_binary: str = "ffmpeg"
     ffprobe_binary: str = "ffprobe"
@@ -265,6 +291,7 @@ def stage52_config_payload(config: Stage52Config) -> dict[str, object]:
         "config": {
             "encoder_threads": config.encoder_threads,
             "filter_threads": config.filter_threads,
+            "filter_complex_threads": config.filter_complex_threads,
             "global_concurrent_renders": config.global_concurrent_renders,
             "stereo_downmix": MP4_H264_AAC_1080X1920.downmix_wider_to_stereo,
         },
@@ -320,6 +347,7 @@ __all__ = [
     "DEFAULT_DELIVERY_PROFILE_KEY",
     "DEFAULT_FFMPEG_THREADS",
     "DEFAULT_FILTER_THREADS",
+    "DEFAULT_FILTER_COMPLEX_THREADS",
     "DEFAULT_GLOBAL_CONCURRENT_RENDERS",
     "DEFAULT_MAX_RENDER_SECONDS",
     "DELIVERY_PROFILES",

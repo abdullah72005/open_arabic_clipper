@@ -173,6 +173,10 @@ def _validate_scene_keyframes(scene: SceneSpec) -> None:
         _fail(CONTRADICTORY_FRAMING_EVIDENCE)
     previous_t: float | None = None
     for keyframe in scene.crop_keyframes:
+        if keyframe.mode and keyframe.mode not in _SUPPORTED_MODES:
+            _fail(CONTRADICTORY_FRAMING_EVIDENCE)
+        if keyframe.mode and mode in _CROP_MODES and keyframe.mode not in _CROP_MODES:
+            _fail(CONTRADICTORY_FRAMING_EVIDENCE)
         if not (
             _is_finite(keyframe.t)
             and _is_finite(keyframe.cx)

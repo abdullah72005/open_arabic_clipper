@@ -223,6 +223,9 @@ def test_argv_is_safe_and_complete() -> None:
     assert argv[-1].endswith("output.mp4")
     assert "-threads" in argv and argv[argv.index("-threads") + 1] == "3"
     assert "-filter_threads" in argv and argv[argv.index("-filter_threads") + 1] == "4"
+    assert (
+        "-filter_complex_threads" in argv and argv[argv.index("-filter_complex_threads") + 1] == "1"
+    )
 
 
 def test_compiled_fingerprint_is_deterministic_and_profile_sensitive() -> None:

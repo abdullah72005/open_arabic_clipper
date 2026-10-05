@@ -16,7 +16,6 @@ from stage51_support import (
     Stage51Fixture,
     seed_stage51,
 )
-from stage52_support import fake_runtime
 
 from app.composition.queue import queue_visual_composition
 from app.composition.service import execute_visual_composition, get_current_visual_composition
@@ -134,15 +133,16 @@ def _make_executor(
 
 
 def _runtime_factory_for(fixture: Stage51Fixture) -> Any:
-    source = fixture.stage50.source_path
+    from app.render.execution.service import resolve_runtime_identity
+
     settings = get_settings()
 
     def factory(
         _settings: Any, *, source_absolute_path: str = "", attempt_directory: str = ""
     ) -> RuntimeIdentity:
-        return fake_runtime(
-            ffmpeg_binary=settings.ffmpeg_binary,
-            source_absolute_path=str(source),
+        return resolve_runtime_identity(
+            settings,
+            source_absolute_path=source_absolute_path,
             attempt_directory=attempt_directory,
         )
 
@@ -215,7 +215,8 @@ def test_old_claim_cannot_fail_newer_run(session: Session, monkeypatch: Any) -> 
     runner = _FakeRunner()
     executor = _make_executor(session, runner, runtime_factory=_runtime_factory_for(fixture))
     executor.set_active_job(outcome.job_id)
-    executor._claim_job()
+    assert executor._claim_job() is True
+    executor._row_id = outcome.render_execution_id
     old_version = executor._claim_version
     session.execute(
         update(ProcessingJob)
@@ -227,6 +228,8 @@ def test_old_claim_cannot_fail_newer_run(session: Session, monkeypatch: Any) -> 
     session.expire_all()
     row = session.get(RenderExecution, outcome.render_execution_id)
     assert row is not None and row.lifecycle is not RenderExecutionLifecycle.FAILED
+    job = session.get(ProcessingJob, outcome.job_id)
+    assert job is not None and job.status is not JobStatus.FAILED
 
 
 def test_source_change_prevents_success(session: Session, monkeypatch: Any) -> None:

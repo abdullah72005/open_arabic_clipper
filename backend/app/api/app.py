@@ -40,6 +40,7 @@ from app.core.enums import (
     PipelineStage,
     ReconstructionStatus,
     RefinementPriority,
+    RenderExecutionLifecycle,
     RightsRisk,
     RightsStatus,
     StrategyDisposition,
@@ -1753,6 +1754,8 @@ def create_app(
         row = get_render_execution(database, render_execution_id)
         if row is None:
             raise HTTPException(status_code=404, detail="render execution not found")
+        if row.lifecycle is not RenderExecutionLifecycle.COMPLETE or not row.cache_eligible:
+            raise HTTPException(status_code=404, detail="artifact is not available")
         reference = dict(row.artifact_reference or {})
         relative = reference.get("relative_path")
         if not isinstance(relative, str) or not relative:
@@ -1825,6 +1828,11 @@ def create_app(
         )
         if latest is None or latest.status not in {JobStatus.FAILED, JobStatus.CANCELLED}:
             raise HTTPException(status_code=409, detail="source has no failed or cancelled job")
+        if latest.kind is JobKind.RENDER_EXECUTION:
+            raise HTTPException(
+                status_code=409,
+                detail="render executions are retried through the render-execution endpoint",
+            )
         latest.status = JobStatus.QUEUED
         latest.retry_count += 1
         latest.error_code = None

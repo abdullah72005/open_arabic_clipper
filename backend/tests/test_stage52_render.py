@@ -49,6 +49,29 @@ _MIXED_ASS = (
     "{\\c&H00FFFFFF&}أنا كنت content creator لمدة سنتين{\\c&H00FFFFFF&}\n"
 ).encode("utf-8")
 
+# Karaoke accent mask: PrimaryColour is pure red (BGR &H000000FF&); the sung
+# portion reveals red over white as time advances. This encodes real advancing
+# active-token states (no OCR, no re-serialization).
+_ADVANCING_ASS = (
+    "[Script Info]\n"
+    "ScriptType: v4.00+\n"
+    "PlayResX: 1080\n"
+    "PlayResY: 1920\n"
+    "WrapStyle: 2\n"
+    "\n"
+    "[V4+ Styles]\n"
+    "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, "
+    "BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, "
+    "BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
+    "Style: CaptionLower,Noto Sans Arabic,88,&H000000FF,&H00FFFFFF,&H00000000,&H00000000,"
+    "0,0,0,0,100,100,0,0,1,7,3,2,54,162,504,1\n"
+    "\n"
+    "[Events]\n"
+    "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+    "Dialogue: 0,0:00:01.00,0:00:02.50,CaptionLower,,0,0,0,,"
+    "{\\k37}أنا {\\k37}كنت {\\k37}content {\\k37}creator\n"
+).encode("utf-8")
+
 
 def _generate_source(path: Path) -> None:
     subprocess.run(
@@ -176,3 +199,68 @@ def test_real_render_qc_reports_blank_failure_on_black_output(tmp_path: Path) ->
     # The selected source is itself black, so blank output is only a warning.
     assert qc.status in {"PASS", "WARN"}
     assert "QC_BLANK_RENDER" in qc.reason_codes or qc.status == "PASS"
+
+
+def _count_red_frames(ffmpeg_binary: str, path: Path, times: tuple[float, ...]) -> list[int]:
+    width, height = 1080, 1920
+    band_start, band_end = 1300, 1460
+    counts: list[int] = []
+    for time_s in times:
+        completed = subprocess.run(
+            [
+                ffmpeg_binary,
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-ss",
+                f"{time_s:.3f}",
+                "-i",
+                str(path),
+                "-frames:v",
+                "1",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgb24",
+                "pipe:1",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        data = completed.stdout
+        red = 0
+        for row in range(band_start, min(band_end, height)):
+            base = row * width * 3
+            for column in range(width):
+                index = base + column * 3
+                r, g, b = data[index], data[index + 1], data[index + 2]
+                if r > 180 and g < 90 and b < 90:
+                    red += 1
+        counts.append(red)
+    return counts
+
+
+def test_real_render_advances_active_token_highlight(tmp_path: Path) -> None:
+    source = tmp_path / "source.mp4"
+    _generate_source(source)
+    scene = SceneSpec(0, 0, 1.0, 2.5, "SOURCE_AS_IS", "smoothstep-ease")
+    occ = occurred("block-0", 0, 1.0, 2.5, 0.0, (scene,))
+    spec = make_spec(
+        occurrences=(occ,),
+        caption_events=(CaptionEventSpec("event-1", 0, 1.0, 2.5),),
+        source_duration=8.0,
+    )
+    validate_spec(spec)
+    attempt = tmp_path / "attempt"
+    runtime = fake_runtime(source_absolute_path=str(source), attempt_directory=str(attempt))
+    compiled = compile_render(spec, runtime)
+    artifacts = run_compiled_render(
+        compiled,
+        AttemptContext(attempt_directory=attempt, ass_bytes=_ADVANCING_ASS, timeout_seconds=300),
+    )
+    # Source-local caption states map to output times offset by the occurrence start.
+    counts = _count_red_frames(FFMPEG_BIN, artifacts.output_path, (0.15, 0.55, 0.95, 1.35))
+    assert all(count > 0 for count in counts), f"every state must show the active token: {counts}"
+    assert counts == sorted(counts), f"active-token accent must advance: {counts}"
+    assert counts[-1] > counts[0], f"last state must reveal more accent: {counts}"

@@ -96,7 +96,7 @@ def run_compiled_render(compiled: CompiledRender, context: AttemptContext) -> Re
     )
     _localize_ass(attempt_directory, compiled, context)
 
-    poll = _DEFAULT_POLL_SECONDS
+    poll = context.poll_seconds if context.poll_seconds > 0 else _DEFAULT_POLL_SECONDS
     process = subprocess.Popen(  # noqa: S603 - allow-listed argv, shell=False
         list(compiled.argv),
         cwd=str(attempt_directory),
@@ -269,11 +269,19 @@ def _probe_output(binary: str, path: Path) -> dict[str, object]:
         else None,
         "frame_count": _as_int(video.get("nb_frames"), 0) if isinstance(video, Mapping) else 0,
         "avg_frame_rate": video.get("avg_frame_rate") if isinstance(video, Mapping) else None,
+        "video_start_time": _as_float(video.get("start_time"), 0.0)
+        if isinstance(video, Mapping)
+        else 0.0,
+        "video_duration": _stream_duration(video, duration),
         "audio_codec": audio.get("codec_name") if isinstance(audio, Mapping) else None,
         "audio_sample_rate": _as_int(audio.get("sample_rate"), 0)
         if isinstance(audio, Mapping)
         else 0,
         "audio_channels": _as_int(audio.get("channels"), 0) if isinstance(audio, Mapping) else 0,
+        "audio_start_time": _as_float(audio.get("start_time"), 0.0)
+        if isinstance(audio, Mapping)
+        else 0.0,
+        "audio_duration": _stream_duration(audio, duration),
         "streams": {
             "video": sum(
                 1 for s in streams if isinstance(s, Mapping) and s.get("codec_type") == "video"
@@ -300,6 +308,14 @@ def _probe_output(binary: str, path: Path) -> dict[str, object]:
     rotation = _rotation_from_stream(video) if isinstance(video, Mapping) else 0
     result["rotation_degrees"] = rotation
     return result
+
+
+def _stream_duration(stream: object, fallback: float) -> float:
+    if isinstance(stream, Mapping):
+        explicit = _as_float(stream.get("duration"), 0.0)
+        if explicit > 0:
+            return explicit
+    return fallback
 
 
 def _rotation_from_stream(stream: Mapping[str, object]) -> int:

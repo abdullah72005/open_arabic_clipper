@@ -94,6 +94,13 @@ def test_stage_5_2_migration_is_reversible_and_preserves_prior_stages() -> None:
             session.add(
                 ProcessingJob(
                     source_video_id=source.id,
+                    kind=JobKind.INGEST,
+                    status=JobStatus.SUCCEEDED,
+                )
+            )
+            session.add(
+                ProcessingJob(
+                    source_video_id=source.id,
                     kind=JobKind.RENDER_EXECUTION,
                     status=JobStatus.QUEUED,
                 )
@@ -107,9 +114,8 @@ def test_stage_5_2_migration_is_reversible_and_preserves_prior_stages() -> None:
             ).scalar_one()
         assert accepted == 1
 
-        with engine.begin() as connection:
-            connection.execute(text("DELETE FROM processing_jobs WHERE kind = 'RENDER_EXECUTION'"))
-
+        # Downgrade must remove Stage 5.2 jobs/rows itself on a populated
+        # database (no test-side cleanup masking the defect).
         command.downgrade(config, "-1")
         inspector = inspect(engine)
         assert "render_executions" not in inspector.get_table_names()
@@ -117,6 +123,10 @@ def test_stage_5_2_migration_is_reversible_and_preserves_prior_stages() -> None:
         columns = {column["name"] for column in inspector.get_columns("processing_jobs")}
         assert "render_execution_id" not in columns
         with engine.connect() as connection:
+            render_jobs = connection.execute(
+                text("SELECT count(*) FROM processing_jobs WHERE kind = 'RENDER_EXECUTION'")
+            ).scalar_one()
+            jobs = connection.execute(text("SELECT count(*) FROM processing_jobs")).scalar_one()
             sources = connection.execute(
                 text("SELECT count(*) FROM source_videos WHERE source_uri = :uri"),
                 {"uri": "/tmp/stage52-migration.mp4"},
@@ -125,6 +135,8 @@ def test_stage_5_2_migration_is_reversible_and_preserves_prior_stages() -> None:
                 text("SELECT count(*) FROM clip_candidates WHERE source_video_id = :id"),
                 {"id": source_id.replace("-", "")},
             ).scalar_one()
+        assert render_jobs == 0
+        assert jobs == 1
         assert sources == 1
         assert candidates == 1
 

@@ -89,6 +89,24 @@ def test_global_render_admission_excludes_second_connection(engine: Engine) -> N
     second.release()
 
 
+def test_lost_admission_backend_reports_not_held_and_releases(engine: Engine) -> None:
+    first = PostgresRenderAdmission(engine)
+    assert first.acquire(wait_seconds=0, cancel_check=lambda: False) is True
+    connection = first._connection
+    assert connection is not None
+    pid = connection.execute(text("SELECT pg_backend_pid()")).scalar_one()
+    assert first.held() is True
+    # Sever the dedicated backend exactly like a lost/terminated worker.
+    with engine.connect() as killer:
+        killer.execution_options(isolation_level="AUTOCOMMIT")
+        killer.execute(text("SELECT pg_terminate_backend(:pid)"), {"pid": pid})
+    assert first.held() is False
+    first.release()
+    second = PostgresRenderAdmission(engine)
+    assert second.acquire(wait_seconds=0, cancel_check=lambda: False) is True
+    second.release()
+
+
 def test_scoped_current_unique_index_rejects_duplicate_scope(engine: Engine) -> None:
     with Session(engine) as session:
         candidate = _candidate(session)

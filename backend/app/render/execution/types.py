@@ -24,6 +24,8 @@ class CropKeyframeSpec:
     cx: float
     cy: float
     height_fraction: float
+    mode: str = ""
+    confidence: float = 0.0
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -31,6 +33,8 @@ class CropKeyframeSpec:
             "cx": round(self.cx, 6),
             "cy": round(self.cy, 6),
             "height_fraction": round(self.height_fraction, 6),
+            "mode": self.mode,
+            "confidence": round(self.confidence, 6),
         }
 
 
@@ -216,10 +220,14 @@ class RuntimeIdentity:
     font_match: str
     compiler_version: str
     policy_version: str
+    libavcodec_version: str = ""
+    build_config_sha256: str = ""
+    font_sha256: str = ""
     ffmpeg_binary: str = "ffmpeg"
     ffprobe_binary: str = "ffprobe"
     encoder_threads: int = 2
     filter_threads: int = 1
+    filter_complex_threads: int = 1
     source_absolute_path: str = ""
     attempt_directory: str = ""
 
@@ -228,9 +236,12 @@ class RuntimeIdentity:
             "ffmpeg_version": self.ffmpeg_version,
             "ffprobe_version": self.ffprobe_version,
             "libavformat_version": self.libavformat_version,
+            "libavcodec_version": self.libavcodec_version,
             "libass_version": self.libass_version,
             "font_family": self.font_family,
             "font_match": self.font_match,
+            "font_sha256": self.font_sha256,
+            "build_config_sha256": self.build_config_sha256,
             "compiler_version": self.compiler_version,
             "policy_version": self.policy_version,
         }
@@ -270,6 +281,8 @@ class RenderSpec:
     occurrences: tuple[TimelineOccurrence, ...]
     omitted: tuple[OmittedRequirement, ...] = ()
     audio_channels: int = 2
+    source_video_start_seconds: float = 0.0
+    source_audio_start_seconds: float = 0.0
 
     @property
     def output_duration(self) -> float:
@@ -303,6 +316,11 @@ class RenderSpec:
             "output_frame_rate": {
                 "numerator": self.output_frame_rate.numerator,
                 "denominator": self.output_frame_rate.denominator,
+            },
+            "source_stream_origin": {
+                "video_start_seconds": round(self.source_video_start_seconds, 6),
+                "audio_start_seconds": round(self.source_audio_start_seconds, 6),
+                "audio_channels": self.audio_channels,
             },
             "delivery_profile_key": self.delivery_profile_key,
             "plan_input_fingerprint": self.plan_input_fingerprint,
@@ -460,6 +478,7 @@ class AttemptContext:
     cancel_check: Callable[[], bool] = lambda: False
     progress_callback: Callable[[float], None] | None = None
     timeout_seconds: float = 0.0
+    poll_seconds: float = 0.5
     ass_bytes: bytes = b""
 
     def cancelled(self) -> bool:

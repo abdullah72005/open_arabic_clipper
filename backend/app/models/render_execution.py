@@ -202,16 +202,16 @@ class RenderExecution(Base):
     )
 
     policy_version: Mapped[str] = mapped_column(
-        String(64), nullable=False, default="stage5.2-v1", server_default="stage5.2-v1"
+        String(64), nullable=False, default="stage5.2-v2", server_default="stage5.2-v2"
     )
     schema_version: Mapped[str] = mapped_column(
         String(64),
         nullable=False,
-        default="stage5.2-schema-v1",
-        server_default="stage5.2-schema-v1",
+        default="stage5.2-schema-v2",
+        server_default="stage5.2-schema-v2",
     )
     fingerprint_version: Mapped[str] = mapped_column(
-        String(16), nullable=False, default="1", server_default="1"
+        String(16), nullable=False, default="2", server_default="2"
     )
 
     created_at: Mapped[datetime] = mapped_column(

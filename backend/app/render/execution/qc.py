@@ -18,6 +18,7 @@ from fractions import Fraction
 from pathlib import Path
 
 from app.render.execution.policy import (
+    QC_AV_DURATION_TOLERANCE_SECONDS,
     QC_BLACK_FRAME_FRACTION_FAIL,
     QC_BLACK_FRAME_FRACTION_WARN,
     QC_BLACK_LUMA_THRESHOLD,
@@ -72,6 +73,21 @@ def _as_int(value: object, default: int = 0) -> int:
         except ValueError:
             return default
     return default
+
+
+def _ratio(value: object) -> float | None:
+    if not isinstance(value, str) or not value:
+        return None
+    numerator_text, separator, denominator_text = value.partition("/")
+    try:
+        if separator:
+            denominator = float(denominator_text)
+            if denominator == 0:
+                return None
+            return float(numerator_text) / denominator
+        return float(value)
+    except ValueError:
+        return None
 
 
 def _timing_tolerance(frame_rate: Fraction) -> float:
@@ -326,6 +342,62 @@ def check_render_artifact(
         tolerance=tolerance,
     )
 
+    video_duration = _as_float(probe.get("video_duration"), 0.0)
+    audio_duration = _as_float(probe.get("audio_duration"), 0.0)
+    video_start = _as_float(probe.get("video_start_time"), 0.0)
+    audio_start = _as_float(probe.get("audio_start_time"), 0.0)
+    measured["video_duration"] = video_duration
+    measured["audio_duration"] = audio_duration
+    measured["video_start_time"] = video_start
+    measured["audio_start_time"] = audio_start
+    if video_duration > 0.0 and audio_duration > 0.0:
+        record(
+            "av_duration_consistency",
+            abs(video_duration - audio_duration) <= QC_AV_DURATION_TOLERANCE_SECONDS,
+            "QC_AV_TIMING_MISMATCH",
+            measured={"video": video_duration, "audio": audio_duration},
+            expected=expected_duration,
+            tolerance=QC_AV_DURATION_TOLERANCE_SECONDS,
+        )
+    else:
+        checks.append(
+            QCCheck(
+                name="av_duration_consistency",
+                status=QC_WARN,
+                reason_code="QC_TIMING_MISSING",
+            )
+        )
+        reasons.append("QC_TIMING_MISSING")
+    record(
+        "video_start_origin",
+        abs(video_start) <= tolerance,
+        "QC_STREAM_TIMING_MISMATCH",
+        measured=video_start,
+        expected=0.0,
+        tolerance=tolerance,
+    )
+    record(
+        "audio_start_origin",
+        abs(audio_start) <= tolerance,
+        "QC_STREAM_TIMING_MISMATCH",
+        measured=audio_start,
+        expected=0.0,
+        tolerance=tolerance,
+    )
+    measured_fps = _ratio(probe.get("avg_frame_rate"))
+    if measured_fps is not None and frame_rate > 0:
+        record(
+            "frame_rate_matches",
+            abs(measured_fps - float(frame_rate)) <= max(0.05, 0.005 * float(frame_rate)),
+            "QC_FRAME_COUNT_MISMATCH",
+            measured=measured_fps,
+            expected=float(frame_rate),
+        )
+    else:
+        checks.append(
+            QCCheck(name="frame_rate_matches", status="WARN", reason_code="QC_FRAME_COUNT_MISMATCH")
+        )
+
     actual_frames = artifacts.frame_count
     expected_frames = _as_int(expected.get("frame_count"), actual_frames)
     frame_tolerance = max(2, int(round(0.10 * float(frame_rate))))
@@ -514,13 +586,24 @@ def _appearance_checks(
         max_volume = output_volume.get("max", -math.inf)
         mean_volume = output_volume.get("mean", -math.inf)
         if mean_volume <= QC_SILENCE_DBFS:
-            source_volume = (
-                _volume_metrics(qc_policy.ffmpeg_binary, source_path)
+            source_has_sound = (
+                _selected_source_has_sound(qc_policy.ffmpeg_binary, source_path, manifest)
                 if source_path is not None
                 else None
             )
-            source_mean = source_volume.get("mean", -math.inf) if source_volume else None
-            if source_mean is not None and source_mean > QC_SILENCE_DBFS:
+            if source_has_sound is None:
+                measured["source_audio_evidence"] = "unavailable"
+                checks.append(
+                    QCCheck(
+                        name="audio_not_silent",
+                        status=QC_WARN,
+                        reason_code="QC_SOURCE_AUDIO_UNAVAILABLE",
+                        measured={"mean": mean_volume},
+                    )
+                )
+                reasons.append("QC_SOURCE_AUDIO_UNAVAILABLE")
+            elif source_has_sound:
+                measured["source_audio_evidence"] = "sound"
                 checks.append(
                     QCCheck(
                         name="audio_not_silent",
@@ -531,15 +614,8 @@ def _appearance_checks(
                 )
                 reasons.append("QC_TOTAL_SILENCE")
             else:
-                checks.append(
-                    QCCheck(
-                        name="audio_not_silent",
-                        status=QC_WARN,
-                        reason_code="QC_TOTAL_SILENCE",
-                        measured={"mean": mean_volume},
-                    )
-                )
-                reasons.append("QC_TOTAL_SILENCE")
+                measured["source_audio_evidence"] = "silent_selected_span"
+                checks.append(QCCheck(name="audio_not_silent", status="PASS"))
         else:
             checks.append(QCCheck(name="audio_not_silent", status="PASS"))
         if isinstance(max_volume, float) and max_volume >= QC_PEAK_DBFS:
@@ -558,6 +634,46 @@ def _appearance_checks(
         checks.append(
             QCCheck(name="audio_not_silent", status=QC_WARN, reason_code="QC_PROBE_FAILED")
         )
+
+
+def _selected_source_has_sound(
+    binary: str, source_path: Path | None, manifest: Mapping[str, object]
+) -> bool | None:
+    """Do the *selected* source occurrences contain sound?
+
+    Bounded to the selected regions so a long source is never fully decoded.
+    ``None`` means evidence is unavailable (decode/probe failure).
+    """
+
+    if source_path is None:
+        return None
+    timeline = manifest.get("timeline")
+    occurrences = []
+    if isinstance(timeline, Mapping):
+        raw = timeline.get("occurrences")
+        if isinstance(raw, list):
+            occurrences = [item for item in raw if isinstance(item, Mapping)]
+    max_total = 60.0
+    analyzed = 0.0
+    any_evidence = False
+    for occurrence in occurrences:
+        if analyzed >= max_total:
+            break
+        start = _as_float(occurrence.get("source_start"))
+        end = _as_float(occurrence.get("source_end"))
+        duration = min(max(0.0, end - start), max_total - analyzed)
+        if duration <= 0.05:
+            continue
+        metrics = _volume_metrics(binary, source_path, start, start + duration)
+        analyzed += duration
+        if metrics is None:
+            continue
+        any_evidence = True
+        if metrics.get("mean", -math.inf) > QC_SILENCE_DBFS:
+            return True
+    if not any_evidence:
+        return None
+    return False
 
 
 __all__ = ["check_render_artifact"]

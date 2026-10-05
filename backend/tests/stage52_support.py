@@ -24,6 +24,7 @@ def fake_runtime(
     attempt_directory: str = "/tmp/attempt",
     encoder_threads: int = 2,
     filter_threads: int = 1,
+    filter_complex_threads: int = 1,
 ) -> RuntimeIdentity:
     return RuntimeIdentity(
         ffmpeg_version="ffmpeg version test",
@@ -38,6 +39,7 @@ def fake_runtime(
         ffprobe_binary="ffprobe",
         encoder_threads=encoder_threads,
         filter_threads=filter_threads,
+        filter_complex_threads=filter_complex_threads,
         source_absolute_path=source_absolute_path,
         attempt_directory=attempt_directory,
     )
@@ -98,6 +100,8 @@ def make_spec(
     rotation_degrees: int = 0,
     pixel_aspect_ratio: float = 1.0,
     audio_channels: int = 2,
+    source_video_start: float = 0.0,
+    source_audio_start: float = 0.0,
 ) -> RenderSpec:
     if occurrences is None:
         occurrences = (
@@ -188,6 +192,8 @@ def make_spec(
         occurrences=tuple(occurrences),
         omitted=tuple(omitted),
         audio_channels=audio_channels,
+        source_video_start_seconds=source_video_start,
+        source_audio_start_seconds=source_audio_start,
     )
 
 

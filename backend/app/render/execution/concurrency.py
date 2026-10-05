@@ -112,7 +112,19 @@ class PostgresRenderAdmission:
             if connection.closed:
                 self._connection = None
                 return False
+            granted = connection.execute(
+                text(
+                    "SELECT count(*) FROM pg_locks "
+                    "WHERE locktype = 'advisory' AND pid = pg_backend_pid() AND granted"
+                )
+            ).scalar()
         except Exception:
+            # A terminated/severed dedicated backend no longer owns admission;
+            # never pretend a lost lock is still held.
+            self._connection = None
+            return False
+        if not granted:
+            self._connection = None
             return False
         return True
 

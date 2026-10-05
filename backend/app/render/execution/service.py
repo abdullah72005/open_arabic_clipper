@@ -12,6 +12,8 @@ FINAL_CLIP binding invalidates the request.
 
 from __future__ import annotations
 
+import hashlib
+import math
 import subprocess
 import uuid
 from collections.abc import Mapping, Sequence
@@ -19,9 +21,9 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from fractions import Fraction
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
-from sqlalchemy import select
+from sqlalchemy import exists, select, update
 from sqlalchemy.orm import Session
 
 from app.composition.geometry import FFprobeDisplayProbe
@@ -29,12 +31,13 @@ from app.composition.policy import FramingMode
 from app.composition.service import read_visual_composition
 from app.core.enums import (
     CandidateDisposition,
+    JobStatus,
     RenderArtifactPurpose,
     RenderExecutionLifecycle,
     RenderQCStatus,
 )
 from app.core.settings import Settings, get_settings
-from app.models import ClipCandidate, VisualCompositionPlan
+from app.models import ClipCandidate, ProcessingJob, VisualCompositionPlan
 from app.models.render_contract import RenderContract
 from app.models.render_execution import RenderExecution
 from app.render.execution.fingerprints import (
@@ -85,7 +88,15 @@ _VALID_DISPOSITIONS = {
     CandidateDisposition.CANDIDATE_NEEDS_REFINEMENT,
 }
 
-_CROP_MODES = frozenset(mode.value for mode in FramingMode)
+_CROP_MODES = frozenset(
+    {
+        FramingMode.STATIC_CROP.value,
+        FramingMode.TRACKED_CROP.value,
+        FramingMode.MULTI_SUBJECT_FIT.value,
+        FramingMode.CENTER_FALLBACK.value,
+    }
+)
+_ALL_MODES = frozenset(mode.value for mode in FramingMode)
 
 
 class RenderExecutionError(ValueError):
@@ -109,6 +120,79 @@ class RenderPrerequisites:
     candidate: ClipCandidate
     contract: RenderContract
     plan: VisualCompositionPlan
+
+
+@dataclass(frozen=True)
+class SourceStreamFacts:
+    """Resolved source stream origin used to build the shared output timeline."""
+
+    video_start_seconds: float
+    audio_start_seconds: float
+    audio_channels: int
+    verified: bool
+
+
+def _resolve_source_streams(
+    source_path: Path,
+    settings: Settings,
+    stream_probe: Any | None,
+) -> SourceStreamFacts:
+    if stream_probe is not None:
+        channels = stream_probe(source_path, settings)
+        audio_channels = channels if isinstance(channels, int) and channels > 0 else 2
+        return SourceStreamFacts(0.0, 0.0, audio_channels, False)
+    facts = _probe_source_stream_facts(source_path, settings)
+    if facts is None:
+        return SourceStreamFacts(0.0, 0.0, 2, False)
+    return facts
+
+
+def _probe_source_stream_facts(source_path: Path, settings: Settings) -> SourceStreamFacts | None:
+    """Probe per-stream start offsets and audio channels; ``None`` when unavailable."""
+
+    command = [
+        settings.ffprobe_binary,
+        "-v",
+        "error",
+        "-show_entries",
+        "stream=codec_type,start_time,channels",
+        "-of",
+        "json",
+        str(source_path),
+    ]
+    try:
+        completed = subprocess.run(command, check=True, capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    try:
+        import json
+
+        payload = json.loads(completed.stdout or "{}")
+    except ValueError:
+        return None
+    streams = payload.get("streams") if isinstance(payload, Mapping) else None
+    if not isinstance(streams, list):
+        return None
+    video_start: float | None = None
+    audio_start: float | None = None
+    audio_channels = 2
+    for stream in streams:
+        if not isinstance(stream, Mapping):
+            continue
+        kind = stream.get("codec_type")
+        start = stream.get("start_time")
+        start_value = _as_float(start, 0.0) if start is not None else 0.0
+        if kind == "video" and video_start is None:
+            video_start = start_value
+        elif kind == "audio" and audio_start is None:
+            audio_start = start_value
+            channels = _as_int(stream.get("channels"), 2)
+            audio_channels = channels if channels > 0 else 2
+    if video_start is None or audio_start is None:
+        return None
+    if video_start < -0.05 or audio_start < -0.05:
+        return None
+    return SourceStreamFacts(video_start, audio_start, audio_channels, True)
 
 
 def _as_float(value: object, default: float = 0.0) -> float:
@@ -147,6 +231,49 @@ def _sequence(value: object) -> list[Any]:
     return []
 
 
+def _strict_float(value: object, reason_code: str) -> float:
+    """Return a finite float or fail closed; never invent a replacement value."""
+
+    if isinstance(value, bool):
+        raise RenderExecutionError(reason_code)
+    if isinstance(value, (int, float)):
+        parsed = float(value)
+    elif isinstance(value, str):
+        try:
+            parsed = float(value)
+        except ValueError as error:
+            raise RenderExecutionError(reason_code) from error
+    else:
+        raise RenderExecutionError(reason_code)
+    if not math.isfinite(parsed):
+        raise RenderExecutionError(reason_code)
+    return parsed
+
+
+def _strict_str(value: object, reason_code: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise RenderExecutionError(reason_code)
+    return value
+
+
+def _strict_int(value: object, reason_code: str, default: int | None = None) -> int:
+    if isinstance(value, bool) or value is None:
+        if default is not None:
+            return default
+        raise RenderExecutionError(reason_code)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, (float, str)):
+        try:
+            parsed = int(float(value))
+        except ValueError as error:
+            raise RenderExecutionError(reason_code) from error
+        return parsed
+    if default is not None:
+        return default
+    raise RenderExecutionError(reason_code)
+
+
 # Read
 
 
@@ -168,7 +295,10 @@ def get_current_render_execution(
     )
     if delivery_profile_key:
         query = query.where(RenderExecution.delivery_profile_key == delivery_profile_key)
-    return session.scalars(query.order_by(RenderExecution.created_at.desc())).first()
+    return cast(
+        "RenderExecution | None",
+        session.scalars(query.order_by(RenderExecution.created_at.desc())).first(),
+    )
 
 
 def get_render_execution(
@@ -177,7 +307,7 @@ def get_render_execution(
     execution_uuid = _as_uuid(render_execution_id)
     if execution_uuid is None:
         return None
-    return session.get(RenderExecution, execution_uuid)
+    return cast("RenderExecution | None", session.get(RenderExecution, execution_uuid))
 
 
 def read_render_execution(
@@ -314,6 +444,7 @@ def build_render_spec(
     profile = delivery_profile_for(delivery_profile_key)
     if profile is None:
         raise RenderExecutionError("UNSUPPORTED_DELIVERY_PROFILE")
+    config = settings.stage52_config()
 
     prerequisites = validate_candidate_for_render(session, candidate.id, settings=settings)
     contract = prerequisites.contract
@@ -357,11 +488,7 @@ def build_render_spec(
     if target_frame_rate <= 0:
         target_frame_rate = source_frame_rate if source_frame_rate > 0 else 30.0
 
-    audio_channels = 2
-    if stream_probe is not None:
-        channels = stream_probe(source_path, settings)
-        if isinstance(channels, int) and channels > 0:
-            audio_channels = channels
+    source_streams = _resolve_source_streams(source_path, settings, stream_probe)
 
     ass_meta = _mapping(plan_payload.get("ass"))
     ass_relative = str(ass_meta.get("asset_path") or "")
@@ -391,6 +518,12 @@ def build_render_spec(
         raise RenderExecutionError(error.reason_code) from error
 
     occurrences, omitted = _occurrences(contract_payload, plan_payload)
+    source_duration = _as_float(probe.get("duration_seconds"), 0.0)
+    if source_duration > config.max_source_duration_seconds + 1e-6:
+        raise RenderExecutionError("SOURCE_DURATION_EXCEEDS_LIMIT")
+    output_duration = sum(max(0.0, occ.source_end - occ.source_start) for occ in occurrences)
+    if output_duration > config.max_output_duration_seconds + 1e-6:
+        raise RenderExecutionError("OUTPUT_DURATION_EXCEEDS_LIMIT")
     spec = RenderSpec(
         render_execution_id="",  # filled by the caller (job-scoped identity)
         candidate_id=str(candidate.id),
@@ -404,7 +537,7 @@ def build_render_spec(
         ),
         source_size_bytes=stat.st_size,
         source_mtime_ns=stat.st_mtime_ns,
-        source_duration=_as_float(probe.get("duration_seconds"), 0.0),
+        source_duration=source_duration,
         source_frame_rate=_fraction(source_frame_rate, 30.0),
         display_width=_as_int(geometry.get("display_width"), width),
         display_height=_as_int(geometry.get("display_height"), height),
@@ -423,7 +556,9 @@ def build_render_spec(
         caption_events=caption_events,
         occurrences=occurrences,
         omitted=omitted,
-        audio_channels=audio_channels,
+        audio_channels=source_streams.audio_channels,
+        source_video_start_seconds=source_streams.video_start_seconds,
+        source_audio_start_seconds=source_streams.audio_start_seconds,
     )
     try:
         validate_spec(spec)
@@ -450,10 +585,14 @@ def _caption_events(plan_payload: Mapping[str, object]) -> tuple[CaptionEventSpe
         event = _mapping(raw)
         events.append(
             CaptionEventSpec(
-                event_id=str(event.get("event_id") or f"event-{index}"),
-                block_index=_as_int(event.get("block_index"), 0),
-                start=_as_float(event.get("start"), 0.0),
-                end=_as_float(event.get("end"), 0.0),
+                event_id=_strict_str(event.get("event_id"), "ASS_METADATA_MISMATCH")
+                if event.get("event_id")
+                else f"event-{index}",
+                block_index=_strict_int(
+                    event.get("block_index"), "ASS_METADATA_MISMATCH", default=0
+                ),
+                start=_strict_float(event.get("start"), "ASS_METADATA_MISMATCH"),
+                end=_strict_float(event.get("end"), "ASS_METADATA_MISMATCH"),
             )
         )
     return tuple(events)
@@ -465,29 +604,33 @@ def _occurrences(
 ) -> tuple[tuple[TimelineOccurrence, ...], tuple[OmittedRequirement, ...]]:
     scenes_by_block: dict[int, list[SceneSpec]] = {}
     for index, raw in enumerate(_sequence(plan_payload.get("scenes"))):
-        scene = _mapping(raw)
-        block_index = _as_int(scene.get("block_index"), 0)
+        if not isinstance(raw, Mapping):
+            raise RenderExecutionError("SCENE_BOUNDS_INVALID")
+        scene = raw
+        block_index = _strict_int(scene.get("block_index"), "SCENE_BLOCK_MISMATCH", default=index)
+        source_start = _strict_float(scene.get("source_start"), "SCENE_BOUNDS_INVALID")
+        source_end = _strict_float(scene.get("source_end"), "SCENE_BOUNDS_INVALID")
+        mode = _strict_str(scene.get("framing_mode"), "UNSUPPORTED_FRAMING_MODE")
+        interpolation = _strict_str(scene.get("interpolation_policy"), "UNSUPPORTED_INTERPOLATION")
         keyframes = tuple(
-            CropKeyframeSpec(
-                t=_as_float(frame.get("t"), 0.0),
-                cx=_as_float(frame.get("cx"), 0.5),
-                cy=_as_float(frame.get("cy"), 0.5),
-                height_fraction=_as_float(frame.get("height_fraction"), 1.0),
-            )
+            _keyframe(frame, mode)
             for frame in _sequence(scene.get("crop_keyframes"))
             if isinstance(frame, Mapping)
         )
-        mode = str(scene.get("framing_mode") or FramingMode.CENTER_FALLBACK.value)
+        if len(keyframes) != len(_sequence(scene.get("crop_keyframes"))):
+            raise RenderExecutionError("KEYFRAME_GEOMETRY_INVALID")
         if not keyframes and mode in _CROP_MODES:
             raise RenderExecutionError("CONTRADICTORY_FRAMING_EVIDENCE")
         scenes_by_block.setdefault(block_index, []).append(
             SceneSpec(
-                scene_index=_as_int(scene.get("scene_index"), index),
+                scene_index=_strict_int(
+                    scene.get("scene_index"), "SCENE_BOUNDS_INVALID", default=index
+                ),
                 block_index=block_index,
-                source_start=_as_float(scene.get("source_start"), 0.0),
-                source_end=_as_float(scene.get("source_end"), 0.0),
+                source_start=source_start,
+                source_end=source_end,
                 framing_mode=mode,
-                interpolation_policy=str(scene.get("interpolation_policy") or "smoothstep-ease"),
+                interpolation_policy=interpolation,
                 crop_keyframes=keyframes,
             )
         )
@@ -498,8 +641,10 @@ def _occurrences(
     omitted: list[OmittedRequirement] = []
     cursor = 0.0
     for raw in _sequence(contract_payload.get("blocks")):
-        block = _mapping(raw)
-        block_index = _as_int(block.get("block_index"), 0)
+        if not isinstance(raw, Mapping):
+            raise RenderExecutionError("OCCURRENCE_BOUNDS_INVALID")
+        block = raw
+        block_index = _strict_int(block.get("block_index"), "OCCURRENCE_BOUNDS_INVALID", default=0)
         block_type = str(block.get("block_type") or "")
         slot_kind = str(block.get("slot_kind") or "")
         if block_type == "SOURCE_EXCERPT":
@@ -508,8 +653,8 @@ def _occurrences(
             end = binding.get("final_clip_end")
             if not bool(binding.get("rebind_valid", True)) or start is None or end is None:
                 raise RenderExecutionError("OCCURRENCE_BOUNDS_INVALID")
-            start_f = _as_float(start)
-            end_f = _as_float(end)
+            start_f = _strict_float(start, "OCCURRENCE_BOUNDS_INVALID")
+            end_f = _strict_float(end, "OCCURRENCE_BOUNDS_INVALID")
             scenes = tuple(scenes_by_block.get(block_index, ()))
             occurrences.append(
                 TimelineOccurrence(
@@ -559,6 +704,23 @@ def _occurrences(
     return tuple(occurrences), tuple(omitted)
 
 
+def _keyframe(frame: Mapping[str, object], scene_mode: str) -> CropKeyframeSpec:
+    keyframe_mode = _strict_str(frame.get("mode"), "CONTRADICTORY_FRAMING_EVIDENCE")
+    if keyframe_mode not in _ALL_MODES:
+        raise RenderExecutionError("CONTRADICTORY_FRAMING_EVIDENCE")
+    both_crop = scene_mode in _CROP_MODES and keyframe_mode in _CROP_MODES
+    if keyframe_mode != scene_mode and not both_crop:
+        raise RenderExecutionError("CONTRADICTORY_FRAMING_EVIDENCE")
+    return CropKeyframeSpec(
+        t=_strict_float(frame.get("t"), "KEYFRAME_GEOMETRY_INVALID"),
+        cx=_strict_float(frame.get("cx"), "KEYFRAME_GEOMETRY_INVALID"),
+        cy=_strict_float(frame.get("cy"), "KEYFRAME_GEOMETRY_INVALID"),
+        height_fraction=_strict_float(frame.get("height_fraction"), "KEYFRAME_GEOMETRY_INVALID"),
+        mode=keyframe_mode,
+        confidence=_as_float(frame.get("confidence"), 0.0),
+    )
+
+
 def _omission_reason(block_type: str, slot_kind: str) -> str:
     if block_type == "ORIGINAL_VALUE":
         return "AUTHORED_NARRATION_MATERIALIZATION_REQUIRED"
@@ -574,6 +736,41 @@ def _omission_reason(block_type: str, slot_kind: str) -> str:
 # Runtime + fingerprints
 
 
+_RUNTIME_VERSION_CACHE: dict[tuple[str, str, str], dict[str, str]] = {}
+
+
+def _runtime_version_fields(
+    ffmpeg_binary: str, ffprobe_binary: str, font_family: str
+) -> dict[str, str]:
+    key = (ffmpeg_binary, ffprobe_binary, font_family)
+    cached = _RUNTIME_VERSION_CACHE.get(key)
+    if cached is not None:
+        return cached
+    ffmpeg_text = _binary_output(ffmpeg_binary, "-version")
+    ffprobe_text = _binary_output(ffprobe_binary, "-version")
+    buildconf_text = _binary_output(ffmpeg_binary, "-buildconf")
+    ffmpeg_version = (ffmpeg_text.splitlines()[0] if ffmpeg_text else "") or ffmpeg_binary
+    ffprobe_version = (ffprobe_text.splitlines()[0] if ffprobe_text else "") or ffprobe_binary
+    configuration = _configuration_line(buildconf_text) or _configuration_line(ffmpeg_text)
+    font_match = _font_match(font_family)
+    fields = {
+        "ffmpeg_version": ffmpeg_version,
+        "ffprobe_version": ffprobe_version,
+        "libavformat_version": _lib_version(ffmpeg_text, "libavformat") or ffmpeg_version,
+        "libavcodec_version": _lib_version(ffmpeg_text, "libavcodec") or ffmpeg_version,
+        "libass_version": _lib_version(ffmpeg_text, "libass")
+        or _version_token(ffmpeg_text, "--enable-libass")
+        or "unavailable",
+        "font_match": font_match,
+        "font_sha256": _font_sha256(font_match),
+        "build_config_sha256": (
+            hashlib.sha256(configuration.encode("utf-8")).hexdigest() if configuration else ""
+        ),
+    }
+    _RUNTIME_VERSION_CACHE[key] = fields
+    return fields
+
+
 def resolve_runtime_identity(
     settings: Settings,
     *,
@@ -582,27 +779,72 @@ def resolve_runtime_identity(
 ) -> RuntimeIdentity:
     ffmpeg_binary = settings.ffmpeg_binary
     ffprobe_binary = settings.ffprobe_binary
-    ffmpeg_version = _first_line([ffmpeg_binary, "-version"])
-    ffprobe_version = _first_line([ffprobe_binary, "-version"])
-    libass_version = _version_token(ffmpeg_version, "--enable-libass")
-    config = settings.stage52_config()
     font_family = settings.visual_caption_font_family
-    return RuntimeIdentity(
-        ffmpeg_version=ffmpeg_version or ffmpeg_binary,
-        ffprobe_version=ffprobe_version or ffprobe_binary,
-        libavformat_version=_version_token(ffmpeg_version, "libavformat"),
-        libass_version=libass_version,
+    config = settings.stage52_config()
+    fields = _runtime_version_fields(ffmpeg_binary, ffprobe_binary, font_family)
+    identity = RuntimeIdentity(
+        ffmpeg_version=fields["ffmpeg_version"],
+        ffprobe_version=fields["ffprobe_version"],
+        libavformat_version=fields["libavformat_version"],
+        libavcodec_version=fields["libavcodec_version"],
+        libass_version=fields["libass_version"],
         font_family=font_family,
-        font_match=_font_match(font_family),
+        font_match=fields["font_match"],
+        font_sha256=fields["font_sha256"],
+        build_config_sha256=fields["build_config_sha256"],
         compiler_version=EXECUTION_POLICY_VERSION,
         policy_version=EXECUTION_POLICY_VERSION,
         ffmpeg_binary=ffmpeg_binary,
         ffprobe_binary=ffprobe_binary,
         encoder_threads=config.encoder_threads,
         filter_threads=config.filter_threads,
+        filter_complex_threads=config.filter_complex_threads,
         source_absolute_path=source_absolute_path,
         attempt_directory=attempt_directory,
     )
+    return identity
+
+
+def _binary_output(binary: str, flag: str) -> str:
+    try:
+        completed = subprocess.run(
+            [binary, flag], check=True, capture_output=True, text=True, timeout=30
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return completed.stdout or ""
+
+
+def _configuration_line(text: str) -> str:
+    for line in text.splitlines():
+        if line.strip().startswith("configuration:"):
+            return line.strip()
+        if line.strip().startswith("--"):
+            return line.strip()
+    return ""
+
+
+def _lib_version(text: str, name: str) -> str:
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(name):
+            parts = stripped.split()
+            if len(parts) >= 2:
+                return f"{parts[0]} {parts[1]}"
+    return ""
+
+
+def _font_sha256(font_match: str) -> str:
+    if not font_match:
+        return ""
+    candidate = font_match.split(":", 1)[0]
+    path = Path(candidate)
+    if not path.is_file():
+        return ""
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return ""
 
 
 def request_input_fingerprint(spec: RenderSpec, config: Stage52Config) -> str:
@@ -611,6 +853,7 @@ def request_input_fingerprint(spec: RenderSpec, config: Stage52Config) -> str:
         "spec": spec.as_dict(),
         "delivery_profile": profile.as_dict() if profile is not None else {},
         "policy": stage52_config_payload(config),
+        "qc_policy": qc_payload(config),
     }
     return render_request_fingerprint(payload)
 
@@ -690,7 +933,7 @@ def persist_envelope(
         .where(RenderExecution.input_fingerprint == input_fingerprint)
     ).first()
     if existing is not None:
-        return existing
+        return cast(RenderExecution, existing)
     row = RenderExecution(
         id=uuid.uuid4(),
         source_video_id=candidate.source_video_id,
@@ -760,36 +1003,121 @@ def qc_fingerprint(config: Stage52Config) -> str:
     return render_qc_fingerprint(qc_payload(config))
 
 
-def cache_hit(
-    session: Session, candidate_id: uuid.UUID, settings: Settings
-) -> RenderExecution | None:
-    """Return a current, valid, cache-eligible COMPLETE execution when one exists."""
+def _job_owns(job_id: uuid.UUID, claim_version: int, statuses: Sequence[JobStatus]) -> Any:
+    """Correlated EXISTS predicate: the executing job still owns its claim."""
 
-    row = get_current_render_execution(session, candidate_id)
-    if row is None:
-        return None
-    if row.lifecycle is not RenderExecutionLifecycle.COMPLETE:
-        return None
-    if not row.cache_eligible:
-        return None
-    if row.qc_status not in {RenderQCStatus.PASS, RenderQCStatus.WARN}:
-        return None
-    reference = _mapping(row.artifact_reference)
-    relative = reference.get("relative_path")
-    if not isinstance(relative, str) or not relative:
-        return None
-    storage = StorageService(settings.storage_root)
-    path = (storage.storage_root / relative).resolve()
-    try:
-        path.relative_to(storage.storage_root)
-    except ValueError:
-        return None
-    if not path.is_file() or path.stat().st_size <= 0:
-        return None
-    expected_hash = str(reference.get("sha256") or "")
-    if expected_hash and sha256_file(path).lower() != expected_hash.lower():
-        return None
-    return row
+    return exists(
+        select(ProcessingJob.id).where(
+            ProcessingJob.id == job_id,
+            ProcessingJob.claim_version == claim_version,
+            ProcessingJob.status.in_(tuple(statuses)),
+        )
+    )
+
+
+def _execution_fence(row_id: uuid.UUID, job_id: uuid.UUID, claim_version: int) -> tuple[Any, ...]:
+    return (
+        RenderExecution.id == row_id,
+        RenderExecution.active_job_id == job_id,
+        _job_owns(job_id, claim_version, (JobStatus.RUNNING,)),
+    )
+
+
+def _job_status_is(job_id: uuid.UUID, statuses: Sequence[JobStatus]) -> Any:
+    return exists(
+        select(ProcessingJob.id).where(
+            ProcessingJob.id == job_id, ProcessingJob.status.in_(tuple(statuses))
+        )
+    )
+
+
+def begin_attempt(
+    session: Session, row_id: uuid.UUID, *, job_id: uuid.UUID, claim_version: int
+) -> bool:
+    """Owned atomic transition into a fresh attempt, resetting cache/attempt state.
+
+    Resets cache eligibility, QC verdict, and the previously published artifact
+    pointer in one fenced UPDATE so an earlier success can never be exposed as
+    the authoritative result of the new attempt, and the
+    ``ck_render_executions_cache_consistency`` check always holds.
+    """
+
+    result = session.execute(
+        update(RenderExecution)
+        .where(*_execution_fence(row_id, job_id, claim_version))
+        .values(
+            lifecycle=RenderExecutionLifecycle.RENDERING,
+            cache_eligible=False,
+            qc_status=None,
+            artifact_reference={},
+            execution_manifest={},
+            qc_result={},
+            output_fingerprint="",
+            reason_codes=[],
+            error_code=None,
+            error_message=None,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    return int(result.rowcount) == 1
+
+
+def set_lifecycle_fenced(
+    session: Session,
+    row_id: uuid.UUID,
+    lifecycle: RenderExecutionLifecycle,
+    *,
+    job_id: uuid.UUID,
+    claim_version: int,
+) -> bool:
+    result = session.execute(
+        update(RenderExecution)
+        .where(*_execution_fence(row_id, job_id, claim_version))
+        .values(lifecycle=lifecycle)
+        .execution_options(synchronize_session=False)
+    )
+    return int(result.rowcount) == 1
+
+
+def release_active_job(session: Session, row_id: uuid.UUID, *, job_id: uuid.UUID) -> None:
+    session.execute(
+        update(RenderExecution)
+        .where(RenderExecution.id == row_id, RenderExecution.active_job_id == job_id)
+        .values(active_job_id=None)
+        .execution_options(synchronize_session=False)
+    )
+
+
+def cancel_execution(session: Session, row_id: uuid.UUID, *, job_id: uuid.UUID) -> bool:
+    """Fenced cancellation: only the authoritative active job cancels the row.
+
+    Deliberately keys on ``active_job_id`` (not job status) so a queued job that
+    was cancelled through the API is still able to finalize its own row, while a
+    superseded job whose row is owned by a newer attempt cannot.
+    """
+
+    result = session.execute(
+        update(RenderExecution)
+        .where(
+            RenderExecution.id == row_id,
+            RenderExecution.active_job_id == job_id,
+            _job_status_is(job_id, (JobStatus.CANCELLED,)),
+        )
+        .values(
+            lifecycle=RenderExecutionLifecycle.CANCELLED,
+            cache_eligible=False,
+            qc_status=None,
+            artifact_reference={},
+            execution_manifest={},
+            qc_result={},
+            output_fingerprint="",
+            reason_codes=[],
+            error_code=None,
+            active_job_id=None,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    return int(result.rowcount) == 1
 
 
 def finalize_success(
@@ -802,49 +1130,223 @@ def finalize_success(
     runtime_fp: str,
     storage: StorageService,
     config: Stage52Config,
-) -> None:
+    job_id: uuid.UUID | None = None,
+    claim_version: int = -1,
+) -> bool:
+    """Publish a successful artifact under an optional ownership fence."""
+
     reference = execution_artifact_reference(storage, artifacts)
-    row.lifecycle = RenderExecutionLifecycle.COMPLETE
-    row.qc_status = RenderQCStatus(qc.status)
-    row.execution_manifest = dict(artifacts.manifest)
-    row.qc_result = qc.as_dict()
-    row.artifact_reference = reference
-    row.compiler_fingerprint = compiled_fingerprint_value
-    row.runtime_fingerprint = runtime_fp
-    row.qc_fingerprint = qc_fingerprint(config)
-    row.output_fingerprint = output_fingerprint(row, artifacts, qc)
-    row.cache_eligible = qc.status in {"PASS", "WARN"}
-    row.reason_codes = list(qc.reason_codes)
-    row.error_code = None
-    row.error_message = None
-    row.active_job_id = None
-    session.flush()
+    qc_fp = qc_fingerprint(config)
+    input_fp = row.input_fingerprint
+    output_fp = render_output_fingerprint(
+        {
+            "artifact": artifacts.as_dict(),
+            "qc": qc.as_dict(),
+            "input_fingerprint": input_fp,
+            "qc_fingerprint": qc_fp,
+        }
+    )
+    values: dict[str, Any] = dict(
+        lifecycle=RenderExecutionLifecycle.COMPLETE,
+        qc_status=RenderQCStatus(qc.status),
+        execution_manifest=dict(artifacts.manifest),
+        qc_result=qc.as_dict(),
+        artifact_reference=reference,
+        compiler_fingerprint=compiled_fingerprint_value,
+        runtime_fingerprint=runtime_fp,
+        qc_fingerprint=qc_fp,
+        output_fingerprint=output_fp,
+        cache_eligible=qc.status in {"PASS", "WARN"},
+        reason_codes=list(qc.reason_codes),
+        error_code=None,
+        error_message=None,
+        active_job_id=None,
+    )
+    if job_id is None:
+        for key, value in values.items():
+            setattr(row, key, value)
+        if row.output_fingerprint != output_fp:
+            row.output_fingerprint = output_fp
+        session.flush()
+        return True
+    result = session.execute(
+        update(RenderExecution)
+        .where(*_execution_fence(row.id, job_id, claim_version))
+        .values(**values)
+        .execution_options(synchronize_session=False)
+    )
+    return int(result.rowcount) == 1
 
 
-def mark_blocked(session: Session, row: RenderExecution, reason_code: str) -> None:
-    row.lifecycle = RenderExecutionLifecycle.BLOCKED
-    row.reason_codes = [reason_code]
-    row.error_code = reason_code
-    row.cache_eligible = False
-    row.active_job_id = None
-    session.flush()
+def mark_blocked(
+    session: Session,
+    row: RenderExecution,
+    reason_code: str,
+    *,
+    job_id: uuid.UUID | None = None,
+    claim_version: int = -1,
+) -> bool:
+    return _mark_terminal(
+        session,
+        row,
+        RenderExecutionLifecycle.BLOCKED,
+        reason_code,
+        job_id=job_id,
+        claim_version=claim_version,
+    )
 
 
-def mark_failed(session: Session, row: RenderExecution, reason_code: str) -> None:
-    row.lifecycle = RenderExecutionLifecycle.FAILED
-    row.reason_codes = [reason_code]
-    row.error_code = reason_code
-    row.cache_eligible = False
-    row.qc_status = RenderQCStatus.FAIL
-    row.active_job_id = None
-    session.flush()
+def mark_failed(
+    session: Session,
+    row: RenderExecution,
+    reason_code: str,
+    *,
+    qc: TechnicalQCResult | None = None,
+    job_id: uuid.UUID | None = None,
+    claim_version: int = -1,
+) -> bool:
+    return _mark_terminal(
+        session,
+        row,
+        RenderExecutionLifecycle.FAILED,
+        reason_code,
+        qc=qc,
+        job_id=job_id,
+        claim_version=claim_version,
+    )
 
 
-def mark_cancelled(session: Session, row: RenderExecution) -> None:
-    row.lifecycle = RenderExecutionLifecycle.CANCELLED
-    row.cache_eligible = False
-    row.active_job_id = None
-    session.flush()
+def mark_cancelled(
+    session: Session,
+    row: RenderExecution,
+    *,
+    job_id: uuid.UUID | None = None,
+    claim_version: int = -1,
+) -> bool:
+    return _mark_terminal(
+        session,
+        row,
+        RenderExecutionLifecycle.CANCELLED,
+        "RENDER_CANCELLED",
+        job_id=job_id,
+        claim_version=claim_version,
+    )
+
+
+def _mark_terminal(
+    session: Session,
+    row: RenderExecution,
+    lifecycle: RenderExecutionLifecycle,
+    reason_code: str,
+    *,
+    qc: TechnicalQCResult | None = None,
+    job_id: uuid.UUID | None = None,
+    claim_version: int = -1,
+) -> bool:
+    values: dict[str, Any] = dict(
+        lifecycle=lifecycle,
+        cache_eligible=False,
+        qc_status=(RenderQCStatus(qc.status) if qc is not None and qc.status == "FAIL" else None),
+        artifact_reference={},
+        execution_manifest=dict(qc.measured) if qc is not None else {},
+        qc_result=qc.as_dict() if qc is not None else {},
+        output_fingerprint="",
+        reason_codes=[reason_code],
+        error_code=reason_code,
+        active_job_id=None,
+    )
+    if job_id is None:
+        for key, value in values.items():
+            setattr(row, key, value)
+        session.flush()
+        return True
+    result = session.execute(
+        update(RenderExecution)
+        .where(*_execution_fence(row.id, job_id, claim_version))
+        .values(**values)
+        .execution_options(synchronize_session=False)
+    )
+    return int(result.rowcount) == 1
+
+
+def cache_hit(
+    session: Session,
+    candidate_id: uuid.UUID,
+    settings: Settings,
+    *,
+    expected_input_fingerprint: str | None = None,
+    runtime_identity: RuntimeIdentity | None = None,
+) -> RenderExecution | None:
+    """Return a current, valid, cache-eligible COMPLETE execution when one exists.
+
+    Validates artifact existence/size/digest, lifecycle/QC, current upstream
+    dependencies, rendering runtime identity, and QC identity. Any mismatch
+    returns ``None`` so the request re-enters execution rather than reusing a
+    stale verdict or a missing/corrupt artifact.
+    """
+
+    config = settings.stage52_config()
+    row = get_current_render_execution(session, candidate_id)
+    if row is None:
+        return None
+    if (
+        expected_input_fingerprint is not None
+        and row.input_fingerprint != expected_input_fingerprint
+    ):
+        return None
+    if row.lifecycle is not RenderExecutionLifecycle.COMPLETE:
+        return None
+    if not row.cache_eligible:
+        return None
+    if row.qc_status not in {RenderQCStatus.PASS, RenderQCStatus.WARN}:
+        return None
+    if row.qc_fingerprint and row.qc_fingerprint != qc_fingerprint(config):
+        return None
+    reference = _mapping(row.artifact_reference)
+    relative = reference.get("relative_path")
+    if not isinstance(relative, str) or not relative:
+        return None
+    storage = StorageService(settings.storage_root)
+    path = (storage.storage_root / relative).resolve()
+    try:
+        path.relative_to(storage.storage_root)
+    except ValueError:
+        return None
+    if not path.is_file():
+        return None
+    size = path.stat().st_size
+    if size <= 0:
+        return None
+    expected_size = reference.get("size_bytes")
+    if isinstance(expected_size, int) and expected_size > 0 and size != expected_size:
+        return None
+    expected_hash = str(reference.get("sha256") or "")
+    if not expected_hash:
+        return None
+    if sha256_file(path).lower() != expected_hash.lower():
+        return None
+
+    candidate = session.get(ClipCandidate, candidate_id)
+    if candidate is None:
+        return None
+    try:
+        spec = build_render_spec(
+            session,
+            candidate,
+            artifact_purpose=row.artifact_purpose.value,
+            delivery_profile_key=row.delivery_profile_key,
+            settings=settings,
+            storage=storage,
+        )
+    except Exception:
+        return None
+    if request_input_fingerprint(spec, config) != row.input_fingerprint:
+        return None
+    if row.runtime_fingerprint:
+        resolved = runtime_identity or resolve_runtime_identity(settings)
+        if runtime_fingerprint(resolved) != row.runtime_fingerprint:
+            return None
+    return row
 
 
 def now() -> datetime:
@@ -868,6 +1370,7 @@ __all__ = [
     "build_render_spec",
     "cache_hit",
     "check_render_artifact",
+    "begin_attempt",
     "execution_artifact_reference",
     "finalize_success",
     "get_current_render_execution",
@@ -879,10 +1382,12 @@ __all__ = [
     "persist_envelope",
     "read_render_execution",
     "read_render_execution_by_id",
+    "release_active_job",
     "request_input_fingerprint",
     "request_payload",
     "resolve_runtime_identity",
     "runtime_fingerprint",
+    "set_lifecycle_fenced",
     "validate_candidate_for_render",
     "with_execution_id",
 ]

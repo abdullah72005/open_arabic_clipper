@@ -105,7 +105,9 @@ def upgrade() -> None:
             sa.ForeignKey("candidate_refinements.id", ondelete="SET NULL"),
             nullable=True,
         ),
-        sa.Column("artifact_purpose", _enum("render_artifact_purpose", _ARTIFACT_PURPOSE), nullable=False),
+        sa.Column(
+            "artifact_purpose", _enum("render_artifact_purpose", _ARTIFACT_PURPOSE), nullable=False
+        ),
         sa.Column("lifecycle", _enum("render_execution_lifecycle", _LIFECYCLE), nullable=False),
         sa.Column("qc_status", _enum("render_qc_status", _QC_STATUS), nullable=True),
         sa.Column("is_current", sa.Boolean(), nullable=False, server_default=sa.true()),
@@ -134,11 +136,11 @@ def upgrade() -> None:
         sa.Column("artifact_reference", sa.JSON(), nullable=False, server_default="{}"),
         sa.Column("omitted_requirements", sa.JSON(), nullable=False, server_default="[]"),
         sa.Column("metrics", sa.JSON(), nullable=False, server_default="{}"),
-        sa.Column("policy_version", sa.String(64), nullable=False, server_default="stage5.2-v1"),
+        sa.Column("policy_version", sa.String(64), nullable=False, server_default="stage5.2-v2"),
         sa.Column(
-            "schema_version", sa.String(64), nullable=False, server_default="stage5.2-schema-v1"
+            "schema_version", sa.String(64), nullable=False, server_default="stage5.2-schema-v2"
         ),
-        sa.Column("fingerprint_version", sa.String(16), nullable=False, server_default="1"),
+        sa.Column("fingerprint_version", sa.String(16), nullable=False, server_default="2"),
         sa.Column(
             "created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()
         ),
@@ -213,6 +215,12 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    # Remove Stage 5.2 rows/jobs ourselves so the narrowed ``job_kind`` check
+    # constraint can be recreated on populated databases. This preserves every
+    # Stage 1-5.1 job and schema object, and never requires test-side cleanup.
+    op.execute("DELETE FROM render_executions")
+    op.execute("DELETE FROM processing_jobs WHERE kind = 'RENDER_EXECUTION'")
+
     op.drop_index("ix_processing_jobs_render_execution_id", table_name="processing_jobs")
     with op.batch_alter_table("processing_jobs") as batch:
         batch.drop_constraint("fk_processing_jobs_render_execution_id", type_="foreignkey")
@@ -220,22 +228,25 @@ def downgrade() -> None:
 
     index_names = [
         "uq_render_executions_current_scope",
-        *[f"ix_render_executions_{column}" for column in reversed(
-            [
-                "source_video_id",
-                "clip_candidate_id",
-                "render_contract_id",
-                "visual_composition_plan_id",
-                "transformation_selection_id",
-                "selected_plan_id",
-                "final_refinement_id",
-                "artifact_purpose",
-                "lifecycle",
-                "qc_status",
-                "is_current",
-                "active_job_id",
-            ]
-        )],
+        *[
+            f"ix_render_executions_{column}"
+            for column in reversed(
+                [
+                    "source_video_id",
+                    "clip_candidate_id",
+                    "render_contract_id",
+                    "visual_composition_plan_id",
+                    "transformation_selection_id",
+                    "selected_plan_id",
+                    "final_refinement_id",
+                    "artifact_purpose",
+                    "lifecycle",
+                    "qc_status",
+                    "is_current",
+                    "active_job_id",
+                ]
+            )
+        ],
     ]
     for index_name in index_names:
         op.drop_index(index_name, table_name="render_executions")

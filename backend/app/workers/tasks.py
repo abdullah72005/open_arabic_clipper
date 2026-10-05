@@ -491,10 +491,6 @@ def run_render_execution(
     try:
         settings = get_settings()
         storage = StorageService(settings.storage_root)
-        if parsed_job is not None:
-            job = session.get(ProcessingJob, parsed_job)
-            if job is not None and job.status is JobStatus.CANCELLED:
-                return {"render_execution_id": str(parsed_execution), "cancelled": True}
         executor = build_render_execution_executor(session, storage, settings)
         executor.set_active_job(parsed_job)
         try:

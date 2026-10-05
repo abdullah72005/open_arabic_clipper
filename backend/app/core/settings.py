@@ -232,6 +232,7 @@ class Settings(BaseSettings):
     render_execution_enabled: bool = True
     render_encoder_threads: int = Field(default=2, ge=1, le=64)
     render_filter_threads: int = Field(default=1, ge=1, le=64)
+    render_filter_complex_threads: int = Field(default=1, ge=1, le=64)
     render_global_concurrent_renders: int = Field(default=1, ge=1, le=16)
     render_cancel_poll_seconds: float = Field(default=0.5, gt=0, le=10)
     render_admission_wait_seconds: float = Field(default=0.0, ge=0, le=600)
@@ -643,6 +644,7 @@ class Settings(BaseSettings):
         return Stage52Config(
             encoder_threads=self.render_encoder_threads,
             filter_threads=self.render_filter_threads,
+            filter_complex_threads=self.render_filter_complex_threads,
             global_concurrent_renders=self.render_global_concurrent_renders,
             ffmpeg_binary=self.ffmpeg_binary,
             ffprobe_binary=self.ffprobe_binary,

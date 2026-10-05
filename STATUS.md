@@ -8,8 +8,9 @@ artifact, a normalized execution manifest, deterministic technical QC, and a
 durable fenced result. It is explicit and candidate-scoped and extends the
 existing Celery/`ProcessingJob` platform with a `RENDER_EXECUTION` job kind; it
 adds no `PipelineStage`, no `PipelineRun`, and no `_NEXT_STAGE` entry, and never
-touches the source lifecycle. Status: **implemented and technically verified;
-awaiting human manual acceptance. Not frozen.**
+touches the source lifecycle. Status: **remediated against code review and
+technically verified; awaiting human media acceptance and Sol review. Not
+frozen.**
 
 - **Purpose.** `CORE_SOURCE_VALIDATION` executes only the ordered `SOURCE_MEDIA`
   occurrences. Authored material is omitted and every omission is persisted and
@@ -22,47 +23,94 @@ awaiting human manual acceptance. Not frozen.**
   filtergraph/command files, and never accepts arbitrary provider FFmpeg flags.
 - **Timing.** Contract-ordered occurrences, unit-speed mapping, explicit
   `trim`/`atrim`, per-scene `setpts`, audio joined only at occurrence
-  boundaries, cumulative frame/sample boundaries. Noncontiguous source gaps are
-  removed from video, audio, and captions. One final video + one final audio
-  encode per render; no mandatory intermediate H.264.
+  boundaries, cumulative frame/sample boundaries. A shared occurrence origin
+  preserves each stream's genuine start offset: a stream starting later is
+  delayed/padded (video freeze, audio silence) rather than silently shifted, so
+  A/V durations stay consistent. Noncontiguous source gaps are removed from
+  video, audio, and captions. One final video + one final audio encode per
+  render; no mandatory intermediate H.264.
 - **Framing.** All six accepted modes execute. Tracked crop uses a per-frame
   dynamic scale + per-frame crop because the installed FFmpeg `crop` exposes no
   runtime width/height commands; smoothstep pan/zoom is real and tested. Native
   rotation applied once; exotic pixel aspect fails closed.
 - **Captions.** Canonical ASS is burned while source-local, before `setpts`,
   preserving bytes and dynamic highlight states; never re-planned/re-ordered.
-  Asset must be managed, exist, and match SHA-256.
+  Asset must be managed, exist, and match SHA-256. A real render test proves the
+  active-token accent advances across word states (no OCR).
 - **Delivery.** Versioned MP4/H.264 (`veryfast`, CRF 20, `yuv420p`, 1080x1920,
   contract FPS via `-r`), AAC 192 kb/s 48 kHz, mono/stereo preserved (wider
   downmixed), `+faststart`, no publication loudness/narration/Stage 6 mixing.
+  Configured source/output duration ceilings are enforced; the complex-filter
+  thread limit uses `-filter_complex_threads` (with the non-complex
+  `-filter_threads` bound).
 - **Persistence.** `render_executions` (migration `20260918_0022`), scoped
   partial unique current index, `JobKind.RENDER_EXECUTION`, nullable
   `processing_jobs.render_execution_id`. Lifecycle `QUEUED`/`RENDERING`/
   `QC_RUNNING`/`COMPLETE`/`BLOCKED`/`FAILED`/`CANCELLED`; QC `PASS`/`WARN`/
   `FAIL`; only valid current `COMPLETE` is cache-eligible. Request frozen at
-  queue time; retries are new attempts, not new request identities.
-- **Concurrency.** Scoped partial unique index + atomic `active_job_id` claim;
-  atomic `QUEUED/FAILED -> RUNNING` job claim advancing `claim_version`;
-  independent-query cancellation; PostgreSQL session advisory lock on a
-  dedicated connection. Bounded retries (max 3) only for transient failures.
+  queue time; retries are new attempts, not new request identities. A forced
+  rerender enters a fenced new attempt that atomically resets cache eligibility,
+  QC verdict, and the prior artifact pointer, so an earlier success can never be
+  exposed as the result of a failed/cancelled new attempt. QC results are
+  persisted on FAIL as well as PASS/WARN.
+- **Ownership.** Every worker-owned mutation (claim, lifecycle, success,
+  failure, block, cancellation, retry state, active-job release) is a single
+  fenced UPDATE keyed on the execution row's authoritative `active_job_id`, the
+  executing job id, its `claim_version`, and permitted `RUNNING` status; a
+  separate ownership SELECT followed by an unfenced ORM update no longer
+  exists. The initial `QUEUED/FAILED -> RUNNING` claim advances `claim_version`
+  in the same statement, captures the allocated token, and cannot be overwritten
+  by a cancellation racing the claim. A superseded worker's `record_failure`
+  rolls back first and then no-ops against the newer claim.
+- **Currentness.** Before publishing, the engine freshly revalidates the
+  candidate, Stage 5.0 contract, Stage 5.1 plan, and canonical ASS bindings by
+  rebuilding the frozen request and comparing fingerprints, re-checks the source
+  stat identity, verifies the exact ASS bytes actually consumed, and checks
+  worker ownership. An execution whose upstream was invalidated mid-render is
+  blocked, never published as a successful artifact.
+- **Cache validity.** Queue-time and execute-time cache reuse validates managed
+  artifact existence/size/SHA-256, lifecycle/QC, current upstream dependencies,
+  rendering runtime identity (real FFmpeg/libavformat/libavcodec/libass build,
+  font content hash, and build-config hash), and QC identity. A changed QC
+  policy invalidates the request/verdict; a deleted or corrupted artifact forces
+  a fresh render. A historical equivalent request reactivates its row atomically
+  within its purpose/profile scope.
+- **Concurrency/admission.** Scoped partial unique index + atomic
+  `active_job_id` claim; PostgreSQL session advisory lock on a dedicated
+  connection whose liveness is verified by an actual ping/advisory-lock query, so
+  a severed backend is reported not-held and the active child is reaped. Bounded
+  retries (max 3) only for transient failures; broker dispatch failure is
+  recorded and redispatched on the next request rather than stranding the job.
+- **QC.** Deterministic structural checks plus per-stream timing evidence
+  (video/audio start and duration, A/V duration delta, actual FPS/timebase
+  sanity, bounded decode). Silence is judged against the *selected* source
+  occurrences (bounded analysis), so a legitimately silent selected span is not a
+  hard failure; unavailable/decode-failure evidence is distinguished from
+  unexpected lost audio.
 - **API/CLI.** `POST/GET /api/candidates/{id}/render-execution`,
-  `GET /api/render-executions/{id}`, `GET /api/render-executions/{id}/artifact`;
-  CLI `render-execution`, `render-execution-status`,
-  `render-execution-artifact`; Celery `clipfactory.run_render_execution`. The
-  Stage 5.2 handoff now exposes the authoritative Stage 5.0 output profile
-  (read-only correction).
-- **Verification.** Engine unit tests, real FFmpeg two-span/dynamic-zoom/render
-  and QC tests, injected-seam lifecycle tests (convergence, duplicate delivery,
-  claim fencing, queued cancellation, source-change block, cache reuse),
-  SQLite migration and gated PostgreSQL migration/concurrency/advisory-lock
-  tests, and a handoff regression test pass. Stage 5.0/5.1/models/migrations
-  regression suites remain green. Manual-acceptance MP4s and the production
-  engine path were exercised; see `docs/STAGE_5_2_OPERATIONS.md`.
-- **Limitations.** Full live DB→queue→executor→artifact integration on real
-  media is exercised through the engine plus injected-seam lifecycle tests (the
-  dedicated live-contract render test was not added this pass); tracked-crop
-  zoom uses the documented dynamic-scale equivalent; the current Stage 5.1
-  handoff `output_profile` fix is read-only. Human acceptance pending.
+  `GET /api/render-executions/{id}`, `GET /api/render-executions/{id}/artifact`
+  (served only for a current cache-eligible COMPLETE execution); CLI
+  `render-execution`, `render-execution-status`, `render-execution-artifact`;
+  Celery `clipfactory.run_render_execution` (cancellation finalizes through the
+  real task entry point). The generic source retry endpoint refuses to dispatch
+  a render job as INGEST. The Stage 5.2 handoff exposes the authoritative Stage
+  5.0 output profile (read-only correction).
+- **Verification.** Engine unit tests, real FFmpeg two-span/dynamic-zoom/offset-
+  preserving render and advancing-highlight tests, real source-aware silence QC,
+  injected-seam lifecycle tests (convergence, duplicate delivery, claim fencing,
+  force-after-success attempt reset, upstream invalidation during render,
+  queued cancellation via the real task entry, malformed-plan fail-closed, cache
+  artifact absence, QC-policy invalidation, dispatch recovery, historical
+  reactivation), SQLite and gated PostgreSQL migration (populated downgrade),
+  admission, and concurrency tests, a gated Stage 5.2 live-contract render, and a
+  handoff regression test pass. Stage 5.0/5.1/models/migrations regression
+  suites remain green. Manual-acceptance MP4s (plus the live-contract artifact)
+  were regenerated with the remediated engine; see
+  `docs/STAGE_5_2_OPERATIONS.md`.
+- **Limitations.** Subjective media inspection still requires the human; tracked
+  crop uses the documented dynamic-scale equivalent because the installed
+  FFmpeg `crop` exposes no runtime size commands. Human acceptance and Sol review
+  pending.
 
 ## Stage 5.0 deterministic execution preflight and render contract (2026-09-18)
 

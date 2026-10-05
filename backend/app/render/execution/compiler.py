@@ -30,9 +30,13 @@ from app.render.execution.fingerprints import render_compiled_fingerprint
 from app.render.execution.policy import (
     COMPILER_VERSION,
     MAX_FILTERGRAPH_CHARACTERS,
+    MAX_OUTPUT_DURATION_SECONDS,
+    MAX_SEGMENTS,
+    MAX_SOURCE_DURATION_SECONDS,
     MAX_TRACKED_SCENE_KEYFRAMES,
     OUTPUT_PROFILE_HEIGHT,
     OUTPUT_PROFILE_WIDTH,
+    SOURCE_START_TOLERANCE_SECONDS,
     DeliveryProfile,
     delivery_profile_for,
 )
@@ -50,6 +54,7 @@ _ASS_LOCAL_NAME = "captions.ass"
 _OUTPUT_NAME = "output.mp4"
 _FILTERGRAPH_NAME = "filtergraph.txt"
 _CROP_MIN_HEIGHT_FRACTION = 0.20
+_SOURCE_START_EPSILON = SOURCE_START_TOLERANCE_SECONDS
 
 
 class CompileError(ValueError):
@@ -200,6 +205,17 @@ def _container_codec(encoder: str) -> str:
     }.get(encoder, encoder)
 
 
+def _occurrence_leading_gap(stream_start_seconds: float, occurrence_start: float) -> float:
+    """Genuine leading offset of a stream relative to the shared occurrence origin.
+
+    A stream that begins after the selected occurrence start has real leading
+    silence/freeze that must be preserved (never silently shifted). A stream that
+    begins before the occurrence is simply trimmed from the origin.
+    """
+
+    return max(0.0, stream_start_seconds - occurrence_start)
+
+
 def _audio_layout(channels: int) -> str:
     return "mono" if channels <= 1 else "stereo"
 
@@ -210,9 +226,15 @@ def compile_render(spec: RenderSpec, runtime_identity: RuntimeIdentity) -> Compi
     profile = delivery_profile_for(spec.delivery_profile_key)
     if profile is None:
         raise CompileError("UNSUPPORTED_DELIVERY_PROFILE")
+    if spec.source_duration > MAX_SOURCE_DURATION_SECONDS + 1e-6:
+        raise CompileError("SOURCE_DURATION_EXCEEDS_LIMIT")
     manifest = build_timeline(spec)
+    if manifest.output_duration > MAX_OUTPUT_DURATION_SECONDS + 1e-6:
+        raise CompileError("OUTPUT_DURATION_EXCEEDS_LIMIT")
 
     total_scenes = sum(len(occurrence.scenes) for occurrence in spec.occurrences)
+    if total_scenes > MAX_SEGMENTS:
+        raise CompileError("SEGMENT_LIMIT_EXCEEDED")
     lines: list[str] = []
     nodes: list[FilterNode] = []
     scene_diagnostics: list[dict[str, object]] = []
@@ -249,9 +271,17 @@ def compile_render(spec: RenderSpec, runtime_identity: RuntimeIdentity) -> Compi
             )
             segment_lines, geometry = _framing_segment(spec, scene, trimmed, framed)
             lines.extend(segment_lines)
+            leading_video_gap = _occurrence_leading_gap(
+                spec.source_video_start_seconds, scene.source_start
+            )
+            tpad = (
+                f",tpad=start_duration={_num(leading_video_gap)}:start_mode=clone"
+                if leading_video_gap > _SOURCE_START_EPSILON
+                else ""
+            )
             lines.append(
                 f"[{framed}]ass={_ASS_LOCAL_NAME},setsar=1,"
-                f"format={profile.pixel_format},setpts=PTS-STARTPTS[{scene_out}]"
+                f"format={profile.pixel_format}{tpad},setpts=PTS-STARTPTS[{scene_out}]"
             )
             scene_outputs.append(scene_out)
             nodes.append(
@@ -290,9 +320,17 @@ def compile_render(spec: RenderSpec, runtime_identity: RuntimeIdentity) -> Compi
             if abs(occurrence.audio.gain_db) < 1e-9
             else f",volume={_num(occurrence.audio.gain_db)}dB"
         )
+        duration = max(0.0, occurrence.source_end - occurrence.source_start)
+        leading_audio_gap = _occurrence_leading_gap(
+            spec.source_audio_start_seconds, occurrence.source_start
+        )
+        audio_origin = ""
+        if leading_audio_gap > _SOURCE_START_EPSILON:
+            delay_ms = max(0, int(round(leading_audio_gap * 1000.0)))
+            audio_origin = f",adelay={delay_ms}:all=1,apad=whole_dur={_num(duration)}"
         lines.append(
             f"[{audio_sources[occurrence_index]}]atrim=start={_num(occurrence.source_start)}:"
-            f"end={_num(occurrence.source_end)},asetpts=PTS-STARTPTS{gain},"
+            f"end={_num(occurrence.source_end)}{audio_origin},asetpts=PTS-STARTPTS{gain},"
             f"aresample={profile.audio_sample_rate},"
             f"aformat=sample_fmts=fltp:sample_rates={profile.audio_sample_rate}:"
             f"channel_layouts={layout}[{audio_label}]"
@@ -376,6 +414,8 @@ def _build_argv(
         "error",
         "-filter_threads",
         str(max(1, runtime_identity.filter_threads)),
+        "-filter_complex_threads",
+        str(max(1, runtime_identity.filter_complex_threads)),
         "-i",
         source_path,
         "-filter_complex_script",

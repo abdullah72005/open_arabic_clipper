@@ -225,8 +225,55 @@ read-only correction and does not alter Stage 5.1 output or fingerprints.
 ## Configuration
 
 Add the `CLIPFACTORY_RENDER_*` variables from `.env.example` to bound encoder
-threads, filtergraph threads, global concurrent renders, cancellation poll
-cadence, admission wait, render/source/output time ceilings, and QC sampling.
+threads, non-complex filtergraph threads (`CLIPFACTORY_RENDER_FILTER_THREADS`),
+complex filtergraph threads (`CLIPFACTORY_RENDER_FILTER_COMPLEX_THREADS`),
+global concurrent renders, cancellation poll cadence, admission wait,
+render/source/output time ceilings, and QC sampling. The source/output duration
+ceilings are enforced at spec build and compile time.
+
+## Remediation against code review (stage5.2-v2)
+
+The engine/policy/fingerprint/schema versions are `stage5.2-v2` (`v2`
+fingerprint). Prior `v1` rows are not reused; a request carrying the new policy
+identity creates a fresh envelope.
+
+- **Attempt state.** A forced rerender enters a fenced `RENDERING` transition
+  that atomically clears `cache_eligible`, `qc_status`, the artifact pointer,
+  manifest, QC result, and output fingerprint, so the
+  `ck_render_executions_cache_consistency` check always holds and an earlier
+  success is never mixed with a later failure.
+- **Ownership fencing.** Every worker-owned mutation is one UPDATE fenced on
+  `active_job_id`, executing job id, `claim_version`, and `RUNNING` status. The
+  job claim predicate itself includes status/heartbeat eligibility. A failed
+  transaction is rolled back before failure persistence (no
+  `PendingRollbackError`), and a superseded worker cannot fail/cancel a newer
+  run.
+- **Final currentness.** Publication rebuilds the frozen request, compares
+  fingerprints, re-checks source stat identity, verifies the exact consumed ASS
+  bytes, and re-checks ownership under a short transaction. An upstream
+  invalidated mid-render blocks instead of publishing.
+- **Shared origin.** The compiler preserves genuine per-stream start offsets via
+  `adelay`/`apad` (audio) and `tpad` (video) around the occurrence origin instead
+  of independently rebasing both streams to zero.
+- **Cache validity.** Cache reuse validates artifact existence/size/digest,
+  lifecycle/QC, current upstream dependencies, rendering runtime identity
+  (FFmpeg/libavformat/libavcodec/libass build, font content hash, build-config
+  hash), and QC identity. A changed QC policy invalidates the request/verdict.
+- **Admission.** Dedicated-connection liveness is verified by an actual
+  ping/advisory-lock query; a severed backend is reported not-held and the active
+  child is reaped.
+- **Dispatch/history.** A broker dispatch failure is recorded and redispatched on
+  the next request; an equivalent historical request reactivates its row
+  atomically within its purpose/profile scope.
+- **Cancellation.** Queued cancellation finalizes through the real task entry
+  point (no early return that leaks the active-job pointer). The generic source
+  retry endpoint refuses to dispatch a render job as INGEST.
+- **QC.** Per-stream start/duration and A/V delta are measured; silence is judged
+  only against the selected source occurrences (bounded), so a legitimately
+  silent selected span is not a hard failure. QC is persisted on FAIL.
+- **Migration.** The `20260918_0022` downgrade deletes Stage 5.2 rows/jobs
+  itself (preserving all prior-stage data/jobs) so it works on a populated
+  database without test-side cleanup.
 
 ## Runtime checks
 
@@ -239,7 +286,10 @@ PostgreSQL-gated tests create and drop disposable databases.
 
 `python -m app.render.execution.acceptance --source <media> --output
 storage/benchmarks/stage-5-2/manual-acceptance` produces four short playable
-MP4s plus `README.md`, `manifest.json`, and per-case QC. Human inspection of lip
-sync, cut timing, crop smoothness, black flashes, caption timing/highlighting,
-mixed BiDi, sharpness, background fill, audio level, and multi-span
-synchronization is required. Automatic QC is not human approval.
+MP4s plus `README.md`, `manifest.json`, and per-case QC. The gated
+`tests/test_stage52_live_contract.py` additionally produces a real artifact from
+persisted Stage 5.0/5.1 bindings and the canonical ASS at
+`storage/benchmarks/stage-5-2/live-contract/live-source-validation.mp4`. Human
+inspection of lip sync, cut timing, crop smoothness, black flashes, caption
+timing/highlighting, mixed BiDi, sharpness, background fill, audio level, and
+multi-span synchronization is required. Automatic QC is not human approval.
