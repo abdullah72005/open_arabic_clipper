@@ -108,7 +108,12 @@ class _FakeRunner:
 
 
 def _fake_qc(
-    artifacts: Any, manifest: Any, config: Any, *, source_path: Any = None
+    artifacts: Any,
+    manifest: Any,
+    config: Any,
+    *,
+    source_path: Any = None,
+    cancel_check: Any = None,
 ) -> TechnicalQCResult:
     return TechnicalQCResult(status="PASS", checks=(), reason_codes=(), policy_version="test")
 

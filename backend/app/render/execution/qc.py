@@ -12,7 +12,7 @@ from __future__ import annotations
 import math
 import re
 import subprocess
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
@@ -40,6 +40,10 @@ from app.render.execution.types import QCCheck, RenderArtifacts, TechnicalQCResu
 _SAMPLE_W = 160
 _SAMPLE_H = 284
 _VOLUME_RE = re.compile(r"(mean|max)_volume:\s*(-?[\d.]+|inf|-inf)\s*dB")
+
+
+class QCCancelled(RuntimeError):
+    """Technical QC observed cancellation or lost ownership and stopped."""
 
 
 @dataclass(frozen=True)
@@ -225,6 +229,7 @@ def check_render_artifact(
     qc_policy: Stage52Config,
     *,
     source_path: Path | None = None,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> TechnicalQCResult:
     """Run deterministic technical QC over a produced artifact."""
 
@@ -439,7 +444,16 @@ def check_render_artifact(
     measured["channels"] = artifacts.channels
 
     # Bounded appearance/audio sampling.
-    _appearance_checks(checks, reasons, measured, artifacts, manifest, qc_policy, source_path)
+    _appearance_checks(
+        checks,
+        reasons,
+        measured,
+        artifacts,
+        manifest,
+        qc_policy,
+        source_path,
+        cancel_check,
+    )
 
     status = QC_PASS
     if any(check.status == QC_FAIL for check in checks):
@@ -463,7 +477,12 @@ def _appearance_checks(
     manifest: Mapping[str, object],
     qc_policy: Stage52Config,
     source_path: Path | None,
+    cancel_check: Callable[[], bool] | None,
 ) -> None:
+    def _ensure_not_cancelled() -> None:
+        if cancel_check is not None and cancel_check():
+            raise QCCancelled("technical QC cancelled")
+
     times = _sample_times(manifest, max(2, qc_policy.qc_max_sampled_frames))
     if not times:
         checks.append(QCCheck(name="decode_sampled_frames", status="PASS", measured={"samples": 0}))
@@ -471,6 +490,7 @@ def _appearance_checks(
     frames: list[_SampledFrame] = []
     decode_ok = 0
     for output_time, source_time in times:
+        _ensure_not_cancelled()
         luma = _extract_luma(qc_policy.ffmpeg_binary, artifacts.output_path, output_time)
         if luma is None:
             continue
@@ -489,6 +509,7 @@ def _appearance_checks(
     source_frames: list[bytes] = []
     if source_path is not None:
         for _output_time, source_time in times:
+            _ensure_not_cancelled()
             if source_time is None:
                 continue
             source_luma = _extract_luma(qc_policy.ffmpeg_binary, source_path, source_time)
@@ -579,6 +600,7 @@ def _appearance_checks(
     else:
         checks.append(QCCheck(name="not_frozen", status="PASS"))
 
+    _ensure_not_cancelled()
     output_volume = _volume_metrics(qc_policy.ffmpeg_binary, artifacts.output_path)
     if output_volume is not None:
         measured["output_mean_volume_db"] = output_volume.get("mean")
@@ -676,4 +698,4 @@ def _selected_source_has_sound(
     return False
 
 
-__all__ = ["check_render_artifact"]
+__all__ = ["QCCancelled", "check_render_artifact"]

@@ -154,7 +154,12 @@ class _FakeRunner:
 
 
 def _fake_qc(
-    artifacts: Any, manifest: Any, config: Any, *, source_path: Any = None
+    artifacts: Any,
+    manifest: Any,
+    config: Any,
+    *,
+    source_path: Any = None,
+    cancel_check: Any = None,
 ) -> TechnicalQCResult:
     return TechnicalQCResult(status="PASS", checks=(), reason_codes=(), policy_version="test")
 
@@ -510,7 +515,12 @@ def test_qc_failure_persists_result_and_is_not_cache_eligible(
     outcome = queue_render_execution(session, fixture.stage50.selection.candidate.id)
 
     def failing_qc(
-        artifacts: Any, manifest: Any, config: Any, *, source_path: Any = None
+        artifacts: Any,
+        manifest: Any,
+        config: Any,
+        *,
+        source_path: Any = None,
+        cancel_check: Any = None,
     ) -> TechnicalQCResult:
         return TechnicalQCResult(
             status="FAIL",
@@ -533,6 +543,26 @@ def test_qc_failure_persists_result_and_is_not_cache_eligible(
     assert row.artifact_reference == {}
     job = session.get(ProcessingJob, outcome.job_id)
     assert job is not None and job.status is JobStatus.FAILED
+
+
+def test_qc_cancellation_marks_cancelled(session: Session, monkeypatch: Any) -> None:
+    from app.pipeline.executor import StageCancelled
+    from app.render.execution.qc import QCCancelled
+
+    fixture = seed_stage51(session, monkeypatch)
+    _plan_ready(session, fixture)
+    outcome = queue_render_execution(session, fixture.stage50.selection.candidate.id)
+
+    def cancelling_qc(*args: Any, **kwargs: Any) -> TechnicalQCResult:
+        raise QCCancelled("cancelled during QC")
+
+    executor = _executor(session, _FakeRunner(), qc_checker=cancelling_qc)
+    executor.set_active_job(outcome.job_id)
+    with pytest.raises(StageCancelled):
+        executor.execute(outcome.render_execution_id)
+    session.expire_all()
+    row = session.get(RenderExecution, outcome.render_execution_id)
+    assert row is not None and row.lifecycle is RenderExecutionLifecycle.CANCELLED
 
 
 def test_queued_cancellation_finalizes_through_task_entry_point(

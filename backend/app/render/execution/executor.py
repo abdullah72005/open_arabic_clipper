@@ -33,7 +33,7 @@ from app.render.execution.concurrency import RenderAdmission, render_admission_f
 from app.render.execution.policy import (
     RENDER_ADMISSION_UNAVAILABLE,
 )
-from app.render.execution.qc import check_render_artifact
+from app.render.execution.qc import QCCancelled, check_render_artifact
 from app.render.execution.runner import (
     RenderCancelled,
     RenderProcessError,
@@ -421,12 +421,17 @@ class RenderExecutionExecutor:
         if not self._set_qc_running(row):
             self.skipped_duplicate = True
             return row
-        qc = self._qc_checker(
-            artifacts,
-            artifacts.manifest,
-            self._config,
-            source_path=Path(source_absolute),
-        )
+        try:
+            qc = self._qc_checker(
+                artifacts,
+                artifacts.manifest,
+                self._config,
+                source_path=Path(source_absolute),
+                cancel_check=self._should_stop,
+            )
+        except QCCancelled:
+            self._mark_cancelled(row)
+            raise StageCancelled("render cancelled during QC") from None
         if qc.status == "FAIL":
             self._fail(row, qc.reason_codes[0] if qc.reason_codes else "QC_FAILED", qc=qc)
             return row
