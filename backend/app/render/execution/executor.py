@@ -26,7 +26,7 @@ from sqlalchemy.orm import Session
 from app.core.enums import JobStatus, RenderExecutionLifecycle
 from app.core.settings import Settings
 from app.db.session import create_session_factory
-from app.models import ClipCandidate, ProcessingJob
+from app.models import CandidateRefinement, ClipCandidate, ProcessingJob
 from app.models.render_contract import RenderContract
 from app.models.render_execution import RenderExecution
 from app.models.visual_composition_plan import VisualCompositionPlan
@@ -37,7 +37,7 @@ from app.render.execution.policy import (
     RENDER_ADMISSION_UNAVAILABLE,
     RENDER_OWNERSHIP_LOST,
 )
-from app.render.execution.qc import QCCancelled, check_render_artifact
+from app.render.execution.qc import QCCancelled, QCTimeout, check_render_artifact
 from app.render.execution.runner import (
     RenderCancelled,
     RenderProcessError,
@@ -285,9 +285,18 @@ class RenderExecutionExecutor:
         return not self._ownership_ok()
 
     def _handle_stop(self, row: RenderExecution) -> None:
-        """Record a truthful, distinct outcome for a stopped attempt."""
+        """Record a truthful, distinct outcome for a stopped attempt.
 
-        if self._ownership_lost:
+        An authoritative cancellation always wins over the heartbeat-loss latch:
+        an API/session cancel flips the executing job to CANCELLED, which makes
+        the heartbeat's RUNNING update match zero rows and set the latch. The
+        owned execution must still be finalized as CANCELLED, not failed with an
+        ownership-loss code that the RUNNING-only failure fence cannot apply.
+        """
+
+        if self._job_cancelled():
+            self._mark_cancelled(row)
+        elif self._ownership_lost:
             self._fail(row, RENDER_OWNERSHIP_LOST)
         else:
             self._mark_cancelled(row)
@@ -447,14 +456,17 @@ class RenderExecutionExecutor:
         if not self._begin_attempt(row):
             self.skipped_duplicate = True
             return row
+        # One absolute deadline covers the whole expensive attempt: encode,
+        # post-encode output probing, and technical QC.
+        attempt_deadline = time.monotonic() + self._config.max_render_seconds
         context = AttemptContext(
             attempt_directory=attempt_directory,
             cancel_check=self._should_stop,
             timeout_seconds=self._config.max_render_seconds,
             poll_seconds=self._config.cancel_poll_seconds,
             ass_bytes=ass_data,
+            deadline=attempt_deadline,
         )
-        attempt_started = time.monotonic()
         try:
             artifacts = self._runner(compiled, context)
         except RenderTimeout:
@@ -469,9 +481,8 @@ class RenderExecutionExecutor:
         if not self._set_qc_running(row):
             self.skipped_duplicate = True
             return row
-        # A shared wall-clock deadline covers the whole expensive attempt,
-        # including QC; each QC subprocess is bounded by the remaining budget.
-        qc_deadline = attempt_started + self._config.max_render_seconds
+        # QC shares the same absolute attempt deadline; each QC subprocess is
+        # bounded by the remaining budget and refuses to start past the ceiling.
         try:
             qc = self._qc_checker(
                 artifacts,
@@ -479,11 +490,16 @@ class RenderExecutionExecutor:
                 self._config,
                 source_path=Path(source_absolute),
                 cancel_check=self._should_stop,
-                deadline=qc_deadline,
+                deadline=attempt_deadline,
             )
         except QCCancelled:
             self._handle_stop(row)
             raise StageCancelled("render cancelled during QC") from None
+        except QCTimeout as error:
+            # Distinct from cancellation: an exhausted mandatory QC budget is a
+            # hard failure that is never published as a warning success.
+            self._fail(row, "QC_TIMEOUT")
+            raise RenderTimeout(str(error)) from error
         if qc.status == "FAIL":
             self._fail(row, qc.reason_codes[0] if qc.reason_codes else "QC_FAILED", qc=qc)
             return row
@@ -596,11 +612,23 @@ class RenderExecutionExecutor:
                 self._block(row, "CANDIDATE_NOT_CURRENT")
                 return "BLOCKED"
             if row.render_contract_id is not None:
-                self._session.execute(
-                    select(RenderContract.id)
+                contract = self._session.scalars(
+                    select(RenderContract)
                     .where(RenderContract.id == row.render_contract_id)
                     .with_for_update()
                 ).first()
+                # The bound FINAL_CLIP refinement is mutable through
+                # ``apply_manual_transcript``, whose writer never takes the
+                # candidate lock. Lock it so its authoritative caption state is
+                # stable across the whole publication transaction; a concurrent
+                # manual edit therefore either commits before this transaction
+                # (and fails the rebuild) or serializes after it.
+                if contract is not None and contract.final_refinement_id is not None:
+                    self._session.execute(
+                        select(CandidateRefinement.id)
+                        .where(CandidateRefinement.id == contract.final_refinement_id)
+                        .with_for_update()
+                    ).first()
             if row.visual_composition_plan_id is not None:
                 self._session.execute(
                     select(VisualCompositionPlan.id)
@@ -637,9 +665,13 @@ class RenderExecutionExecutor:
             if self._job_cancelled():
                 self._safe_rollback()
                 return "CANCELLED"
-            if not self._claim_is_current(require_running=True) or not self._execution_owns():
+            # Recheck full ownership at the final boundary: fresh RUNNING status,
+            # claim token, execution ownership, the sticky heartbeat-loss latch,
+            # and admission. An observed loss must never publish success.
+            if not self._ownership_ok():
                 self._safe_rollback()
-                return "SUPERSEDED"
+                self._handle_stop(row)
+                return "CANCELLED" if self._job_cancelled() else "SUPERSEDED"
 
             published = finalize_success(
                 self._session,

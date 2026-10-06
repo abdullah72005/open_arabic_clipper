@@ -8,7 +8,7 @@ artifact, a normalized execution manifest, deterministic technical QC, and a
 durable fenced result. It is explicit and candidate-scoped and extends the
 existing Celery/`ProcessingJob` platform with a `RENDER_EXECUTION` job kind; it
 adds no `PipelineStage`, no `PipelineRun`, and no `_NEXT_STAGE` entry, and never
-touches the source lifecycle. Status: **remediated in a second focused pass
+touches the source lifecycle. Status: **remediated in a third focused pass
 (`stage5.2-v3`) against code review and technically verified; awaiting human
 media acceptance and Sol review. Not frozen.**
 
@@ -79,15 +79,26 @@ media acceptance and Sol review. Not frozen.**
   heartbeat-loss latch is sticky and authoritative in the stop predicate, and the
   stop predicate freshly verifies the job is still `RUNNING`, the claim and
   `active_job_id` still match, and admission is still held; lost ownership
-  records `RENDER_OWNERSHIP_LOST` distinctly from cancellation.
+  records `RENDER_OWNERSHIP_LOST` distinctly from cancellation. An authoritative
+  cancellation wins over the heartbeat-loss latch: because an API/session cancel
+  flips the job to `CANCELLED`, the heartbeat's `RUNNING` update matches zero rows
+  and sets the latch, but the stop path still finalizes the owned execution as
+  `CANCELLED` (never a `RENDER_OWNERSHIP_LOST` failure the `RUNNING`-only fence
+  cannot apply).
 - **Currentness.** Publication is a single short transaction that locks the
-  candidate and its bound contract/plan rows, rebuilds the frozen request,
-  compares fingerprints, re-checks the source stat and the exact ASS bytes
-  consumed, and verifies job/envelope ownership *inside* the same transaction
-  that writes the result and completes the job. An upstream invalidation, a
-  cancellation, or a claim change committed at any point before publication
-  therefore prevents a stale `COMPLETE`; no upstream lock is held during
-  encoding or QC.
+  candidate, its bound contract and visual plan, and the bound `FINAL_CLIP`
+  refinement, rebuilds the frozen request, compares fingerprints, re-checks the
+  source stat and the exact ASS bytes consumed, re-checks full ownership
+  (fresh `RUNNING`/claim/`active_job_id`, the sticky heartbeat-loss latch, and
+  admission), and completes the job *inside* the same transaction that writes the
+  result. Upstream writers that already serialize through the candidate lock
+  (contract/selection/plan) are covered by that lock; the `FINAL_CLIP` refinement
+  is joined explicitly because its manual-edit writer takes no candidate lock, so
+  a manual transcript edit either commits before the transaction (and fails the
+  rebuild) or blocks on the locked row and serializes after publication. An
+  upstream invalidation, a cancellation, an observed ownership/admission loss, or
+  a claim change committed at any point before publication therefore prevents a
+  stale `COMPLETE`; no upstream lock is held during encoding or QC.
 - **Cache validity.** Queue-time and execute-time cache reuse validates managed
   artifact existence/size/SHA-256, lifecycle/QC, current upstream dependencies,
   rendering runtime identity, and QC identity. Runtime identity is truthful: the
@@ -99,7 +110,9 @@ media acceptance and Sol review. Not frozen.**
   dependency changed under an unchanged path cannot be concealed by the cache. A
   changed QC policy invalidates the request/verdict; a deleted or corrupted
   artifact forces a fresh render. A historical equivalent request reactivates its
-  row atomically within its purpose/profile scope.
+  row atomically within its purpose/profile scope, and that promotion is
+  committed before the queue returns so a cached/active response cannot leave an
+  uncommitted current-row flip that a request-session close would roll back.
 - **Concurrency/admission.** Scoped partial unique index + atomic
   `active_job_id` claim; PostgreSQL session advisory lock on a dedicated
   connection whose liveness is verified by an actual ping/advisory-lock query, so
@@ -111,10 +124,15 @@ media acceptance and Sol review. Not frozen.**
   sanity, bounded decode). Silence is judged against the *selected* source
   occurrences (bounded analysis), so a legitimately silent selected span is not a
   hard failure; unavailable/decode-failure evidence is distinguished from
-  unexpected lost audio. Cancellation/ownership is polled before and after every
-  bounded QC subprocess (including each source-audio analysis call), and all QC
-  work shares the attempt's wall-clock deadline so no source-audio subprocess
-  starts after a stop is observed. A publication/database error is never
+  unexpected lost audio. One absolute monotonic deadline covers the whole
+  expensive attempt (encode, post-encode output probing, and QC); each bounded
+  subprocess is sized to the remaining budget, and once the deadline is exhausted
+  no further process starts (QC raises a distinct `QCTimeout` that is persisted as
+  a hard `QC_TIMEOUT` failure — never downgraded into a `WARN` success; post-encode
+  output probing raises `RENDER_TIMEOUT` and is skipped). Cancellation/ownership
+  is polled before and after every bounded QC subprocess (including each
+  source-audio analysis call) and around output probing, so no source-audio or
+  probe subprocess starts after a stop is observed. A publication/database error is never
   swallowed as duplicate delivery: it propagates after rollback and is recorded
   truthfully, so a failed commit can neither report a false success nor strand a
   `RUNNING` job.
@@ -134,9 +152,14 @@ media acceptance and Sol review. Not frozen.**
   cancellation via render and QC, queued cancellation via the real task entry,
   malformed-plan fail-closed, cache-artifact absence, QC-policy invalidation,
   dispatch recovery, historical reactivation, sticky ownership loss, terminal
-  status/claim/active-job/admission stops); deterministic PostgreSQL publication
-  and ownership race tests (concurrent candidate invalidation, cancellation, and
-  claim supersession, plus a controlled lock-serialization test); SQLite and
+  status/claim/active-job/admission stops, authoritative-cancel-wins-over-latch
+  (direct and end-to-end), publication ownership-latch and admission rechecks,
+  expired-deadline/no-subprocess and remaining-budget probing, `QC_TIMEOUT`
+  non-publication, and cross-connection historical-reactivation commit);
+  deterministic PostgreSQL publication and ownership race tests (concurrent
+  candidate invalidation, cancellation, claim supersession, concurrent bound
+  `FINAL_CLIP` refinement update blocking a stale publication, and controlled
+  lock-serialization of a manual refinement edit against publication); SQLite and
   gated PostgreSQL migration (populated downgrade); admission and concurrency
   tests; a handoff regression test; and a gated Stage 5.2 live-contract run that
   binds a uniquely named disposable database and drives the real Celery task

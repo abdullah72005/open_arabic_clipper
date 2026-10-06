@@ -13,6 +13,7 @@ import hashlib
 import math
 import shutil
 import subprocess
+import time
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
@@ -43,7 +44,12 @@ from app.render.execution.executor import build_render_execution_executor
 from app.render.execution.policy import Stage52Config
 from app.render.execution.qc import check_render_artifact
 from app.render.execution.queue import queue_render_execution
-from app.render.execution.runner import RenderCancelled, RenderProcessError, run_compiled_render
+from app.render.execution.runner import (
+    RenderCancelled,
+    RenderProcessError,
+    RenderTimeout,
+    run_compiled_render,
+)
 from app.render.execution.service import (
     RenderExecutionError,
     build_render_spec,
@@ -986,3 +992,380 @@ def test_queued_cancellation_finalizes_through_task_entry_point(
     row = session.get(RenderExecution, outcome.render_execution_id)
     assert row is not None and row.lifecycle is RenderExecutionLifecycle.CANCELLED
     assert row.active_job_id is None
+
+
+# ---------------------------------------------------------------------------
+# V4 focused remediation: cancellation vs ownership latch, publication
+# ownership recheck, historical reactivation commit, shared attempt deadline.
+# ---------------------------------------------------------------------------
+
+
+def test_cancellation_wins_over_heartbeat_loss_latch(
+    session: Session, monkeypatch: Any, sqlite_engine: Engine
+) -> None:
+    """An authoritative cancel must finalize the owned execution even when the
+    real heartbeat-loss callback has also latched ownership lost."""
+
+    fixture = seed_stage51(session, monkeypatch)
+    _plan_ready(session, fixture)
+    outcome = queue_render_execution(session, fixture.stage50.selection.candidate.id)
+    assert outcome.job_id is not None
+    job_id = outcome.job_id
+    executor = _claimed_executor(session, outcome)
+
+    # API/session cancellation committed on another connection, then the real
+    # heartbeat loss callback fires (its RUNNING update matched zero rows).
+    _cancel_job_in_other_session(sqlite_engine, job_id)
+    executor._mark_ownership_lost()
+    row = session.get(RenderExecution, outcome.render_execution_id)
+    assert row is not None
+    executor._handle_stop(row)
+
+    session.expire_all()
+    row = session.get(RenderExecution, outcome.render_execution_id)
+    assert row is not None
+    assert row.lifecycle is RenderExecutionLifecycle.CANCELLED
+    assert row.active_job_id is None
+    assert row.cache_eligible is False
+    assert row.artifact_reference == {}
+    job = session.get(ProcessingJob, job_id)
+    assert job is not None and job.status is JobStatus.CANCELLED
+
+
+def test_running_cancellation_with_heartbeat_latch_finalizes_through_execute(
+    session: Session, monkeypatch: Any, sqlite_engine: Engine
+) -> None:
+    """End-to-end: a runner observes both the API cancel and the heartbeat-loss
+    callback; execute() must still finalize the owned execution as CANCELLED."""
+
+    fixture = seed_stage51(session, monkeypatch)
+    _plan_ready(session, fixture)
+    outcome = queue_render_execution(session, fixture.stage50.selection.candidate.id)
+    assert outcome.job_id is not None
+    job_id = outcome.job_id
+    holder: dict[str, Any] = {}
+
+    class _CancelAndLoseRunner:
+        def __call__(self, compiled: Any, context: Any) -> Any:
+            _cancel_job_in_other_session(sqlite_engine, job_id)
+            holder["executor"]._mark_ownership_lost()
+            raise RenderCancelled("render cancelled")
+
+    executor = _executor(session, _CancelAndLoseRunner())
+    holder["executor"] = executor
+    executor.set_active_job(job_id)
+    with pytest.raises(StageCancelled):
+        executor.execute(outcome.render_execution_id)
+
+    session.expire_all()
+    row = session.get(RenderExecution, outcome.render_execution_id)
+    assert row is not None
+    assert row.lifecycle is RenderExecutionLifecycle.CANCELLED
+    assert row.active_job_id is None
+    assert row.cache_eligible is False
+    assert row.artifact_reference == {}
+    job = session.get(ProcessingJob, job_id)
+    assert job is not None and job.status is JobStatus.CANCELLED
+
+
+def test_publication_rechecks_ownership_loss_latch(session: Session, monkeypatch: Any) -> None:
+    fixture = seed_stage51(session, monkeypatch)
+    _plan_ready(session, fixture)
+    outcome = queue_render_execution(session, fixture.stage50.selection.candidate.id)
+    assert outcome.job_id is not None
+    holder: dict[str, Any] = {}
+
+    def latching_qc(*args: Any, **kwargs: Any) -> TechnicalQCResult:
+        # Heartbeat loss observed after QC's final stop poll, before publication.
+        holder["executor"]._mark_ownership_lost()
+        return TechnicalQCResult(status="PASS", checks=(), reason_codes=(), policy_version="test")
+
+    executor = _executor(session, _FakeRunner(), qc_checker=latching_qc)
+    holder["executor"] = executor
+    executor.set_active_job(outcome.job_id)
+    executor.execute(outcome.render_execution_id)
+
+    session.expire_all()
+    row = session.get(RenderExecution, outcome.render_execution_id)
+    assert row is not None
+    assert row.lifecycle is not RenderExecutionLifecycle.COMPLETE
+    assert row.cache_eligible is False
+    assert row.artifact_reference == {}
+    job = session.get(ProcessingJob, outcome.job_id)
+    assert job is not None and job.status is not JobStatus.SUCCEEDED
+
+
+def test_publication_rechecks_admission_lock(session: Session, monkeypatch: Any) -> None:
+    fixture = seed_stage51(session, monkeypatch)
+    _plan_ready(session, fixture)
+    outcome = queue_render_execution(session, fixture.stage50.selection.candidate.id)
+    assert outcome.job_id is not None
+    holder: dict[str, Any] = {}
+
+    def losing_admission_qc(*args: Any, **kwargs: Any) -> TechnicalQCResult:
+        executor = holder["executor"]
+        executor._admission_held = True
+        executor._admission = _LosingAdmission()
+        return TechnicalQCResult(status="PASS", checks=(), reason_codes=(), policy_version="test")
+
+    executor = _executor(session, _FakeRunner(), qc_checker=losing_admission_qc)
+    holder["executor"] = executor
+    executor.set_active_job(outcome.job_id)
+    executor.execute(outcome.render_execution_id)
+
+    session.expire_all()
+    row = session.get(RenderExecution, outcome.render_execution_id)
+    assert row is not None
+    assert row.lifecycle is not RenderExecutionLifecycle.COMPLETE
+    assert row.cache_eligible is False
+    job = session.get(ProcessingJob, outcome.job_id)
+    assert job is not None and job.status is not JobStatus.SUCCEEDED
+
+
+def test_historical_reactivation_persists_without_caller_commit(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """The 2 -> 3 -> 2 promotion must be committed before the queue returns so a
+    request-session close cannot roll it back.
+
+    Uses a file-backed SQLite database so the promotion is observed across real
+    separate connections; an in-memory shared connection would mask the bug.
+    """
+
+    from sqlalchemy import create_engine
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'reactivation.db'}")
+    Base.metadata.create_all(engine)
+    settings = get_settings()
+    try:
+        with Session(engine) as session:
+            fixture = seed_stage51(session, monkeypatch)
+            _plan_ready(session, fixture)
+            candidate_id = fixture.stage50.selection.candidate.id
+
+            monkeypatch.setattr(settings, "render_encoder_threads", 2)
+            first = queue_render_execution(session, candidate_id)
+            ex = _executor(session, _FakeRunner())
+            ex.set_active_job(first.job_id)
+            ex.execute(first.render_execution_id)
+
+            monkeypatch.setattr(settings, "render_encoder_threads", 3)
+            second = queue_render_execution(session, candidate_id)
+            assert second.render_execution_id != first.render_execution_id
+            ex2 = _executor(session, _FakeRunner())
+            ex2.set_active_job(second.job_id)
+            ex2.execute(second.render_execution_id)
+
+            monkeypatch.setattr(settings, "render_encoder_threads", 2)
+            # Force a real outer transaction (a DML emits BEGIN on SQLite) so a
+            # nested savepoint release cannot implicitly commit the promotion.
+            session.execute(
+                update(RenderExecution)
+                .where(RenderExecution.id == second.render_execution_id)
+                .values(is_current=False)
+            )
+            reactivated = queue_render_execution(session, candidate_id)
+            assert reactivated.render_execution_id == first.render_execution_id
+            session.rollback()
+        # Session context closed without a caller commit.
+
+        with Session(engine) as check:
+            first_row = check.get(RenderExecution, first.render_execution_id)
+            second_row = check.get(RenderExecution, second.render_execution_id)
+            assert first_row is not None and first_row.is_current is True
+            assert second_row is not None and second_row.is_current is False
+    finally:
+        engine.dispose()
+
+
+def _qc_artifacts(manifest: dict[str, Any]) -> RenderArtifacts:
+    return RenderArtifacts(
+        output_path=Path("/tmp/output.mp4"),
+        output_relative_path="output.mp4",
+        sha256="x",
+        size_bytes=1024,
+        probe={
+            "streams": {"video": 1, "audio": 1, "subtitle": 0, "data": 0},
+            "avg_frame_rate": "30/1",
+            "video_duration": 2.0,
+            "audio_duration": 2.0,
+            "video_start_time": 0.0,
+            "audio_start_time": 0.0,
+            "width": 1080,
+            "height": 1920,
+            "video_codec": "h264",
+            "pix_fmt": "yuv420p",
+            "audio_codec": "aac",
+            "audio_sample_rate": 48000,
+            "audio_channels": 2,
+        },
+        manifest=manifest,
+        duration_seconds=2.0,
+        frame_count=60,
+        sample_count=96000,
+        sample_rate=48000,
+        channels=2,
+    )
+
+
+def test_qc_expired_deadline_starts_no_subprocess(monkeypatch: Any) -> None:
+    from app.render.execution import qc as qc_module
+
+    calls: list[Any] = []
+
+    def fake_run(*args: Any, **kwargs: Any) -> None:
+        calls.append(args)
+
+    monkeypatch.setattr(qc_module.subprocess, "run", fake_run)
+    manifest = {
+        "timeline": {
+            "occurrences": [
+                {
+                    "output_start": 0.0,
+                    "output_end": 2.0,
+                    "source_start": 10.0,
+                    "source_end": 12.0,
+                }
+            ]
+        }
+    }
+    artifacts = _qc_artifacts(manifest)
+    with pytest.raises(qc_module.QCTimeout):
+        qc_module.check_render_artifact(
+            artifacts,
+            manifest,
+            Stage52Config(),
+            source_path=Path("/tmp/source.mp4"),
+            deadline=time.monotonic() - 1.0,
+        )
+    assert calls == []
+
+
+def _compiled_for_runner(tmp_path: Path) -> tuple[Any, Path]:
+    from stage52_support import fake_runtime
+
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"not-a-real-source")
+    spec = make_spec(caption_events=())
+    attempt = tmp_path / "attempt"
+    runtime = fake_runtime(
+        ffmpeg_binary=FFMPEG_BIN,
+        source_absolute_path=str(source),
+        attempt_directory=str(attempt),
+    )
+    return compile_render(spec, runtime), attempt
+
+
+def _install_fake_popen(monkeypatch: Any, compiled: Any, *, payload: bytes = b"rendered") -> None:
+    import app.render.execution.runner as runner
+
+    class _FakeStderr:
+        def read(self, _size: int) -> bytes:
+            return b""
+
+    class _FakeProcess:
+        def __init__(self, argv: Any, cwd: Any = None, **kwargs: Any) -> None:
+            self.returncode = 0
+            self.pid = 999_999
+            self.stderr = _FakeStderr()
+            output = Path(cwd) / compiled.output_relative_path
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_bytes(payload)
+
+        def poll(self) -> int:
+            return 0
+
+        def wait(self, timeout: float | None = None) -> int:
+            return 0
+
+    monkeypatch.setattr(runner.subprocess, "Popen", _FakeProcess)
+
+
+def test_runner_expired_deadline_skips_output_probe(monkeypatch: Any, tmp_path: Path) -> None:
+    import app.render.execution.runner as runner
+
+    compiled, attempt = _compiled_for_runner(tmp_path)
+    _install_fake_popen(monkeypatch, compiled)
+    probed: list[Any] = []
+    monkeypatch.setattr(runner, "_probe_output", lambda *args, **kwargs: probed.append(args) or {})
+
+    with pytest.raises(RenderTimeout):
+        runner.run_compiled_render(
+            compiled,
+            AttemptContext(
+                attempt_directory=attempt,
+                ass_bytes=_VALID_ASS,
+                deadline=time.monotonic() - 1.0,
+            ),
+        )
+    assert probed == []
+
+
+def test_runner_output_probe_receives_remaining_budget(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    import app.render.execution.runner as runner
+
+    compiled, attempt = _compiled_for_runner(tmp_path)
+    _install_fake_popen(monkeypatch, compiled)
+    captured: dict[str, float] = {}
+    probe = {
+        "duration_seconds": 2.0,
+        "video_codec": "h264",
+        "pix_fmt": "yuv420p",
+        "width": 1080,
+        "height": 1920,
+        "sample_aspect_ratio": "1:1",
+        "display_aspect_ratio": "16:9",
+        "frame_count": 60,
+        "avg_frame_rate": "30/1",
+        "video_start_time": 0.0,
+        "video_duration": 2.0,
+        "audio_codec": "aac",
+        "audio_sample_rate": 48000,
+        "audio_channels": 2,
+        "audio_start_time": 0.0,
+        "audio_duration": 2.0,
+        "streams": {"video": 1, "audio": 1, "subtitle": 0, "data": 0},
+        "rotation_degrees": 0,
+    }
+
+    def fake_probe(binary: str, path: Path, *, timeout_seconds: float) -> dict[str, object]:
+        captured["timeout"] = timeout_seconds
+        return probe
+
+    monkeypatch.setattr(runner, "_probe_output", fake_probe)
+    deadline = time.monotonic() + 50.0
+    runner.run_compiled_render(
+        compiled,
+        AttemptContext(attempt_directory=attempt, ass_bytes=_VALID_ASS, deadline=deadline),
+    )
+    assert 0 < captured["timeout"] <= 50.0
+
+
+def test_qc_timeout_fails_without_publishing(session: Session, monkeypatch: Any) -> None:
+    from app.render.execution.qc import QCTimeout
+
+    fixture = seed_stage51(session, monkeypatch)
+    _plan_ready(session, fixture)
+    outcome = queue_render_execution(session, fixture.stage50.selection.candidate.id)
+    assert outcome.job_id is not None
+
+    def timeout_qc(*args: Any, **kwargs: Any) -> TechnicalQCResult:
+        raise QCTimeout("attempt deadline exhausted")
+
+    executor = _executor(session, _FakeRunner(), qc_checker=timeout_qc)
+    executor.set_active_job(outcome.job_id)
+    with pytest.raises(RenderTimeout):
+        executor.execute(outcome.render_execution_id)
+
+    session.expire_all()
+    row = session.get(RenderExecution, outcome.render_execution_id)
+    assert row is not None
+    # Timeout is distinct from cancellation and never publishes.
+    assert row.lifecycle is RenderExecutionLifecycle.FAILED
+    assert row.error_code == "QC_TIMEOUT"
+    assert row.cache_eligible is False
+    assert row.artifact_reference == {}
+    job = session.get(ProcessingJob, outcome.job_id)
+    assert job is not None and job.status is JobStatus.FAILED

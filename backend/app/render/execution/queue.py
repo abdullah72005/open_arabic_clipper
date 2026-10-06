@@ -241,10 +241,18 @@ def _get_or_create_envelope(
 
 
 def _reactivate(session: Session, row: RenderExecution, delivery_profile_key: str) -> None:
-    """Make an equivalent historical execution authoritative again in its scope."""
+    """Make an equivalent historical execution authoritative again in its scope.
+
+    The promotion is committed before returning: every caller of
+    ``_get_or_create_envelope`` may return a cached/active outcome without any
+    further commit, and a request session that simply closes must not roll the
+    promotion back. Scoped uniqueness is preserved by the savepoint (an
+    ``IntegrityError`` is handled and the outer transaction left untouched).
+    """
 
     if row.is_current:
         return
+    changed = False
     try:
         with session.begin_nested():
             current = get_current_render_execution(
@@ -258,8 +266,13 @@ def _reactivate(session: Session, row: RenderExecution, delivery_profile_key: st
                 session.flush()
             row.is_current = True
             session.flush()
+            changed = True
     except IntegrityError:
         session.expire_all()
+        session.refresh(row)
+        return
+    if changed:
+        session.commit()
         session.refresh(row)
 
 

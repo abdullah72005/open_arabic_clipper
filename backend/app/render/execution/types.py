@@ -482,12 +482,25 @@ class AttemptContext:
     timeout_seconds: float = 0.0
     poll_seconds: float = 0.5
     ass_bytes: bytes = b""
+    #: Absolute monotonic deadline shared by the whole expensive attempt
+    #: (encode, post-encode probing, and QC). ``None`` falls back to a per-phase
+    #: ``timeout_seconds`` budget when set.
+    deadline: float | None = None
 
     def cancelled(self) -> bool:
         try:
             return bool(self.cancel_check())
         except Exception:
             return True
+
+    def effective_deadline(self, started: float) -> float | None:
+        """The absolute deadline for this attempt, if any."""
+
+        if self.deadline is not None:
+            return self.deadline
+        if self.timeout_seconds > 0:
+            return started + self.timeout_seconds
+        return None
 
 
 @dataclass(frozen=True)

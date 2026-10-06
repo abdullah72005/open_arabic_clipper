@@ -47,6 +47,14 @@ class QCCancelled(RuntimeError):
     """Technical QC observed cancellation or lost ownership and stopped."""
 
 
+class QCTimeout(RuntimeError):
+    """Technical QC exhausted the shared attempt deadline.
+
+    Distinct from cancellation: an exhausted mandatory QC budget must never be
+    downgraded into a warning and published as a success.
+    """
+
+
 @dataclass(frozen=True)
 class _SampledFrame:
     output_time: float
@@ -109,11 +117,18 @@ def _raise_if_cancelled(cancel_check: Callable[[], bool] | None) -> None:
 
 
 def _remaining_seconds(deadline: float | None, base: float) -> float:
-    """Bound a subprocess by the remaining shared QC wall-clock budget."""
+    """Bound a subprocess by the remaining shared QC wall-clock budget.
+
+    Raises ``QCTimeout`` once the deadline has expired so no further expensive
+    work is started; it never grants a fresh minimum slice past the deadline.
+    """
 
     if deadline is None:
         return base
-    return max(0.1, min(base, deadline - time.monotonic()))
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise QCTimeout("technical QC deadline exhausted")
+    return min(base, remaining)
 
 
 def _extract_luma(
@@ -766,4 +781,4 @@ def _selected_source_has_sound(
     return False
 
 
-__all__ = ["QCCancelled", "check_render_artifact"]
+__all__ = ["QCCancelled", "QCTimeout", "check_render_artifact"]

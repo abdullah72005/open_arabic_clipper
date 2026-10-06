@@ -22,9 +22,11 @@ from stage52_support import install_fake_stream_probe
 from test_stage52_remediation import _executor, _FakeRunner, _plan_ready
 
 from app.core.enums import JobStatus, RenderExecutionLifecycle
+from app.core.settings import get_settings
 from app.db.base import Base
-from app.models import ClipCandidate, ProcessingJob
+from app.models import CandidateRefinement, ClipCandidate, ProcessingJob
 from app.models.render_execution import RenderExecution
+from app.refinement.queue import apply_manual_transcript
 from app.render.execution.queue import queue_render_execution
 from app.render.execution.types import TechnicalQCResult
 
@@ -80,7 +82,7 @@ def _seed(engine: Engine, monkeypatch: Any) -> tuple[uuid.UUID, uuid.UUID]:
         return outcome.render_execution_id, outcome.job_id
 
 
-def _pass_qc(**_: Any) -> TechnicalQCResult:
+def _pass_qc(*_: Any, **__: Any) -> TechnicalQCResult:
     return TechnicalQCResult(status="PASS", checks=(), reason_codes=(), policy_version="test")
 
 
@@ -224,3 +226,148 @@ def _candidate_id(engine: Engine, row_id: uuid.UUID) -> uuid.UUID:
         row = session.get(RenderExecution, row_id)
         assert row is not None
         return row.clip_candidate_id
+
+
+def _final_refinement_id(engine: Engine, row_id: uuid.UUID) -> uuid.UUID:
+    from app.core.enums import RefinementPriority
+
+    with Session(engine) as session:
+        row = session.get(RenderExecution, row_id)
+        assert row is not None
+        refinement = session.scalars(
+            select(CandidateRefinement).where(
+                CandidateRefinement.clip_candidate_id == row.clip_candidate_id,
+                CandidateRefinement.priority == RefinementPriority.FINAL_CLIP,
+            )
+        ).first()
+        assert refinement is not None
+        return refinement.id
+
+
+def test_final_publication_blocks_on_concurrent_refinement_update(
+    engine: Engine, monkeypatch: Any
+) -> None:
+    """A bound FINAL_CLIP refinement committed before the publication transaction
+    is authoritative and must block a stale publication."""
+
+    row_id, job_id = _seed(engine, monkeypatch)
+    refinement_id = _final_refinement_id(engine, row_id)
+
+    def updating_qc(*args: Any, **kwargs: Any) -> TechnicalQCResult:
+        other = Session(engine)
+        try:
+            apply_manual_transcript(other, refinement_id, "نص بديل متعمد")
+        finally:
+            other.close()
+        return _pass_qc()
+
+    _run(engine, row_id, job_id, updating_qc)
+    with Session(engine) as check:
+        row = check.get(RenderExecution, row_id)
+        job = check.get(ProcessingJob, job_id)
+        assert row is not None and row.lifecycle is not RenderExecutionLifecycle.COMPLETE
+        assert row.cache_eligible is False
+        assert row.artifact_reference == {}
+        assert job is not None and job.status is not JobStatus.SUCCEEDED
+
+
+def test_refinement_update_serializes_with_publication_lock(
+    engine: Engine, monkeypatch: Any
+) -> None:
+    """A manual refinement update overlapping the publication transaction must
+    block on the locked bound refinement and serialize after it commits."""
+
+    import threading
+
+    import app.render.execution.executor as executor_module
+
+    row_id, job_id = _seed(engine, monkeypatch)
+    refinement_id = _final_refinement_id(engine, row_id)
+
+    reached = threading.Event()
+    release = threading.Event()
+    updater_started = threading.Event()
+    updater_finished = threading.Event()
+    errors: list[BaseException] = []
+    real_finalize = executor_module.finalize_success
+
+    def gated_finalize(*args: Any, **kwargs: Any) -> Any:
+        reached.set()
+        assert release.wait(timeout=30)
+        return real_finalize(*args, **kwargs)
+
+    monkeypatch.setattr(executor_module, "finalize_success", gated_finalize)
+
+    def worker() -> None:
+        session = Session(engine)
+        try:
+            executor = _executor(session, _FakeRunner(), qc_checker=_pass_qc)
+            executor.set_active_job(job_id)
+            executor.execute(row_id)
+        except BaseException as error:  # noqa: BLE001
+            errors.append(error)
+        finally:
+            session.close()
+
+    worker_thread = threading.Thread(target=worker, daemon=True)
+    updater = Session(engine)
+
+    def update() -> None:
+        updater_started.set()
+        try:
+            apply_manual_transcript(updater, refinement_id, "نص متأخر")
+        finally:
+            updater.close()
+            updater_finished.set()
+
+    updater_thread = threading.Thread(target=update, daemon=True)
+    try:
+        worker_thread.start()
+        assert reached.wait(timeout=30), errors
+        # The worker now holds the bound refinement FOR UPDATE.
+        updater_thread.start()
+        assert updater_started.wait(timeout=30)
+        assert not updater_finished.wait(timeout=2.0)  # blocked, not merely slow
+        release.set()
+        worker_thread.join(timeout=30)
+        updater_thread.join(timeout=30)
+    finally:
+        release.set()
+    assert not worker_thread.is_alive()
+    assert updater_finished.is_set()
+    assert not errors, errors
+
+
+def test_historical_reactivation_persists_on_postgres(engine: Engine, monkeypatch: Any) -> None:
+    with Session(engine) as seeding:
+        fixture = seed_stage51(seeding, monkeypatch)
+        _plan_ready(seeding, fixture)
+        candidate_id = fixture.stage50.selection.candidate.id
+    settings = get_settings()
+
+    monkeypatch.setattr(settings, "render_encoder_threads", 2)
+    with Session(engine) as session:
+        first = queue_render_execution(session, candidate_id)
+        executor = _executor(session, _FakeRunner())
+        executor.set_active_job(first.job_id)
+        executor.execute(first.render_execution_id)
+
+    monkeypatch.setattr(settings, "render_encoder_threads", 3)
+    with Session(engine) as session:
+        second = queue_render_execution(session, candidate_id)
+        assert second.render_execution_id != first.render_execution_id
+        executor = _executor(session, _FakeRunner())
+        executor.set_active_job(second.job_id)
+        executor.execute(second.render_execution_id)
+
+    monkeypatch.setattr(settings, "render_encoder_threads", 2)
+    session = Session(engine)
+    reactivated = queue_render_execution(session, candidate_id)
+    assert reactivated.render_execution_id == first.render_execution_id
+    session.close()  # no caller commit
+
+    with Session(engine) as check:
+        first_row = check.get(RenderExecution, first.render_execution_id)
+        second_row = check.get(RenderExecution, second.render_execution_id)
+        assert first_row is not None and first_row.is_current is True
+        assert second_row is not None and second_row.is_current is False
