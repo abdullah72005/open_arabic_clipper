@@ -14,9 +14,10 @@ from __future__ import annotations
 
 import hashlib
 import math
+import shutil
 import subprocess
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from fractions import Fraction
@@ -52,6 +53,7 @@ from app.render.execution.policy import (
     EXECUTION_FINGERPRINT_VERSION,
     EXECUTION_POLICY_VERSION,
     EXECUTION_SCHEMA_VERSION,
+    SOURCE_STREAMS_UNSUPPORTED,
     SUPPORTED_ARTIFACT_PURPOSES,
     Stage52Config,
     delivery_profile_for,
@@ -132,18 +134,29 @@ class SourceStreamFacts:
     verified: bool
 
 
+# Explicit test seam. Production leaves this ``None`` so stream timing evidence
+# is never invented; hermetic tests inject deterministic facts rather than
+# relying on a silent production failure fallback.
+_SOURCE_STREAM_PROBE_OVERRIDE: Callable[[Path, Settings], Any] | None = None
+
+
 def _resolve_source_streams(
     source_path: Path,
     settings: Settings,
     stream_probe: Any | None,
 ) -> SourceStreamFacts:
-    if stream_probe is not None:
-        channels = stream_probe(source_path, settings)
-        audio_channels = channels if isinstance(channels, int) and channels > 0 else 2
-        return SourceStreamFacts(0.0, 0.0, audio_channels, False)
+    probe = stream_probe if stream_probe is not None else _SOURCE_STREAM_PROBE_OVERRIDE
+    if probe is not None:
+        resolved = probe(source_path, settings)
+        if isinstance(resolved, SourceStreamFacts):
+            return resolved
+        channels = resolved if isinstance(resolved, int) and resolved > 0 else 2
+        return SourceStreamFacts(0.0, 0.0, channels, True)
     facts = _probe_source_stream_facts(source_path, settings)
     if facts is None:
-        return SourceStreamFacts(0.0, 0.0, 2, False)
+        # Missing/unusable stream timing evidence must fail closed, never be
+        # replaced with an invented zero origin that silently shifts content.
+        raise RenderExecutionError(SOURCE_STREAMS_UNSUPPORTED)
     return facts
 
 
@@ -192,7 +205,14 @@ def _probe_source_stream_facts(source_path: Path, settings: Settings) -> SourceS
         return None
     if video_start < -0.05 or audio_start < -0.05:
         return None
-    return SourceStreamFacts(video_start, audio_start, audio_channels, True)
+    # Normalize to the shared source-local origin used across ingestion,
+    # refinement, contracts, and FFmpeg: FFmpeg resets each input stream's
+    # timestamps to its own first packet, so the authoritative source-local time
+    # zero is the earliest stream start. The *relative* A/V offset survives as a
+    # genuine leading gap; the common container offset is never treated as
+    # missing content.
+    origin = min(video_start, audio_start)
+    return SourceStreamFacts(video_start - origin, audio_start - origin, audio_channels, True)
 
 
 def _as_float(value: object, default: float = 0.0) -> float:
@@ -736,13 +756,145 @@ def _omission_reason(block_type: str, slot_kind: str) -> str:
 # Runtime + fingerprints
 
 
-_RUNTIME_VERSION_CACHE: dict[tuple[str, str, str], dict[str, str]] = {}
+# Cache keyed by a cheap dependency *signature* (binary/font/library path + stat),
+# never by path alone, so a changed dependency under an unchanged path cannot be
+# concealed by a stale cache entry.
+_RUNTIME_VERSION_CACHE: dict[tuple[object, ...], dict[str, object]] = {}
+
+
+def _stat_signature(path: str) -> tuple[int, int]:
+    if not path:
+        return (0, 0)
+    try:
+        stat = Path(path).stat()
+    except OSError:
+        return (0, 0)
+    return (stat.st_mtime_ns, stat.st_size)
+
+
+def _resolved_binary(binary: str) -> str:
+    return shutil.which(binary) or binary
+
+
+def _file_sha256(path: str) -> str:
+    if not path:
+        return ""
+    try:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    except OSError:
+        return ""
+
+
+def _font_match_path(family: str) -> str:
+    """Resolve the concrete font file fontconfig selects for ``family``."""
+
+    try:
+        completed = subprocess.run(
+            ["fc-match", "-f", "%{file}", family],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return (completed.stdout or "").strip()
+
+
+def _resolve_effective_fonts(family: str) -> tuple[str, ...]:
+    """Concrete files for the primary family plus its Latin fallback.
+
+    The canonical ASS places mixed Arabic/Latin text through one family, and
+    libass resolves missing glyphs through fontconfig fallback; both the primary
+    and the generic fallback file participate in the runtime content identity.
+    """
+
+    paths: list[str] = []
+    for name in (family, "sans-serif"):
+        path = _font_match_path(name)
+        if path and path not in paths and Path(path).is_file():
+            paths.append(path)
+    return tuple(paths)
+
+
+def _font_sha256(font_paths: Sequence[str]) -> str:
+    """Composite content digest over the effective font files."""
+
+    digest = hashlib.sha256()
+    hashed_any = False
+    for path in font_paths:
+        data_digest = _file_sha256(path)
+        if not data_digest:
+            continue
+        hashed_any = True
+        digest.update(path.encode("utf-8"))
+        digest.update(b"\x00")
+        digest.update(bytes.fromhex(data_digest))
+    return digest.hexdigest() if hashed_any else ""
+
+
+def _shared_library_path(binary: str, name: str) -> str:
+    """Resolve the concrete loaded shared object for ``name`` (via ldd, then ctypes)."""
+
+    resolved_binary = _resolved_binary(binary)
+    try:
+        completed = subprocess.run(
+            ["ldd", resolved_binary], check=False, capture_output=True, text=True, timeout=30
+        )
+        output = completed.stdout or ""
+    except (OSError, subprocess.SubprocessError):
+        output = ""
+    for line in output.splitlines():
+        left, separator, right = line.partition("=>")
+        if separator and name in left and right.strip():
+            candidate = right.strip().split(" ")[0]
+            if candidate.startswith("/") and Path(candidate).is_file():
+                return str(Path(candidate).resolve())
+    import ctypes.util
+
+    found = ctypes.util.find_library(name)
+    if found:
+        try:
+            resolved = Path(found)
+        except (OSError, ValueError):
+            resolved = None
+        if resolved is not None and resolved.is_file():
+            return str(resolved.resolve())
+    return ""
+
+
+def _libass_identity(ffmpeg_binary: str) -> tuple[str, str]:
+    """Truthful identity of the loaded libass: real filename + content digest."""
+
+    path = _shared_library_path(ffmpeg_binary, "ass")
+    if not path:
+        return ("", "")
+    return (Path(path).name, _file_sha256(path))
+
+
+def _runtime_signature(
+    ffmpeg_binary: str, ffprobe_binary: str, font_family: str
+) -> tuple[object, ...]:
+    ffmpeg_path = _resolved_binary(ffmpeg_binary)
+    ffprobe_path = _resolved_binary(ffprobe_binary)
+    fonts = _resolve_effective_fonts(font_family)
+    libass_path = _shared_library_path(ffmpeg_binary, "ass")
+    return (
+        ffmpeg_path,
+        _stat_signature(ffmpeg_path),
+        ffprobe_path,
+        _stat_signature(ffprobe_path),
+        font_family,
+        tuple((path, _stat_signature(path)) for path in fonts),
+        libass_path,
+        _stat_signature(libass_path),
+    )
 
 
 def _runtime_version_fields(
     ffmpeg_binary: str, ffprobe_binary: str, font_family: str
-) -> dict[str, str]:
-    key = (ffmpeg_binary, ffprobe_binary, font_family)
+) -> dict[str, object]:
+    key = _runtime_signature(ffmpeg_binary, ffprobe_binary, font_family)
     cached = _RUNTIME_VERSION_CACHE.get(key)
     if cached is not None:
         return cached
@@ -752,17 +904,18 @@ def _runtime_version_fields(
     ffmpeg_version = (ffmpeg_text.splitlines()[0] if ffmpeg_text else "") or ffmpeg_binary
     ffprobe_version = (ffprobe_text.splitlines()[0] if ffprobe_text else "") or ffprobe_binary
     configuration = _configuration_line(buildconf_text) or _configuration_line(ffmpeg_text)
-    font_match = _font_match(font_family)
-    fields = {
+    fonts = _resolve_effective_fonts(font_family)
+    libass_version, libass_sha256 = _libass_identity(ffmpeg_binary)
+    fields: dict[str, object] = {
         "ffmpeg_version": ffmpeg_version,
         "ffprobe_version": ffprobe_version,
         "libavformat_version": _lib_version(ffmpeg_text, "libavformat") or ffmpeg_version,
         "libavcodec_version": _lib_version(ffmpeg_text, "libavcodec") or ffmpeg_version,
-        "libass_version": _lib_version(ffmpeg_text, "libass")
-        or _version_token(ffmpeg_text, "--enable-libass")
-        or "unavailable",
-        "font_match": font_match,
-        "font_sha256": _font_sha256(font_match),
+        "libass_version": libass_version or "unavailable",
+        "libass_sha256": libass_sha256,
+        "font_match": fonts[0] if fonts else "",
+        "font_sha256": _font_sha256(fonts),
+        "effective_fonts": list(fonts),
         "build_config_sha256": (
             hashlib.sha256(configuration.encode("utf-8")).hexdigest() if configuration else ""
         ),
@@ -783,15 +936,16 @@ def resolve_runtime_identity(
     config = settings.stage52_config()
     fields = _runtime_version_fields(ffmpeg_binary, ffprobe_binary, font_family)
     identity = RuntimeIdentity(
-        ffmpeg_version=fields["ffmpeg_version"],
-        ffprobe_version=fields["ffprobe_version"],
-        libavformat_version=fields["libavformat_version"],
-        libavcodec_version=fields["libavcodec_version"],
-        libass_version=fields["libass_version"],
+        ffmpeg_version=cast(str, fields["ffmpeg_version"]),
+        ffprobe_version=cast(str, fields["ffprobe_version"]),
+        libavformat_version=cast(str, fields["libavformat_version"]),
+        libavcodec_version=cast(str, fields["libavcodec_version"]),
+        libass_version=cast(str, fields["libass_version"]),
+        libass_sha256=cast(str, fields["libass_sha256"]),
         font_family=font_family,
-        font_match=fields["font_match"],
-        font_sha256=fields["font_sha256"],
-        build_config_sha256=fields["build_config_sha256"],
+        font_match=cast(str, fields["font_match"]),
+        font_sha256=cast(str, fields["font_sha256"]),
+        build_config_sha256=cast(str, fields["build_config_sha256"]),
         compiler_version=EXECUTION_POLICY_VERSION,
         policy_version=EXECUTION_POLICY_VERSION,
         ffmpeg_binary=ffmpeg_binary,
@@ -825,26 +979,16 @@ def _configuration_line(text: str) -> str:
 
 
 def _lib_version(text: str, name: str) -> str:
+    """Full, whitespace-collapsed version (never a truncated fragment)."""
+
     for line in text.splitlines():
         stripped = line.strip()
         if stripped.startswith(name):
-            parts = stripped.split()
-            if len(parts) >= 2:
-                return f"{parts[0]} {parts[1]}"
+            remainder = stripped[len(name) :].strip()
+            version = "".join(remainder.split("/", 1)[0].split())
+            if version:
+                return f"{name} {version}"
     return ""
-
-
-def _font_sha256(font_match: str) -> str:
-    if not font_match:
-        return ""
-    candidate = font_match.split(":", 1)[0]
-    path = Path(candidate)
-    if not path.is_file():
-        return ""
-    try:
-        return hashlib.sha256(path.read_bytes()).hexdigest()
-    except OSError:
-        return ""
 
 
 def request_input_fingerprint(spec: RenderSpec, config: Stage52Config) -> str:
@@ -856,56 +1000,6 @@ def request_input_fingerprint(spec: RenderSpec, config: Stage52Config) -> str:
         "qc_policy": qc_payload(config),
     }
     return render_request_fingerprint(payload)
-
-
-def _first_line(command: Sequence[str]) -> str:
-    try:
-        completed = subprocess.run(
-            list(command), check=True, capture_output=True, text=True, timeout=30
-        )
-    except (OSError, subprocess.SubprocessError):
-        return ""
-    return (completed.stdout or "").splitlines()[0] if completed.stdout else ""
-
-
-def _version_token(text: str, token: str) -> str:
-    for part in text.split():
-        if token in part:
-            return part
-    return ""
-
-
-def _font_match(family: str) -> str:
-    try:
-        completed = subprocess.run(
-            ["fc-match", family], check=True, capture_output=True, text=True, timeout=30
-        )
-    except (OSError, subprocess.SubprocessError):
-        return ""
-    return (completed.stdout or "").strip()
-
-
-def _probe_streams(source_path: Path, settings: Settings) -> int:
-    command = [
-        settings.ffprobe_binary,
-        "-v",
-        "error",
-        "-select_streams",
-        "a:0",
-        "-show_entries",
-        "stream=channels",
-        "-of",
-        "default=nw=1:nk=1",
-        str(source_path),
-    ]
-    try:
-        completed = subprocess.run(command, check=True, capture_output=True, text=True, timeout=60)
-    except (OSError, subprocess.SubprocessError):
-        return 2
-    try:
-        return int((completed.stdout or "").strip().splitlines()[0])
-    except (ValueError, IndexError):
-        return 2
 
 
 # Persistence
@@ -1086,6 +1180,50 @@ def release_active_job(session: Session, row_id: uuid.UUID, *, job_id: uuid.UUID
         .values(active_job_id=None)
         .execution_options(synchronize_session=False)
     )
+
+
+#: Job statuses a running cancellation may observe. An API/session cancel flips
+#: the job to CANCELLED before the worker notices, so a cancellation fence that
+#: required RUNNING would match zero rows and strand the owned execution.
+_CANCELLATION_JOB_STATUSES = (JobStatus.RUNNING, JobStatus.CANCELLED)
+
+
+def finalize_cancellation(
+    session: Session, row_id: uuid.UUID, *, job_id: uuid.UUID, claim_version: int
+) -> bool:
+    """Atomically finalize an owned running execution as CANCELLED.
+
+    Requires the exact execution, the authoritative ``active_job_id``, the exact
+    executing job, and the exact ``claim_version`` -- but accepts a job already
+    flipped to CANCELLED as well as one still RUNNING. A superseded worker (newer
+    claim or reassigned active job) therefore matches zero rows and can never
+    cancel or release a newer run's result. Clears cache eligibility and the
+    published-artifact pointer and releases ownership coherently.
+    """
+
+    result = session.execute(
+        update(RenderExecution)
+        .where(
+            RenderExecution.id == row_id,
+            RenderExecution.active_job_id == job_id,
+            _job_owns(job_id, claim_version, _CANCELLATION_JOB_STATUSES),
+        )
+        .values(
+            lifecycle=RenderExecutionLifecycle.CANCELLED,
+            cache_eligible=False,
+            qc_status=None,
+            artifact_reference={},
+            execution_manifest={},
+            qc_result={},
+            output_fingerprint="",
+            reason_codes=["RENDER_CANCELLED"],
+            error_code="RENDER_CANCELLED",
+            error_message=None,
+            active_job_id=None,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    return int(result.rowcount) == 1
 
 
 def cancel_execution(session: Session, row_id: uuid.UUID, *, job_id: uuid.UUID) -> bool:
@@ -1372,6 +1510,7 @@ __all__ = [
     "check_render_artifact",
     "begin_attempt",
     "execution_artifact_reference",
+    "finalize_cancellation",
     "finalize_success",
     "get_current_render_execution",
     "get_render_execution",

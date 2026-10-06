@@ -10,14 +10,16 @@ source-aware silence QC, and truthful runtime identity.
 from __future__ import annotations
 
 import hashlib
+import math
 import shutil
 import subprocess
+import uuid
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
-from sqlalchemy import Engine
+from sqlalchemy import Engine, update
 from sqlalchemy.orm import Session
 from stage51_support import (
     FakeDetector,
@@ -26,7 +28,7 @@ from stage51_support import (
     Stage51Fixture,
     seed_stage51,
 )
-from stage52_support import make_spec, occurred
+from stage52_support import install_fake_stream_probe, make_spec, occurred
 
 from app.composition.queue import queue_visual_composition
 from app.composition.service import execute_visual_composition, get_current_visual_composition
@@ -35,12 +37,13 @@ from app.core.settings import get_settings
 from app.db.base import Base
 from app.models import ProcessingJob, VisualCompositionPlan
 from app.models.render_execution import RenderExecution
+from app.pipeline.executor import StageCancelled
 from app.render.execution.compiler import compile_render
 from app.render.execution.executor import build_render_execution_executor
 from app.render.execution.policy import Stage52Config
 from app.render.execution.qc import check_render_artifact
 from app.render.execution.queue import queue_render_execution
-from app.render.execution.runner import RenderProcessError, run_compiled_render
+from app.render.execution.runner import RenderCancelled, RenderProcessError, run_compiled_render
 from app.render.execution.service import (
     RenderExecutionError,
     build_render_spec,
@@ -92,6 +95,7 @@ def session(sqlite_engine: Engine) -> Iterator[Session]:
 def _no_dispatch(monkeypatch: Any) -> None:
     monkeypatch.setattr("app.render.execution.queue._dispatch", lambda *args: None)
     monkeypatch.setattr("app.composition.queue._dispatch", lambda *args: None)
+    install_fake_stream_probe(monkeypatch)
 
 
 def _plan_ready(session: Session, fixture: Stage51Fixture) -> None:
@@ -160,6 +164,7 @@ def _fake_qc(
     *,
     source_path: Any = None,
     cancel_check: Any = None,
+    deadline: Any = None,
 ) -> TechnicalQCResult:
     return TechnicalQCResult(status="PASS", checks=(), reason_codes=(), policy_version="test")
 
@@ -181,16 +186,55 @@ def _runtime_factory() -> Any:
     return factory
 
 
-def _executor(session: Session, runner: _FakeRunner, *, qc_checker: Any | None = None) -> Any:
+def _executor(
+    session: Session,
+    runner: _FakeRunner,
+    *,
+    qc_checker: Any | None = None,
+    admission: Any | None = None,
+) -> Any:
     settings = get_settings()
     return build_render_execution_executor(
         session,
         StorageService(settings.storage_root),
         settings,
+        admission=admission,
         runner=runner,
         qc_checker=qc_checker or _fake_qc,
         runtime_factory=_runtime_factory(),
     )
+
+
+def _cancel_job_in_other_session(engine: Engine, job_id: Any) -> None:
+    """Flip the real job to CANCELLED on a separate committed connection."""
+
+    other = Session(engine)
+    try:
+        job = other.get(ProcessingJob, job_id)
+        assert job is not None
+        job.status = JobStatus.CANCELLED
+        other.commit()
+    finally:
+        other.close()
+
+
+def _claimed_executor(session: Session, outcome: Any, *, admission: Any | None = None) -> Any:
+    executor = _executor(session, _FakeRunner(), admission=admission)
+    executor.set_active_job(outcome.job_id)
+    assert executor._claim_job() is True
+    executor._row_id = outcome.render_execution_id
+    return executor
+
+
+class _LosingAdmission:
+    def acquire(self, *, wait_seconds: float, cancel_check: Any) -> bool:
+        return True
+
+    def release(self) -> None:  # pragma: no cover - not exercised
+        return None
+
+    def held(self) -> bool:
+        return False
 
 
 def _complete_once(session: Session, fixture: Stage51Fixture, runner: _FakeRunner) -> Any:
@@ -253,6 +297,138 @@ def test_upstream_invalidation_during_render_blocks_publication(
     assert row is not None
     assert row.lifecycle is not RenderExecutionLifecycle.COMPLETE
     assert row.cache_eligible is False
+
+
+def test_post_qc_upstream_invalidation_blocks_publication(
+    session: Session, monkeypatch: Any
+) -> None:
+    fixture = seed_stage51(session, monkeypatch)
+    _plan_ready(session, fixture)
+    candidate_id = fixture.stage50.selection.candidate.id
+    outcome = queue_render_execution(session, candidate_id)
+
+    def invalidating_qc(*args: Any, **kwargs: Any) -> TechnicalQCResult:
+        # Invalidate *after* QC passes, in the window that used to sit between
+        # revalidation and publication.
+        from app.models import ClipCandidate
+
+        candidate = session.get(ClipCandidate, candidate_id)
+        assert candidate is not None
+        candidate.is_current = False
+        session.commit()
+        return TechnicalQCResult(status="PASS", checks=(), reason_codes=(), policy_version="test")
+
+    executor = _executor(session, _FakeRunner(), qc_checker=invalidating_qc)
+    executor.set_active_job(outcome.job_id)
+    executor.execute(outcome.render_execution_id)
+    session.expire_all()
+    row = session.get(RenderExecution, outcome.render_execution_id)
+    assert row is not None
+    assert row.lifecycle is not RenderExecutionLifecycle.COMPLETE
+    assert row.cache_eligible is False
+    job = session.get(ProcessingJob, outcome.job_id)
+    assert job is not None and job.status is not JobStatus.SUCCEEDED
+
+
+def test_publication_failure_propagates_and_does_not_falsely_succeed(
+    session: Session, monkeypatch: Any, sqlite_engine: Engine
+) -> None:
+    import app.render.execution.executor as executor_module
+    import app.workers.tasks as tasks
+
+    fixture = seed_stage51(session, monkeypatch)
+    _plan_ready(session, fixture)
+    outcome = queue_render_execution(session, fixture.stage50.selection.candidate.id)
+    assert outcome.job_id is not None
+
+    def boom(*args: Any, **kwargs: Any) -> bool:
+        raise RuntimeError("publication backend failure")
+
+    monkeypatch.setattr(executor_module, "finalize_success", boom)
+    monkeypatch.setattr(tasks, "create_session_factory", lambda: lambda: Session(sqlite_engine))
+
+    with pytest.raises(RuntimeError):
+        tasks.run_render_execution.apply(
+            args=[str(outcome.render_execution_id), str(outcome.job_id), False]
+        ).get()
+
+    session.expire_all()
+    row = session.get(RenderExecution, outcome.render_execution_id)
+    job = session.get(ProcessingJob, outcome.job_id)
+    assert row is not None
+    assert row.lifecycle is not RenderExecutionLifecycle.COMPLETE
+    assert row.cache_eligible is False
+    # The failure is recorded truthfully; the job is never left RUNNING.
+    assert job is not None and job.status is not JobStatus.RUNNING
+    assert job.status is JobStatus.FAILED
+
+
+def test_source_audio_analysis_does_not_start_after_cancel(monkeypatch: Any) -> None:
+    from app.render.execution import qc as qc_module
+    from app.render.execution.qc import QCCancelled
+
+    calls: list[str] = []
+    state = {"cancel": False}
+
+    def fake_luma(binary: str, path: Path, time_s: float, *, deadline: Any = None) -> bytes:
+        return b"\x00" * (160 * 284)
+
+    def fake_volume(
+        binary: str,
+        path: Path,
+        start: float = 0.0,
+        end: float | None = None,
+        *,
+        cancel_check: Any = None,
+        deadline: Any = None,
+    ) -> dict[str, float]:
+        calls.append(path.name)
+        if path.name == "output.mp4":
+            # Cancellation is observed during output-audio analysis.
+            state["cancel"] = True
+            return {"mean": -math.inf, "max": -math.inf}
+        return {"mean": -20.0, "max": -3.0}
+
+    monkeypatch.setattr(qc_module, "_extract_luma", fake_luma)
+    monkeypatch.setattr(qc_module, "_volume_metrics", fake_volume)
+    manifest = {
+        "timeline": {
+            "occurrences": [
+                {
+                    "output_start": 0.0,
+                    "output_end": 2.0,
+                    "source_start": 10.0,
+                    "source_end": 12.0,
+                }
+            ]
+        }
+    }
+    artifacts = RenderArtifacts(
+        output_path=Path("/tmp/output.mp4"),
+        output_relative_path="output.mp4",
+        sha256="x",
+        size_bytes=1,
+        probe={
+            "streams": {"video": 1, "audio": 1, "subtitle": 0, "data": 0},
+            "avg_frame_rate": "30/1",
+        },
+        manifest=manifest,
+        duration_seconds=2.0,
+        frame_count=60,
+        sample_count=96000,
+        sample_rate=48000,
+        channels=2,
+    )
+    with pytest.raises(QCCancelled):
+        qc_module.check_render_artifact(
+            artifacts,
+            manifest,
+            Stage52Config(),
+            source_path=Path("/tmp/source.mp4"),
+            cancel_check=lambda: state["cancel"],
+        )
+    # No source-audio subprocess may start once cancellation is observed.
+    assert "source.mp4" not in calls
 
 
 def test_malformed_plan_fails_closed(session: Session, monkeypatch: Any) -> None:
@@ -326,12 +502,52 @@ def test_qc_policy_change_invalidates_request_fingerprint() -> None:
 
 
 def test_runtime_identity_is_truthful() -> None:
+    from app.render.execution import service
+
+    service._RUNTIME_VERSION_CACHE.clear()
     identity = resolve_runtime_identity(get_settings())
     assert identity.ffmpeg_version
-    assert identity.libavformat_version
     assert identity.libavcodec_version
+    # Complete, whitespace-collapsed version (never a truncated fragment).
+    assert identity.libavformat_version.count(".") >= 2
+    assert "  " not in identity.libavformat_version
     assert identity.build_config_sha256
-    assert identity.libass_version != ""
+    # Truthful libass identity, never the configure capability flag.
+    assert identity.libass_version
+    assert identity.libass_version != "--enable-libass"
+    assert identity.libass_sha256
+    # Actual resolved font content is hashed, never an empty hash or a basename.
+    assert identity.font_sha256
+    assert identity.font_match.startswith("/")
+    assert Path(identity.font_match).is_file()
+
+
+def test_runtime_cache_detects_dependency_change(monkeypatch: Any) -> None:
+    from app.render.execution import service
+
+    service._RUNTIME_VERSION_CACHE.clear()
+    calls = {"n": 0}
+
+    def fake_binary_output(binary: str, flag: str) -> str:
+        calls["n"] += 1
+        return (
+            "ffmpeg version test\n"
+            "configuration: --enable-libass\n"
+            "libavformat    61.  7.103 / 61.  7.103\n"
+            "libavcodec     61. 19.101 / 61. 19.101\n"
+        )
+
+    monkeypatch.setattr(service, "_binary_output", fake_binary_output)
+    service._runtime_version_fields("ffmpeg", "ffprobe", "Noto Sans Arabic")
+    after_first = calls["n"]
+    assert after_first > 0
+    # Repeated identical dependency signature is a cache hit.
+    service._runtime_version_fields("ffmpeg", "ffprobe", "Noto Sans Arabic")
+    assert calls["n"] == after_first
+    # A changed dependency signature under the same path must invalidate.
+    monkeypatch.setattr(service, "_stat_signature", lambda path: (999999, 1) if path else (0, 0))
+    service._runtime_version_fields("ffmpeg", "ffprobe", "Noto Sans Arabic")
+    assert calls["n"] > after_first
 
 
 def test_historical_request_reactivation(session: Session, monkeypatch: Any) -> None:
@@ -451,6 +667,83 @@ def test_real_render_preserves_audio_start_offset(tmp_path: Path) -> None:
     assert float(probe["audio_duration"]) == pytest.approx(1.0, abs=0.2)
 
 
+def _generate_absolute_offset_source(path: Path) -> None:
+    subprocess.run(
+        [
+            FFMPEG_BIN,
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=1920x1080:rate=30:duration=2",
+            "-itsoffset",
+            "0.25",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=2",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-output_ts_offset",
+            "5",
+            "-y",
+            str(path),
+        ],
+        check=True,
+        capture_output=True,
+    )
+
+
+@_requires_ffmpeg
+def test_absolute_stream_offsets_normalize_to_shared_origin(tmp_path: Path) -> None:
+    from app.render.execution.qc import _volume_metrics
+    from app.render.execution.service import _probe_source_stream_facts
+
+    source = tmp_path / "absolute-offset.mp4"
+    _generate_absolute_offset_source(source)
+    facts = _probe_source_stream_facts(source, get_settings())
+    assert facts is not None
+    # Common 5 s container offset is removed; the relative 250 ms A/V offset stays.
+    assert facts.video_start_seconds == pytest.approx(0.0, abs=0.02)
+    assert facts.audio_start_seconds == pytest.approx(0.25, abs=0.05)
+    assert facts.verified is True
+
+    scene = SceneSpec(0, 0, 0.0, 1.0, "SOURCE_AS_IS", "smoothstep-ease")
+    occ = occurred("block-0", 0, 0.0, 1.0, 0.0, (scene,))
+    spec = make_spec(
+        occurrences=(occ,),
+        caption_events=(),
+        source_duration=2.0,
+        source_video_start=facts.video_start_seconds,
+        source_audio_start=facts.audio_start_seconds,
+    )
+    attempt = tmp_path / "attempt"
+    from stage52_support import fake_runtime
+
+    runtime = fake_runtime(
+        ffmpeg_binary=FFMPEG_BIN, source_absolute_path=str(source), attempt_directory=str(attempt)
+    )
+    compiled = compile_render(spec, runtime)
+    artifacts = run_compiled_render(
+        compiled,
+        AttemptContext(attempt_directory=attempt, ass_bytes=_VALID_ASS, timeout_seconds=300),
+    )
+    # A 1 s source-local span must render ~1 s, never the ~6 s the raw offset caused.
+    assert artifacts.duration_seconds == pytest.approx(1.0, abs=0.15)
+    # Decoded audio: leading ~250 ms silence, then real signal.
+    leading = _volume_metrics(FFMPEG_BIN, artifacts.output_path, 0.0, 0.2)
+    signal = _volume_metrics(FFMPEG_BIN, artifacts.output_path, 0.4, 0.9)
+    assert leading is not None and leading.get("mean", 0.0) <= -60.0
+    assert signal is not None and signal.get("mean", -100.0) > -60.0
+
+
 def _generate_partly_silent_source(path: Path) -> None:
     subprocess.run(
         [
@@ -521,6 +814,7 @@ def test_qc_failure_persists_result_and_is_not_cache_eligible(
         *,
         source_path: Any = None,
         cancel_check: Any = None,
+        deadline: Any = None,
     ) -> TechnicalQCResult:
         return TechnicalQCResult(
             status="FAIL",
@@ -545,24 +839,128 @@ def test_qc_failure_persists_result_and_is_not_cache_eligible(
     assert job is not None and job.status is JobStatus.FAILED
 
 
-def test_qc_cancellation_marks_cancelled(session: Session, monkeypatch: Any) -> None:
-    from app.pipeline.executor import StageCancelled
+def test_running_cancellation_finalizes_execution(
+    session: Session, monkeypatch: Any, sqlite_engine: Engine
+) -> None:
+    fixture = seed_stage51(session, monkeypatch)
+    _plan_ready(session, fixture)
+    outcome = queue_render_execution(session, fixture.stage50.selection.candidate.id)
+    assert outcome.job_id is not None
+    job_id = outcome.job_id
+
+    class _CancelRunner:
+        def __call__(self, compiled: Any, context: Any) -> Any:
+            # The API session cancels the real job on another connection while
+            # the worker is rendering.
+            _cancel_job_in_other_session(sqlite_engine, job_id)
+            raise RenderCancelled("render cancelled")
+
+    executor = _executor(session, _CancelRunner())
+    executor.set_active_job(job_id)
+    with pytest.raises(StageCancelled):
+        executor.execute(outcome.render_execution_id)
+
+    session.expire_all()
+    row = session.get(RenderExecution, outcome.render_execution_id)
+    assert row is not None
+    assert row.lifecycle is RenderExecutionLifecycle.CANCELLED
+    assert row.active_job_id is None
+    assert row.cache_eligible is False
+    assert row.artifact_reference == {}
+    job = session.get(ProcessingJob, job_id)
+    assert job is not None and job.status is JobStatus.CANCELLED
+
+
+def test_qc_cancellation_finalizes_execution(
+    session: Session, monkeypatch: Any, sqlite_engine: Engine
+) -> None:
     from app.render.execution.qc import QCCancelled
 
     fixture = seed_stage51(session, monkeypatch)
     _plan_ready(session, fixture)
     outcome = queue_render_execution(session, fixture.stage50.selection.candidate.id)
+    assert outcome.job_id is not None
+    job_id = outcome.job_id
 
     def cancelling_qc(*args: Any, **kwargs: Any) -> TechnicalQCResult:
+        _cancel_job_in_other_session(sqlite_engine, job_id)
         raise QCCancelled("cancelled during QC")
 
     executor = _executor(session, _FakeRunner(), qc_checker=cancelling_qc)
-    executor.set_active_job(outcome.job_id)
+    executor.set_active_job(job_id)
     with pytest.raises(StageCancelled):
         executor.execute(outcome.render_execution_id)
+
     session.expire_all()
     row = session.get(RenderExecution, outcome.render_execution_id)
-    assert row is not None and row.lifecycle is RenderExecutionLifecycle.CANCELLED
+    assert row is not None
+    assert row.lifecycle is RenderExecutionLifecycle.CANCELLED
+    assert row.active_job_id is None
+    job = session.get(ProcessingJob, job_id)
+    assert job is not None and job.status is JobStatus.CANCELLED
+
+
+def test_ownership_loss_latch_is_sticky_and_stops_work(session: Session, monkeypatch: Any) -> None:
+    fixture = seed_stage51(session, monkeypatch)
+    _plan_ready(session, fixture)
+    outcome = queue_render_execution(session, fixture.stage50.selection.candidate.id)
+    executor = _claimed_executor(session, outcome)
+    assert executor._should_stop() is False
+    executor._mark_ownership_lost()
+    assert executor._should_stop() is True
+    # The latch is sticky even while the job is still RUNNING and owned.
+    assert executor._should_stop() is True
+
+
+def test_terminal_job_status_stops_work(session: Session, monkeypatch: Any) -> None:
+    fixture = seed_stage51(session, monkeypatch)
+    _plan_ready(session, fixture)
+    outcome = queue_render_execution(session, fixture.stage50.selection.candidate.id)
+    executor = _claimed_executor(session, outcome)
+    session.execute(
+        update(ProcessingJob)
+        .where(ProcessingJob.id == outcome.job_id)
+        .values(status=JobStatus.SUCCEEDED)
+    )
+    session.commit()
+    assert executor._should_stop() is True
+
+
+def test_claim_replacement_stops_work(session: Session, monkeypatch: Any) -> None:
+    fixture = seed_stage51(session, monkeypatch)
+    _plan_ready(session, fixture)
+    outcome = queue_render_execution(session, fixture.stage50.selection.candidate.id)
+    executor = _claimed_executor(session, outcome)
+    session.execute(
+        update(ProcessingJob)
+        .where(ProcessingJob.id == outcome.job_id)
+        .values(claim_version=executor._claim_version + 5)
+    )
+    session.commit()
+    assert executor._should_stop() is True
+
+
+def test_active_job_reassignment_stops_work(session: Session, monkeypatch: Any) -> None:
+    fixture = seed_stage51(session, monkeypatch)
+    _plan_ready(session, fixture)
+    outcome = queue_render_execution(session, fixture.stage50.selection.candidate.id)
+    executor = _claimed_executor(session, outcome)
+    session.execute(
+        update(RenderExecution)
+        .where(RenderExecution.id == outcome.render_execution_id)
+        .values(active_job_id=uuid.uuid4())
+    )
+    session.commit()
+    assert executor._should_stop() is True
+
+
+def test_admission_loss_stops_work(session: Session, monkeypatch: Any) -> None:
+    fixture = seed_stage51(session, monkeypatch)
+    _plan_ready(session, fixture)
+    outcome = queue_render_execution(session, fixture.stage50.selection.candidate.id)
+    executor = _claimed_executor(session, outcome, admission=_LosingAdmission())
+    executor._admission_held = True
+    assert executor._should_stop() is True
 
 
 def test_queued_cancellation_finalizes_through_task_entry_point(

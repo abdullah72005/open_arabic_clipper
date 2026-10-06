@@ -17,14 +17,14 @@ from dataclasses import dataclass
 
 # Versions
 
-EXECUTION_POLICY_VERSION = "stage5.2-v2"
-EXECUTION_SCHEMA_VERSION = "stage5.2-schema-v2"
-EXECUTION_FINGERPRINT_VERSION = "2"
-COMPILER_VERSION = "stage5.2-compiler-v2"
-TIMELINE_POLICY_VERSION = "stage5.2-timeline-v2"
-QC_POLICY_VERSION = "stage5.2-qc-v2"
+EXECUTION_POLICY_VERSION = "stage5.2-v3"
+EXECUTION_SCHEMA_VERSION = "stage5.2-schema-v3"
+EXECUTION_FINGERPRINT_VERSION = "3"
+COMPILER_VERSION = "stage5.2-compiler-v3"
+TIMELINE_POLICY_VERSION = "stage5.2-timeline-v3"
+QC_POLICY_VERSION = "stage5.2-qc-v3"
 DELIVERY_PROFILE_VERSION = "stage5.2-delivery-v1"
-CONCURRENCY_POLICY_VERSION = "stage5.2-concurrency-v2"
+CONCURRENCY_POLICY_VERSION = "stage5.2-concurrency-v3"
 
 # Artifact purpose. ``CORE_SOURCE_VALIDATION`` executes the ordered
 # SOURCE_MEDIA occurrences from the Stage 5.0 contract. It is a terminal

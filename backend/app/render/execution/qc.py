@@ -12,6 +12,7 @@ from __future__ import annotations
 import math
 import re
 import subprocess
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from fractions import Fraction
@@ -102,7 +103,22 @@ def _timing_tolerance(frame_rate: Fraction) -> float:
     )
 
 
-def _extract_luma(binary: str, path: Path, time_s: float) -> bytes | None:
+def _raise_if_cancelled(cancel_check: Callable[[], bool] | None) -> None:
+    if cancel_check is not None and cancel_check():
+        raise QCCancelled("technical QC cancelled")
+
+
+def _remaining_seconds(deadline: float | None, base: float) -> float:
+    """Bound a subprocess by the remaining shared QC wall-clock budget."""
+
+    if deadline is None:
+        return base
+    return max(0.1, min(base, deadline - time.monotonic()))
+
+
+def _extract_luma(
+    binary: str, path: Path, time_s: float, *, deadline: float | None = None
+) -> bytes | None:
     command = [
         binary,
         "-nostdin",
@@ -125,7 +141,7 @@ def _extract_luma(binary: str, path: Path, time_s: float) -> bytes | None:
     ]
     try:
         completed = subprocess.run(  # noqa: S603 - allow-listed argv
-            command, check=True, capture_output=True, timeout=60
+            command, check=True, capture_output=True, timeout=_remaining_seconds(deadline, 60)
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -159,8 +175,15 @@ def _frame_diff(first: bytes, second: bytes) -> float:
 
 
 def _volume_metrics(
-    binary: str, path: Path, start: float = 0.0, end: float | None = None
+    binary: str,
+    path: Path,
+    start: float = 0.0,
+    end: float | None = None,
+    *,
+    cancel_check: Callable[[], bool] | None = None,
+    deadline: float | None = None,
 ) -> dict[str, float] | None:
+    _raise_if_cancelled(cancel_check)
     command = [binary, "-nostdin", "-hide_banner", "-loglevel", "info"]
     if start > 0 or end is not None:
         command += [
@@ -172,10 +195,15 @@ def _volume_metrics(
     command += ["-i", str(path), "-af", "volumedetect", "-f", "null", "-"]
     try:
         completed = subprocess.run(  # noqa: S603 - allow-listed argv
-            command, check=False, capture_output=True, text=True, timeout=180
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=_remaining_seconds(deadline, 180),
         )
     except (OSError, subprocess.SubprocessError):
         return None
+    _raise_if_cancelled(cancel_check)
     text = completed.stderr or ""
     metrics: dict[str, float] = {}
     for name, value in _VOLUME_RE.findall(text):
@@ -230,8 +258,14 @@ def check_render_artifact(
     *,
     source_path: Path | None = None,
     cancel_check: Callable[[], bool] | None = None,
+    deadline: float | None = None,
 ) -> TechnicalQCResult:
-    """Run deterministic technical QC over a produced artifact."""
+    """Run deterministic technical QC over a produced artifact.
+
+    ``cancel_check`` is polled before and after every bounded subprocess call and
+    ``deadline`` (monotonic seconds) bounds each subprocess by the remaining
+    shared attempt budget, so QC can never run far past the attempt ceiling.
+    """
 
     checks: list[QCCheck] = []
     reasons: list[str] = []
@@ -453,6 +487,7 @@ def check_render_artifact(
         qc_policy,
         source_path,
         cancel_check,
+        deadline,
     )
 
     status = QC_PASS
@@ -478,10 +513,10 @@ def _appearance_checks(
     qc_policy: Stage52Config,
     source_path: Path | None,
     cancel_check: Callable[[], bool] | None,
+    deadline: float | None,
 ) -> None:
     def _ensure_not_cancelled() -> None:
-        if cancel_check is not None and cancel_check():
-            raise QCCancelled("technical QC cancelled")
+        _raise_if_cancelled(cancel_check)
 
     times = _sample_times(manifest, max(2, qc_policy.qc_max_sampled_frames))
     if not times:
@@ -491,7 +526,9 @@ def _appearance_checks(
     decode_ok = 0
     for output_time, source_time in times:
         _ensure_not_cancelled()
-        luma = _extract_luma(qc_policy.ffmpeg_binary, artifacts.output_path, output_time)
+        luma = _extract_luma(
+            qc_policy.ffmpeg_binary, artifacts.output_path, output_time, deadline=deadline
+        )
         if luma is None:
             continue
         decode_ok += 1
@@ -512,7 +549,9 @@ def _appearance_checks(
             _ensure_not_cancelled()
             if source_time is None:
                 continue
-            source_luma = _extract_luma(qc_policy.ffmpeg_binary, source_path, source_time)
+            source_luma = _extract_luma(
+                qc_policy.ffmpeg_binary, source_path, source_time, deadline=deadline
+            )
             if source_luma is not None:
                 source_frames.append(source_luma)
 
@@ -601,15 +640,28 @@ def _appearance_checks(
         checks.append(QCCheck(name="not_frozen", status="PASS"))
 
     _ensure_not_cancelled()
-    output_volume = _volume_metrics(qc_policy.ffmpeg_binary, artifacts.output_path)
+    output_volume = _volume_metrics(
+        qc_policy.ffmpeg_binary,
+        artifacts.output_path,
+        cancel_check=cancel_check,
+        deadline=deadline,
+    )
     if output_volume is not None:
         measured["output_mean_volume_db"] = output_volume.get("mean")
         measured["output_max_volume_db"] = output_volume.get("max")
         max_volume = output_volume.get("max", -math.inf)
         mean_volume = output_volume.get("mean", -math.inf)
+        # Re-check before any further (source-audio) subprocess work.
+        _ensure_not_cancelled()
         if mean_volume <= QC_SILENCE_DBFS:
             source_has_sound = (
-                _selected_source_has_sound(qc_policy.ffmpeg_binary, source_path, manifest)
+                _selected_source_has_sound(
+                    qc_policy.ffmpeg_binary,
+                    source_path,
+                    manifest,
+                    cancel_check=cancel_check,
+                    deadline=deadline,
+                )
                 if source_path is not None
                 else None
             )
@@ -659,7 +711,12 @@ def _appearance_checks(
 
 
 def _selected_source_has_sound(
-    binary: str, source_path: Path | None, manifest: Mapping[str, object]
+    binary: str,
+    source_path: Path | None,
+    manifest: Mapping[str, object],
+    *,
+    cancel_check: Callable[[], bool] | None = None,
+    deadline: float | None = None,
 ) -> bool | None:
     """Do the *selected* source occurrences contain sound?
 
@@ -679,6 +736,9 @@ def _selected_source_has_sound(
     analyzed = 0.0
     any_evidence = False
     for occurrence in occurrences:
+        # Cancellation is checked before *every* source-audio subprocess, so a
+        # stop observed during output-audio analysis prevents any source call.
+        _raise_if_cancelled(cancel_check)
         if analyzed >= max_total:
             break
         start = _as_float(occurrence.get("source_start"))
@@ -686,10 +746,18 @@ def _selected_source_has_sound(
         duration = min(max(0.0, end - start), max_total - analyzed)
         if duration <= 0.05:
             continue
-        metrics = _volume_metrics(binary, source_path, start, start + duration)
+        metrics = _volume_metrics(
+            binary,
+            source_path,
+            start,
+            start + duration,
+            cancel_check=cancel_check,
+            deadline=deadline,
+        )
         analyzed += duration
         if metrics is None:
             continue
+        _raise_if_cancelled(cancel_check)
         any_evidence = True
         if metrics.get("mean", -math.inf) > QC_SILENCE_DBFS:
             return True

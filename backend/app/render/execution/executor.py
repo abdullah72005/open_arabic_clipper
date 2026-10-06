@@ -14,24 +14,28 @@ child is reaped on every exit path.
 from __future__ import annotations
 
 import threading
+import time
 import uuid
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
 
-from sqlalchemy import and_, or_, update
+from sqlalchemy import and_, or_, select, update
 from sqlalchemy.orm import Session
 
 from app.core.enums import JobStatus, RenderExecutionLifecycle
 from app.core.settings import Settings
 from app.db.session import create_session_factory
-from app.models import ProcessingJob
+from app.models import ClipCandidate, ProcessingJob
+from app.models.render_contract import RenderContract
 from app.models.render_execution import RenderExecution
+from app.models.visual_composition_plan import VisualCompositionPlan
 from app.pipeline.executor import StageCancelled
 from app.render.execution.compiler import compile_render
 from app.render.execution.concurrency import RenderAdmission, render_admission_for
 from app.render.execution.policy import (
     RENDER_ADMISSION_UNAVAILABLE,
+    RENDER_OWNERSHIP_LOST,
 )
 from app.render.execution.qc import QCCancelled, check_render_artifact
 from app.render.execution.runner import (
@@ -46,12 +50,14 @@ from app.render.execution.service import (
     build_render_spec,
     cache_hit,
     cancel_execution,
+    finalize_cancellation,
     finalize_success,
     mark_blocked,
     mark_cancelled,
     mark_failed,
     request_input_fingerprint,
     resolve_runtime_identity,
+    runtime_fingerprint,
     set_lifecycle_fenced,
 )
 from app.render.execution.types import AttemptContext, TechnicalQCResult
@@ -239,8 +245,31 @@ class RenderExecutionExecutor:
         job = self._fresh_job()
         return job is not None and job.status is JobStatus.CANCELLED
 
+    def _execution_owns(self) -> bool:
+        """Fresh check that the execution row still points at this job."""
+
+        if self._row_id is None or self._job_id is None:
+            return True
+        active = self._session.execute(
+            select(RenderExecution.active_job_id).where(RenderExecution.id == self._row_id)
+        ).scalar_one_or_none()
+        return bool(active == self._job_id)
+
     def _ownership_ok(self) -> bool:
-        if not self._claim_is_current(require_running=False):
+        """Authoritative, sticky ownership check.
+
+        Verifies the executing job is still RUNNING with the same claim_version,
+        the execution row still names this job, admission is still held, and the
+        heartbeat-loss latch is unset. The latch is sticky: once lost it is never
+        cleared and no further expensive work is permitted.
+        """
+
+        if self._ownership_lost:
+            return False
+        if not self._claim_is_current(require_running=True):
+            self._ownership_lost = True
+            return False
+        if not self._execution_owns():
             self._ownership_lost = True
             return False
         if self._admission_held and not self._admission.held():
@@ -249,18 +278,37 @@ class RenderExecutionExecutor:
         return True
 
     def _should_stop(self) -> bool:
-        """Polled by the runner: True on cancellation or lost ownership."""
+        """Polled by the runner/QC: True on cancellation or lost ownership."""
 
         if self._job_cancelled():
             return True
         return not self._ownership_ok()
 
+    def _handle_stop(self, row: RenderExecution) -> None:
+        """Record a truthful, distinct outcome for a stopped attempt."""
+
+        if self._ownership_lost:
+            self._fail(row, RENDER_OWNERSHIP_LOST)
+        else:
+            self._mark_cancelled(row)
+
     def _finish_job(self, status: JobStatus, *, error_code: str | None = None) -> None:
-        if self._job_id is None or not self._claim_is_current(require_running=False):
-            return
+        self._finish_job_locked(status, error_code=error_code)
+        self._session.commit()
+
+    def _finish_job_locked(self, status: JobStatus, *, error_code: str | None = None) -> bool:
+        """Fenced job completion without committing the surrounding transaction.
+
+        Returns ``True`` when the job was in the expected ``RUNNING`` claim and
+        was completed; ``False`` when a concurrent cancellation/supersession
+        already changed it (caller must not publish).
+        """
+
+        if self._job_id is None:
+            return True
         from datetime import datetime, timezone
 
-        self._session.execute(
+        result = self._session.execute(
             update(ProcessingJob)
             .where(
                 ProcessingJob.id == self._job_id,
@@ -270,7 +318,7 @@ class RenderExecutionExecutor:
             .values(status=status, completed_at=datetime.now(timezone.utc), error_code=error_code)
             .execution_options(synchronize_session=False)
         )
-        self._session.commit()
+        return int(result.rowcount) == 1
 
     # Entry point
 
@@ -314,10 +362,10 @@ class RenderExecutionExecutor:
                     return row
             return self._run(row)
         except StageCancelled:
-            self._mark_cancelled(row)
+            self._handle_stop(row)
             raise
         except RenderCancelled as error:
-            self._mark_cancelled(row)
+            self._handle_stop(row)
             raise StageCancelled(str(error)) from error
         finally:
             if self._admission_held:
@@ -406,6 +454,7 @@ class RenderExecutionExecutor:
             poll_seconds=self._config.cancel_poll_seconds,
             ass_bytes=ass_data,
         )
+        attempt_started = time.monotonic()
         try:
             artifacts = self._runner(compiled, context)
         except RenderTimeout:
@@ -415,12 +464,14 @@ class RenderExecutionExecutor:
             self._fail(row, error.reason_code)
             raise
         except RenderCancelled:
-            self._mark_cancelled(row)
             raise
 
         if not self._set_qc_running(row):
             self.skipped_duplicate = True
             return row
+        # A shared wall-clock deadline covers the whole expensive attempt,
+        # including QC; each QC subprocess is bounded by the remaining budget.
+        qc_deadline = attempt_started + self._config.max_render_seconds
         try:
             qc = self._qc_checker(
                 artifacts,
@@ -428,30 +479,24 @@ class RenderExecutionExecutor:
                 self._config,
                 source_path=Path(source_absolute),
                 cancel_check=self._should_stop,
+                deadline=qc_deadline,
             )
         except QCCancelled:
-            self._mark_cancelled(row)
+            self._handle_stop(row)
             raise StageCancelled("render cancelled during QC") from None
         if qc.status == "FAIL":
             self._fail(row, qc.reason_codes[0] if qc.reason_codes else "QC_FAILED", qc=qc)
             return row
 
-        if not self._revalidate_before_publish(row, candidate, source_absolute, spec):
+        outcome = self._finalize_publication(
+            row, candidate, source_absolute, spec, artifacts, qc, compiled.fingerprint, runtime
+        )
+        if outcome == "PUBLISHED":
             return row
-
-        if self._job_cancelled():
+        if outcome == "CANCELLED":
             raise StageCancelled("render cancelled before publish")
-        if not self._ownership_ok():
-            if self._job_cancelled():
-                raise StageCancelled("render cancelled before publish")
+        if outcome == "SUPERSEDED":
             self.skipped_duplicate = True
-            return row
-
-        published = self._finalize_success(row, artifacts, qc, compiled.fingerprint, runtime)
-        if not published:
-            self.skipped_duplicate = True
-            return row
-        self._finish_job(JobStatus.SUCCEEDED)
         return row
 
     def _begin_attempt(self, row: RenderExecution) -> bool:
@@ -515,32 +560,113 @@ class RenderExecutionExecutor:
             raise RenderExecutionError("ASS_HASH_MISMATCH")
         return bytes(data)
 
-    def _revalidate_before_publish(
-        self, row: RenderExecution, candidate: Any, source_absolute: str, spec: Any
-    ) -> bool:
+    def _finalize_publication(
+        self,
+        row: RenderExecution,
+        candidate: Any,
+        source_absolute: str,
+        spec: Any,
+        artifacts: Any,
+        qc: TechnicalQCResult,
+        compiled_fingerprint_value: str,
+        runtime: Any,
+    ) -> str:
+        """Revalidate upstream authority and publish atomically.
+
+        Rebuilds the frozen request and re-checks authoritative upstream bindings
+        *inside* the publishing transaction while holding row locks on the
+        candidate and its bound contract/plan, so a concurrent invalidation or
+        cancellation cannot commit between revalidation and publication. Short
+        transactions only: no upstream lock is ever held during encoding or QC.
+
+        Returns ``PUBLISHED``, ``BLOCKED``, ``FAILED``, ``SUPERSEDED``, or
+        ``CANCELLED``.
+        """
+
+        candidate_id = candidate.id if candidate is not None else row.clip_candidate_id
         try:
-            fresh = self._spec_builder(
-                self._session,
-                candidate,
-                artifact_purpose=row.artifact_purpose.value,
-                delivery_profile_key=row.delivery_profile_key,
-                settings=self._settings,
-                storage=self._storage,
-            )
-        except RenderExecutionError as error:
-            if error.blocked:
-                self._block(row, error.reason_code)
-            else:
+            self._session.rollback()  # end any prior transaction; take a fresh snapshot
+            locked = self._session.scalars(
+                select(ClipCandidate)
+                .where(ClipCandidate.id == candidate_id, ClipCandidate.is_current.is_(True))
+                .with_for_update()
+            ).first()
+            if locked is None:
+                self._safe_rollback()
+                self._block(row, "CANDIDATE_NOT_CURRENT")
+                return "BLOCKED"
+            if row.render_contract_id is not None:
+                self._session.execute(
+                    select(RenderContract.id)
+                    .where(RenderContract.id == row.render_contract_id)
+                    .with_for_update()
+                ).first()
+            if row.visual_composition_plan_id is not None:
+                self._session.execute(
+                    select(VisualCompositionPlan.id)
+                    .where(VisualCompositionPlan.id == row.visual_composition_plan_id)
+                    .with_for_update()
+                ).first()
+
+            try:
+                fresh = self._spec_builder(
+                    self._session,
+                    locked,
+                    artifact_purpose=row.artifact_purpose.value,
+                    delivery_profile_key=row.delivery_profile_key,
+                    settings=self._settings,
+                    storage=self._storage,
+                )
+            except RenderExecutionError as error:
+                self._safe_rollback()
+                if error.blocked:
+                    self._block(row, error.reason_code)
+                    return "BLOCKED"
                 self._fail(row, error.reason_code)
-            return False
-        if request_input_fingerprint(fresh, self._config) != row.input_fingerprint:
-            self._block(row, "REQUEST_INPUT_CHANGED")
-            return False
-        stat = Path(source_absolute).stat()
-        if stat.st_size != spec.source_size_bytes or stat.st_mtime_ns != spec.source_mtime_ns:
-            self._fail(row, "SOURCE_MEDIA_CHANGED")
-            return False
-        return True
+                return "FAILED"
+            if request_input_fingerprint(fresh, self._config) != row.input_fingerprint:
+                self._safe_rollback()
+                self._block(row, "REQUEST_INPUT_CHANGED")
+                return "BLOCKED"
+            stat = Path(source_absolute).stat()
+            if stat.st_size != spec.source_size_bytes or stat.st_mtime_ns != spec.source_mtime_ns:
+                self._safe_rollback()
+                self._fail(row, "SOURCE_MEDIA_CHANGED")
+                return "FAILED"
+
+            if self._job_cancelled():
+                self._safe_rollback()
+                return "CANCELLED"
+            if not self._claim_is_current(require_running=True) or not self._execution_owns():
+                self._safe_rollback()
+                return "SUPERSEDED"
+
+            published = finalize_success(
+                self._session,
+                row,
+                artifacts=artifacts,
+                qc=qc,
+                compiled_fingerprint_value=compiled_fingerprint_value,
+                runtime_fp=runtime_fingerprint(runtime),
+                storage=self._storage,
+                config=self._config,
+                job_id=self._job_id,
+                claim_version=self._claim_version,
+            )
+            if not published:
+                self._safe_rollback()
+                return "SUPERSEDED"
+            # Complete the job in the same transaction that publishes the result;
+            # if a concurrent cancellation/supersession already changed it, roll
+            # the whole publication back.
+            if not self._finish_job_locked(JobStatus.SUCCEEDED):
+                self._safe_rollback()
+                return "CANCELLED" if self._job_cancelled() else "SUPERSEDED"
+            self._session.commit()
+            return "PUBLISHED"
+        except Exception:
+            self._safe_rollback()
+            raise
 
     # Lifecycle helpers
 
@@ -551,20 +677,16 @@ class RenderExecutionExecutor:
             return
         if not self._claimed:
             return
-        try:
-            marked = mark_blocked(
-                self._session,
-                row,
-                reason_code,
-                job_id=self._job_id,
-                claim_version=self._claim_version,
-            )
-            self._session.commit()
-            if not marked:
-                self.skipped_duplicate = True
-                return
-        except Exception:
-            self._safe_rollback()
+        marked = mark_blocked(
+            self._session,
+            row,
+            reason_code,
+            job_id=self._job_id,
+            claim_version=self._claim_version,
+        )
+        self._session.commit()
+        if not marked:
+            self.skipped_duplicate = True
             return
         self._finish_job(JobStatus.FAILED, error_code=reason_code)
 
@@ -581,70 +703,44 @@ class RenderExecutionExecutor:
             return
         if not self._claimed:
             return
-        try:
-            marked = mark_failed(
-                self._session,
-                row,
-                reason_code,
-                qc=qc,
-                job_id=self._job_id,
-                claim_version=self._claim_version,
-            )
-            self._session.commit()
-            if not marked:
-                self.skipped_duplicate = True
-                return
-        except Exception:
-            self._safe_rollback()
+        marked = mark_failed(
+            self._session,
+            row,
+            reason_code,
+            qc=qc,
+            job_id=self._job_id,
+            claim_version=self._claim_version,
+        )
+        self._session.commit()
+        if not marked:
+            self.skipped_duplicate = True
             return
         self._finish_job(JobStatus.FAILED, error_code=reason_code)
-
-    def _finalize_success(
-        self,
-        row: RenderExecution,
-        artifacts: Any,
-        qc: TechnicalQCResult,
-        compiled_fingerprint_value: str,
-        runtime: Any,
-    ) -> bool:
-        from app.render.execution.service import runtime_fingerprint
-
-        try:
-            published = finalize_success(
-                self._session,
-                row,
-                artifacts=artifacts,
-                qc=qc,
-                compiled_fingerprint_value=compiled_fingerprint_value,
-                runtime_fp=runtime_fingerprint(runtime),
-                storage=self._storage,
-                config=self._config,
-                job_id=self._job_id,
-                claim_version=self._claim_version,
-            )
-            self._session.commit()
-        except Exception:
-            self._safe_rollback()
-            return False
-        return bool(published)
 
     def _mark_cancelled(self, row: RenderExecution) -> None:
         if self._job_id is None:
             mark_cancelled(self._session, row)
             self._commit_or_rollback()
             return
-        if not self._claim_is_current(require_running=False):
-            return
         try:
-            marked = mark_cancelled(
-                self._session, row, job_id=self._job_id, claim_version=self._claim_version
+            # Fresh transaction so an API-session cancel committed on another
+            # connection is visible to the cancellation fence.
+            self._safe_rollback()
+            marked = finalize_cancellation(
+                self._session,
+                row.id,
+                job_id=self._job_id,
+                claim_version=self._claim_version,
             )
             if marked:
+                # Flip a still-RUNNING executing job to CANCELLED; never clobber
+                # an API-set CANCELLED or a newer worker's status.
                 self._session.execute(
                     update(ProcessingJob)
                     .where(
                         ProcessingJob.id == self._job_id,
                         ProcessingJob.claim_version == self._claim_version,
+                        ProcessingJob.status == JobStatus.RUNNING,
                     )
                     .values(status=JobStatus.CANCELLED)
                     .execution_options(synchronize_session=False)

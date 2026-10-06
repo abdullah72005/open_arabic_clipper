@@ -16,6 +16,7 @@ from stage51_support import (
     Stage51Fixture,
     seed_stage51,
 )
+from stage52_support import install_fake_stream_probe
 
 from app.composition.queue import queue_visual_composition
 from app.composition.service import execute_visual_composition, get_current_visual_composition
@@ -48,6 +49,7 @@ def session(sqlite_engine: Engine) -> Iterator[Session]:
 def _no_dispatch(monkeypatch: Any) -> None:
     monkeypatch.setattr("app.render.execution.queue._dispatch", lambda *args: None)
     monkeypatch.setattr("app.composition.queue._dispatch", lambda *args: None)
+    install_fake_stream_probe(monkeypatch)
 
 
 def _plan_ready(session: Session, fixture: Stage51Fixture) -> None:
@@ -114,6 +116,7 @@ def _fake_qc(
     *,
     source_path: Any = None,
     cancel_check: Any = None,
+    deadline: Any = None,
 ) -> TechnicalQCResult:
     return TechnicalQCResult(status="PASS", checks=(), reason_codes=(), policy_version="test")
 

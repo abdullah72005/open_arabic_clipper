@@ -2,17 +2,21 @@
 
 The only Stage 5.2 test that exercises the *real* seams end to end:
 
-    alembic upgrade head
+    alembic upgrade head (on a uniquely named disposable database)
       -> seeded retained candidate + FINAL_CLIP refinement (real rows)
       -> real ``create_render_contract`` with the real FFprobe on real media
       -> real visual-composition plan with the canonical ASS asset
       -> ``queue_render_execution`` (one render row + one RENDER_EXECUTION job)
-      -> real ``RenderExecutionExecutor`` with the real compiler/FFmpeg/QC seams
+      -> the real Celery task entry point ``run_render_execution``
+      -> real compiler/FFmpeg/QC seams
       -> persisted managed MP4 artifact + technical QC
 
-It is gated on ``CLIPFACTORY_TEST_POSTGRES_URL`` (plus real media under the
-mounted storage root) and skips otherwise rather than faking the run. Artifacts
-are written to ``CLIPFACTORY_LIVE_STAGE52_ARTIFACTS`` (default
+The supplied ``CLIPFACTORY_TEST_POSTGRES_URL`` is treated strictly as a
+connection *base*: this test creates, binds, and drops its own database and
+never resets the supplied (or any other) database's schema. It is gated on that
+URL plus real media under the mounted storage root and skips otherwise rather
+than faking the run. Artifacts are written to
+``CLIPFACTORY_LIVE_STAGE52_ARTIFACTS`` (default
 ``/var/lib/clipfactory/benchmarks/stage-5-2/live-contract``).
 """
 
@@ -21,20 +25,18 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import uuid
 from pathlib import Path
 from typing import Any
 
 import pytest
 from alembic.config import Config
-from sqlalchemy import Engine, create_engine, inspect
+from sqlalchemy import Engine, create_engine, inspect, text
+from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session, sessionmaker
 from stage43_support import FakeGovernanceSettings, install_selection_settings
 from stage50_support import seed_stage50
-from test_stage51_live_contract import (
-    _alembic_config,
-    _reset_public_schema,
-    _select_real_media,
-)
+from test_stage51_live_contract import _select_real_media
 
 from alembic import command
 from app.composition.analysis import (
@@ -52,9 +54,9 @@ from app.core.settings import get_settings
 from app.media.ffprobe import FFprobe
 from app.models import ProcessingJob
 from app.models.render_execution import RenderExecution
-from app.render.execution.executor import build_render_execution_executor
 from app.render.execution.queue import queue_render_execution
 from app.render.service import create_render_contract
+from app.workers.tasks import run_render_execution
 
 _URL = os.environ.get("CLIPFACTORY_TEST_POSTGRES_URL")
 
@@ -62,6 +64,8 @@ pytestmark = pytest.mark.skipif(
     not _URL,
     reason="CLIPFACTORY_TEST_POSTGRES_URL is required for the Stage 5.2 live run",
 )
+
+_DATABASE = f"clipfactory_stage52_live_{uuid.uuid4().hex[:12]}"
 
 
 def _artifacts_dir() -> Path:
@@ -87,6 +91,45 @@ def _write_report(report: dict[str, object], directory: Path) -> Path:
     return target
 
 
+def _admin_url() -> str:
+    assert _URL is not None
+    return str(make_url(_URL).set(database="postgres").render_as_string(hide_password=False))
+
+
+def _target_url() -> str:
+    assert _URL is not None
+    return str(
+        make_url(_URL).set(database=_DATABASE).render_as_string(hide_password=False)
+    )
+
+
+def _create_database() -> None:
+    admin = create_engine(_admin_url(), isolation_level="AUTOCOMMIT")
+    try:
+        with admin.connect() as connection:
+            connection.execute(text(f'DROP DATABASE IF EXISTS "{_DATABASE}" WITH (FORCE)'))
+            connection.execute(text(f'CREATE DATABASE "{_DATABASE}"'))
+    finally:
+        admin.dispose()
+
+
+def _drop_database() -> None:
+    admin = create_engine(_admin_url(), isolation_level="AUTOCOMMIT")
+    try:
+        with admin.connect() as connection:
+            connection.execute(text(f'DROP DATABASE IF EXISTS "{_DATABASE}" WITH (FORCE)'))
+    finally:
+        admin.dispose()
+
+
+def _alembic_config(url: str) -> Config:
+    backend_root = Path(__file__).parents[1]
+    config = Config()
+    config.set_main_option("script_location", str(backend_root / "alembic"))
+    config.set_main_option("sqlalchemy.url", url)
+    return config
+
+
 @pytest.fixture(autouse=True)  # noqa: PT004 - name mirrors Stage 5.1 live test
 def _no_dispatch(monkeypatch: Any) -> None:
     monkeypatch.setattr("app.composition.queue._dispatch", lambda *args: None)
@@ -100,15 +143,19 @@ def test_stage52_live_contract_end_to_end(tmp_path: Path, monkeypatch: Any) -> N
     session: Session | None = None
     engine: Engine | None = None
     failure: str | None = None
+    target_url = _target_url()
+    _create_database()
     try:
+        # Bind settings AND the worker task factory to the disposable database.
+        monkeypatch.setenv("CLIPFACTORY_DATABASE_URL", target_url)
+        get_settings.cache_clear()
+
         settings = get_settings()
         media, media_meta = _select_real_media(settings.ffprobe_binary)
         report["media"] = media_meta
 
-        config: Config = _alembic_config()
-        engine = create_engine(_URL)
-        _reset_public_schema(engine)
-        command.upgrade(config, "head")
+        command.upgrade(_alembic_config(target_url), "head")
+        engine = create_engine(target_url)
         inspector = inspect(engine)
         tables = set(inspector.get_table_names())
         assert "render_executions" in tables
@@ -176,12 +223,18 @@ def test_stage52_live_contract_end_to_end(tmp_path: Path, monkeypatch: Any) -> N
         session.refresh(plan_row)
         assert plan_row.status.value == "READY_FOR_VISUAL_EXECUTION"
 
-        # ----- Real render execution through the actual task entry point ------
+        # ----- Queue, then drive the REAL task entry point -------------------
         render_outcome = queue_render_execution(session, candidate.id, settings=settings)
         assert render_outcome.queued is True and render_outcome.job_id is not None
-        executor = build_render_execution_executor(session, stage50.storage, settings)
-        executor.set_active_job(render_outcome.job_id)
-        executor.execute(render_outcome.render_execution_id)
+        result = run_render_execution.apply(
+            args=[
+                str(render_outcome.render_execution_id),
+                str(render_outcome.job_id),
+                False,
+            ]
+        ).get()
+        assert result.get("cancelled") is not True
+        assert result["render_execution_id"] == str(render_outcome.render_execution_id)
 
         session.expire_all()
         row = session.get(RenderExecution, render_outcome.render_execution_id)
@@ -244,3 +297,5 @@ def test_stage52_live_contract_end_to_end(tmp_path: Path, monkeypatch: Any) -> N
             session.close()
         if engine is not None:
             engine.dispose()
+        get_settings.cache_clear()
+        _drop_database()

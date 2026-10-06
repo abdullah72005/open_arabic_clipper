@@ -136,11 +136,11 @@ def upgrade() -> None:
         sa.Column("artifact_reference", sa.JSON(), nullable=False, server_default="{}"),
         sa.Column("omitted_requirements", sa.JSON(), nullable=False, server_default="[]"),
         sa.Column("metrics", sa.JSON(), nullable=False, server_default="{}"),
-        sa.Column("policy_version", sa.String(64), nullable=False, server_default="stage5.2-v2"),
+        sa.Column("policy_version", sa.String(64), nullable=False, server_default="stage5.2-v3"),
         sa.Column(
-            "schema_version", sa.String(64), nullable=False, server_default="stage5.2-schema-v2"
+            "schema_version", sa.String(64), nullable=False, server_default="stage5.2-schema-v3"
         ),
-        sa.Column("fingerprint_version", sa.String(16), nullable=False, server_default="2"),
+        sa.Column("fingerprint_version", sa.String(16), nullable=False, server_default="3"),
         sa.Column(
             "created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()
         ),

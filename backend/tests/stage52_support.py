@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from fractions import Fraction
+from typing import Any
 
 from app.render.execution.types import (
     AssAsset,
@@ -197,4 +198,22 @@ def make_spec(
     )
 
 
-__all__ = ["crop_scene", "fake_runtime", "make_spec", "occurred"]
+def install_fake_stream_probe(monkeypatch: Any, *, channels: int = 2) -> None:
+    """Inject deterministic stream facts for hermetic DB tests (no real probe)."""
+
+    from app.render.execution import service
+
+    monkeypatch.setattr(
+        service,
+        "_SOURCE_STREAM_PROBE_OVERRIDE",
+        lambda path, settings: channels,
+    )
+
+
+__all__ = [
+    "crop_scene",
+    "fake_runtime",
+    "install_fake_stream_probe",
+    "make_spec",
+    "occurred",
+]

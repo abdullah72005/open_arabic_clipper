@@ -168,8 +168,8 @@ def _runtime(source: Path, attempt: Path) -> RuntimeIdentity:
         libass_version="",
         font_family="Noto Sans Arabic",
         font_match="",
-        compiler_version="stage5.2-compiler-v1",
-        policy_version="stage5.2-v1",
+        compiler_version="stage5.2-compiler-v3",
+        policy_version="stage5.2-v3",
         source_absolute_path=str(source),
         attempt_directory=str(attempt),
     )

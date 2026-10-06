@@ -223,6 +223,7 @@ class RuntimeIdentity:
     libavcodec_version: str = ""
     build_config_sha256: str = ""
     font_sha256: str = ""
+    libass_sha256: str = ""
     ffmpeg_binary: str = "ffmpeg"
     ffprobe_binary: str = "ffprobe"
     encoder_threads: int = 2
@@ -238,6 +239,7 @@ class RuntimeIdentity:
             "libavformat_version": self.libavformat_version,
             "libavcodec_version": self.libavcodec_version,
             "libass_version": self.libass_version,
+            "libass_sha256": self.libass_sha256,
             "font_family": self.font_family,
             "font_match": self.font_match,
             "font_sha256": self.font_sha256,
