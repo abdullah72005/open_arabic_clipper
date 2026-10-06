@@ -116,13 +116,34 @@ def _raise_if_cancelled(cancel_check: Callable[[], bool] | None) -> None:
         raise QCCancelled("technical QC cancelled")
 
 
-def _remaining_seconds(deadline: float | None, base: float) -> float:
-    """Bound a subprocess by the remaining shared QC wall-clock budget.
+def _raise_if_stopped(deadline: float | None, cancel_check: Callable[[], bool] | None) -> None:
+    """Stop QC for cancellation (precedence) or exhausted shared budget.
 
-    Raises ``QCTimeout`` once the deadline has expired so no further expensive
-    work is started; it never grants a fresh minimum slice past the deadline.
+    Cancellation is checked first so a stop at the deadline boundary is reported
+    truthfully as ``QCCancelled`` rather than mislabeled as a timeout.
     """
 
+    if cancel_check is not None and cancel_check():
+        raise QCCancelled("technical QC cancelled")
+    if deadline is not None and time.monotonic() >= deadline:
+        raise QCTimeout("technical QC deadline exhausted")
+
+
+def _remaining_seconds(
+    deadline: float | None,
+    base: float,
+    *,
+    cancel_check: Callable[[], bool] | None = None,
+) -> float:
+    """Bound a subprocess by the remaining shared QC wall-clock budget.
+
+    Cancellation is checked first; then ``QCTimeout`` is raised once the deadline
+    has expired so no further expensive work is started. It never grants a fresh
+    minimum slice past the deadline.
+    """
+
+    if cancel_check is not None and cancel_check():
+        raise QCCancelled("technical QC cancelled")
     if deadline is None:
         return base
     remaining = deadline - time.monotonic()
@@ -132,7 +153,12 @@ def _remaining_seconds(deadline: float | None, base: float) -> float:
 
 
 def _extract_luma(
-    binary: str, path: Path, time_s: float, *, deadline: float | None = None
+    binary: str,
+    path: Path,
+    time_s: float,
+    *,
+    deadline: float | None = None,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> bytes | None:
     command = [
         binary,
@@ -156,10 +182,19 @@ def _extract_luma(
     ]
     try:
         completed = subprocess.run(  # noqa: S603 - allow-listed argv
-            command, check=True, capture_output=True, timeout=_remaining_seconds(deadline, 60)
+            command,
+            check=True,
+            capture_output=True,
+            timeout=_remaining_seconds(deadline, 60, cancel_check=cancel_check),
         )
+    except subprocess.TimeoutExpired:
+        # A frame call that consumed its shared budget is deadline exhaustion,
+        # not an ordinary decode failure.
+        _raise_if_stopped(deadline, cancel_check)
+        return None
     except (OSError, subprocess.SubprocessError):
         return None
+    _raise_if_stopped(deadline, cancel_check)
     data = completed.stdout
     if len(data) < _SAMPLE_W * _SAMPLE_H:
         return None
@@ -214,11 +249,15 @@ def _volume_metrics(
             check=False,
             capture_output=True,
             text=True,
-            timeout=_remaining_seconds(deadline, 180),
+            timeout=_remaining_seconds(deadline, 180, cancel_check=cancel_check),
         )
+    except subprocess.TimeoutExpired:
+        # Consuming the shared budget is exhaustion, not a bounded probe failure.
+        _raise_if_stopped(deadline, cancel_check)
+        return None
     except (OSError, subprocess.SubprocessError):
         return None
-    _raise_if_cancelled(cancel_check)
+    _raise_if_stopped(deadline, cancel_check)
     text = completed.stderr or ""
     metrics: dict[str, float] = {}
     for name, value in _VOLUME_RE.findall(text):
@@ -505,6 +544,10 @@ def check_render_artifact(
         deadline,
     )
 
+    # Never return a verdict from an exhausted/stale budget: a mandatory-QC
+    # deadline exhaustion is a hard failure, not a warning.
+    _raise_if_stopped(deadline, cancel_check)
+
     status = QC_PASS
     if any(check.status == QC_FAIL for check in checks):
         status = QC_FAIL
@@ -542,7 +585,11 @@ def _appearance_checks(
     for output_time, source_time in times:
         _ensure_not_cancelled()
         luma = _extract_luma(
-            qc_policy.ffmpeg_binary, artifacts.output_path, output_time, deadline=deadline
+            qc_policy.ffmpeg_binary,
+            artifacts.output_path,
+            output_time,
+            deadline=deadline,
+            cancel_check=cancel_check,
         )
         if luma is None:
             continue
@@ -565,7 +612,11 @@ def _appearance_checks(
             if source_time is None:
                 continue
             source_luma = _extract_luma(
-                qc_policy.ffmpeg_binary, source_path, source_time, deadline=deadline
+                qc_policy.ffmpeg_binary,
+                source_path,
+                source_time,
+                deadline=deadline,
+                cancel_check=cancel_check,
             )
             if source_luma is not None:
                 source_frames.append(source_luma)

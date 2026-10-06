@@ -237,12 +237,17 @@ The engine/policy/fingerprint/schema versions are `stage5.2-v3` (`v3`
 fingerprint). Prior `v1`/`v2` rows are not reused; a request carrying the new
 policy identity creates a fresh envelope.
 
-A third focused pass closed five remaining review findings without changing any
+A third focused pass closed five review findings without changing any
 policy/fingerprint version: an authoritative cancellation now wins over the
 heartbeat-loss latch; the bound `FINAL_CLIP` refinement is locked through
 publication; full ownership (including the latch and admission) is rechecked at
 the final boundary; historical reactivation is committed before returning; and a
-single absolute attempt deadline covers encode, output probing, and QC.
+single absolute attempt deadline covers encode, output probing, and QC. A fourth
+focused pass closed two more: the bound selected Stage 4.1 `TransformationPlan`
+is locked through publication (its writer does not take the candidate lock), and
+shared-deadline exhaustion is propagated as `QCTimeout` through every frame/audio
+QC path and rechecked before returning the verdict (never a `WARN`), with the
+runner recomputing its probe budget after hashing.
 
 - **Attempt state.** A forced rerender enters a fenced `RENDERING` transition
   that atomically clears `cache_eligible`, `qc_status`, the artifact pointer,
@@ -276,21 +281,25 @@ single absolute attempt deadline covers encode, output probing, and QC.
   admission) runs again at the final publication boundary, so a heartbeat or
   admission loss observed after QC's last stop poll cannot publish success.
 - **Final currentness.** Publication is one short transaction that locks the
-  candidate, its bound contract and visual plan, and the bound `FINAL_CLIP`
-  refinement, rebuilds the frozen request, compares fingerprints, re-checks source
-  stat identity and the exact consumed ASS bytes, re-checks job/envelope/admission
+  candidate, its bound contract, the bound selected Stage 4.1
+  `TransformationPlan`, the visual plan, and the bound `FINAL_CLIP` refinement,
+  rebuilds the frozen request, compares fingerprints, re-checks source stat
+  identity and the exact consumed ASS bytes, re-checks job/envelope/admission
   ownership, and completes the job *in the same transaction* that writes the
-  result. Upstream writers that take the candidate lock first (contract, selection,
-  plan) serialize through that lock; the `FINAL_CLIP` refinement is joined
-  explicitly because `apply_manual_transcript` takes no candidate lock, so a
-  manual edit either commits before the transaction (and fails the rebuild) or
-  blocks on the locked refinement row and serializes after publication. An
-  upstream invalidation, cancellation, observed ownership/admission loss, or claim
-  change committed before publication therefore blocks/cancels/supersedes instead
-  of publishing a stale `COMPLETE`; no upstream lock is held during encoding or
-  QC. Deterministic PostgreSQL race tests cover concurrent invalidation,
-  cancellation, claim supersession, a bound-refinement update overlapping
-  publication, and lock serialization.
+  result. Only the contract and selection writers take the candidate lock first;
+  the selected plan and the `FINAL_CLIP` refinement are joined explicitly because
+  their writers take no candidate lock — Stage 4.1's `_persist_plans` updates
+  existing `TransformationPlan` rows (including `plan_output_fingerprint` and
+  `is_current`) and commits without it, and `apply_manual_transcript` likewise.
+  A planning rerun or a manual edit therefore either commits before the
+  transaction (and fails the rebuild) or blocks on the locked row and serializes
+  after publication. An upstream invalidation, cancellation, observed
+  ownership/admission loss, or claim change committed before publication therefore
+  blocks/cancels/supersedes instead of publishing a stale `COMPLETE`; no upstream
+  lock is held during encoding or QC. Deterministic PostgreSQL race tests cover
+  concurrent invalidation, cancellation, claim supersession, a bound-refinement
+  update overlapping publication, a selected-plan update overlapping publication,
+  and lock serialization of both.
 - **Publication errors.** A publication/database failure is not swallowed as
   duplicate delivery: it propagates after rollback and is recorded truthfully, so
   it cannot report a false success or strand a `RUNNING` job. Terminal-state
@@ -327,12 +336,19 @@ single absolute attempt deadline covers encode, output probing, and QC.
   legitimately silent selected span is not a hard failure. One absolute monotonic
   deadline covers encode, post-encode output probing, and QC; each bounded
   subprocess is sized to the remaining budget, and once the deadline is exhausted
-  no further process starts — QC raises a distinct `QCTimeout` (persisted as a
-  hard `QC_TIMEOUT` failure, never downgraded into a `WARN` success) and
-  post-encode probing raises `RENDER_TIMEOUT` and is skipped. Cancellation/ownership
-  is polled before and after every bounded subprocess (including each source-audio
-  call) and around output probing; no source-audio or probe call starts after a
-  stop is observed. QC is persisted on FAIL.
+  no further process starts. A frame or audio call that consumes its shared budget
+  and raises `TimeoutExpired` is classified as exhaustion (not an ordinary decode
+  failure), QC re-checks cancellation/deadline after every call — including
+  exception exits — and once more before returning the verdict, so exhaustion is
+  always a distinct `QCTimeout` persisted as a hard `QC_TIMEOUT` failure, never
+  downgraded into a `WARN` success. Post-encode probing recomputes its budget
+  *after* hashing (hashing can consume the remaining budget), verifies the
+  deadline after probing, and raises `RENDER_TIMEOUT` and is skipped when the
+  budget is already exhausted. Cancellation/ownership is polled before and after
+  every bounded subprocess (including each source-audio call) and around output
+  probing; cancellation keeps precedence over an exhausted deadline, and no
+  source-audio or probe call starts after a stop is observed. QC is persisted on
+  FAIL.
 - **Migration.** The `20260918_0022` downgrade deletes Stage 5.2 rows/jobs
   itself (preserving all prior-stage data/jobs) so it works on a populated
   database without test-side cleanup.

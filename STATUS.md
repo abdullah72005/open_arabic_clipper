@@ -8,7 +8,7 @@ artifact, a normalized execution manifest, deterministic technical QC, and a
 durable fenced result. It is explicit and candidate-scoped and extends the
 existing Celery/`ProcessingJob` platform with a `RENDER_EXECUTION` job kind; it
 adds no `PipelineStage`, no `PipelineRun`, and no `_NEXT_STAGE` entry, and never
-touches the source lifecycle. Status: **remediated in a third focused pass
+touches the source lifecycle. Status: **remediated in a fourth focused pass
 (`stage5.2-v3`) against code review and technically verified; awaiting human
 media acceptance and Sol review. Not frozen.**
 
@@ -86,19 +86,21 @@ media acceptance and Sol review. Not frozen.**
   `CANCELLED` (never a `RENDER_OWNERSHIP_LOST` failure the `RUNNING`-only fence
   cannot apply).
 - **Currentness.** Publication is a single short transaction that locks the
-  candidate, its bound contract and visual plan, and the bound `FINAL_CLIP`
-  refinement, rebuilds the frozen request, compares fingerprints, re-checks the
-  source stat and the exact ASS bytes consumed, re-checks full ownership
-  (fresh `RUNNING`/claim/`active_job_id`, the sticky heartbeat-loss latch, and
-  admission), and completes the job *inside* the same transaction that writes the
-  result. Upstream writers that already serialize through the candidate lock
-  (contract/selection/plan) are covered by that lock; the `FINAL_CLIP` refinement
-  is joined explicitly because its manual-edit writer takes no candidate lock, so
-  a manual transcript edit either commits before the transaction (and fails the
-  rebuild) or blocks on the locked row and serializes after publication. An
-  upstream invalidation, a cancellation, an observed ownership/admission loss, or
-  a claim change committed at any point before publication therefore prevents a
-  stale `COMPLETE`; no upstream lock is held during encoding or QC.
+  candidate, its bound contract, the bound selected Stage 4.1 `TransformationPlan`,
+  the visual plan, and the bound `FINAL_CLIP` refinement, rebuilds the frozen
+  request, compares fingerprints, re-checks the source stat and the exact ASS
+  bytes consumed, re-checks full ownership (fresh `RUNNING`/claim/`active_job_id`,
+  the sticky heartbeat-loss latch, and admission), and completes the job *inside*
+  the same transaction that writes the result. Only the contract and selection
+  writers serialize through the candidate lock; the selected plan and the
+  `FINAL_CLIP` refinement are joined explicitly because their writers
+  (`_persist_plans` and `apply_manual_transcript`) take no candidate lock, so a
+  planning rerun or a manual transcript edit either commits before the transaction
+  (and fails the rebuild) or blocks on the locked row and serializes after
+  publication. An upstream invalidation, a cancellation, an observed
+  ownership/admission loss, or a claim change committed at any point before
+  publication therefore prevents a stale `COMPLETE`; no upstream lock is held
+  during encoding or QC.
 - **Cache validity.** Queue-time and execute-time cache reuse validates managed
   artifact existence/size/SHA-256, lifecycle/QC, current upstream dependencies,
   rendering runtime identity, and QC identity. Runtime identity is truthful: the
@@ -127,12 +129,18 @@ media acceptance and Sol review. Not frozen.**
   unexpected lost audio. One absolute monotonic deadline covers the whole
   expensive attempt (encode, post-encode output probing, and QC); each bounded
   subprocess is sized to the remaining budget, and once the deadline is exhausted
-  no further process starts (QC raises a distinct `QCTimeout` that is persisted as
-  a hard `QC_TIMEOUT` failure — never downgraded into a `WARN` success; post-encode
-  output probing raises `RENDER_TIMEOUT` and is skipped). Cancellation/ownership
-  is polled before and after every bounded QC subprocess (including each
-  source-audio analysis call) and around output probing, so no source-audio or
-  probe subprocess starts after a stop is observed. A publication/database error is never
+  no further process starts. A frame or audio subprocess that consumes its shared
+  budget and raises `TimeoutExpired` is classified as exhaustion, not an ordinary
+  decode failure, and QC checks cancellation/deadline after every call (including
+  exception exits) and once more before returning the verdict, so a mandatory-QC
+  exhaustion is always a distinct `QCTimeout` persisted as a hard `QC_TIMEOUT`
+  failure — never downgraded into a `WARN` success. Post-encode output probing
+  raises `RENDER_TIMEOUT` and is skipped, and its budget is recomputed *after*
+  hashing (hashing can consume the remaining budget) with a deadline verification
+  after probing. Cancellation/ownership is polled before and after every bounded
+  QC subprocess (including each source-audio analysis call) and around output
+  probing, so no source-audio or probe subprocess starts after a stop is observed;
+  cancellation keeps precedence over an exhausted deadline. A publication/database error is never
   swallowed as duplicate delivery: it propagates after rollback and is recorded
   truthfully, so a failed commit can neither report a false success nor strand a
   `RUNNING` job.
@@ -155,11 +163,17 @@ media acceptance and Sol review. Not frozen.**
   status/claim/active-job/admission stops, authoritative-cancel-wins-over-latch
   (direct and end-to-end), publication ownership-latch and admission rechecks,
   expired-deadline/no-subprocess and remaining-budget probing, `QC_TIMEOUT`
-  non-publication, and cross-connection historical-reactivation commit);
+  non-publication, deadline-exhaustion-during-frame/audio classified as
+  `QCTimeout` (unit + real-QC executor integration), cancellation-precedence at
+  the deadline boundary, hashing-consumes-budget-skips-probe and
+  probe-budget-recomputed-after-hashing, and cross-connection
+  historical-reactivation commit);
   deterministic PostgreSQL publication and ownership race tests (concurrent
   candidate invalidation, cancellation, claim supersession, concurrent bound
-  `FINAL_CLIP` refinement update blocking a stale publication, and controlled
-  lock-serialization of a manual refinement edit against publication); SQLite and
+  `FINAL_CLIP` refinement update blocking a stale publication, concurrent
+  selected-plan update blocking a stale publication, and controlled
+  lock-serialization of a manual refinement edit and of a selected-plan update
+  against publication); SQLite and
   gated PostgreSQL migration (populated downgrade); admission and concurrency
   tests; a handoff regression test; and a gated Stage 5.2 live-contract run that
   binds a uniquely named disposable database and drives the real Celery task

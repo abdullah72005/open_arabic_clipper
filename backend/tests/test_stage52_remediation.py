@@ -376,7 +376,14 @@ def test_source_audio_analysis_does_not_start_after_cancel(monkeypatch: Any) -> 
     calls: list[str] = []
     state = {"cancel": False}
 
-    def fake_luma(binary: str, path: Path, time_s: float, *, deadline: Any = None) -> bytes:
+    def fake_luma(
+        binary: str,
+        path: Path,
+        time_s: float,
+        *,
+        deadline: Any = None,
+        cancel_check: Any = None,
+    ) -> bytes:
         return b"\x00" * (160 * 284)
 
     def fake_volume(
@@ -1178,6 +1185,9 @@ def test_historical_reactivation_persists_without_caller_commit(
         engine.dispose()
 
 
+_SAMPLE_FRAME_BYTES = 160 * 284
+
+
 def _qc_artifacts(manifest: dict[str, Any]) -> RenderArtifacts:
     return RenderArtifacts(
         output_path=Path("/tmp/output.mp4"),
@@ -1330,7 +1340,9 @@ def test_runner_output_probe_receives_remaining_budget(
         "rotation_degrees": 0,
     }
 
-    def fake_probe(binary: str, path: Path, *, timeout_seconds: float) -> dict[str, object]:
+    def fake_probe(
+        binary: str, path: Path, *, timeout_seconds: float, deadline: Any = None
+    ) -> dict[str, object]:
         captured["timeout"] = timeout_seconds
         return probe
 
@@ -1341,6 +1353,256 @@ def test_runner_output_probe_receives_remaining_budget(
         AttemptContext(attempt_directory=attempt, ass_bytes=_VALID_ASS, deadline=deadline),
     )
     assert 0 < captured["timeout"] <= 50.0
+
+
+class _Completed:
+    def __init__(self, *, stdout: bytes = b"", stderr: str = "") -> None:
+        self.stdout = stdout
+        self.stderr = stderr
+        self.returncode = 0
+
+
+def _qc_manifest() -> dict[str, Any]:
+    return {
+        "timeline": {
+            "occurrences": [
+                {
+                    "output_start": 0.0,
+                    "output_end": 2.0,
+                    "source_start": 10.0,
+                    "source_end": 12.0,
+                }
+            ]
+        }
+    }
+
+
+def test_qc_deadline_exhausted_during_final_audio_raises_timeout(monkeypatch: Any) -> None:
+    """A call that starts before the deadline, consumes it, then raises
+    TimeoutExpired during the final output-audio check must raise QCTimeout,
+    never return PASS/WARN."""
+
+    from app.render.execution import qc as qc_module
+
+    clock = {"now": 0.0}
+    monkeypatch.setattr(qc_module.time, "monotonic", lambda: clock["now"])
+
+    def fake_run(command: Any, **kwargs: Any) -> _Completed:
+        if "volumedetect" in command:
+            clock["now"] = 2.0
+            raise subprocess.TimeoutExpired(command, kwargs.get("timeout", 0))
+        return _Completed(stdout=b"\x00" * (_SAMPLE_FRAME_BYTES))
+
+    monkeypatch.setattr(qc_module.subprocess, "run", fake_run)
+    manifest = _qc_manifest()
+    artifacts = _qc_artifacts(manifest)
+
+    with pytest.raises(qc_module.QCTimeout):
+        qc_module.check_render_artifact(
+            artifacts,
+            manifest,
+            Stage52Config(),
+            source_path=Path("/tmp/source.mp4"),
+            deadline=1.0,
+        )
+
+
+def test_qc_deadline_exhausted_during_frame_extraction_raises_timeout(monkeypatch: Any) -> None:
+    from app.render.execution import qc as qc_module
+
+    clock = {"now": 0.0}
+    monkeypatch.setattr(qc_module.time, "monotonic", lambda: clock["now"])
+
+    def fake_run(command: Any, **kwargs: Any) -> _Completed:
+        clock["now"] = 2.0
+        raise subprocess.TimeoutExpired(command, kwargs.get("timeout", 0))
+
+    monkeypatch.setattr(qc_module.subprocess, "run", fake_run)
+    manifest = _qc_manifest()
+    artifacts = _qc_artifacts(manifest)
+
+    with pytest.raises(qc_module.QCTimeout):
+        qc_module.check_render_artifact(
+            artifacts,
+            manifest,
+            Stage52Config(),
+            source_path=Path("/tmp/source.mp4"),
+            deadline=1.0,
+        )
+
+
+def test_qc_cancellation_at_deadline_stays_cancelled(monkeypatch: Any) -> None:
+    from app.render.execution import qc as qc_module
+
+    with pytest.raises(qc_module.QCCancelled):
+        # Cancellation takes precedence over an exhausted shared deadline.
+        qc_module._remaining_seconds(1.0, 60, cancel_check=lambda: True)
+
+
+def test_real_qc_deadline_exhaustion_persists_timeout(session: Session, monkeypatch: Any) -> None:
+    """Integration: the real check_render_artifact, driven by controlled seams,
+    exhausts the shared deadline during output-audio analysis and the real
+    executor persists FAILED/QC_TIMEOUT without publishing."""
+
+    from app.render.execution import qc as qc_module
+
+    fixture = seed_stage51(session, monkeypatch)
+    _plan_ready(session, fixture)
+    outcome = queue_render_execution(session, fixture.stage50.selection.candidate.id)
+    assert outcome.job_id is not None
+
+    clock = {"now": 1_000.0}
+    monkeypatch.setattr(qc_module.time, "monotonic", lambda: clock["now"])
+    import app.render.execution.executor as executor_module
+
+    monkeypatch.setattr(executor_module.time, "monotonic", lambda: clock["now"])
+
+    real_run = subprocess.run
+
+    def fake_run(command: Any, **kwargs: Any) -> Any:
+        if "volumedetect" in command:
+            # Consume the shared attempt budget (max_render_seconds default 900).
+            clock["now"] = 1_901.0
+            raise subprocess.TimeoutExpired(command, kwargs.get("timeout", 0))
+        if any("format=gray" in str(arg) for arg in command):
+            return _Completed(stdout=b"\x00" * (_SAMPLE_FRAME_BYTES))
+        # Runtime-identity discovery (ffmpeg -version, fc-match, ldd) is not QC.
+        return real_run(command, **kwargs)
+
+    monkeypatch.setattr(qc_module.subprocess, "run", fake_run)
+
+    from dataclasses import replace
+
+    class _TimelineManifestRunner(_FakeRunner):
+        def __call__(self, compiled: Any, context: Any) -> Any:
+            artifacts = super().__call__(compiled, context)
+            return replace(artifacts, manifest={"timeline": compiled.manifest.as_dict()})
+
+    executor = _executor(
+        session, _TimelineManifestRunner(), qc_checker=qc_module.check_render_artifact
+    )
+    executor.set_active_job(outcome.job_id)
+    with pytest.raises(RenderTimeout):
+        executor.execute(outcome.render_execution_id)
+
+    session.expire_all()
+    row = session.get(RenderExecution, outcome.render_execution_id)
+    assert row is not None
+    assert row.lifecycle is RenderExecutionLifecycle.FAILED
+    assert row.error_code == "QC_TIMEOUT"
+    assert row.cache_eligible is False
+    assert row.artifact_reference == {}
+    job = session.get(ProcessingJob, outcome.job_id)
+    assert job is not None and job.status is JobStatus.FAILED
+
+
+def test_runner_hashing_consumes_budget_skips_output_probe(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    import app.render.execution.runner as runner
+
+    compiled, attempt = _compiled_for_runner(tmp_path)
+    _install_fake_popen(monkeypatch, compiled)
+    clock = {"now": 0.0}
+    monkeypatch.setattr(runner.time, "monotonic", lambda: clock["now"])
+
+    def slow_hash(path: Path) -> str:
+        clock["now"] = 100.0  # hashing consumes the whole budget
+        return "deadbeef"
+
+    monkeypatch.setattr(runner, "_sha256_file", slow_hash)
+    probed: list[Any] = []
+    monkeypatch.setattr(runner, "_probe_output", lambda *args, **kwargs: probed.append(args) or {})
+
+    with pytest.raises(RenderTimeout):
+        runner.run_compiled_render(
+            compiled,
+            AttemptContext(attempt_directory=attempt, ass_bytes=_VALID_ASS, deadline=50.0),
+        )
+    assert probed == []
+
+
+def test_runner_probe_budget_recomputed_after_hashing(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    import app.render.execution.runner as runner
+
+    compiled, attempt = _compiled_for_runner(tmp_path)
+    _install_fake_popen(monkeypatch, compiled)
+    clock = {"now": 0.0}
+    monkeypatch.setattr(runner.time, "monotonic", lambda: clock["now"])
+
+    def slow_hash(path: Path) -> str:
+        clock["now"] = 15.0  # hashing consumes part of the budget
+        return "deadbeef"
+
+    monkeypatch.setattr(runner, "_sha256_file", slow_hash)
+    captured: dict[str, float] = {}
+    probe = {
+        "duration_seconds": 2.0,
+        "video_codec": "h264",
+        "pix_fmt": "yuv420p",
+        "width": 1080,
+        "height": 1920,
+        "sample_aspect_ratio": "1:1",
+        "display_aspect_ratio": "16:9",
+        "frame_count": 60,
+        "avg_frame_rate": "30/1",
+        "video_start_time": 0.0,
+        "video_duration": 2.0,
+        "audio_codec": "aac",
+        "audio_sample_rate": 48000,
+        "audio_channels": 2,
+        "audio_start_time": 0.0,
+        "audio_duration": 2.0,
+        "streams": {"video": 1, "audio": 1, "subtitle": 0, "data": 0},
+        "rotation_degrees": 0,
+    }
+
+    def fake_probe(binary: str, path: Path, *, timeout_seconds: float, deadline: Any = None) -> Any:
+        captured["timeout"] = timeout_seconds
+        return probe
+
+    monkeypatch.setattr(runner, "_probe_output", fake_probe)
+    runner.run_compiled_render(
+        compiled,
+        AttemptContext(attempt_directory=attempt, ass_bytes=_VALID_ASS, deadline=50.0),
+    )
+    # Freshly recomputed after hashing consumed 15 of the 50s budget.
+    assert captured["timeout"] == pytest.approx(35.0, abs=1.0)
+
+
+def test_runner_cancellation_at_probe_boundary_stays_cancelled(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    import app.render.execution.runner as runner
+
+    compiled, attempt = _compiled_for_runner(tmp_path)
+    _install_fake_popen(monkeypatch, compiled)
+    clock = {"now": 0.0}
+    state = {"cancel": False}
+    monkeypatch.setattr(runner.time, "monotonic", lambda: clock["now"])
+
+    def hash_and_cancel(path: Path) -> str:
+        clock["now"] = 100.0  # deadline now exhausted
+        state["cancel"] = True
+        return "deadbeef"
+
+    monkeypatch.setattr(runner, "_sha256_file", hash_and_cancel)
+    probed: list[Any] = []
+    monkeypatch.setattr(runner, "_probe_output", lambda *args, **kwargs: probed.append(args) or {})
+
+    with pytest.raises(RenderCancelled):
+        runner.run_compiled_render(
+            compiled,
+            AttemptContext(
+                attempt_directory=attempt,
+                ass_bytes=_VALID_ASS,
+                deadline=50.0,
+                cancel_check=lambda: state["cancel"],
+            ),
+        )
+    assert probed == []
 
 
 def test_qc_timeout_fails_without_publishing(session: Session, monkeypatch: Any) -> None:

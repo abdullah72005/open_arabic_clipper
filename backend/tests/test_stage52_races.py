@@ -24,7 +24,8 @@ from test_stage52_remediation import _executor, _FakeRunner, _plan_ready
 from app.core.enums import JobStatus, RenderExecutionLifecycle
 from app.core.settings import get_settings
 from app.db.base import Base
-from app.models import CandidateRefinement, ClipCandidate, ProcessingJob
+from app.models import CandidateRefinement, ClipCandidate, ProcessingJob, TransformationPlan
+from app.models.render_contract import RenderContract
 from app.models.render_execution import RenderExecution
 from app.refinement.queue import apply_manual_transcript
 from app.render.execution.queue import queue_render_execution
@@ -226,6 +227,133 @@ def _candidate_id(engine: Engine, row_id: uuid.UUID) -> uuid.UUID:
         row = session.get(RenderExecution, row_id)
         assert row is not None
         return row.clip_candidate_id
+
+
+def _selected_plan_id(engine: Engine, row_id: uuid.UUID) -> uuid.UUID:
+    with Session(engine) as session:
+        row = session.get(RenderExecution, row_id)
+        assert row is not None and row.render_contract_id is not None
+        contract = session.get(RenderContract, row.render_contract_id)
+        assert contract is not None and contract.selected_plan_id is not None
+        return contract.selected_plan_id
+
+
+def test_final_publication_blocks_on_concurrent_selected_plan_update(
+    engine: Engine, monkeypatch: Any
+) -> None:
+    """A selected Stage 4.1 TransformationPlan update committed before the
+    publication transaction is authoritative and must block a stale completion."""
+
+    row_id, job_id = _seed(engine, monkeypatch)
+    plan_id = _selected_plan_id(engine, row_id)
+
+    def updating_qc(*args: Any, **kwargs: Any) -> TechnicalQCResult:
+        other = Session(engine)
+        try:
+            plan = other.get(TransformationPlan, plan_id)
+            assert plan is not None
+            plan.plan_output_fingerprint = "changed-before-publication"
+            other.commit()
+        finally:
+            other.close()
+        return _pass_qc()
+
+    _run(engine, row_id, job_id, updating_qc)
+    with Session(engine) as check:
+        row = check.get(RenderExecution, row_id)
+        job = check.get(ProcessingJob, job_id)
+        assert row is not None and row.lifecycle is not RenderExecutionLifecycle.COMPLETE
+        assert row.cache_eligible is False
+        assert row.artifact_reference == {}
+        assert job is not None and job.status is not JobStatus.SUCCEEDED
+
+
+def test_selected_plan_update_serializes_with_publication_lock(
+    engine: Engine, monkeypatch: Any
+) -> None:
+    """A selected-plan update overlapping the publication transaction must block
+    on the renderer's dependency lock and commit only after publication."""
+
+    import threading
+
+    import app.render.execution.executor as executor_module
+
+    row_id, job_id = _seed(engine, monkeypatch)
+    plan_id = _selected_plan_id(engine, row_id)
+
+    reached = threading.Event()
+    release = threading.Event()
+    updater_started = threading.Event()
+    updater_finished = threading.Event()
+    errors: list[BaseException] = []
+    real_finalize = executor_module.finalize_success
+
+    def gated_finalize(*args: Any, **kwargs: Any) -> Any:
+        reached.set()
+        assert release.wait(timeout=30)
+        return real_finalize(*args, **kwargs)
+
+    monkeypatch.setattr(executor_module, "finalize_success", gated_finalize)
+
+    def worker() -> None:
+        session = Session(engine)
+        try:
+            executor = _executor(session, _FakeRunner(), qc_checker=_pass_qc)
+            executor.set_active_job(job_id)
+            executor.execute(row_id)
+        except BaseException as error:  # noqa: BLE001
+            errors.append(error)
+        finally:
+            session.close()
+
+    worker_thread = threading.Thread(target=worker, daemon=True)
+    updater = Session(engine)
+
+    def update() -> None:
+        updater_started.set()
+        try:
+            plan = updater.get(TransformationPlan, plan_id)
+            assert plan is not None
+            plan.plan_output_fingerprint = "changed-during-publication-window"
+            updater.commit()
+        except BaseException as error:  # noqa: BLE001
+            errors.append(error)
+        finally:
+            updater.close()
+            updater_finished.set()
+
+    updater_thread = threading.Thread(target=update, daemon=True)
+    try:
+        worker_thread.start()
+        assert reached.wait(timeout=30), errors
+        # The worker now holds the selected-plan dependency lock.
+        updater_thread.start()
+        assert updater_started.wait(timeout=30)
+        # Blocked on the renderer's dependency lock, not merely slow.
+        assert not updater_finished.wait(timeout=2.0)
+        # The uncommitted writer state is invisible to another session while the
+        # publication transaction holds the lock.
+        with Session(engine) as pre:
+            uncommitted = pre.get(TransformationPlan, plan_id)
+            assert uncommitted is not None
+            assert uncommitted.plan_output_fingerprint != "changed-during-publication-window"
+        release.set()
+        worker_thread.join(timeout=30)
+        updater_thread.join(timeout=30)
+    finally:
+        release.set()
+    assert not worker_thread.is_alive()
+    assert updater_finished.is_set()
+    assert not errors, errors
+    with Session(engine) as check:
+        row = check.get(RenderExecution, row_id)
+        assert row is not None and row.lifecycle is RenderExecutionLifecycle.COMPLETE
+        assert row.cache_eligible is True
+        plan = check.get(TransformationPlan, plan_id)
+        assert plan is not None
+        # The renderer published from the state validated inside its transaction;
+        # the overlapping writer serialized and committed afterwards.
+        assert plan.plan_output_fingerprint == "changed-during-publication-window"
 
 
 def _final_refinement_id(engine: Engine, row_id: uuid.UUID) -> uuid.UUID:

@@ -175,14 +175,23 @@ def run_compiled_render(compiled: CompiledRender, context: AttemptContext) -> Re
     # Post-encode work shares the attempt deadline and polls cancellation between
     # bounded steps; no further process starts once the deadline is exhausted.
     if context.cancelled():
+        raise RenderCancelled("render cancelled before hashing")
+    digest = _sha256_file(output_path)
+    # Cancellation is checked before the deadline so a stop at the boundary is
+    # reported as cancellation, and the probe budget is recomputed *after*
+    # hashing (which may itself have consumed the remaining budget).
+    if context.cancelled():
         raise RenderCancelled("render cancelled before output probing")
     probe_budget = _remaining_budget(deadline, _PROBE_TIMEOUT_SECONDS)
-    digest = _sha256_file(output_path)
     probe = _probe_output(
-        compiled.runtime_identity.ffprobe_binary, output_path, timeout_seconds=probe_budget
+        compiled.runtime_identity.ffprobe_binary,
+        output_path,
+        timeout_seconds=probe_budget,
+        deadline=deadline,
     )
     if context.cancelled():
         raise RenderCancelled("render cancelled after output probing")
+    _ensure_deadline_not_expired(deadline)
     duration = _as_float(probe.get("duration_seconds"), 0.0)
     frame_count = _as_int(probe.get("frame_count"), 0)
     sample_rate = _as_int(probe.get("audio_sample_rate"), 0)
@@ -235,8 +244,17 @@ def _remaining_budget(deadline: float | None, base: float) -> float:
     return min(base, remaining)
 
 
+def _ensure_deadline_not_expired(deadline: float | None) -> None:
+    if deadline is not None and time.monotonic() >= deadline:
+        raise RenderTimeout("render timed out during output probing")
+
+
 def _probe_output(
-    binary: str, path: Path, *, timeout_seconds: float = _PROBE_TIMEOUT_SECONDS
+    binary: str,
+    path: Path,
+    *,
+    timeout_seconds: float = _PROBE_TIMEOUT_SECONDS,
+    deadline: float | None = None,
 ) -> dict[str, object]:
     command = [
         binary,
@@ -252,6 +270,12 @@ def _probe_output(
         completed = subprocess.run(  # noqa: S603 - allow-listed argv, shell=False
             command, check=True, capture_output=True, text=True, timeout=timeout_seconds
         )
+    except subprocess.TimeoutExpired as error:
+        # A probe that consumed its shared budget is deadline exhaustion, not an
+        # ordinary probe failure.
+        if deadline is not None and time.monotonic() >= deadline:
+            raise RenderTimeout("render timed out during output probing") from error
+        raise RenderProcessError("QC_PROBE_FAILED", type(error).__name__) from error
     except (OSError, subprocess.SubprocessError) as error:
         raise RenderProcessError("QC_PROBE_FAILED", type(error).__name__) from error
     try:

@@ -26,7 +26,12 @@ from sqlalchemy.orm import Session
 from app.core.enums import JobStatus, RenderExecutionLifecycle
 from app.core.settings import Settings
 from app.db.session import create_session_factory
-from app.models import CandidateRefinement, ClipCandidate, ProcessingJob
+from app.models import (
+    CandidateRefinement,
+    ClipCandidate,
+    ProcessingJob,
+    TransformationPlan,
+)
 from app.models.render_contract import RenderContract
 from app.models.render_execution import RenderExecution
 from app.models.visual_composition_plan import VisualCompositionPlan
@@ -496,6 +501,11 @@ class RenderExecutionExecutor:
             self._handle_stop(row)
             raise StageCancelled("render cancelled during QC") from None
         except QCTimeout as error:
+            # Cancellation/ownership precedence: a stop observed at the deadline
+            # boundary is reported truthfully, not mislabeled as a timeout.
+            if self._job_cancelled() or self._ownership_lost:
+                self._handle_stop(row)
+                raise StageCancelled("render stopped during QC") from None
             # Distinct from cancellation: an exhausted mandatory QC budget is a
             # hard failure that is never published as a warning success.
             self._fail(row, "QC_TIMEOUT")
@@ -617,12 +627,22 @@ class RenderExecutionExecutor:
                     .where(RenderContract.id == row.render_contract_id)
                     .with_for_update()
                 ).first()
+                # The bound selected Stage 4.1 plan is mutable by a planning
+                # rerun: ``_persist_plans`` updates existing TransformationPlan
+                # rows (including ``plan_output_fingerprint`` and ``is_current``)
+                # and commits *without* taking the candidate lock. Lock it so its
+                # authoritative state is stable across the whole publication
+                # transaction; a rerun therefore either commits before this
+                # transaction (and fails the rebuild) or serializes after it.
+                if contract is not None and contract.selected_plan_id is not None:
+                    self._session.execute(
+                        select(TransformationPlan.id)
+                        .where(TransformationPlan.id == contract.selected_plan_id)
+                        .with_for_update()
+                    ).first()
                 # The bound FINAL_CLIP refinement is mutable through
                 # ``apply_manual_transcript``, whose writer never takes the
-                # candidate lock. Lock it so its authoritative caption state is
-                # stable across the whole publication transaction; a concurrent
-                # manual edit therefore either commits before this transaction
-                # (and fails the rebuild) or serializes after it.
+                # candidate lock. Lock it for the same reason.
                 if contract is not None and contract.final_refinement_id is not None:
                     self._session.execute(
                         select(CandidateRefinement.id)
