@@ -1,5 +1,49 @@
 # Runtime status
 
+## Stage 5.2 tracked-crop defect remediation (2026-10-07)
+
+Status: **human acceptance of the Stage 5.2 media package FAILED. The confirmed
+production TRACKED_CROP execution defect is remediated and verified; the
+acceptance-generation boundary is corrected; genuine regenerated media is
+BLOCKED on an upstream Stage 3.5 prerequisite. Stage 5.2 NOT FROZEN. Stage 6 NOT
+STARTED.**
+
+- **Confirmed renderer defect (fixed).** `compiler.py::_tracked_crop_chain`
+  previously computed the fixed 1080x1920 crop position/clamps from the `crop`
+  filter's cached `in_w`/`in_h`, which retain the initially configured
+  dimensions while a per-frame dynamic `scale` changes the frame size. Varying
+  `height_fraction` therefore produced a stale crop position (the reviewed case
+  was ~706 scaled px too far left at 87.2 s). The chain now derives the scaled
+  width/height once (from authoritative display geometry, with the same
+  even-rounding as `scale`) and reuses those exact expressions for the crop
+  position and clamps. `COMPILER_VERSION` advanced to `stage5.2-compiler-v4`, so
+  cached outputs from the defective compiler cannot satisfy corrected requests.
+  Bounded requested-vs-derived geometry samples are emitted in the compiled
+  diagnostics. Regression coverage decodes encoded output frames and compares
+  them against an independently calculated source reference for simultaneous
+  pan/zoom, vertical movement, edge clamps, constant-height tracking, and
+  portrait display geometry; the reviewed case-01 geometry is included and the
+  new regressions fail on the old compiler.
+- **Acceptance boundary (fixed).** `acceptance.py` now separates
+  `SYNTHETIC_REGRESSION` (hand-built specs/invented text, written under
+  `synthetic-regression/`, never the final gate) from
+  `PRODUCTION_MANUAL_ACCEPTANCE` (genuine persisted, audio-backed lineage only,
+  executed through the normal production adapter/queue/executor, full evidence
+  export). Production acceptance fails closed on placeholder identities, missing
+  plan fingerprints, missing/mismatched canonical ASS, seeded/non-audio-backed
+  `FINAL_CLIP` evidence, and occurrences without a per-occurrence visual
+  decision. The gated `test_stage52_live_contract.py` is explicitly classified
+  `SEEDED_PLUMBING`.
+- **Blocked prerequisite (upstream).** Preparing a genuine `FINAL_CLIP`
+  refinement fails in Stage 3.5:
+  `app/refinement/audio_window.py::_extract_window` writes the extracted window
+  to `<destination>.wav.tmp` and passes it to FFmpeg 7.1.5 without an explicit
+  output format; FFmpeg cannot infer a muxer from `.tmp` and the refinement
+  fails with `RefinementAudioError`. This is an upstream behavior change the
+  Stage 5.2 remediation is not authorized to make. No genuine manual-acceptance
+  media is produced until SOL resolves it; see
+  `storage/benchmarks/stage-5-2/manual-acceptance/README.md`.
+
 ## Stage 5.2 render execution, audio, and technical QC (2026-10-05)
 
 Stage 5.2 turns one current executable Stage 5.0 render contract and one current
@@ -35,9 +79,12 @@ media acceptance and Sol review. Not frozen.**
   final video + one final audio encode per render; no mandatory intermediate
   H.264.
 - **Framing.** All six accepted modes execute. Tracked crop uses a per-frame
-  dynamic scale + per-frame crop because the installed FFmpeg `crop` exposes no
-  runtime width/height commands; smoothstep pan/zoom is real and tested. Native
-  rotation applied once; exotic pixel aspect fails closed.
+  dynamic `scale` plus a fixed 1080x1920 `crop`; the crop position and explicit
+  clamp limits are computed from the current, identically rounded scale
+  dimensions (never the `crop` filter's cached `in_w`/`in_h`), so varying-height
+  tracking preserves the requested subject position. Smoothstep pan/zoom is real
+  and verified from decoded frames against an independent geometry reference.
+  Native rotation applied once; exotic pixel aspect fails closed.
 - **Captions.** Canonical ASS is burned while source-local, before `setpts`,
   preserving bytes and dynamic highlight states; never re-planned/re-ordered.
   Asset must be managed, exist, and match SHA-256. A real render regression

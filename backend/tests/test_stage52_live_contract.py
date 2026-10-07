@@ -1,5 +1,15 @@
 """Stage 5.2 live-contract end-to-end test against a disposable PostgreSQL.
 
+CLASSIFICATION: SEEDED_PLUMBING. This is useful persisted end-to-end
+plumbing/integration coverage, NOT product caption acceptance. It seeds upstream
+rows with ``stage50_support``/``stage43_support``/``stage41_support``, including
+an English remote-work transcript and synthetic word timings, then copies
+unrelated source media over the fixture source. The exported MP4 therefore
+contains the unrelated seeded English captions; its transcript/timing evidence is
+synthetic and unrelated to the copied media's speech. Final production
+acceptance is generated separately from genuine audio-backed evidence via
+``python -m app.render.execution.acceptance production-acceptance``.
+
 The only Stage 5.2 test that exercises the *real* seams end to end:
 
     alembic upgrade head (on a uniquely named disposable database)
@@ -98,9 +108,7 @@ def _admin_url() -> str:
 
 def _target_url() -> str:
     assert _URL is not None
-    return str(
-        make_url(_URL).set(database=_DATABASE).render_as_string(hide_password=False)
-    )
+    return str(make_url(_URL).set(database=_DATABASE).render_as_string(hide_password=False))
 
 
 def _create_database() -> None:
@@ -138,7 +146,18 @@ def _no_dispatch(monkeypatch: Any) -> None:
 
 def test_stage52_live_contract_end_to_end(tmp_path: Path, monkeypatch: Any) -> None:
     assert _URL is not None
-    report: dict[str, object] = {"assertions": {}, "artifacts": {}, "media": None}
+    report: dict[str, object] = {
+        "classification": "SEEDED_PLUMBING",
+        "counts_toward_final_gate": False,
+        "evidence_note": (
+            "Seeded English remote-work transcript and synthetic word timings are "
+            "unrelated to the copied source media's speech. Useful persisted "
+            "plumbing/integration coverage only; not product caption acceptance."
+        ),
+        "assertions": {},
+        "artifacts": {},
+        "media": None,
+    }
     artifacts = _artifacts_dir()
     session: Session | None = None
     engine: Engine | None = None
@@ -285,6 +304,15 @@ def test_stage52_live_contract_end_to_end(tmp_path: Path, monkeypatch: Any) -> N
 
         artifacts.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(artifact_path, artifacts / "live-source-validation.mp4")
+        (artifacts / "README.md").write_text(
+            "# Stage 5.2 live-contract (SEEDED_PLUMBING)\n\n"
+            "Persisted end-to-end plumbing/integration artifact, NOT product "
+            "caption acceptance. The transcript and word timings are seeded and "
+            "unrelated to the copied source media's speech. Final production "
+            "acceptance is generated separately from genuine audio-backed "
+            "evidence.\n",
+            encoding="utf-8",
+        )
         report["artifacts"]["video"] = str(artifacts / "live-source-validation.mp4")
     except BaseException as error:  # noqa: BLE001 - recorded then re-raised
         failure = f"{type(error).__name__}: {error}"

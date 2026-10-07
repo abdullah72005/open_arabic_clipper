@@ -13,11 +13,14 @@ Stage 5.1 visual plan and canonical ASS. The graph:
   repeatedly round or pad audio;
 - concatenates occurrences and encodes once.
 
-The installed FFmpeg's ``crop`` filter does not expose runtime width/height
-commands, so a genuinely changing ``height_fraction`` is executed with a
-per-frame dynamic ``scale`` (``eval=frame``) plus a per-frame ``crop`` position.
-This is the smallest proven equivalent; the accepted normalized crop path is
-not redesigned.
+A genuinely changing ``height_fraction`` is executed with a per-frame dynamic
+``scale`` (``eval=frame``) plus a fixed 1080x1920 ``crop`` whose position is
+computed each frame. The ``crop`` filter exposes runtime width/height commands,
+but this compiler deliberately keeps a fixed-size crop and only varies its
+position: it derives that position (and its explicit clamp limits) from the
+*current* scaled dimensions using the identical rounding used by ``scale``.
+Referencing ``crop``'s cached ``in_w``/``in_h`` would use the initially
+configured input dimensions and is never done for varying scale geometry.
 """
 
 from __future__ import annotations
@@ -137,7 +140,112 @@ def _static_crop_chain(spec: RenderSpec, scene: SceneSpec) -> tuple[str, dict[st
     }
 
 
-def _tracked_crop_chain(scene: SceneSpec) -> tuple[str, dict[str, object]]:
+def _interpolate_keyframes(frames: Sequence[CropKeyframeSpec], getter: str, t: float) -> float:
+    """Evaluate the accepted smoothstep piecewise interpolation in Python.
+
+    Mirrors :func:`_lerp_expression`/`_piecewise` exactly so geometry preflight
+    and diagnostics describe the same curve the filtergraph evaluates.
+    """
+
+    values = [getattr(frame, getter) for frame in frames]
+    if len(frames) == 1 or all(abs(value - values[0]) < 1e-9 for value in values):
+        return float(values[0])
+    if t < frames[0].t:
+        return float(values[0])
+    for index in range(len(frames) - 1):
+        left = frames[index]
+        right = frames[index + 1]
+        if t < right.t:
+            span = right.t - left.t
+            if span < 1e-9:
+                return float(getattr(left, getter))
+            u = (t - left.t) / span
+            ease = u * u * (3.0 - 2.0 * u)
+            left_value = getattr(left, getter)
+            return float(left_value + (getattr(right, getter) - left_value) * ease)
+    return float(values[-1])
+
+
+def _tracked_scaled_dimensions(
+    height_fraction: float, display_width: int, display_height: int
+) -> tuple[int, int]:
+    """Even-rounded scaled frame dimensions for one accepted crop height fraction.
+
+    Uses the identical ``trunc(value / 2) * 2`` rounding the emitted ``scale``
+    expressions use, so crop position/clamp arithmetic can reuse these values
+    without silently diverging from the executed scale geometry.
+    """
+
+    scaled_height = int((OUTPUT_PROFILE_HEIGHT / height_fraction) / 2) * 2
+    scaled_width = (
+        int((display_width * OUTPUT_PROFILE_HEIGHT / (height_fraction * display_height)) / 2) * 2
+    )
+    return scaled_width, scaled_height
+
+
+def _tracked_scaled_expressions(height_expr: str, spec: RenderSpec) -> tuple[str, str]:
+    """Shared scale width/height expressions reused verbatim by the crop clamps."""
+
+    scale_height = f"trunc(({OUTPUT_PROFILE_HEIGHT}/({height_expr}))/2)*2"
+    scale_width = (
+        f"trunc(({spec.display_width}*{OUTPUT_PROFILE_HEIGHT}/"
+        f"(({height_expr})*{spec.display_height}))/2)*2"
+    )
+    return scale_width, scale_height
+
+
+def _tracked_geometry_samples(
+    frames: Sequence[CropKeyframeSpec], spec: RenderSpec
+) -> list[dict[str, object]]:
+    """Bounded requested-vs-derived geometry samples at meaningful source times.
+
+    Samples every keyframe, each scene boundary, and each interior interpolation
+    midpoint. Fails closed on unsupported geometry (a fixed 1080x1920 crop that
+    cannot fit the scaled frame) instead of emitting an unresolvable graph.
+    """
+
+    times: set[float] = set()
+    for frame in frames:
+        times.add(round(frame.t, 6))
+    for index in range(len(frames) - 1):
+        times.add(round((frames[index].t + frames[index + 1].t) / 2.0, 6))
+    samples: list[dict[str, object]] = []
+    for t in sorted(times):
+        center_x = _interpolate_keyframes(frames, "cx", t)
+        center_y = _interpolate_keyframes(frames, "cy", t)
+        height_fraction = min(
+            1.0,
+            max(_CROP_MIN_HEIGHT_FRACTION, _interpolate_keyframes(frames, "height_fraction", t)),
+        )
+        scaled_width, scaled_height = _tracked_scaled_dimensions(
+            height_fraction, spec.display_width, spec.display_height
+        )
+        if scaled_width < OUTPUT_PROFILE_WIDTH or scaled_height < OUTPUT_PROFILE_HEIGHT:
+            raise CompileError("KEYFRAME_GEOMETRY_INVALID")
+        crop_x = min(
+            max(center_x * scaled_width - OUTPUT_PROFILE_WIDTH / 2.0, 0.0),
+            scaled_width - OUTPUT_PROFILE_WIDTH,
+        )
+        crop_y = min(
+            max(center_y * scaled_height - OUTPUT_PROFILE_HEIGHT / 2.0, 0.0),
+            scaled_height - OUTPUT_PROFILE_HEIGHT,
+        )
+        samples.append(
+            {
+                "t": round(t, 6),
+                "cx": round(center_x, 6),
+                "cy": round(center_y, 6),
+                "height_fraction": round(height_fraction, 6),
+                "scaled_width": scaled_width,
+                "scaled_height": scaled_height,
+                "crop_x": round(crop_x, 3),
+                "crop_y": round(crop_y, 3),
+            }
+        )
+    return samples
+
+
+def _tracked_crop_chain(spec: RenderSpec, scene: SceneSpec) -> tuple[str, dict[str, object]]:
     frames = scene.crop_keyframes
     if len(frames) > MAX_TRACKED_SCENE_KEYFRAMES:
         raise CompileError("KEYFRAME_OUT_OF_SCOPE")
@@ -148,21 +256,36 @@ def _tracked_crop_chain(scene: SceneSpec) -> tuple[str, dict[str, object]]:
     center_x_expr = _piecewise(frames, "cx") if _has_varying(frames, "cx") else _num(frames[0].cx)
     center_y_expr = _piecewise(frames, "cy") if _has_varying(frames, "cy") else _num(frames[0].cy)
     height_expr = f"min(1\\,max({_num(_CROP_MIN_HEIGHT_FRACTION)}\\,{height_expr}))"
-    scale_w = f"trunc(iw*(1920/(({height_expr})*ih))/2)*2"
-    scale_h = f"trunc((1920/({height_expr}))/2)*2"
+    # The scale and crop position share these exact expressions: crop clamps use
+    # the current even-rounded scaled dimensions, never crop's cached in_w/in_h.
+    scale_w, scale_h = _tracked_scaled_expressions(height_expr, spec)
     half_w = OUTPUT_PROFILE_WIDTH // 2
     half_h = OUTPUT_PROFILE_HEIGHT // 2
-    crop_x = f"max(0\\,min(in_w-{OUTPUT_PROFILE_WIDTH}\\,({center_x_expr})*in_w-{half_w}))"
-    crop_y = f"max(0\\,min(in_h-{OUTPUT_PROFILE_HEIGHT}\\,({center_y_expr})*in_h-{half_h}))"
+    crop_x = (
+        f"max(0\\,min(({scale_w})-{OUTPUT_PROFILE_WIDTH}\\,({center_x_expr})*({scale_w})-{half_w}))"
+    )
+    crop_y = (
+        f"max(0\\,min(({scale_h})-{OUTPUT_PROFILE_HEIGHT}\\,"
+        f"({center_y_expr})*({scale_h})-{half_h}))"
+    )
     chain = (
         f"scale=w='{scale_w}':h='{scale_h}':eval=frame:flags=bicubic,"
         f"crop=w={OUTPUT_PROFILE_WIDTH}:h={OUTPUT_PROFILE_HEIGHT}:x='{crop_x}':y='{crop_y}'"
     )
     return chain, {
         "dynamic": True,
+        "display_width": spec.display_width,
+        "display_height": spec.display_height,
         "height_expression": height_expr,
         "center_x_expression": center_x_expr,
         "center_y_expression": center_y_expr,
+        "scale_width_expression": scale_w,
+        "scale_height_expression": scale_h,
+        "crop_width": OUTPUT_PROFILE_WIDTH,
+        "crop_height": OUTPUT_PROFILE_HEIGHT,
+        "crop_x_expression": crop_x,
+        "crop_y_expression": crop_y,
+        "geometry_samples": _tracked_geometry_samples(frames, spec),
     }
 
 
@@ -190,7 +313,7 @@ def _framing_segment(
         ]
         return lines, {"mode": mode}
     if mode == "TRACKED_CROP":
-        chain, geometry = _tracked_crop_chain(scene)
+        chain, geometry = _tracked_crop_chain(spec, scene)
         return [f"[{input_label}]{chain}[{output_label}]"], {"mode": mode, **geometry}
     chain, geometry = _static_crop_chain(spec, scene)
     return [f"[{input_label}]{chain}[{output_label}]"], {"mode": mode, **geometry}
@@ -303,6 +426,7 @@ def compile_render(spec: RenderSpec, runtime_identity: RuntimeIdentity) -> Compi
                     "framing_mode": scene.framing_mode,
                     "keyframes": len(scene.crop_keyframes),
                     "dynamic": bool(geometry.get("dynamic", False)),
+                    "geometry": geometry,
                 }
             )
         if len(scene_outputs) == 1:

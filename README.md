@@ -489,9 +489,11 @@ kind (migration `20260918_0022`) and one `render_executions` table, and adds no
 The current purpose `CORE_SOURCE_VALIDATION` is source-core validation, not a
 publication-final artifact: authored material is omitted and reported,
 `publication_ready=false`, `stage6_implemented=false`, and the authored timeline
-stays unfrozen. Tracked-crop zoom uses a proven per-frame dynamic-scale
-equivalent because the installed FFmpeg `crop` exposes no runtime width/height
-commands. See [Stage 5.2 operations](docs/STAGE_5_2_OPERATIONS.md).
+stays unfrozen. Tracked-crop zoom uses a per-frame dynamic `scale` plus a fixed
+1080x1920 `crop` whose position and explicit clamp limits are computed from the
+current, identically rounded scale dimensions (never the `crop` filter's cached
+`in_w`/`in_h`), so varying-height tracking preserves the requested subject
+position. See [Stage 5.2 operations](docs/STAGE_5_2_OPERATIONS.md).
 
 CLI: `render-execution`, `render-execution-status`, `render-execution-artifact`.
 API: `POST/GET /api/candidates/{id}/render-execution`, `GET

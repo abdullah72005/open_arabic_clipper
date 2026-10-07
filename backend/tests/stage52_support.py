@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from fractions import Fraction
-from typing import Any
+from typing import Any, cast
 
 from app.render.execution.types import (
     AssAsset,
     CaptionEventSpec,
+    CompiledRender,
     CropKeyframeSpec,
     OmittedRequirement,
     RenderSpec,
@@ -103,6 +105,8 @@ def make_spec(
     audio_channels: int = 2,
     source_video_start: float = 0.0,
     source_audio_start: float = 0.0,
+    display_width: int = 1920,
+    display_height: int = 1080,
 ) -> RenderSpec:
     if occurrences is None:
         occurrences = (
@@ -164,10 +168,10 @@ def make_spec(
         source_mtime_ns=1,
         source_duration=source_duration,
         source_frame_rate=source_frame_rate,
-        display_width=1920,
-        display_height=1080,
-        encoded_width=1920,
-        encoded_height=1080,
+        display_width=display_width,
+        display_height=display_height,
+        encoded_width=display_width,
+        encoded_height=display_height,
         rotation_degrees=rotation_degrees,
         pixel_aspect_ratio=pixel_aspect_ratio,
         output_width=1080,
@@ -210,10 +214,72 @@ def install_fake_stream_probe(monkeypatch: Any, *, channels: int = 2) -> None:
     )
 
 
+def scene_geometry(compiled: CompiledRender, index: int = 0) -> dict[str, Any]:
+    """Typed access to one scene's compiler diagnostics (crop geometry/samples)."""
+
+    scenes = cast(list[dict[str, Any]], compiled.diagnostics.get("scenes", []))
+    geometry = scenes[index].get("geometry")
+    assert isinstance(geometry, dict)
+    return cast(dict[str, Any], geometry)
+
+
+def independent_tracked_geometry(
+    frames: Sequence[CropKeyframeSpec],
+    t: float,
+    display_width: int,
+    display_height: int,
+) -> dict[str, float]:
+    """Independent reference geometry for one accepted tracked-crop keyframe set.
+
+    Deliberately re-derives the accepted smoothstep interpolation, the even
+    scale rounding, the fixed-output crop position, and the output-center ->
+    source-pixel mapping without importing or calling the compiler helper. Used
+    by regressions to check encoded pixels against an external calculation.
+    """
+
+    def interp(getter: str) -> float:
+        values = [getattr(frame, getter) for frame in frames]
+        if len(frames) == 1 or all(abs(value - values[0]) < 1e-9 for value in values):
+            return float(values[0])
+        if t < frames[0].t:
+            return float(values[0])
+        for index in range(len(frames) - 1):
+            left = frames[index]
+            right = frames[index + 1]
+            if t < right.t:
+                span = right.t - left.t
+                if span < 1e-9:
+                    return float(getattr(left, getter))
+                u = (t - left.t) / span
+                ease = u * u * (3.0 - 2.0 * u)
+                return float(
+                    getattr(left, getter) + (getattr(right, getter) - getattr(left, getter)) * ease
+                )
+        return float(values[-1])
+
+    height_fraction = min(1.0, max(0.20, interp("height_fraction")))
+    scaled_height = math.trunc((1920.0 / height_fraction) / 2.0) * 2
+    scaled_width = (
+        math.trunc((display_width * 1920.0 / (height_fraction * display_height)) / 2.0) * 2
+    )
+    crop_x = min(max(interp("cx") * scaled_width - 540.0, 0.0), scaled_width - 1080)
+    crop_y = min(max(interp("cy") * scaled_height - 960.0, 0.0), scaled_height - 1920)
+    return {
+        "scaled_width": float(scaled_width),
+        "scaled_height": float(scaled_height),
+        "crop_x": crop_x,
+        "crop_y": crop_y,
+        "source_x": (crop_x + 540.0) * display_width / scaled_width,
+        "source_y": (crop_y + 960.0) * display_height / scaled_height,
+    }
+
+
 __all__ = [
     "crop_scene",
     "fake_runtime",
+    "independent_tracked_geometry",
     "install_fake_stream_probe",
     "make_spec",
     "occurred",
+    "scene_geometry",
 ]

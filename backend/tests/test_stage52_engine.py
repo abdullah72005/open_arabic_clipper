@@ -3,7 +3,14 @@
 from __future__ import annotations
 
 import pytest
-from stage52_support import crop_scene, fake_runtime, make_spec, occurred
+from stage52_support import (
+    crop_scene,
+    fake_runtime,
+    independent_tracked_geometry,
+    make_spec,
+    occurred,
+    scene_geometry,
+)
 
 from app.render.execution.compiler import compile_render
 from app.render.execution.policy import (
@@ -18,6 +25,7 @@ from app.render.execution.timeline import (
 )
 from app.render.execution.types import (
     CaptionEventSpec,
+    RenderSpec,
     SceneSpec,
     TechnicalQCResult,
 )
@@ -257,3 +265,84 @@ def test_qc_result_shape_rejects_blank() -> None:
 
 def make_config() -> Stage52Config:  # local helper to avoid importing Settings
     return Stage52Config()
+
+
+_REVIEWED_CASE_KEYFRAMES = [
+    (85.2, 0.45, 0.48, 0.95),
+    (86.2, 0.50, 0.46, 0.82),
+    (87.2, 0.55, 0.44, 0.70),
+    (88.2, 0.52, 0.45, 0.78),
+]
+
+
+def _reviewed_case_spec() -> RenderSpec:
+    scene = crop_scene(0, 0, 85.2, 88.2, "TRACKED_CROP", _REVIEWED_CASE_KEYFRAMES)
+    occ = occurred("block-0", 0, 85.2, 88.2, 0.0, (scene,))
+    return make_spec(
+        occurrences=(occ,),
+        caption_events=(),
+        source_duration=120.0,
+        display_width=3840,
+        display_height=2160,
+    )
+
+
+def test_tracked_crop_geometry_samples_match_independent_reference() -> None:
+    # The reviewed case-01 geometry (3840x2160, varying cx/cy/height_fraction).
+    spec = _reviewed_case_spec()
+    compiled = compile_render(spec, fake_runtime())
+    geometry = scene_geometry(compiled)
+    samples = geometry["geometry_samples"]
+    assert len(samples) >= 7
+    frames = spec.occurrences[0].scenes[0].crop_keyframes
+    for sample in samples:
+        reference = independent_tracked_geometry(
+            frames, sample["t"], spec.display_width, spec.display_height
+        )
+        assert sample["scaled_width"] == reference["scaled_width"]
+        assert sample["scaled_height"] == reference["scaled_height"]
+        assert sample["crop_x"] == pytest.approx(reference["crop_x"], abs=0.02)
+        assert sample["crop_y"] == pytest.approx(reference["crop_y"], abs=0.02)
+    # Exact values SOL measured against the defective graph, now correct.
+    by_t = {round(sample["t"], 6): sample for sample in samples}
+    assert by_t[85.2]["crop_x"] == pytest.approx(1076.4, abs=0.1)
+    assert by_t[85.2]["crop_y"] == pytest.approx(9.6, abs=0.1)
+    assert by_t[86.2]["crop_x"] == pytest.approx(1541.0, abs=0.1)
+    assert by_t[86.2]["crop_y"] == pytest.approx(116.4, abs=0.1)
+    assert by_t[87.2]["crop_x"] == pytest.approx(2141.8, abs=0.1)
+    assert by_t[87.2]["crop_y"] == pytest.approx(246.48, abs=0.1)
+
+
+def test_tracked_crop_uses_current_scaled_dimensions_not_cached_input() -> None:
+    spec = _reviewed_case_spec()
+    compiled = compile_render(spec, fake_runtime())
+    graph = compiled.filtergraph
+    # crop must never read its cached input dimensions for varying scale geometry
+    assert "in_w" not in graph
+    assert "in_h" not in graph
+    geometry = scene_geometry(compiled)
+    scale_width = geometry["scale_width_expression"]
+    scale_height = geometry["scale_height_expression"]
+    # scale and crop position/clamp must share the identical dimension expressions
+    assert f"w='{scale_width}'" in graph
+    assert f"h='{scale_height}'" in graph
+    assert scale_width in geometry["crop_x_expression"]
+    assert scale_height in geometry["crop_y_expression"]
+
+
+def test_tracked_crop_rejects_geometry_too_narrow_for_output() -> None:
+    # A portrait display narrower than 9:16 cannot host a fixed 1080-wide crop.
+    scene = crop_scene(0, 0, 0.0, 2.0, "TRACKED_CROP", [(0.0, 0.5, 0.5, 1.0), (2.0, 0.5, 0.5, 1.0)])
+    occ = occurred("block-0", 0, 0.0, 2.0, 0.0, (scene,))
+    spec = make_spec(
+        occurrences=(occ,),
+        caption_events=(),
+        source_duration=10.0,
+        display_width=480,
+        display_height=1920,
+    )
+    from app.render.execution.compiler import CompileError
+
+    with pytest.raises(CompileError) as error:
+        compile_render(spec, fake_runtime())
+    assert error.value.reason_code == "KEYFRAME_GEOMETRY_INVALID"

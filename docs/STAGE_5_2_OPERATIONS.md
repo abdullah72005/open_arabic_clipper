@@ -375,20 +375,66 @@ PostgreSQL-gated tests create and drop disposable databases.
 
 ## Manual acceptance
 
-`python -m app.render.execution.acceptance --source <media> --output
-storage/benchmarks/stage-5-2/manual-acceptance` produces four short playable
-MP4s plus `README.md`, `manifest.json`, and per-case QC. Cases 01/02/04 use the
-real source A/V with demonstration crop/scene specifications (not the frozen
-Stage 5.1 plan) and are labeled as such; case 03 burns the canonical ASS built
-through production `serialize_ass`. The gated
-`tests/test_stage52_live_contract.py` exercises *persisted* Stage 5.0/5.1
-bindings plus the canonical ASS through the real Celery task entry point to a
-persisted managed artifact at
-`storage/benchmarks/stage-5-2/live-contract/live-source-validation.mp4`; it binds
-a uniquely named disposable database and never resets the supplied or operator
-database. The canonical active-word regression
-(`tests/test_stage52_render.py`) verifies the encoded highlight and stable
-surrounding layout for `أنا كنت content creator لمدة سنتين` without OCR. Human
-inspection of lip sync, cut timing, crop smoothness, black flashes, caption
-timing/highlighting, mixed BiDi, sharpness, background fill, audio level, and
-multi-span synchronization is required. Automatic QC is not human approval.
+Stage 5.2 separates deterministic synthetic demonstrations from the genuine
+final product gate:
+
+- **Synthetic regression** (never the final gate):
+
+  ```bash
+  python -m app.render.execution.acceptance synthetic-regression \
+      --source <media> --output storage/benchmarks/stage-5-2/synthetic-regression
+  ```
+
+  Produces four short playable MP4s plus `README.md`, `manifest.json`, and
+  per-case QC. Specs/text/timings are hand-built and labelled `SYNTHETIC_REGRESSION`
+  (`counts_toward_final_gate: false`).
+
+- **Production manual acceptance** (the genuine gate):
+
+  ```bash
+  python -m app.render.execution.acceptance production-acceptance \
+      --candidate <uuid> --output storage/benchmarks/stage-5-2/manual-acceptance
+  ```
+
+  Requires a current retained candidate, a current executable Stage 5.0 render
+  contract, a current ready Stage 5.1 visual-composition plan with its canonical
+  ASS, and an audio-backed `FINAL_CLIP` Stage 3.5 refinement. The request is
+  built by the production adapter (`build_render_spec`), executed through the
+  normal queue/executor, and exported with full lineage (`render_spec.json`,
+  contract/plan snapshots, refinement snapshot, execution manifest, filtergraph,
+  canonical ASS bytes + SHA-256, output SHA-256, QC, identity, and bounded
+  geometry samples). Placeholder identities, missing plan fingerprints, a
+  missing/mismatched ASS, seeded/non-audio-backed `FINAL_CLIP` evidence, and
+  occurrences without a per-occurrence visual decision are rejected
+  (`AcceptanceValidationError`). It never falls back to synthetic evidence.
+
+  **Current status: BLOCKED.** Genuine preparation is blocked by a confirmed
+  upstream Stage 3.5 defect (`audio_window.py::_extract_window` passes an
+  untyped `.wav.tmp` output path to FFmpeg 7.1.5, which cannot choose a muxer).
+  See `storage/benchmarks/stage-5-2/manual-acceptance/README.md`. No genuine
+  acceptance media is produced until SOL resolves the upstream prerequisite.
+
+The gated `tests/test_stage52_live_contract.py` is explicitly classified
+`SEEDED_PLUMBING`: it exercises *persisted* Stage 5.0/5.1 bindings plus the
+canonical ASS through the real Celery task entry point to a persisted managed
+artifact at
+`storage/benchmarks/stage-5-2/live-contract/live-source-validation.mp4`, but its
+transcript/timings are seeded and unrelated to the copied source speech. It
+binds a uniquely named disposable database and never resets the supplied or
+operator database. It is not product caption acceptance.
+
+Tracked-crop execution geometry is emitted in the compiled render diagnostics
+(`diagnostics.scenes[*].geometry`) as requested-versus-derived samples so the
+emitted scale/crop expressions can be compared against sampled source times.
+
+The canonical active-word regression (`tests/test_stage52_render.py`) verifies
+the encoded highlight and stable surrounding layout for
+`أنا كنت content creator لمدة سنتين` without OCR. Decoded-geometry regressions
+(`tests/test_stage52_render.py`) compare encoded output pixels against an
+independently calculated source reference for simultaneous pan/zoom, vertical
+movement, edge clamps, constant-height tracking, and portrait display geometry.
+Human inspection of lip sync, cut timing, crop smoothness, black flashes,
+caption timing/highlighting, mixed BiDi, sharpness, background fill, audio
+level, and multi-span synchronization is required. Automatic QC is not human
+approval, and fingerprint/hash checks prove identity/lineage only, not speech or
+composition correctness.

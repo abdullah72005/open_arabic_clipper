@@ -20,7 +20,7 @@ from dataclasses import dataclass
 EXECUTION_POLICY_VERSION = "stage5.2-v3"
 EXECUTION_SCHEMA_VERSION = "stage5.2-schema-v3"
 EXECUTION_FINGERPRINT_VERSION = "3"
-COMPILER_VERSION = "stage5.2-compiler-v3"
+COMPILER_VERSION = "stage5.2-compiler-v4"
 TIMELINE_POLICY_VERSION = "stage5.2-timeline-v3"
 QC_POLICY_VERSION = "stage5.2-qc-v3"
 DELIVERY_PROFILE_VERSION = "stage5.2-delivery-v1"
