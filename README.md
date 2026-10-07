@@ -473,6 +473,30 @@ See [Stage 5.0 operations](docs/STAGE_5_0_OPERATIONS.md) and
 [Stage 5.1 operations](docs/STAGE_5_1_OPERATIONS.md) for boundaries, bounds,
 fingerprints, jobs/concurrency/cancellation, and configuration.
 
+### Stage 5.2 render execution, audio, and technical QC
+
+Stage 5.2 is an explicit, candidate-scoped deterministic media execution engine.
+It consumes a current executable Stage 5.0 render contract and one current ready
+Stage 5.1 plan (with canonical ASS), executes the accepted ordered
+`SOURCE_MEDIA` occurrences at unit speed, burns canonical ASS while timestamps
+are source-local, joins audio only at real occurrence boundaries, and produces
+one final video encode and one final audio encode (CPU-only MP4/H.264+AAC,
+1080x1920, `+faststart`) plus a normalized manifest and deterministic technical
+QC. It extends the Celery/`ProcessingJob` platform with a `RENDER_EXECUTION` job
+kind (migration `20260918_0022`) and one `render_executions` table, and adds no
+`PipelineStage`, `PipelineRun`, or `_NEXT_STAGE` entry.
+
+The current purpose `CORE_SOURCE_VALIDATION` is source-core validation, not a
+publication-final artifact: authored material is omitted and reported,
+`publication_ready=false`, `stage6_implemented=false`, and the authored timeline
+stays unfrozen. Tracked-crop zoom uses a proven per-frame dynamic-scale
+equivalent because the installed FFmpeg `crop` exposes no runtime width/height
+commands. See [Stage 5.2 operations](docs/STAGE_5_2_OPERATIONS.md).
+
+CLI: `render-execution`, `render-execution-status`, `render-execution-artifact`.
+API: `POST/GET /api/candidates/{id}/render-execution`, `GET
+/api/render-executions/{id}`, `GET /api/render-executions/{id}/artifact`.
+
 
 Stage 3 semantic mode defaults to `deterministic`: zero Gemini calls and zero
 Qwen model loads. `adaptive` uses Gemini only when a key is configured, and

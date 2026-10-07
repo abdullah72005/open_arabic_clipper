@@ -40,6 +40,7 @@ from app.core.enums import (
     PipelineStage,
     ReconstructionStatus,
     RefinementPriority,
+    RenderExecutionLifecycle,
     RightsRisk,
     RightsStatus,
     StrategyDisposition,
@@ -52,6 +53,7 @@ from app.models import (
     ClipCandidate,
     ProcessingJob,
     RenderContract,
+    RenderExecution,
     SourceQualityAssessment,
     SourceVideo,
     Transcript,
@@ -68,6 +70,13 @@ from app.refinement.queue import (
     queue_candidate_batch,
     queue_candidate_refinement,
     validate_candidate_for_refinement,
+)
+from app.render.execution.policy import DEFAULT_DELIVERY_PROFILE_KEY
+from app.render.execution.queue import RenderQueueError, queue_render_execution
+from app.render.execution.service import (
+    get_render_execution,
+    read_render_execution,
+    read_render_execution_by_id,
 )
 from app.render.handoff import build_stage5_1_handoff
 from app.render.service import (
@@ -676,6 +685,60 @@ class Stage52HandoffResponse(BaseModel):
     render_ready: bool
     stage5_2_implemented: bool
     stage6_implemented: bool
+    model_config = {"extra": "allow"}
+
+
+class RenderExecutionResponse(BaseModel):
+    id: UUID
+    source_video_id: UUID
+    clip_candidate_id: UUID
+    render_contract_id: UUID | None
+    visual_composition_plan_id: UUID | None
+    transformation_selection_id: UUID | None
+    selected_plan_id: UUID | None
+    final_refinement_id: UUID | None
+    artifact_purpose: str
+    lifecycle: str
+    qc_status: str | None
+    is_current: bool
+    publication_ready: bool
+    stage6_implemented: bool
+    cache_eligible: bool
+    reason_codes: list[str]
+    error_code: str | None
+    delivery_profile_key: str
+    delivery_profile_version: str
+    input_fingerprint: str
+    output_fingerprint: str
+    runtime_fingerprint: str
+    compiler_fingerprint: str
+    qc_fingerprint: str
+    execution_manifest: dict[str, object]
+    qc_result: dict[str, object]
+    artifact_reference: dict[str, object]
+    omitted_requirements: list[dict[str, object]]
+    metrics: dict[str, object]
+    policy_version: str
+    schema_version: str
+    fingerprint_version: str
+    live_freshness: str
+    effective: bool
+    created_at: datetime
+    updated_at: datetime
+    model_config = {"extra": "allow"}
+
+
+class RenderExecutionQueueResponse(BaseModel):
+    render_execution_id: UUID
+    job_id: UUID | None
+    status: str
+    queued: bool
+    cached: bool
+    active: bool
+    artifact_purpose: str
+    delivery_profile_key: str
+    publication_ready: bool = False
+    stage6_implemented: bool = False
     model_config = {"extra": "allow"}
 
 
@@ -1626,6 +1689,87 @@ def create_app(
             raise HTTPException(status_code=404, detail="candidate not found")
         return Stage52HandoffResponse(**handoff)
 
+    @app.post(
+        "/api/candidates/{candidate_id}/render-execution",
+        response_model=RenderExecutionQueueResponse,
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    def queue_candidate_render_execution(
+        candidate_id: UUID,
+        delivery_profile_key: str = DEFAULT_DELIVERY_PROFILE_KEY,
+        force: bool = False,
+        database: Session = Depends(session),
+    ) -> RenderExecutionQueueResponse:
+        """Queue one bounded source-core Stage 5.2 render validation."""
+
+        try:
+            outcome = queue_render_execution(
+                database,
+                candidate_id,
+                delivery_profile_key=delivery_profile_key,
+                artifact_purpose="CORE_SOURCE_VALIDATION",
+                force=force,
+            )
+        except RenderQueueError as error:
+            raise _render_http(error, candidate_id=candidate_id) from error
+        return RenderExecutionQueueResponse(
+            render_execution_id=outcome.render_execution_id,
+            job_id=outcome.job_id,
+            status=outcome.status,
+            queued=outcome.queued,
+            cached=outcome.cached,
+            active=outcome.active,
+            artifact_purpose=outcome.artifact_purpose,
+            delivery_profile_key=outcome.delivery_profile_key,
+        )
+
+    @app.get(
+        "/api/candidates/{candidate_id}/render-execution",
+        response_model=RenderExecutionResponse,
+    )
+    def get_candidate_render_execution(
+        candidate_id: UUID, database: Session = Depends(session)
+    ) -> RenderExecutionResponse:
+        view = read_render_execution(database, candidate_id)
+        if view is None:
+            raise HTTPException(status_code=404, detail="render execution not found")
+        return _render_execution_response(view.row, view.live_freshness, view.effective)
+
+    @app.get(
+        "/api/render-executions/{render_execution_id}",
+        response_model=RenderExecutionResponse,
+    )
+    def get_render_execution_by_id(
+        render_execution_id: UUID, database: Session = Depends(session)
+    ) -> RenderExecutionResponse:
+        view = read_render_execution_by_id(database, render_execution_id)
+        if view is None:
+            raise HTTPException(status_code=404, detail="render execution not found")
+        return _render_execution_response(view.row, view.live_freshness, view.effective)
+
+    @app.get("/api/render-executions/{render_execution_id}/artifact")
+    def get_render_execution_artifact(
+        render_execution_id: UUID, database: Session = Depends(session)
+    ) -> FileResponse:
+        row = get_render_execution(database, render_execution_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="render execution not found")
+        if row.lifecycle is not RenderExecutionLifecycle.COMPLETE or not row.cache_eligible:
+            raise HTTPException(status_code=404, detail="artifact is not available")
+        reference = dict(row.artifact_reference or {})
+        relative = reference.get("relative_path")
+        if not isinstance(relative, str) or not relative:
+            raise HTTPException(status_code=404, detail="artifact is not available")
+        storage_service = StorageService(settings.storage_root)
+        path = (storage_service.storage_root / relative).resolve()
+        try:
+            path.relative_to(storage_service.storage_root)
+        except ValueError as error:
+            raise HTTPException(status_code=404, detail="artifact is not available") from error
+        if not path.is_file() or path.stat().st_size <= 0:
+            raise HTTPException(status_code=404, detail="artifact is not available")
+        return FileResponse(path, media_type="video/mp4", filename=path.name)
+
     @app.patch("/api/sources/{source_id}/provenance", response_model=SourceResponse)
     def update_source_provenance(
         source_id: UUID,
@@ -1684,6 +1828,11 @@ def create_app(
         )
         if latest is None or latest.status not in {JobStatus.FAILED, JobStatus.CANCELLED}:
             raise HTTPException(status_code=409, detail="source has no failed or cancelled job")
+        if latest.kind is JobKind.RENDER_EXECUTION:
+            raise HTTPException(
+                status_code=409,
+                detail="render executions are retried through the render-execution endpoint",
+            )
         latest.status = JobStatus.QUEUED
         latest.retry_count += 1
         latest.error_code = None
@@ -2178,6 +2327,62 @@ def _visual_composition_response(
         readiness=dict(row.readiness or {}),
         metrics=dict(row.metrics or {}),
         cache_eligible=bool(row.cache_eligible),
+        live_freshness=live_freshness,
+        effective=effective,
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+    )
+
+
+def _render_http(error: RenderQueueError, *, candidate_id: UUID | None = None) -> HTTPException:
+    detail = str(error)
+    code = 404 if ("NOT_FOUND" in detail or "NOT_CURRENT" in detail) else 409
+    if detail in {
+        "CANDIDATE_NOT_CURRENT",
+        "CANDIDATE_NOT_RETAINED",
+        "CONTRACT_NOT_FOUND",
+        "VISUAL_PLAN_NOT_FOUND",
+    }:
+        code = 404
+    return HTTPException(status_code=code, detail=detail)
+
+
+def _render_execution_response(
+    row: RenderExecution, live_freshness: str, effective: bool
+) -> RenderExecutionResponse:
+    return RenderExecutionResponse(
+        id=row.id,
+        source_video_id=row.source_video_id,
+        clip_candidate_id=row.clip_candidate_id,
+        render_contract_id=row.render_contract_id,
+        visual_composition_plan_id=row.visual_composition_plan_id,
+        transformation_selection_id=row.transformation_selection_id,
+        selected_plan_id=row.selected_plan_id,
+        final_refinement_id=row.final_refinement_id,
+        artifact_purpose=row.artifact_purpose.value,
+        lifecycle=row.lifecycle.value,
+        qc_status=row.qc_status.value if row.qc_status is not None else None,
+        is_current=bool(row.is_current),
+        publication_ready=bool(row.publication_ready),
+        stage6_implemented=bool(row.stage6_implemented),
+        cache_eligible=bool(row.cache_eligible),
+        reason_codes=list(row.reason_codes or []),
+        error_code=row.error_code,
+        delivery_profile_key=row.delivery_profile_key,
+        delivery_profile_version=row.delivery_profile_version,
+        input_fingerprint=row.input_fingerprint,
+        output_fingerprint=row.output_fingerprint,
+        runtime_fingerprint=row.runtime_fingerprint,
+        compiler_fingerprint=row.compiler_fingerprint,
+        qc_fingerprint=row.qc_fingerprint,
+        execution_manifest=dict(row.execution_manifest or {}),
+        qc_result=dict(row.qc_result or {}),
+        artifact_reference=dict(row.artifact_reference or {}),
+        omitted_requirements=list(row.omitted_requirements or []),
+        metrics=dict(row.metrics or {}),
+        policy_version=row.policy_version,
+        schema_version=row.schema_version,
+        fingerprint_version=row.fingerprint_version,
         live_freshness=live_freshness,
         effective=effective,
         created_at=row.created_at,

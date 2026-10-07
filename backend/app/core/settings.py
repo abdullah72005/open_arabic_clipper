@@ -12,6 +12,7 @@ from app.candidates.providers import SemanticProvider
 from app.composition.policy import Stage51Config, stage51_config_payload
 from app.core.enums import SemanticProviderMode
 from app.refinement.policy import AdmissionPolicy, Stage35Config
+from app.render.execution.policy import Stage52Config, stage52_config_payload
 from app.render.policy import Stage50Config
 from app.runtime.heavy_model_lease import HeavyModelLeaseFactory
 from app.transcription.correction import ContextualCorrector, CorrectionConfig
@@ -225,6 +226,21 @@ class Settings(BaseSettings):
     visual_caption_dynamic_emphasis: bool = True
     visual_caption_max_words_per_event: int = Field(default=7, gt=0, le=12)
     visual_preview_enabled: bool = True
+    # Stage 5.2 deterministic render-execution configuration. CPU-only delivery
+    # profile, bounded resource usage, and a narrow global admission. It never
+    # selects a codec benchmark, GPU encoder, or Stage 6 mixing semantics.
+    render_execution_enabled: bool = True
+    render_encoder_threads: int = Field(default=2, ge=1, le=64)
+    render_filter_threads: int = Field(default=1, ge=1, le=64)
+    render_filter_complex_threads: int = Field(default=1, ge=1, le=64)
+    render_global_concurrent_renders: int = Field(default=1, ge=1, le=16)
+    render_cancel_poll_seconds: float = Field(default=0.5, gt=0, le=10)
+    render_admission_wait_seconds: float = Field(default=0.0, ge=0, le=600)
+    render_max_render_seconds: float = Field(default=900.0, gt=0, le=86_400)
+    render_max_source_duration_seconds: float = Field(default=3600.0, gt=0, le=86_400)
+    render_max_output_duration_seconds: float = Field(default=900.0, gt=0, le=86_400)
+    render_qc_max_sampled_frames: int = Field(default=24, ge=2, le=240)
+    render_qc_sample_luma_dimension: int = Field(default=160, ge=32, le=1_024)
     transcription_queue_concurrency: int = Field(default=1, gt=0)
     cors_origins: list[str] = ["http://localhost:3301"]
 
@@ -620,6 +636,31 @@ class Settings(BaseSettings):
         """Build the deterministic Stage 5.1 output-affecting policy fingerprint payload."""
 
         payload: dict[str, object] = stage51_config_payload(self.stage51_config())
+        return payload
+
+    def stage52_config(self) -> Stage52Config:
+        """Build bounded Stage 5.2 render-execution configuration."""
+
+        return Stage52Config(
+            encoder_threads=self.render_encoder_threads,
+            filter_threads=self.render_filter_threads,
+            filter_complex_threads=self.render_filter_complex_threads,
+            global_concurrent_renders=self.render_global_concurrent_renders,
+            ffmpeg_binary=self.ffmpeg_binary,
+            ffprobe_binary=self.ffprobe_binary,
+            cancel_poll_seconds=self.render_cancel_poll_seconds,
+            admission_wait_seconds=self.render_admission_wait_seconds,
+            max_render_seconds=self.render_max_render_seconds,
+            max_source_duration_seconds=self.render_max_source_duration_seconds,
+            max_output_duration_seconds=self.render_max_output_duration_seconds,
+            qc_max_sampled_frames=self.render_qc_max_sampled_frames,
+            qc_sample_luma_dimension=self.render_qc_sample_luma_dimension,
+        )
+
+    def stage52_config_payload(self) -> dict[str, object]:
+        """Build the deterministic Stage 5.2 boundary-affecting policy payload."""
+
+        payload: dict[str, object] = stage52_config_payload(self.stage52_config())
         return payload
 
     def transformation_governance_semantic_mode(self) -> SemanticProviderMode:

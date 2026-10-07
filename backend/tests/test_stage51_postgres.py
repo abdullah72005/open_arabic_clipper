@@ -119,7 +119,7 @@ def test_stage_5_1_migration_upgrade_and_downgrade_on_postgres() -> None:
                 text("DELETE FROM processing_jobs WHERE kind = 'VISUAL_COMPOSITION'")
             )
 
-        command.downgrade(config, "-1")
+        command.downgrade(config, "20260918_0020")
 
         inspector = inspect(engine)
         assert "visual_composition_plans" not in inspector.get_table_names()
