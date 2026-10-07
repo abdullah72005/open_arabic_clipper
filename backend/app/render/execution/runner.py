@@ -183,12 +183,21 @@ def run_compiled_render(compiled: CompiledRender, context: AttemptContext) -> Re
     if context.cancelled():
         raise RenderCancelled("render cancelled before output probing")
     probe_budget = _remaining_budget(deadline, _PROBE_TIMEOUT_SECONDS)
-    probe = _probe_output(
-        compiled.runtime_identity.ffprobe_binary,
-        output_path,
-        timeout_seconds=probe_budget,
-        deadline=deadline,
-    )
+    try:
+        probe = _probe_output(
+            compiled.runtime_identity.ffprobe_binary,
+            output_path,
+            timeout_seconds=probe_budget,
+            deadline=deadline,
+        )
+    except (RenderTimeout, RenderProcessError):
+        # A cancellation/ownership stop observed during probing must enter the
+        # cancellation path, not be reported as a timeout or probe failure. This
+        # covers every probe exception boundary: shared-deadline exhaustion,
+        # nonzero exit, launch failure, and malformed output.
+        if context.cancelled():
+            raise RenderCancelled("render cancelled during output probing") from None
+        raise
     if context.cancelled():
         raise RenderCancelled("render cancelled after output probing")
     _ensure_deadline_not_expired(deadline)

@@ -474,13 +474,19 @@ class RenderExecutionExecutor:
         )
         try:
             artifacts = self._runner(compiled, context)
-        except RenderTimeout:
-            self._fail(row, "RENDER_TIMEOUT")
-            raise
-        except RenderProcessError as error:
-            self._fail(row, error.reason_code)
-            raise
         except RenderCancelled:
+            raise
+        except (RenderTimeout, RenderProcessError) as error:
+            # A cancellation/ownership stop observed at the runner error boundary
+            # (e.g. a cancel committed between the runner's last poll and its
+            # exception exit) enters the cancellation path; otherwise the
+            # truthful timeout/probe-error classification is preserved.
+            if self._should_stop():
+                raise RenderCancelled("render stopped during output probing") from error
+            self._fail(
+                row,
+                "RENDER_TIMEOUT" if isinstance(error, RenderTimeout) else error.reason_code,
+            )
             raise
 
         if not self._set_qc_running(row):

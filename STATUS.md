@@ -8,7 +8,7 @@ artifact, a normalized execution manifest, deterministic technical QC, and a
 durable fenced result. It is explicit and candidate-scoped and extends the
 existing Celery/`ProcessingJob` platform with a `RENDER_EXECUTION` job kind; it
 adds no `PipelineStage`, no `PipelineRun`, and no `_NEXT_STAGE` entry, and never
-touches the source lifecycle. Status: **remediated in a fourth focused pass
+touches the source lifecycle. Status: **remediated in a fifth focused pass
 (`stage5.2-v3`) against code review and technically verified; awaiting human
 media acceptance and Sol review. Not frozen.**
 
@@ -84,7 +84,17 @@ media acceptance and Sol review. Not frozen.**
   flips the job to `CANCELLED`, the heartbeat's `RUNNING` update matches zero rows
   and sets the latch, but the stop path still finalizes the owned execution as
   `CANCELLED` (never a `RENDER_OWNERSHIP_LOST` failure the `RUNNING`-only fence
-  cannot apply).
+  cannot apply). Cancellation observed at the output-probe exception boundary is
+  also honored: if the operator cancels while `ffprobe` runs and the probe then
+  times out, exits nonzero, fails to launch, or returns malformed output, the
+  runner re-checks cancellation/ownership on that exception exit and raises the
+  cancellation path instead of propagating `RENDER_TIMEOUT`/`QC_PROBE_FAILED`
+  (the executor re-checks again at its runner-error boundary, so a cancel
+  committed between the runner's last poll and its error exit cannot strand the
+  execution `RENDERING` with `active_job_id` retained). Without a stop, the
+  truthful timeout/probe-error classification is preserved; ownership loss keeps
+  its distinct `RENDER_OWNERSHIP_LOST` outcome, and a superseded worker no-ops
+  against the newer claim.
 - **Currentness.** Publication is a single short transaction that locks the
   candidate, its bound contract, the bound selected Stage 4.1 `TransformationPlan`,
   the visual plan, and the bound `FINAL_CLIP` refinement, rebuilds the frozen
@@ -166,10 +176,15 @@ media acceptance and Sol review. Not frozen.**
   non-publication, deadline-exhaustion-during-frame/audio classified as
   `QCTimeout` (unit + real-QC executor integration), cancellation-precedence at
   the deadline boundary, hashing-consumes-budget-skips-probe and
-  probe-budget-recomputed-after-hashing, and cross-connection
-  historical-reactivation commit);
+  probe-budget-recomputed-after-hashing, failing-output-probe cancellation
+  (probe timeout and nonzero exit after a cross-connection cancel, through the
+  real runner and real executor persistence, plus real-runner unit coverage;
+  truthful `RENDER_TIMEOUT`/`QC_PROBE_FAILED` without a stop; ownership-loss
+  distinct from cancellation; a superseded claim not overwritten), and
+  cross-connection historical-reactivation commit);
   deterministic PostgreSQL publication and ownership race tests (concurrent
-  candidate invalidation, cancellation, claim supersession, concurrent bound
+  candidate invalidation, cancellation, claim supersession, a failing output
+  probe after a cross-connection cancel finalizing as CANCELLED, concurrent bound
   `FINAL_CLIP` refinement update blocking a stale publication, concurrent
   selected-plan update blocking a stale publication, and controlled
   lock-serialization of a manual refinement edit and of a selected-plan update

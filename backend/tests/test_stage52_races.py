@@ -27,8 +27,10 @@ from app.db.base import Base
 from app.models import CandidateRefinement, ClipCandidate, ProcessingJob, TransformationPlan
 from app.models.render_contract import RenderContract
 from app.models.render_execution import RenderExecution
+from app.pipeline.executor import StageCancelled
 from app.refinement.queue import apply_manual_transcript
 from app.render.execution.queue import queue_render_execution
+from app.render.execution.runner import run_compiled_render
 from app.render.execution.types import TechnicalQCResult
 
 _URL = os.environ.get("CLIPFACTORY_TEST_POSTGRES_URL")
@@ -227,6 +229,47 @@ def _candidate_id(engine: Engine, row_id: uuid.UUID) -> uuid.UUID:
         row = session.get(RenderExecution, row_id)
         assert row is not None
         return row.clip_candidate_id
+
+
+def test_probe_failure_after_cancel_finalizes_on_postgres(
+    engine: Engine, monkeypatch: Any
+) -> None:
+    """A cancel committed during a failing output probe must finalize the owned
+    execution as CANCELLED on PostgreSQL, driven through the real runner."""
+
+    import time
+
+    from test_stage52_remediation import (
+        _assert_cancelled_outcome,
+        _install_fake_encode_popen,
+        _install_probe_seam,
+    )
+
+    with Session(engine) as seeding:
+        fixture = seed_stage51(seeding, monkeypatch)
+        _plan_ready(seeding, fixture)
+        candidate_id = fixture.stage50.selection.candidate.id
+
+    with Session(engine) as session:
+        outcome = queue_render_execution(session, candidate_id)
+        assert outcome.job_id is not None
+        _install_fake_encode_popen(monkeypatch)
+        clock = {"now": 0.0}
+        monkeypatch.setattr(time, "monotonic", lambda: clock["now"])
+        _install_probe_seam(
+            monkeypatch,
+            engine=engine,
+            job_id=outcome.job_id,
+            clock=clock,
+            mode="timeout",
+        )
+        executor = _executor(session, run_compiled_render)
+        executor.set_active_job(outcome.job_id)
+        with pytest.raises(StageCancelled):
+            executor.execute(outcome.render_execution_id)
+
+    with Session(engine) as check:
+        _assert_cancelled_outcome(check, outcome)
 
 
 def _selected_plan_id(engine: Engine, row_id: uuid.UUID) -> uuid.UUID:

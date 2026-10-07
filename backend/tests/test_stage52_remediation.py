@@ -1605,6 +1605,287 @@ def test_runner_cancellation_at_probe_boundary_stays_cancelled(
     assert probed == []
 
 
+def _install_fake_encode_popen(monkeypatch: Any) -> None:
+    import app.render.execution.runner as runner
+
+    real_popen = subprocess.Popen
+
+    class _FakeStderr:
+        def read(self, _size: int) -> bytes:
+            return b""
+
+    class _FakeProcess:
+        def __init__(self, argv: Any, cwd: Any = None, **kwargs: Any) -> None:
+            # ``subprocess.run`` (runtime-identity discovery: ffmpeg -version,
+            # fc-match, ldd) reaches this patched Popen with no cwd; delegate it
+            # to the real process. Only the ffmpeg encode passes a cwd.
+            if cwd is None:
+                self._delegate: Any = real_popen(argv, **kwargs)
+                return
+            self._delegate = None
+            self.returncode = 0
+            self.pid = 999_999
+            self.stderr = _FakeStderr()
+            output = Path(cwd) / "output.mp4"
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_bytes(b"rendered-bytes")
+
+        def __getattr__(self, name: str) -> Any:
+            delegate = self.__dict__.get("_delegate")
+            if delegate is not None:
+                return getattr(delegate, name)
+            raise AttributeError(name)
+
+        def __enter__(self) -> Any:
+            delegate = self.__dict__.get("_delegate")
+            if delegate is not None:
+                delegate.__enter__()
+            return self
+
+        def __exit__(self, *exc: Any) -> Any:
+            delegate = self.__dict__.get("_delegate")
+            if delegate is not None:
+                return delegate.__exit__(*exc)
+            return None
+
+        def poll(self) -> int:
+            return 0
+
+        def wait(self, timeout: float | None = None) -> int:
+            return 0
+
+    monkeypatch.setattr(runner.subprocess, "Popen", _FakeProcess)
+
+
+def _install_probe_seam(
+    monkeypatch: Any,
+    *,
+    engine: Engine,
+    job_id: Any,
+    clock: dict[str, float],
+    mode: str,
+    action: str = "cancel",
+    holder: dict[str, Any] | None = None,
+) -> None:
+    """A controlled ffprobe seam: perform an action, then fail the probe."""
+
+    real_run = subprocess.run
+
+    def seam(command: Any, **kwargs: Any) -> Any:
+        if any("-show_format" in str(arg) for arg in command):
+            if action == "cancel":
+                _cancel_job_in_other_session(engine, job_id)
+            elif action == "supersede":
+                other = Session(engine)
+                try:
+                    job = other.get(ProcessingJob, job_id)
+                    assert job is not None
+                    job.claim_version = int(job.claim_version) + 5
+                    other.commit()
+                finally:
+                    other.close()
+            elif action == "lose":
+                assert holder is not None
+                holder["executor"]._mark_ownership_lost()
+            if mode == "timeout":
+                clock["now"] = 1e9
+                raise subprocess.TimeoutExpired(command, kwargs.get("timeout", 0))
+            raise subprocess.CalledProcessError(1, command)
+        return real_run(command, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", seam)
+
+
+def _failing_probe_executor(
+    session: Session,
+    monkeypatch: Any,
+    engine: Engine,
+    *,
+    mode: str,
+    action: str = "cancel",
+) -> tuple[Any, Any]:
+    fixture = seed_stage51(session, monkeypatch)
+    _plan_ready(session, fixture)
+    outcome = queue_render_execution(session, fixture.stage50.selection.candidate.id)
+    assert outcome.job_id is not None
+    _install_fake_encode_popen(monkeypatch)
+    clock = {"now": 0.0}
+    monkeypatch.setattr(time, "monotonic", lambda: clock["now"])
+    holder: dict[str, Any] = {}
+    _install_probe_seam(
+        monkeypatch,
+        engine=engine,
+        job_id=outcome.job_id,
+        clock=clock,
+        mode=mode,
+        action=action,
+        holder=holder,
+    )
+    executor = _executor(session, run_compiled_render)
+    holder["executor"] = executor
+    executor.set_active_job(outcome.job_id)
+    return outcome, executor
+
+
+def _assert_cancelled_outcome(session: Session, outcome: Any) -> None:
+    session.expire_all()
+    row = session.get(RenderExecution, outcome.render_execution_id)
+    assert row is not None
+    assert row.lifecycle is RenderExecutionLifecycle.CANCELLED
+    assert row.active_job_id is None
+    assert row.cache_eligible is False
+    assert row.artifact_reference == {}
+    job = session.get(ProcessingJob, outcome.job_id)
+    assert job is not None and job.status is JobStatus.CANCELLED
+
+
+def test_probe_timeout_after_cancel_finalizes_execution_as_cancelled(
+    session: Session, monkeypatch: Any, sqlite_engine: Engine
+) -> None:
+    outcome, executor = _failing_probe_executor(
+        session, monkeypatch, sqlite_engine, mode="timeout"
+    )
+    with pytest.raises(StageCancelled):
+        executor.execute(outcome.render_execution_id)
+    _assert_cancelled_outcome(session, outcome)
+
+
+def test_probe_nonzero_exit_after_cancel_finalizes_execution_as_cancelled(
+    session: Session, monkeypatch: Any, sqlite_engine: Engine
+) -> None:
+    outcome, executor = _failing_probe_executor(
+        session, monkeypatch, sqlite_engine, mode="nonzero"
+    )
+    with pytest.raises(StageCancelled):
+        executor.execute(outcome.render_execution_id)
+    _assert_cancelled_outcome(session, outcome)
+
+
+def test_probe_timeout_without_cancel_fails_as_timeout(
+    session: Session, monkeypatch: Any, sqlite_engine: Engine
+) -> None:
+    outcome, executor = _failing_probe_executor(
+        session, monkeypatch, sqlite_engine, mode="timeout", action="none"
+    )
+    with pytest.raises(RenderTimeout):
+        executor.execute(outcome.render_execution_id)
+    session.expire_all()
+    row = session.get(RenderExecution, outcome.render_execution_id)
+    assert row is not None
+    assert row.lifecycle is RenderExecutionLifecycle.FAILED
+    assert row.error_code == "RENDER_TIMEOUT"
+    assert row.cache_eligible is False
+    job = session.get(ProcessingJob, outcome.job_id)
+    assert job is not None and job.status is JobStatus.FAILED
+
+
+def test_probe_nonzero_without_cancel_fails_as_probe_error(
+    session: Session, monkeypatch: Any, sqlite_engine: Engine
+) -> None:
+    outcome, executor = _failing_probe_executor(
+        session, monkeypatch, sqlite_engine, mode="nonzero", action="none"
+    )
+    with pytest.raises(RenderProcessError):
+        executor.execute(outcome.render_execution_id)
+    session.expire_all()
+    row = session.get(RenderExecution, outcome.render_execution_id)
+    assert row is not None
+    assert row.lifecycle is RenderExecutionLifecycle.FAILED
+    assert row.error_code == "QC_PROBE_FAILED"
+    assert row.cache_eligible is False
+    job = session.get(ProcessingJob, outcome.job_id)
+    assert job is not None and job.status is JobStatus.FAILED
+
+
+def test_probe_failure_after_superseded_claim_does_not_overwrite_newer_run(
+    session: Session, monkeypatch: Any, sqlite_engine: Engine
+) -> None:
+    outcome, executor = _failing_probe_executor(
+        session, monkeypatch, sqlite_engine, mode="nonzero", action="supersede"
+    )
+    with pytest.raises(StageCancelled):
+        executor.execute(outcome.render_execution_id)
+    session.expire_all()
+    row = session.get(RenderExecution, outcome.render_execution_id)
+    assert row is not None
+    # The old worker must not cancel/fail a newer attempt it no longer owns.
+    assert row.lifecycle is not RenderExecutionLifecycle.CANCELLED
+    assert row.lifecycle is not RenderExecutionLifecycle.FAILED
+    assert row.active_job_id == outcome.job_id
+
+
+def test_probe_failure_after_ownership_loss_records_ownership_lost(
+    session: Session, monkeypatch: Any, sqlite_engine: Engine
+) -> None:
+    outcome, executor = _failing_probe_executor(
+        session, monkeypatch, sqlite_engine, mode="nonzero", action="lose"
+    )
+    with pytest.raises(StageCancelled):
+        executor.execute(outcome.render_execution_id)
+    session.expire_all()
+    row = session.get(RenderExecution, outcome.render_execution_id)
+    assert row is not None
+    assert row.lifecycle is RenderExecutionLifecycle.FAILED
+    assert row.error_code == "RENDER_OWNERSHIP_LOST"
+    job = session.get(ProcessingJob, outcome.job_id)
+    assert job is not None and job.status is JobStatus.FAILED
+
+
+def test_runner_probe_timeout_after_cancel_raises_cancelled(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    import app.render.execution.runner as runner
+
+    compiled, attempt = _compiled_for_runner(tmp_path)
+    _install_fake_popen(monkeypatch, compiled)
+    state = {"cancel": False}
+    clock = {"now": 0.0}
+    monkeypatch.setattr(runner.time, "monotonic", lambda: clock["now"])
+
+    def seam(command: Any, **kwargs: Any) -> Any:
+        state["cancel"] = True
+        clock["now"] = 1e9
+        raise subprocess.TimeoutExpired(command, kwargs.get("timeout", 0))
+
+    monkeypatch.setattr(runner.subprocess, "run", seam)
+    with pytest.raises(RenderCancelled):
+        runner.run_compiled_render(
+            compiled,
+            AttemptContext(
+                attempt_directory=attempt,
+                ass_bytes=_VALID_ASS,
+                deadline=900.0,
+                cancel_check=lambda: state["cancel"],
+            ),
+        )
+
+
+def test_runner_probe_nonzero_after_cancel_raises_cancelled(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    import app.render.execution.runner as runner
+
+    compiled, attempt = _compiled_for_runner(tmp_path)
+    _install_fake_popen(monkeypatch, compiled)
+    state = {"cancel": False}
+
+    def seam(command: Any, **kwargs: Any) -> Any:
+        state["cancel"] = True
+        raise subprocess.CalledProcessError(1, command)
+
+    monkeypatch.setattr(runner.subprocess, "run", seam)
+    with pytest.raises(RenderCancelled):
+        runner.run_compiled_render(
+            compiled,
+            AttemptContext(
+                attempt_directory=attempt,
+                ass_bytes=_VALID_ASS,
+                deadline=time.monotonic() + 900.0,
+                cancel_check=lambda: state["cancel"],
+            ),
+        )
+
+
 def test_qc_timeout_fails_without_publishing(session: Session, monkeypatch: Any) -> None:
     from app.render.execution.qc import QCTimeout
 

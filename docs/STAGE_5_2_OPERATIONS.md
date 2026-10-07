@@ -247,7 +247,11 @@ focused pass closed two more: the bound selected Stage 4.1 `TransformationPlan`
 is locked through publication (its writer does not take the candidate lock), and
 shared-deadline exhaustion is propagated as `QCTimeout` through every frame/audio
 QC path and rechecked before returning the verdict (never a `WARN`), with the
-runner recomputing its probe budget after hashing.
+runner recomputing its probe budget after hashing. A fifth focused pass closed
+the failing-output-probe cancellation gap: a cancel observed while `ffprobe` runs
+is honored on the probe exception exit (timeout, nonzero exit, launch failure, or
+malformed output) in both the runner and the executor's runner-error boundary, so
+it can no longer strand the execution as `RENDERING`.
 
 - **Attempt state.** A forced rerender enters a fenced `RENDERING` transition
   that atomically clears `cache_eligible`, `qc_status`, the artifact pointer,
@@ -271,6 +275,15 @@ runner recomputing its probe budget after hashing.
   heartbeat's `RUNNING` update match zero rows and set the latch, but the stop path
   still finalizes the owned execution as `CANCELLED` rather than failing it with a
   `RENDER_OWNERSHIP_LOST` code the `RUNNING`-only fence cannot apply.
+  Cancellation during a *failing* output probe is also honored: if the operator
+  cancels while `ffprobe` runs and the probe then times out (after consuming the
+  shared budget), exits nonzero, fails to launch, or returns malformed output, the
+  runner re-checks cancellation/ownership on the probe exception exit and raises
+  the cancellation path instead of propagating `RENDER_TIMEOUT`/`QC_PROBE_FAILED`.
+  The executor re-checks again at its runner-error boundary, so a cancel committed
+  between the runner's last poll and its error exit cannot leave the execution
+  `RENDERING` with `active_job_id` retained. Without a stop the truthful
+  timeout/probe-error classification is preserved.
 - **Ownership loss.** The heartbeat-loss latch is sticky and authoritative in the
   stop predicate, which freshly verifies the job is still `RUNNING`, the claim
   and `active_job_id` still match, admission is still held, and the latch is
