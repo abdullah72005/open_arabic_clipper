@@ -1,12 +1,12 @@
 # Runtime status
 
-## Stage 5.2 tracked-crop defect remediation (2026-10-07)
+## Stage 5.2 tracked-crop defect remediation (2026-10-08)
 
-Status: **human acceptance of the Stage 5.2 media package FAILED. The confirmed
-production TRACKED_CROP execution defect is remediated and verified; the
-acceptance-generation boundary is corrected; genuine regenerated media is
-BLOCKED on an upstream Stage 3.5 prerequisite. Stage 5.2 NOT FROZEN. Stage 6 NOT
-STARTED.**
+Status: **the confirmed production TRACKED_CROP execution defect is remediated
+and verified; the Stage 3.5 extraction prerequisite is FIXED; the
+acceptance-generation boundary and provenance checks are corrected; genuine
+regenerated media is still BLOCKED on upstream Stage 4 planning/governance
+outcomes. Stage 5.2 NOT FROZEN. Stage 6 NOT STARTED.**
 
 - **Confirmed renderer defect (fixed).** `compiler.py::_tracked_crop_chain`
   previously computed the fixed 1080x1920 crop position/clamps from the `crop`
@@ -24,25 +24,42 @@ STARTED.**
   pan/zoom, vertical movement, edge clamps, constant-height tracking, and
   portrait display geometry; the reviewed case-01 geometry is included and the
   new regressions fail on the old compiler.
-- **Acceptance boundary (fixed).** `acceptance.py` now separates
-  `SYNTHETIC_REGRESSION` (hand-built specs/invented text, written under
-  `synthetic-regression/`, never the final gate) from
-  `PRODUCTION_MANUAL_ACCEPTANCE` (genuine persisted, audio-backed lineage only,
-  executed through the normal production adapter/queue/executor, full evidence
-  export). Production acceptance fails closed on placeholder identities, missing
-  plan fingerprints, missing/mismatched canonical ASS, seeded/non-audio-backed
-  `FINAL_CLIP` evidence, and occurrences without a per-occurrence visual
-  decision. The gated `test_stage52_live_contract.py` is explicitly classified
-  `SEEDED_PLUMBING`.
-- **Blocked prerequisite (upstream).** Preparing a genuine `FINAL_CLIP`
-  refinement fails in Stage 3.5:
-  `app/refinement/audio_window.py::_extract_window` writes the extracted window
-  to `<destination>.wav.tmp` and passes it to FFmpeg 7.1.5 without an explicit
-  output format; FFmpeg cannot infer a muxer from `.tmp` and the refinement
-  fails with `RefinementAudioError`. This is an upstream behavior change the
-  Stage 5.2 remediation is not authorized to make. No genuine manual-acceptance
-  media is produced until SOL resolves it; see
-  `storage/benchmarks/stage-5-2/manual-acceptance/README.md`.
+- **Stage 3.5 extraction prerequisite (fixed).**
+  `app/refinement/audio_window.py::_extract_window` wrote the extracted window to
+  `<destination>.wav.tmp` and passed it to FFmpeg without an explicit output
+  format; FFmpeg 7.1.5 cannot infer a WAV muxer from `.tmp`, so every genuine
+  `FINAL_CLIP` refinement failed with `RefinementAudioError`. The safe argv now
+  includes an explicit `-f wav`. Bounds/priority policies, mono 16 kHz PCM,
+  temporary-file validation/atomic replacement, cleanup, storage ownership, cache
+  behavior, and all transcription/provider routing/models/fingerprints are
+  unchanged. A real-FFmpeg regression exercises the actual helper through its
+  temporary filename for `CANDIDATE` and `FINAL_CLIP` and verifies WAV
+  properties, duration, content hash, temporary-file cleanup, and cache reuse.
+- **Acceptance boundary (fixed).** `acceptance.py` separates
+  `SYNTHETIC_REGRESSION` (hand-built specs/invented text, never the final gate)
+  from `PRODUCTION_MANUAL_ACCEPTANCE` (genuine persisted, audio-backed lineage
+  only, executed through the normal production adapter/queue/executor, full
+  evidence export). Production acceptance verifies real managed-audio
+  provenance (resolved file size and actual SHA-256 against the persisted
+  `audio_content_hash`, plus the recomputed `audio_extraction` and a `local_asr`
+  component fingerprint — component *names* never establish provenance), rejects
+  placeholder/absent/corrupt/mismatched evidence, revalidates the exact execution
+  through the production cache machinery before export (stale/upstream-changed
+  executions are rejected), makes `--no-queue` strictly read-only (no
+  execution/job/dispatch/claim/commit), and upserts each case into the package
+  manifest by `candidate_id` (several candidates coexist; regeneration is stable
+  and a failed regeneration preserves the existing valid package). The gated
+  `test_stage52_live_contract.py` remains classified `SEEDED_PLUMBING`.
+- **Genuine media still blocked (upstream Stage 4).** With the extraction fix,
+  genuine audio-backed `FINAL_CLIP` refinements now complete end-to-end. The
+  available genuine candidates nonetheless still cannot reach an executable
+  Stage 5.0 contract: refinements land in `NEEDS_MANUAL_TRANSCRIPT_REVIEW`
+  (meaning-critical entity conflicts) or `PROVIDER_DEGRADED`, or, once refined,
+  Stage 4.0 finds no recommended strategy, Stage 4.1 produces no valid plan
+  (`NO_SOURCE_EXCERPT` / `EMPTY_OR_GENERIC_INTENT` / `PROVIDER_UNAVAILABLE`),
+  Stage 4.2 governance approves no plan (`NO_GOVERNOR_APPROVED_PLAN`), and Stage
+  4.3 selects none (`NO_SELECTABLE_PLAN`). No genuine manual-acceptance media is
+  produced; see `storage/benchmarks/stage-5-2/manual-acceptance/README.md`.
 
 ## Stage 5.2 render execution, audio, and technical QC (2026-10-05)
 

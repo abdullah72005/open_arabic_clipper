@@ -43,13 +43,14 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from app.composition.ass import serialize_ass
 from app.composition.captions import CaptionPlan
 from app.composition.policy import CaptionStyle, safe_zone_for
 from app.composition.types import CaptionEvent, CaptionWordTiming
 from app.core.settings import Settings, get_settings
+from app.refinement.fingerprints import component_fingerprint
 from app.render.execution.compiler import compile_render
 from app.render.execution.policy import (
     COMPILER_VERSION,
@@ -61,7 +62,9 @@ from app.render.execution.qc import check_render_artifact
 from app.render.execution.runner import run_compiled_render
 from app.render.execution.service import (
     build_render_spec,
+    cache_hit,
     get_render_execution,
+    request_input_fingerprint,
     resolve_runtime_identity,
     validate_candidate_for_render,
 )
@@ -76,7 +79,7 @@ from app.render.execution.types import (
     SceneSpec,
     TimelineOccurrence,
 )
-from app.services.storage import StorageService
+from app.services.storage import StorageCategory, StorageService, StorageValidationError
 
 SYNTHETIC_REGRESSION = "SYNTHETIC_REGRESSION"
 PRODUCTION_MANUAL_ACCEPTANCE = "PRODUCTION_MANUAL_ACCEPTANCE"
@@ -100,7 +103,8 @@ _PLACEHOLDER_IDENTIFIERS = frozenset(
 _FINGERPRINT_PATTERN = re.compile(r"^[0-9a-f]{16,128}$")
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _FINAL_REFINEMENT_STATUSES = frozenset({"CANDIDATE_REFINED", "FINAL_TRANSCRIPT_READY"})
-_AUDIO_COMPONENT_HINTS = ("audio", "local", "asr", "whisper", "transcription")
+_REFINEMENT_AUDIO_COMPONENT = "audio_extraction"
+_REFINEMENT_LOCAL_ASR_COMPONENT = "local_asr"
 
 
 class AcceptanceValidationError(ValueError):
@@ -572,13 +576,19 @@ def validate_production_evidence(
     contract_payload: Mapping[str, object],
     plan_payload: Mapping[str, object],
     refinement: object,
+    storage: StorageService,
+    candidate: object | None = None,
 ) -> None:
     """Fail closed unless the request is backed by genuine persisted evidence.
 
     Rejects placeholder contract/plan/candidate identities, empty plan
-    fingerprints, a missing/mismatched canonical ASS, seeded or demonstration
-    (non-audio-backed) ``FINAL_CLIP`` evidence, and occurrences without a real
+    fingerprints, a missing/mismatched canonical ASS, a ``FINAL_CLIP`` refinement
+    whose managed audio is absent, corrupt, or does not match its persisted
+    content hash and dependency fingerprints, and occurrences without a real
     per-occurrence Stage 5.1 visual decision.
+
+    Hashes and fingerprints establish *lineage and identity only*. They never
+    prove speech accuracy; human listening remains required.
     """
 
     _require_real_uuid(spec.candidate_id, "CANDIDATE_IDENTITY_MISSING")
@@ -591,11 +601,17 @@ def validate_production_evidence(
     if not spec.caption_events and spec.ass.event_count:
         raise AcceptanceValidationError("ASS_EVENT_MISMATCH")
 
-    _validate_final_refinement(refinement)
+    _validate_final_refinement(refinement, storage=storage, spec=spec, candidate=candidate)
     _validate_occurrence_decisions(spec, contract_payload, plan_payload)
 
 
-def _validate_final_refinement(refinement: object) -> None:
+def _validate_final_refinement(
+    refinement: object,
+    *,
+    storage: StorageService,
+    spec: RenderSpec,
+    candidate: object | None,
+) -> None:
     if refinement is None:
         raise AcceptanceValidationError("FINAL_CLIP_REFINEMENT_MISSING")
     priority = getattr(getattr(refinement, "priority", None), "value", None)
@@ -604,21 +620,68 @@ def _validate_final_refinement(refinement: object) -> None:
     status = getattr(getattr(refinement, "status", None), "value", None)
     if status not in _FINAL_REFINEMENT_STATUSES:
         raise AcceptanceValidationError("FINAL_CLIP_NOT_READY")
+
+    if candidate is not None:
+        if str(getattr(refinement, "clip_candidate_id", "")) != str(getattr(candidate, "id", "")):
+            raise AcceptanceValidationError("REFINEMENT_IDENTITY_MISMATCH")
+        if str(getattr(refinement, "source_video_id", "")) != str(
+            getattr(candidate, "source_video_id", "")
+        ):
+            raise AcceptanceValidationError("REFINEMENT_IDENTITY_MISMATCH")
+    if str(getattr(refinement, "source_video_id", "")) not in {"", spec.source_id}:
+        raise AcceptanceValidationError("REFINEMENT_IDENTITY_MISMATCH")
+    if str(getattr(refinement, "clip_candidate_id", "")) not in {"", spec.candidate_id}:
+        raise AcceptanceValidationError("REFINEMENT_IDENTITY_MISMATCH")
+
     audio_path = getattr(refinement, "audio_relative_path", None)
     audio_hash = getattr(refinement, "audio_content_hash", None)
     if not audio_path or not audio_hash:
         raise AcceptanceValidationError("FINAL_CLIP_NOT_AUDIO_BACKED")
     _require_sha256(audio_hash, "FINAL_CLIP_NOT_AUDIO_BACKED")
+    resolved = _resolve_managed_audio(storage, str(audio_path))
+    if not resolved.is_file() or resolved.stat().st_size <= 0:
+        raise AcceptanceValidationError("FINAL_CLIP_AUDIO_MISSING")
+    if _sha256_file(resolved) != audio_hash:
+        raise AcceptanceValidationError("FINAL_CLIP_AUDIO_HASH_MISMATCH")
+
     if not list(getattr(refinement, "word_timestamps", None) or []):
         raise AcceptanceValidationError("FINAL_CLIP_WORD_TIMESTAMPS_MISSING")
     if not str(getattr(refinement, "final_transcript", "") or "").strip():
         raise AcceptanceValidationError("FINAL_CLIP_TRANSCRIPT_MISSING")
-    components = getattr(refinement, "component_fingerprints", None) or {}
-    keys = (
-        " ".join(str(key).lower() for key in components) if isinstance(components, Mapping) else ""
+
+    _validate_refinement_dependencies(refinement, audio_hash=audio_hash)
+
+
+def _validate_refinement_dependencies(refinement: object, *, audio_hash: str) -> None:
+    """Require the persisted audio-extraction and local-ASR dependency evidence.
+
+    Recomputes the ``audio_extraction`` component fingerprint from the persisted
+    audio input fingerprint and content hash through the same Stage 3.5 helper
+    that produced it. Component *names* (or arbitrary substrings) never establish
+    provenance; only the matching recomputed fingerprint does.
+    """
+
+    components = getattr(refinement, "component_fingerprints", None)
+    if not isinstance(components, Mapping):
+        raise AcceptanceValidationError("FINAL_CLIP_AUDIO_PROVENANCE_MISSING")
+    audio_input = getattr(refinement, "audio_input_fingerprint", None)
+    _require_fingerprint(audio_input, "FINAL_CLIP_AUDIO_INPUT_MISSING")
+    expected_audio = component_fingerprint(
+        "audio-extraction",
+        {"audio_input_fingerprint": audio_input, "content_hash": audio_hash},
     )
-    if not any(hint in keys for hint in _AUDIO_COMPONENT_HINTS):
-        raise AcceptanceValidationError("FINAL_CLIP_NOT_AUDIO_BACKED")
+    stored_audio = str(components.get(_REFINEMENT_AUDIO_COMPONENT) or "")
+    if stored_audio != expected_audio:
+        raise AcceptanceValidationError("FINAL_CLIP_AUDIO_PROVENANCE_MISMATCH")
+    local_asr = str(components.get(_REFINEMENT_LOCAL_ASR_COMPONENT) or "")
+    _require_fingerprint(local_asr, "FINAL_CLIP_LOCAL_ASR_MISSING")
+
+
+def _resolve_managed_audio(storage: StorageService, relative: str) -> Path:
+    try:
+        return cast(Path, storage.resolve(StorageCategory.SOURCES, relative))
+    except (StorageValidationError, OSError) as error:
+        raise AcceptanceValidationError("FINAL_CLIP_AUDIO_UNMANAGED") from error
 
 
 def _validate_occurrence_decisions(
@@ -689,6 +752,8 @@ def _load_production_context(
         contract_payload=contract_payload,
         plan_payload=plan_payload,
         refinement=refinement,
+        storage=storage,
+        candidate=candidate,
     )
     return _ProductionContext(
         candidate=candidate, contract=contract, plan=plan, refinement=refinement, spec=spec
@@ -723,17 +788,23 @@ def build_production_acceptance(
         spec = context.spec
         storage = StorageService(resolved.storage_root)
 
-        execution_id, job_id = _queue_and_execute(
-            session, candidate_id, resolved, queue=queue, executor=executor
-        )
-        session.expire_all()
-        row = get_render_execution(session, execution_id)
-        if row is None:
-            raise AcceptanceValidationError("RENDER_EXECUTION_MISSING")
-        if row.lifecycle.value != "COMPLETE":
-            raise AcceptanceValidationError("RENDER_EXECUTION_NOT_COMPLETE")
-        if row.qc_status is None or row.qc_status.value not in {"PASS", "WARN"}:
-            raise AcceptanceValidationError("RENDER_QC_NOT_ACCEPTABLE")
+        if queue:
+            execution_id, _job_id = _queue_and_execute(
+                session, candidate_id, resolved, executor=executor
+            )
+            session.expire_all()
+            row = get_render_execution(session, execution_id)
+            if row is None:
+                raise AcceptanceValidationError("RENDER_EXECUTION_MISSING")
+        else:
+            # Read-only: reuse an existing validated cache-eligible execution and
+            # never create an execution/job, dispatch, claim, or commit.
+            row = _validated_cached_execution(session, candidate_id, spec, resolved)
+
+        # Revalidate the exact execution being exported against current upstream
+        # prerequisites, request/runtime/QC fingerprints, cache eligibility, and
+        # artifact integrity before any evidence is published.
+        row = _revalidate_execution(session, candidate_id, spec, resolved, row)
 
         case = _export_production_case(
             session=session,
@@ -748,24 +819,47 @@ def build_production_acceptance(
     finally:
         session.close()
 
-    manifest = {
-        "stage": "5.2",
-        "classification": PRODUCTION_MANUAL_ACCEPTANCE,
-        "counts_toward_final_gate": True,
-        "purpose": "CORE_SOURCE_VALIDATION",
-        "candidate_id": candidate_id,
-        "cases": [case],
-        "publication_ready": False,
-        "stage6_implemented": False,
-        "fingerprint_limitation": (
-            "Fingerprint/hash checks prove identity and lineage only, not speech "
-            "correctness, caption sync, lip sync, composition, or readability."
-        ),
-    }
     output.mkdir(parents=True, exist_ok=True)
-    (output / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    manifest = _merge_production_manifest(output, case)
+    _write_json(output / "manifest.json", manifest)
     (output / "README.md").write_text(_readme(manifest), encoding="utf-8")
     return manifest
+
+
+def _validated_cached_execution(
+    session: object, candidate_id: str, spec: RenderSpec, settings: Settings
+) -> object:
+    """Read-only lookup of an existing validated cache-eligible execution."""
+
+    expected = request_input_fingerprint(spec, settings.stage52_config())
+    row = cache_hit(
+        session,
+        uuid.UUID(candidate_id),
+        settings,
+        expected_input_fingerprint=expected,
+    )
+    if row is None:
+        raise AcceptanceValidationError("NO_CACHE_ELIGIBLE_EXECUTION")
+    return row
+
+
+def _revalidate_execution(
+    session: object, candidate_id: str, spec: RenderSpec, settings: Settings, row: object
+) -> object:
+    """Require the exact execution being exported to still be fully valid."""
+
+    validated = _validated_cached_execution(session, candidate_id, spec, settings)
+    if validated.id != getattr(row, "id", None):  # type: ignore[attr-defined]
+        raise AcceptanceValidationError("EXECUTION_NOT_CURRENT")
+    lifecycle = getattr(getattr(validated, "lifecycle", None), "value", None)
+    if lifecycle != "COMPLETE":
+        raise AcceptanceValidationError("EXECUTION_NOT_COMPLETE")
+    if not getattr(validated, "cache_eligible", False):
+        raise AcceptanceValidationError("EXECUTION_NOT_CACHE_ELIGIBLE")
+    qc_status = getattr(getattr(validated, "qc_status", None), "value", None)
+    if qc_status not in {"PASS", "WARN"}:
+        raise AcceptanceValidationError("RENDER_QC_NOT_ACCEPTABLE")
+    return validated
 
 
 def _queue_and_execute(
@@ -773,7 +867,6 @@ def _queue_and_execute(
     candidate_id: str,
     settings: Settings,
     *,
-    queue: bool,
     executor: Callable[[str, str | None], Mapping[str, object]] | None,
 ) -> tuple[str, str | None]:
     from app.render.execution.queue import queue_render_execution
@@ -788,7 +881,7 @@ def _queue_and_execute(
     )
     execution_id = str(outcome.render_execution_id)
     job_id = str(outcome.job_id) if outcome.job_id else None
-    if queue and outcome.queued:
+    if outcome.queued:
         _run_production_execution(execution_id, job_id, executor)
     return execution_id, job_id
 
@@ -817,15 +910,69 @@ def _export_production_case(
     storage: StorageService,
     settings: Settings,
 ) -> dict[str, object]:
-    case_dir = output / candidate_id
-    if case_dir.exists():
-        shutil.rmtree(case_dir)
-    case_dir.mkdir(parents=True, exist_ok=True)
+    """Validate one case into a staging directory, then publish it atomically.
 
+    The replacement is published only after every validation and evidence write
+    succeeds, so a failed regeneration leaves the existing valid package intact.
+    """
+
+    output.mkdir(parents=True, exist_ok=True)
+    case_dir = output / candidate_id
+    staging = output / f".staging-{candidate_id}-{uuid.uuid4().hex[:8]}"
+    if staging.exists():
+        shutil.rmtree(staging, ignore_errors=True)
+    staging.mkdir(parents=True)
+    try:
+        case = _write_production_case_evidence(
+            session=session,
+            staging=staging,
+            candidate_id=candidate_id,
+            spec=spec,
+            context=context,
+            row=row,
+            storage=storage,
+            settings=settings,
+        )
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    _publish_directory(staging, case_dir)
+    case["evidence_dir"] = str(case_dir)
+    case["path"] = str(case_dir / "output.mp4")
+    return case
+
+
+def _publish_directory(staging: Path, target: Path) -> None:
+    backup: Path | None = None
+    if target.exists():
+        backup = target.with_name(f"{target.name}.previous-{uuid.uuid4().hex[:8]}")
+        target.rename(backup)
+    try:
+        staging.rename(target)
+    except BaseException:
+        if backup is not None and not target.exists():
+            backup.rename(target)
+        raise
+    if backup is not None:
+        shutil.rmtree(backup, ignore_errors=True)
+
+
+def _write_production_case_evidence(
+    *,
+    session: object,
+    staging: Path,
+    candidate_id: str,
+    spec: RenderSpec,
+    context: _ProductionContext,
+    row: object,
+    storage: StorageService,
+    settings: Settings,
+) -> dict[str, object]:
     artifact = dict(getattr(row, "artifact_reference", {}) or {})
     relative = str(artifact.get("relative_path") or "")
     if not relative:
         raise AcceptanceValidationError("ARTIFACT_REFERENCE_MISSING")
+    job_id = _case_job_id(session, row)
     managed_path = (storage.storage_root / relative).resolve()
     if not managed_path.is_file():
         raise AcceptanceValidationError("ARTIFACT_MISSING")
@@ -841,32 +988,35 @@ def _export_production_case(
 
     source_path = (storage.storage_root / spec.source_media_relative_path).resolve()
     source_sha = _sha256_file(source_path)
+    if _SHA256_PATTERN.match(spec.source_content_hash) and source_sha != spec.source_content_hash:
+        raise AcceptanceValidationError("SOURCE_HASH_MISMATCH")
 
     runtime = resolve_runtime_identity(
         settings,
         source_absolute_path=str(source_path),
-        attempt_directory=str(case_dir),
+        attempt_directory=str(staging),
     )
     compiled = compile_render(spec, runtime)
     filtergraph = compiled.filtergraph
     if filtergraph != _read_attempt_filtergraph(managed_path.parent):
         raise AcceptanceValidationError("FILTERGRAPH_MISMATCH")
 
-    review_copy = case_dir / "output.mp4"
+    review_copy = staging / "output.mp4"
     shutil.copyfile(managed_path, review_copy)
 
-    _write_json(case_dir / "render_spec.json", spec.as_dict())
+    _write_json(staging / "render_spec.json", spec.as_dict())
     _write_json(
-        case_dir / "contract_snapshot.json", getattr(context.contract, "contract_payload", {})
+        staging / "contract_snapshot.json", getattr(context.contract, "contract_payload", {})
     )
-    _write_json(case_dir / "plan_snapshot.json", getattr(context.plan, "plan_payload", {}))
-    _write_json(case_dir / "final_refinement.json", _refinement_snapshot(context.refinement))
+    _write_json(staging / "plan_snapshot.json", getattr(context.plan, "plan_payload", {}))
+    _write_json(staging / "final_refinement.json", _refinement_snapshot(context.refinement))
     _write_json(
-        case_dir / "render_execution.json",
+        staging / "render_execution.json",
         {
             "render_execution_id": str(getattr(row, "id", "")),
             "lifecycle": getattr(getattr(row, "lifecycle", None), "value", None),
             "qc_status": getattr(getattr(row, "qc_status", None), "value", None),
+            "cache_eligible": bool(getattr(row, "cache_eligible", False)),
             "input_fingerprint": getattr(row, "input_fingerprint", ""),
             "output_fingerprint": getattr(row, "output_fingerprint", ""),
             "compiler_fingerprint": getattr(row, "compiler_fingerprint", ""),
@@ -879,12 +1029,12 @@ def _export_production_case(
             "managed_artifact_relative_path": relative,
         },
     )
-    _write_json(case_dir / "qc.json", getattr(row, "qc_result", {}))
-    (case_dir / "filtergraph.txt").write_text(filtergraph, encoding="utf-8")
-    (case_dir / "captions.ass").write_bytes(ass_bytes)
-    _write_json(case_dir / "geometry.json", _geometry_evidence(compiled))
+    _write_json(staging / "qc.json", getattr(row, "qc_result", {}))
+    (staging / "filtergraph.txt").write_text(filtergraph, encoding="utf-8")
+    (staging / "captions.ass").write_bytes(ass_bytes)
+    _write_json(staging / "geometry.json", _geometry_evidence(compiled))
     _write_json(
-        case_dir / "identity.json",
+        staging / "identity.json",
         {
             "candidate_id": candidate_id,
             "source_id": spec.source_id,
@@ -903,20 +1053,26 @@ def _export_production_case(
 
     return {
         "name": "output.mp4",
-        "path": str(review_copy),
         "classification": PRODUCTION_MANUAL_ACCEPTANCE,
         "managed_artifact_relative_path": relative,
-        "evidence_dir": str(case_dir),
         "candidate_id": candidate_id,
         "source_id": spec.source_id,
         "render_contract_id": spec.render_contract_id,
         "visual_plan_id": spec.visual_plan_id,
         "final_refinement_id": str(getattr(context.refinement, "id", "")),
         "render_execution_id": str(getattr(row, "id", "")),
+        "job_id": job_id,
         "output_sha256": output_sha,
         "ass_sha256": ass_sha,
         "qc_status": getattr(getattr(row, "qc_status", None), "value", None),
         "qc_reason_codes": list(getattr(row, "reason_codes", []) or []),
+        "input_fingerprint": getattr(row, "input_fingerprint", ""),
+        "output_fingerprint": getattr(row, "output_fingerprint", ""),
+        "compiler_fingerprint": getattr(row, "compiler_fingerprint", ""),
+        "runtime_fingerprint": getattr(row, "runtime_fingerprint", ""),
+        "qc_fingerprint": getattr(row, "qc_fingerprint", ""),
+        "plan_input_fingerprint": spec.plan_input_fingerprint,
+        "plan_output_fingerprint": spec.plan_output_fingerprint,
         "framing_modes": sorted(
             {scene.framing_mode for occurrence in spec.occurrences for scene in occurrence.scenes}
         ),
@@ -932,6 +1088,65 @@ def _export_production_case(
             for occurrence in spec.occurrences
         ],
     }
+
+
+def _case_job_id(session: object, row: object) -> str:
+    from sqlalchemy import select
+
+    from app.core.enums import JobKind
+    from app.models import ProcessingJob
+
+    execution_id = getattr(row, "id", None)
+    if execution_id is None:
+        return ""
+    job = session.scalars(  # type: ignore[attr-defined]
+        select(ProcessingJob)
+        .where(ProcessingJob.render_execution_id == execution_id)
+        .where(ProcessingJob.kind == JobKind.RENDER_EXECUTION)
+        .order_by(ProcessingJob.created_at.desc())
+    ).first()
+    return str(job.id) if job is not None else ""
+
+
+def _merge_production_manifest(output: Path, case: dict[str, object]) -> dict[str, object]:
+    """Upsert one case into the package manifest without erasing other cases."""
+
+    existing = _load_manifest(output)
+    classification = existing.get("classification")
+    if classification not in (None, PRODUCTION_MANUAL_ACCEPTANCE):
+        raise AcceptanceValidationError("OUTPUT_DIRECTORY_MISMATCH")
+    case_candidate = str(case.get("candidate_id") or "")
+    cases = [
+        existing_case
+        for existing_case in _case_list(existing)
+        if str(existing_case.get("candidate_id") or "") != case_candidate
+    ]
+    cases.append(case)
+    cases.sort(key=lambda item: str(item.get("candidate_id") or ""))
+    return {
+        "stage": "5.2",
+        "classification": PRODUCTION_MANUAL_ACCEPTANCE,
+        "counts_toward_final_gate": True,
+        "purpose": "CORE_SOURCE_VALIDATION",
+        "cases": cases,
+        "publication_ready": False,
+        "stage6_implemented": False,
+        "fingerprint_limitation": (
+            "Fingerprint/hash checks prove identity and lineage only, not speech "
+            "correctness, caption sync, lip sync, composition, or readability."
+        ),
+    }
+
+
+def _load_manifest(output: Path) -> dict[str, object]:
+    path = output / "manifest.json"
+    if not path.is_file():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
 
 
 def _read_attempt_filtergraph(attempt_directory: Path) -> str:
@@ -1000,7 +1215,10 @@ def main() -> None:
     production.add_argument(
         "--no-queue",
         action="store_true",
-        help="Reuse an existing cache-eligible execution instead of executing.",
+        help=(
+            "Read-only: reuse an existing validated cache-eligible execution. "
+            "Never creates an execution/job, dispatches, claims, or commits."
+        ),
     )
 
     args = parser.parse_args()

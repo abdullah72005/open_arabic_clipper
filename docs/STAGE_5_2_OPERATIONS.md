@@ -402,17 +402,53 @@ final product gate:
   built by the production adapter (`build_render_spec`), executed through the
   normal queue/executor, and exported with full lineage (`render_spec.json`,
   contract/plan snapshots, refinement snapshot, execution manifest, filtergraph,
-  canonical ASS bytes + SHA-256, output SHA-256, QC, identity, and bounded
-  geometry samples). Placeholder identities, missing plan fingerprints, a
-  missing/mismatched ASS, seeded/non-audio-backed `FINAL_CLIP` evidence, and
-  occurrences without a per-occurrence visual decision are rejected
+  canonical ASS bytes + SHA-256, output SHA-256, QC, identity, selected-plan /
+  contract / visual-plan / refinement / execution / job identities and their
+  fingerprints, and bounded geometry samples).
+
+  Provenance is verified against real managed files: the refinement's audio is
+  resolved through managed storage, its size is checked, and its actual SHA-256
+  must equal the persisted `audio_content_hash`; the `audio_extraction` component
+  fingerprint is recomputed from the persisted audio-input fingerprint and
+  content hash through the same Stage 3.5 helper, and a `local_asr` component
+  fingerprint is required. Component *names* (or arbitrary substrings) never
+  establish provenance. Source identity, contract/plan/ASS identity and
+  fingerprints, and per-occurrence Stage 5.1 decisions are all validated.
+  Hashes/fingerprints prove lineage and identity only, never speech accuracy;
+  human listening remains required.
+
+  Before export the exact execution is revalidated through the production cache
+  machinery (current upstream dependencies, request/runtime/QC fingerprints,
+  cache eligibility, artifact integrity, and a matching source hash). A stale or
+  upstream-changed execution is rejected.
+
+  `--no-queue` is strictly read-only with respect to application state: it reuses
+  an existing validated cache-eligible execution via the production cache lookup
+  and, when none exists, fails (`NO_CACHE_ELIGIBLE_EXECUTION`) without creating an
+  execution/job, dispatching, claiming `active_job_id`, or committing.
+
+  Each run upserts its case into the package manifest by `candidate_id`, so
+  several real candidates coexist in one output directory; regenerating one case
+  neither erases nor duplicates the others, and a failed regeneration preserves
+  the existing valid package (evidence is staged and published only after
+  validation succeeds). Placeholder identities, missing plan fingerprints, a
+  missing/mismatched ASS, non-audio-backed `FINAL_CLIP` evidence, and occurrences
+  without a per-occurrence visual decision are rejected
   (`AcceptanceValidationError`). It never falls back to synthetic evidence.
 
-  **Current status: BLOCKED.** Genuine preparation is blocked by a confirmed
-  upstream Stage 3.5 defect (`audio_window.py::_extract_window` passes an
-  untyped `.wav.tmp` output path to FFmpeg 7.1.5, which cannot choose a muxer).
-  See `storage/benchmarks/stage-5-2/manual-acceptance/README.md`. No genuine
-  acceptance media is produced until SOL resolves the upstream prerequisite.
+  **Current status: extraction prerequisite FIXED; genuine media still BLOCKED.**
+  The Stage 3.5 `audio_window.py::_extract_window` defect (an untyped `.wav.tmp`
+  output path that FFmpeg 7.1.5 cannot map to a muxer) is fixed with an explicit
+  WAV output format, and genuine audio-backed `FINAL_CLIP` refinements now
+  complete (verified by a real-FFmpeg regression and an end-to-end genuine run).
+  Genuine production acceptance media is nonetheless still blocked upstream: the
+  available genuine candidates either land in `NEEDS_MANUAL_TRANSCRIPT_REVIEW`
+  (meaning-critical entity conflicts) or `PROVIDER_DEGRADED`, or, once refined,
+  fail Stage 4.0 (no recommended strategy), Stage 4.1 (no valid plan:
+  `NO_SOURCE_EXCERPT` / `EMPTY_OR_GENERIC_INTENT` / `PROVIDER_UNAVAILABLE`),
+  Stage 4.2 governance (`NO_GOVERNOR_APPROVED_PLAN`), or Stage 4.3
+  (`NO_SELECTABLE_PLAN`), so no executable Stage 5.0 contract can be created.
+  See `storage/benchmarks/stage-5-2/manual-acceptance/README.md`.
 
 The gated `tests/test_stage52_live_contract.py` is explicitly classified
 `SEEDED_PLUMBING`: it exercises *persisted* Stage 5.0/5.1 bindings plus the
