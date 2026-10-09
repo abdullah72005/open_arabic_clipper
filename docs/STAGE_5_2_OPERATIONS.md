@@ -445,19 +445,25 @@ final product gate:
   are rejected (`AcceptanceValidationError`). It never falls back to synthetic
   evidence.
 
-  **Current status: extraction prerequisite FIXED; genuine media still BLOCKED.**
-  The Stage 3.5 `audio_window.py::_extract_window` defect (an untyped `.wav.tmp`
-  output path that FFmpeg 7.1.5 cannot map to a muxer) is fixed with an explicit
-  WAV output format, and genuine audio-backed `FINAL_CLIP` refinements now
-  complete (verified by a real-FFmpeg regression and an end-to-end genuine run).
-  Genuine production acceptance media is nonetheless still blocked upstream: the
-  available genuine candidates either land in `NEEDS_MANUAL_TRANSCRIPT_REVIEW`
-  (meaning-critical entity conflicts) or `PROVIDER_DEGRADED`, or, once refined,
-  fail Stage 4.0 (no recommended strategy), Stage 4.1 (no valid plan:
-  `NO_SOURCE_EXCERPT` / `EMPTY_OR_GENERIC_INTENT` / `PROVIDER_UNAVAILABLE`),
-  Stage 4.2 governance (`NO_GOVERNOR_APPROVED_PLAN`), or Stage 4.3
-  (`NO_SELECTABLE_PLAN`), so no executable Stage 5.0 contract can be created.
-  See `storage/benchmarks/stage-5-2/manual-acceptance/README.md`.
+  **Current status: genuine media PRODUCED (partial coverage).** The Stage 3.5
+  `audio_window.py::_extract_window` defect (an untyped `.wav.tmp` output path
+  that FFmpeg 7.1.5 cannot map to a muxer) is fixed with an explicit WAV output
+  format. Three additional upstream integration defects that prevented any
+  genuine candidate from reaching an executable contract are fixed: the hosted
+  Gemini planning schema now constrains its closed block/value/narration enums
+  (previously the model emitted unconstrained values that the case-sensitive
+  parser dropped, failing every hosted plan `NO_SOURCE_EXCERPT`); the planning
+  instruction now requires `why_unavailable` on substantive blocks; and
+  `apply_semantic_review` now reconciles the persisted verification evidence when
+  a passing review clears an ambiguous claim (previously Stage 4.3 deferred the
+  approved plan forever with `INCONSISTENT_GOVERNANCE_EVIDENCE`). A genuine
+  production manual-acceptance MP4 is exported for candidate `1827c524`
+  (CONTEXT_HOOK plan, `BACKGROUND_FILL` + `TRACKED_CROP`, single span 583.78-589.26,
+  QC `WARN` `QC_PEAK_CLIPPING_RISK`). Two of the four attempted candidates remain
+  blocked by frozen Stage 5.0 behavior: `align_excerpt` raises `IndexError` on a
+  time-filtered window (frozen Stage 5.0 code, not modified), and one candidate's
+  selected plan yields the frozen `PAYOFF_NOT_COVERED` verdict. See
+  `storage/benchmarks/stage-5-2/manual-acceptance/upstream-evidence/blocker.json`.
 
 The gated `tests/test_stage52_live_contract.py` is explicitly classified
 `SEEDED_PLUMBING`: it exercises *persisted* Stage 5.0/5.1 bindings plus the

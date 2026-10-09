@@ -4,9 +4,10 @@
 
 Status: **the confirmed production TRACKED_CROP execution defect is remediated
 and verified; the Stage 3.5 extraction prerequisite is FIXED; the
-acceptance-generation boundary and provenance checks are corrected; genuine
-regenerated media is still BLOCKED on upstream Stage 4 planning/governance
-outcomes. Stage 5.2 NOT FROZEN. Stage 6 NOT STARTED.**
+acceptance-generation boundary and provenance checks are corrected; three
+upstream Stage 4 planning/governance integration defects are fixed; one genuine
+production manual-acceptance MP4 is produced (partial coverage). Stage 5.2 NOT
+FROZEN. Stage 6 NOT STARTED.**
 
 - **Confirmed renderer defect (fixed).** `compiler.py::_tracked_crop_chain`
   previously computed the fixed 1080x1920 crop position/clamps from the `crop`
@@ -58,16 +59,29 @@ outcomes. Stage 5.2 NOT FROZEN. Stage 6 NOT STARTED.**
   incomplete rollback surfaces `PACKAGE_ROLLBACK_INCOMPLETE` instead of being
   swallowed. The gated
   `test_stage52_live_contract.py` remains classified `SEEDED_PLUMBING`.
-- **Genuine media still blocked (upstream Stage 4).** With the extraction fix,
-  genuine audio-backed `FINAL_CLIP` refinements now complete end-to-end. The
-  available genuine candidates nonetheless still cannot reach an executable
-  Stage 5.0 contract: refinements land in `NEEDS_MANUAL_TRANSCRIPT_REVIEW`
-  (meaning-critical entity conflicts) or `PROVIDER_DEGRADED`, or, once refined,
-  Stage 4.0 finds no recommended strategy, Stage 4.1 produces no valid plan
-  (`NO_SOURCE_EXCERPT` / `EMPTY_OR_GENERIC_INTENT` / `PROVIDER_UNAVAILABLE`),
-  Stage 4.2 governance approves no plan (`NO_GOVERNOR_APPROVED_PLAN`), and Stage
-  4.3 selects none (`NO_SELECTABLE_PLAN`). No genuine manual-acceptance media is
-  produced; see `storage/benchmarks/stage-5-2/manual-acceptance/README.md`.
+- **Genuine media produced (partial coverage).** With the extraction fix and
+  three additional upstream integration fixes, genuine audio-backed `FINAL_CLIP`
+  refinements now drive a full genuine chain to an executable contract. The three
+  fixes: the hosted Gemini planning schema now constrains its closed
+  block/value/narration enums (previously the model emitted unconstrained values
+  such as `original_value`/`hero`, which the case-sensitive parser dropped,
+  failing every hosted plan `NO_SOURCE_EXCERPT`); the planning instruction now
+  requires `why_unavailable` on substantive blocks (else
+  `EMPTY_OR_GENERIC_INTENT`); and `apply_semantic_review` now reconciles the
+  persisted verification evidence when a passing review clears an ambiguous claim
+  (previously the governor approved a plan while leaving
+  `verification.unresolved` set, so Stage 4.3 deferred it forever with
+  `INCONSISTENT_GOVERNANCE_EVIDENCE`). One genuine production manual-acceptance
+  MP4 is exported for candidate `1827c524` (CONTEXT_HOOK plan; `BACKGROUND_FILL`
+  + `TRACKED_CROP`; single span 583.78-589.26 -> output 0-5.48; QC `WARN`
+  `QC_PEAK_CLIPPING_RISK`). Two of four attempted candidates remain blocked by
+  frozen Stage 5.0 behavior: `align_excerpt` raises `IndexError` when a
+  time-filtered window is indexed by a global word index (frozen Stage 5.0 code,
+  deliberately not modified), and one candidate's selected plan yields the frozen
+  `PAYOFF_NOT_COVERED` verdict. Mixed Arabic-English caption and multi-span
+  timeline coverage remain unproduced. See
+  `storage/benchmarks/stage-5-2/manual-acceptance/` and its
+  `upstream-evidence/blocker.json`.
 
 ## Stage 5.2 render execution, audio, and technical QC (2026-10-05)
 
