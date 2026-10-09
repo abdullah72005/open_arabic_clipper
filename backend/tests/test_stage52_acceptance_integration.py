@@ -389,6 +389,7 @@ def test_production_acceptance_mechanics(tmp_path: Path, monkeypatch: Any) -> No
             == output_sha
         )
         assert not list(output.glob(".staging-*"))
+        assert not list(output.glob(".metadata-*"))
         assert not list(output.glob("*.previous-*"))
     finally:
         if session is not None:

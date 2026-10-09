@@ -366,6 +366,15 @@ def test_load_manifest_invalid_cases_fails_closed(tmp_path: Path) -> None:
     assert error.value.reason_code == "MANIFEST_INVALID"
 
 
+def test_load_manifest_null_cases_fails_closed(tmp_path: Path) -> None:
+    from app.render.execution.acceptance import _load_manifest
+
+    (tmp_path / "manifest.json").write_text('{"cases": null}', encoding="utf-8")
+    with pytest.raises(AcceptanceValidationError) as error:
+        _load_manifest(tmp_path)
+    assert error.value.reason_code == "MANIFEST_INVALID"
+
+
 def test_load_manifest_unreadable_fails_closed(tmp_path: Path, monkeypatch: object) -> None:
     from app.render.execution.acceptance import _load_manifest
 
@@ -434,6 +443,7 @@ def test_publish_package_manifest_failure_restores_previous(
     assert json.loads((output / "manifest.json").read_text())["cases"][0]["output_sha256"] == "old"
     assert (output / "README.md").read_text() == "OLD README"
     assert not list(output.glob("*.previous-*"))
+    assert not list(output.glob(".metadata-*"))
     assert not staging.exists()
 
 
@@ -460,4 +470,39 @@ def test_publish_package_readme_failure_restores_previous(
     assert json.loads((output / "manifest.json").read_text())["cases"][0]["output_sha256"] == "old"
     assert (output / "README.md").read_text() == "OLD README"
     assert not list(output.glob("*.previous-*"))
+    assert not list(output.glob(".metadata-*"))
+    assert not staging.exists()
+
+
+def test_publish_package_partial_metadata_write_leaves_live_untouched(
+    tmp_path: Path, monkeypatch: object
+) -> None:
+    import app.render.execution.acceptance as acceptance
+
+    output, case_dir = _seed_package(tmp_path)
+    staging = _staged_case(output)
+    manifest = {
+        "classification": "PRODUCTION_MANUAL_ACCEPTANCE",
+        "cases": [{"candidate_id": "candidate-a", "output_sha256": "new"}],
+    }
+    real_write_json = acceptance._write_json
+
+    def partial_then_fail(path: Path, payload: object) -> None:
+        if path.name == "manifest.json":
+            # Simulate a truncated write followed by a persistent failure.
+            path.write_text('{"cases":', encoding="utf-8")
+            raise OSError("persistent filesystem failure")
+        real_write_json(path, payload)
+
+    monkeypatch.setattr(acceptance, "_write_json", partial_then_fail)  # type: ignore[attr-defined]
+    with pytest.raises(OSError):
+        acceptance._publish_package(output, staging, case_dir, manifest)
+
+    # The live package is untouched: new metadata never reached it, and no
+    # partial write leaked into the live manifest.
+    assert (case_dir / "output.mp4").read_bytes() == b"OLD-MEDIA"
+    assert json.loads((output / "manifest.json").read_text())["cases"][0]["output_sha256"] == "old"
+    assert (output / "README.md").read_text() == "OLD README"
+    assert not list(output.glob("*.previous-*"))
+    assert not list(output.glob(".metadata-*"))
     assert not staging.exists()

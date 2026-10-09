@@ -432,14 +432,18 @@ final product gate:
   neither erases nor duplicates the others. Existing package metadata is read and
   validated *before* any file is touched: an absent manifest is treated as empty,
   while an unreadable or invalid one fails closed (`MANIFEST_UNREADABLE` /
-  `MANIFEST_INVALID`) so a package's case entries are never silently dropped. The
-  case directory, merged manifest, and README are published as a single rollback
-  unit — the previous package is retained until all three are written, so a
-  failure at any publication boundary (case, manifest, or README) restores the
-  exact previous valid package. Placeholder identities, missing plan
-  fingerprints, a missing/mismatched ASS, non-audio-backed `FINAL_CLIP` evidence,
-  and occurrences without a per-occurrence visual decision are rejected
-  (`AcceptanceValidationError`). It never falls back to synthetic evidence.
+  `MANIFEST_INVALID`, including a present `cases` key that is not a list) so a
+  package's case entries are never silently dropped. The new manifest and README
+  are written into a staging directory first, then the case directory, manifest,
+  and README are published as a single rollback unit: each previous file is
+  retained as a filesystem backup and restored by rename on any failure, so a
+  partial or failing metadata write never reaches the live package. A rollback
+  that cannot complete surfaces `PACKAGE_ROLLBACK_INCOMPLETE` and retains the
+  recoverable backups rather than swallowing the failure. Placeholder identities,
+  missing plan fingerprints, a missing/mismatched ASS, non-audio-backed
+  `FINAL_CLIP` evidence, and occurrences without a per-occurrence visual decision
+  are rejected (`AcceptanceValidationError`). It never falls back to synthetic
+  evidence.
 
   **Current status: extraction prerequisite FIXED; genuine media still BLOCKED.**
   The Stage 3.5 `audio_window.py::_extract_window` defect (an untyped `.wav.tmp`

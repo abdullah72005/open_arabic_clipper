@@ -947,42 +947,83 @@ def _publish_package(
 ) -> None:
     """Publish the case directory, manifest, and README as one rollback unit.
 
-    Every previous file is retained until all three are written successfully; a
-    failure at any publication boundary restores the exact previous package.
+    New metadata is prepared inside a staging directory *before* any live file is
+    touched, so a partial or failing metadata write never reaches the live
+    package. Publication then replaces live files by rename, retaining each
+    previous file as a filesystem backup until all three replacements succeed;
+    any failure restores the previous package by rename and surfaces an
+    incomplete rollback instead of silently swallowing it.
     """
 
     manifest_path = output / "manifest.json"
     readme_path = output / "README.md"
-    previous_manifest = manifest_path.read_bytes() if manifest_path.is_file() else None
-    previous_readme = readme_path.read_bytes() if readme_path.is_file() else None
-    backup: Path | None = None
-    if case_dir.exists():
-        backup = case_dir.with_name(f"{case_dir.name}.previous-{uuid.uuid4().hex[:8]}")
-        case_dir.rename(backup)
+    metadata_staging = output / f".metadata-{uuid.uuid4().hex[:8]}"
+    metadata_staging.mkdir(parents=True)
     try:
-        staging.rename(case_dir)
-        _write_json(manifest_path, manifest)
-        readme_path.write_text(_readme(manifest), encoding="utf-8")
+        _write_json(metadata_staging / "manifest.json", manifest)
+        (metadata_staging / "README.md").write_text(_readme(manifest), encoding="utf-8")
     except BaseException:
-        if case_dir.exists():
-            shutil.rmtree(case_dir, ignore_errors=True)
-        if backup is not None and not case_dir.exists():
-            backup.rename(case_dir)
-        _restore_bytes(manifest_path, previous_manifest)
-        _restore_bytes(readme_path, previous_readme)
+        shutil.rmtree(metadata_staging, ignore_errors=True)
+        shutil.rmtree(staging, ignore_errors=True)
         raise
-    if backup is not None:
-        shutil.rmtree(backup, ignore_errors=True)
 
-
-def _restore_bytes(path: Path, previous: bytes | None) -> None:
+    token = uuid.uuid4().hex[:8]
+    replacements: list[tuple[Path, Path, Path]] = [
+        (metadata_staging / "manifest.json", manifest_path, _backup_path(manifest_path, token)),
+        (metadata_staging / "README.md", readme_path, _backup_path(readme_path, token)),
+        (staging, case_dir, _backup_path(case_dir, token)),
+    ]
+    backed_up: list[tuple[Path, Path]] = []
+    published: list[Path] = []
     try:
-        if previous is None:
-            path.unlink(missing_ok=True)
-        else:
-            path.write_bytes(previous)
-    except OSError:
-        pass
+        for _new_source, live_target, backup in replacements:
+            if live_target.exists():
+                live_target.rename(backup)
+                backed_up.append((live_target, backup))
+        for new_source, live_target, _backup in replacements:
+            new_source.rename(live_target)
+            published.append(live_target)
+    except BaseException as error:
+        _rollback_package(published, backed_up, error)
+        raise
+    for _live_target, backup in backed_up:
+        _remove_path(backup)
+    shutil.rmtree(metadata_staging, ignore_errors=True)
+
+
+def _backup_path(live_target: Path, token: str) -> Path:
+    return live_target.with_name(f"{live_target.name}.previous-{token}")
+
+
+def _rollback_package(
+    published: list[Path], backed_up: list[tuple[Path, Path]], error: BaseException
+) -> None:
+    """Restore the previous package by rename; surface any rollback failure."""
+
+    failures: list[str] = []
+    for live_target in reversed(published):
+        try:
+            _remove_path(live_target)
+        except OSError as remove_error:
+            failures.append(f"remove {live_target.name}: {remove_error}")
+    for live_target, backup in reversed(backed_up):
+        if not backup.exists():
+            continue
+        try:
+            if live_target.exists():
+                _remove_path(live_target)
+            backup.rename(live_target)
+        except OSError as restore_error:
+            failures.append(f"restore {live_target.name}: {restore_error}")
+    if failures:
+        raise AcceptanceValidationError("PACKAGE_ROLLBACK_INCOMPLETE") from error
+
+
+def _remove_path(path: Path) -> None:
+    if path.is_dir():
+        shutil.rmtree(path)
+    elif path.exists():
+        path.unlink()
 
 
 def _write_production_case_evidence(
@@ -1193,8 +1234,8 @@ def _load_manifest(output: Path) -> dict[str, object]:
         raise AcceptanceValidationError("MANIFEST_INVALID") from error
     if not isinstance(payload, dict):
         raise AcceptanceValidationError("MANIFEST_INVALID")
-    cases = payload.get("cases")
-    if cases is not None:
+    if "cases" in payload:
+        cases = payload["cases"]
         if not isinstance(cases, list):
             raise AcceptanceValidationError("MANIFEST_INVALID")
         for case in cases:

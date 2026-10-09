@@ -50,9 +50,13 @@ outcomes. Stage 5.2 NOT FROZEN. Stage 6 NOT STARTED.**
   manifest by `candidate_id` (several candidates coexist; regeneration is
   stable). Existing package metadata is read/validated before any file is
   touched and an unreadable/invalid manifest fails closed
-  (`MANIFEST_UNREADABLE`/`MANIFEST_INVALID`); the case directory, manifest, and
-  README publish as one rollback unit, so a failure at any publication boundary
-  restores the exact previous valid package. The gated
+  (`MANIFEST_UNREADABLE`/`MANIFEST_INVALID`, including a non-list `cases` value);
+  the new manifest/README are staged before publication, then the case
+  directory, manifest, and README are replaced as one rollback unit with each
+  previous file retained as a filesystem backup and restored by rename, so a
+  partial or failing metadata write never reaches the live package and an
+  incomplete rollback surfaces `PACKAGE_ROLLBACK_INCOMPLETE` instead of being
+  swallowed. The gated
   `test_stage52_live_contract.py` remains classified `SEEDED_PLUMBING`.
 - **Genuine media still blocked (upstream Stage 4).** With the extraction fix,
   genuine audio-backed `FINAL_CLIP` refinements now complete end-to-end. The
