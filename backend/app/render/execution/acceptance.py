@@ -533,7 +533,7 @@ def _readme(manifest: dict[str, object]) -> str:
     return "\n".join(lines)
 
 
-def _case_list(manifest: dict[str, object]) -> list[dict[str, object]]:
+def _case_list(manifest: Mapping[str, object]) -> list[dict[str, object]]:
     cases = manifest.get("cases")
     if not isinstance(cases, list):
         return []
@@ -806,7 +806,7 @@ def build_production_acceptance(
         # artifact integrity before any evidence is published.
         row = _revalidate_execution(session, candidate_id, spec, resolved, row)
 
-        case = _export_production_case(
+        manifest = _export_production_case(
             session=session,
             output=output,
             candidate_id=candidate_id,
@@ -819,10 +819,6 @@ def build_production_acceptance(
     finally:
         session.close()
 
-    output.mkdir(parents=True, exist_ok=True)
-    manifest = _merge_production_manifest(output, case)
-    _write_json(output / "manifest.json", manifest)
-    (output / "README.md").write_text(_readme(manifest), encoding="utf-8")
     return manifest
 
 
@@ -912,11 +908,14 @@ def _export_production_case(
 ) -> dict[str, object]:
     """Validate one case into a staging directory, then publish it atomically.
 
-    The replacement is published only after every validation and evidence write
-    succeeds, so a failed regeneration leaves the existing valid package intact.
+    The case directory, the merged manifest, and the README are published as a
+    single rollback unit: the previous package is retained until all three are
+    written, so a failed regeneration leaves the existing valid package intact.
+    Existing package metadata is read and validated *before* any file is touched.
     """
 
     output.mkdir(parents=True, exist_ok=True)
+    existing = _load_manifest(output)
     case_dir = output / candidate_id
     staging = output / f".staging-{candidate_id}-{uuid.uuid4().hex[:8]}"
     if staging.exists():
@@ -936,25 +935,54 @@ def _export_production_case(
     except BaseException:
         shutil.rmtree(staging, ignore_errors=True)
         raise
-    _publish_directory(staging, case_dir)
     case["evidence_dir"] = str(case_dir)
     case["path"] = str(case_dir / "output.mp4")
-    return case
+    manifest = _merge_manifest(existing, case)
+    _publish_package(output, staging, case_dir, manifest)
+    return manifest
 
 
-def _publish_directory(staging: Path, target: Path) -> None:
+def _publish_package(
+    output: Path, staging: Path, case_dir: Path, manifest: dict[str, object]
+) -> None:
+    """Publish the case directory, manifest, and README as one rollback unit.
+
+    Every previous file is retained until all three are written successfully; a
+    failure at any publication boundary restores the exact previous package.
+    """
+
+    manifest_path = output / "manifest.json"
+    readme_path = output / "README.md"
+    previous_manifest = manifest_path.read_bytes() if manifest_path.is_file() else None
+    previous_readme = readme_path.read_bytes() if readme_path.is_file() else None
     backup: Path | None = None
-    if target.exists():
-        backup = target.with_name(f"{target.name}.previous-{uuid.uuid4().hex[:8]}")
-        target.rename(backup)
+    if case_dir.exists():
+        backup = case_dir.with_name(f"{case_dir.name}.previous-{uuid.uuid4().hex[:8]}")
+        case_dir.rename(backup)
     try:
-        staging.rename(target)
+        staging.rename(case_dir)
+        _write_json(manifest_path, manifest)
+        readme_path.write_text(_readme(manifest), encoding="utf-8")
     except BaseException:
-        if backup is not None and not target.exists():
-            backup.rename(target)
+        if case_dir.exists():
+            shutil.rmtree(case_dir, ignore_errors=True)
+        if backup is not None and not case_dir.exists():
+            backup.rename(case_dir)
+        _restore_bytes(manifest_path, previous_manifest)
+        _restore_bytes(readme_path, previous_readme)
         raise
     if backup is not None:
         shutil.rmtree(backup, ignore_errors=True)
+
+
+def _restore_bytes(path: Path, previous: bytes | None) -> None:
+    try:
+        if previous is None:
+            path.unlink(missing_ok=True)
+        else:
+            path.write_bytes(previous)
+    except OSError:
+        pass
 
 
 def _write_production_case_evidence(
@@ -1111,7 +1139,12 @@ def _case_job_id(session: object, row: object) -> str:
 def _merge_production_manifest(output: Path, case: dict[str, object]) -> dict[str, object]:
     """Upsert one case into the package manifest without erasing other cases."""
 
-    existing = _load_manifest(output)
+    return _merge_manifest(_load_manifest(output), case)
+
+
+def _merge_manifest(existing: Mapping[str, object], case: dict[str, object]) -> dict[str, object]:
+    """Upsert one case into an already-loaded manifest (pure)."""
+
     classification = existing.get("classification")
     if classification not in (None, PRODUCTION_MANUAL_ACCEPTANCE):
         raise AcceptanceValidationError("OUTPUT_DIRECTORY_MISMATCH")
@@ -1139,14 +1172,35 @@ def _merge_production_manifest(output: Path, case: dict[str, object]) -> dict[st
 
 
 def _load_manifest(output: Path) -> dict[str, object]:
+    """Load and validate the package manifest.
+
+    Absent metadata yields an empty manifest. Present-but-unreadable or invalid
+    metadata fails closed (``MANIFEST_UNREADABLE`` / ``MANIFEST_INVALID``) so an
+    existing package is never silently overwritten with a manifest that drops
+    its case entries.
+    """
+
     path = output / "manifest.json"
     if not path.is_file():
         return {}
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
-    return payload if isinstance(payload, dict) else {}
+        text = path.read_text(encoding="utf-8")
+    except OSError as error:
+        raise AcceptanceValidationError("MANIFEST_UNREADABLE") from error
+    try:
+        payload = json.loads(text)
+    except ValueError as error:
+        raise AcceptanceValidationError("MANIFEST_INVALID") from error
+    if not isinstance(payload, dict):
+        raise AcceptanceValidationError("MANIFEST_INVALID")
+    cases = payload.get("cases")
+    if cases is not None:
+        if not isinstance(cases, list):
+            raise AcceptanceValidationError("MANIFEST_INVALID")
+        for case in cases:
+            if not isinstance(case, dict) or not str(case.get("candidate_id") or ""):
+                raise AcceptanceValidationError("MANIFEST_INVALID")
+    return payload
 
 
 def _read_attempt_filtergraph(attempt_directory: Path) -> str:

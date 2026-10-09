@@ -360,6 +360,36 @@ def test_production_acceptance_mechanics(tmp_path: Path, monkeypatch: Any) -> No
             == output_sha
         )
         assert not list(output.glob(".staging-*"))
+
+        # 6. A failure at the manifest publication boundary during a valid
+        # regeneration must leave the previous package (media + manifest) intact.
+        import app.render.execution.acceptance as acceptance
+
+        real_write_json = acceptance._write_json
+
+        def flaky_manifest_write(path: Path, payload: object) -> None:
+            if path.name == "manifest.json":
+                raise RuntimeError("simulated manifest publication failure")
+            real_write_json(path, payload)
+
+        monkeypatch.setattr(acceptance, "_write_json", flaky_manifest_write)
+        with pytest.raises(RuntimeError):
+            build_production_acceptance(
+                candidate_id,
+                output,
+                settings=settings,
+                session_factory=lambda: Session(engine),
+                queue=False,
+            )
+        monkeypatch.setattr(acceptance, "_write_json", real_write_json)
+        assert Path(case["path"]).is_file()
+        assert sha256_file(Path(case["path"])) == output_sha
+        assert (
+            json.loads((output / "manifest.json").read_text())["cases"][0]["output_sha256"]
+            == output_sha
+        )
+        assert not list(output.glob(".staging-*"))
+        assert not list(output.glob("*.previous-*"))
     finally:
         if session is not None:
             session.close()

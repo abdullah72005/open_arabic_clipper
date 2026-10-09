@@ -429,11 +429,16 @@ final product gate:
 
   Each run upserts its case into the package manifest by `candidate_id`, so
   several real candidates coexist in one output directory; regenerating one case
-  neither erases nor duplicates the others, and a failed regeneration preserves
-  the existing valid package (evidence is staged and published only after
-  validation succeeds). Placeholder identities, missing plan fingerprints, a
-  missing/mismatched ASS, non-audio-backed `FINAL_CLIP` evidence, and occurrences
-  without a per-occurrence visual decision are rejected
+  neither erases nor duplicates the others. Existing package metadata is read and
+  validated *before* any file is touched: an absent manifest is treated as empty,
+  while an unreadable or invalid one fails closed (`MANIFEST_UNREADABLE` /
+  `MANIFEST_INVALID`) so a package's case entries are never silently dropped. The
+  case directory, merged manifest, and README are published as a single rollback
+  unit — the previous package is retained until all three are written, so a
+  failure at any publication boundary (case, manifest, or README) restores the
+  exact previous valid package. Placeholder identities, missing plan
+  fingerprints, a missing/mismatched ASS, non-audio-backed `FINAL_CLIP` evidence,
+  and occurrences without a per-occurrence visual decision are rejected
   (`AcceptanceValidationError`). It never falls back to synthetic evidence.
 
   **Current status: extraction prerequisite FIXED; genuine media still BLOCKED.**

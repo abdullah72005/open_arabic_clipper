@@ -47,8 +47,12 @@ outcomes. Stage 5.2 NOT FROZEN. Stage 6 NOT STARTED.**
   through the production cache machinery before export (stale/upstream-changed
   executions are rejected), makes `--no-queue` strictly read-only (no
   execution/job/dispatch/claim/commit), and upserts each case into the package
-  manifest by `candidate_id` (several candidates coexist; regeneration is stable
-  and a failed regeneration preserves the existing valid package). The gated
+  manifest by `candidate_id` (several candidates coexist; regeneration is
+  stable). Existing package metadata is read/validated before any file is
+  touched and an unreadable/invalid manifest fails closed
+  (`MANIFEST_UNREADABLE`/`MANIFEST_INVALID`); the case directory, manifest, and
+  README publish as one rollback unit, so a failure at any publication boundary
+  restores the exact previous valid package. The gated
   `test_stage52_live_contract.py` remains classified `SEEDED_PLUMBING`.
 - **Genuine media still blocked (upstream Stage 4).** With the extraction fix,
   genuine audio-backed `FINAL_CLIP` refinements now complete end-to-end. The
