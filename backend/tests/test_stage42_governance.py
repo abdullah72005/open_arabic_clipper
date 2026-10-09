@@ -665,6 +665,37 @@ def test_ambiguous_claim_support_without_provider_never_approves():
     }
 
 
+def test_semantically_reviewed_ambiguous_claim_is_resolved_and_selectable():
+    plan = make_plan(
+        blocks=[
+            source_block(0, text="The team discussed the annual plan in a closed meeting."),
+            original_block(
+                1,
+                intent="Explain how the plan reflects broader strategy",
+                kind="EXPLANATION",
+                grounding=("block:0",),
+            ),
+        ],
+        original_value_kinds=("EXPLANATION",),
+    )
+    evaluation = evaluate_plan(
+        plan, make_inputs([plan]), DEFAULT_CONFIG, provider_mode_deterministic=False
+    )
+    assert evaluation.verification["claim_state"] == "SUPPORT_UNVERIFIED"
+    critique = make_critique(plan)
+    apply_semantic_review(evaluation, critique, SEMANTIC_AVAILABLE)
+    # A passing semantic review must reconcile the lexically-unverifiable claim
+    # evidence; otherwise the governor approves a plan whose persisted
+    # verification is still unresolved and Stage 4.3 defers it forever with
+    # INCONSISTENT_GOVERNANCE_EVIDENCE.
+    assert evaluation.verification["claim_state"] == "GROUNDED_IN_SOURCE"
+    assert evaluation.verification["unresolved"] is False
+    governance = build_plan_governance(evaluation, input_fingerprint="in", output_fingerprint="out")
+    assert governance.status is GovernancePlanStatus.APPROVED_FOR_SELECTION
+    assert governance.verification["claim_state"] == "GROUNDED_IN_SOURCE"
+    assert governance.verification["unresolved"] is False
+
+
 def test_supported_claim_requires_no_semantic_review():
     plan = make_plan()
     inputs = make_inputs([plan])

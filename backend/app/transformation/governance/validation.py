@@ -2119,6 +2119,28 @@ def apply_semantic_review(
     evaluation.critique = critique
     evaluation.provider_evidence = {"state": state, "critique": critique.as_dict()}
 
+    # A claim whose claim-to-evidence support the deterministic lexical check
+    # could not confirm is exactly what the semantic review resolves. When that
+    # review clears the unsupported-claim concern, the persisted verification
+    # evidence must be reconciled with the resulting approval; otherwise the
+    # governor approves a plan while leaving ``verification.unresolved`` set, and
+    # Stage 4.3 correctly refuses the internally inconsistent evidence forever
+    # (``INCONSISTENT_GOVERNANCE_EVIDENCE``).
+    if (
+        evaluation.verification.get("claim_state") == ClaimGroundingState.SUPPORT_UNVERIFIED.value
+        and critique.unsupported_claim == UnsupportedClaimFinding.NONE
+        and critique.fidelity != SemanticFidelityFinding.FAIL
+    ):
+        evaluation.verification = {
+            "claim_state": ClaimGroundingState.GROUNDED_IN_SOURCE.value,
+            "claims": [],
+            "unresolved": False,
+            "reason_codes": [],
+        }
+        evaluation.dimensions["verification_completeness"] = (
+            ClaimGroundingState.GROUNDED_IN_SOURCE.value
+        )
+
     dimensions = evaluation.dimensions
     dimensions["semantic_fidelity"] = {
         SemanticFidelityFinding.PASS: GovernanceEvidenceStrength.STRONG.value,

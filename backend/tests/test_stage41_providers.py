@@ -16,9 +16,14 @@ from stage41_support import (
     seed_stage41,
 )
 
-from app.core.enums import TransformationStrategyType
+from app.core.enums import (
+    PlanBlockType,
+    SourceExcerptRole,
+    SubstantiveValueKind,
+    TransformationStrategyType,
+)
 from app.db.base import Base
-from app.transformation.planning.gemini import GeminiPlanningProvider
+from app.transformation.planning.gemini import GeminiPlanningProvider, _GeminiBlock
 from app.transformation.planning.local import LocalPlanningProvider
 from app.transformation.planning.policy import (
     GEMINI_ROUTINE_MODEL,
@@ -27,6 +32,7 @@ from app.transformation.planning.policy import (
     strategy_value_kinds,
 )
 from app.transformation.planning.providers import (
+    PLANNING_SYSTEM_INSTRUCTION,
     DeterministicPlanningProvider,
     PlanningProviderError,
     PlanningRequest,
@@ -152,6 +158,38 @@ def test_gemini_provider_missing_key_fails_sanitized() -> None:
     with pytest.raises(PlanningProviderError) as error:
         provider.plan([_request()], "ROUTINE")
     assert "MISSING_KEY" in error.value.category or error.value.category == "MISSING_KEY"
+
+
+def test_gemini_schema_constrains_closed_vocabularies() -> None:
+    """The hosted structured-output schema must enumerate every closed vocabulary.
+
+    Declaring these fields as plain strings let the model emit unconstrained
+    values (for example ``original_value``/``hero``); the case-sensitive parser
+    then dropped every block and every hosted plan failed ``NO_SOURCE_EXCERPT``.
+    """
+
+    props = _GeminiBlock.model_json_schema()["properties"]
+    assert set(props["block_type"]["enum"]) == {item.value for item in PlanBlockType}
+    assert set(props["source_role"]["anyOf"][0]["enum"]) == {
+        item.value for item in SourceExcerptRole
+    }
+    assert set(props["substantive_value_kind"]["anyOf"][0]["enum"]) == {
+        item.value for item in SubstantiveValueKind
+    }
+
+
+def test_gemini_schema_rejects_unconstrained_block_type() -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        _GeminiBlock(block_type="original_value")
+    assert _GeminiBlock(block_type="SOURCE_EXCERPT").block_type == "SOURCE_EXCERPT"
+
+
+def test_planning_instruction_requires_why_unavailable() -> None:
+    """Substantive blocks are rejected without ``why_unavailable``; the model must be told."""
+
+    assert "why_unavailable" in PLANNING_SYSTEM_INSTRUCTION
 
 
 def test_gemini_provider_uses_client_factory_and_parses_response() -> None:
