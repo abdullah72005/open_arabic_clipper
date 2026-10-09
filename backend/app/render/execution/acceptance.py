@@ -522,7 +522,13 @@ def _readme(manifest: dict[str, object]) -> str:
             "",
         ]
     for case in _case_list(manifest):
-        lines.append(f"- `{case.get('name')}` — {case.get('evidence')} (QC {case.get('wc')})")
+        name = case.get("name")
+        evidence = case.get("evidence")
+        label = f" — {evidence}" if evidence else ""
+        qc = case.get("wc") or case.get("qc_status") or "UNKNOWN"
+        reasons = case.get("qc_reason_codes") or []
+        suffix = f" ({', '.join(str(reason) for reason in reasons)})" if reasons else ""
+        lines.append(f"- `{name}`{label} (QC {qc}{suffix})")
     lines += [
         "",
         "Automatic QC proves structural/timing correctness only; it does not prove",
@@ -1121,7 +1127,7 @@ def _write_production_case_evidence(
     )
 
     return {
-        "name": "output.mp4",
+        "name": candidate_id,
         "classification": PRODUCTION_MANUAL_ACCEPTANCE,
         "managed_artifact_relative_path": relative,
         "candidate_id": candidate_id,
