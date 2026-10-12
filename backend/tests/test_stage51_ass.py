@@ -18,6 +18,7 @@ from app.composition.ass import (
     write_ass_asset,
 )
 from app.composition.captions import CaptionPlan, build_caption_plan
+from app.composition.planner import _caption_style
 from app.composition.policy import (
     CaptionPlacementZone,
     CaptionStyle,
@@ -25,8 +26,10 @@ from app.composition.policy import (
     SafeZoneProfile,
     Stage51Config,
     safe_zone_for,
+    stage51_config_payload,
 )
 from app.composition.types import CaptionEvent, CaptionWordTiming
+from app.core.settings import Settings
 from app.services.storage import StorageService
 
 SOURCE_ID = "11111111-1111-1111-1111-111111111111"
@@ -271,6 +274,28 @@ def test_serialize_ass_degrades_to_static_on_unreliable_timing(
 
     assert len(dialogues) == 1
     assert "\\c&H0000FFFF" not in dialogues[0]
+
+
+def test_production_default_renders_static_captions() -> None:
+    default_payload = stage51_config_payload(Stage51Config())
+    caption_style = default_payload["caption_style"]
+    assert isinstance(caption_style, dict)
+    assert caption_style["active_emphasis"] is False
+    assert Settings().visual_caption_dynamic_emphasis is False
+
+    style = _caption_style(Stage51Config())
+    assert style.active_emphasis is False
+
+    plan = CaptionPlan(policy_version="test", events=(_dynamic_event(),))
+    dialogues = _dialogue_lines(serialize_ass(plan, style, _safe_zone()).decode("utf-8"))
+    assert len(dialogues) == 1
+    assert "\\c&H0000FFFF" not in dialogues[0]
+
+    enabled_style = _caption_style(Stage51Config(caption_dynamic_emphasis=True))
+    enabled_dialogues = _dialogue_lines(
+        serialize_ass(plan, enabled_style, _safe_zone()).decode("utf-8")
+    )
+    assert len(enabled_dialogues) == 3
 
 
 def test_serialize_ass_places_upper_zone_with_an8() -> None:

@@ -232,8 +232,8 @@ def test_input_fingerprint_changes_with_active_word_policy() -> None:
     recolored = stage51_config_payload(Stage51Config(caption_active_color="&H00FF0000"))
     assert _fp() != _fp(stage51_config=recolored)
 
-    disabled = stage51_config_payload(Stage51Config(caption_dynamic_emphasis=False))
-    assert _fp() != _fp(stage51_config=disabled)
+    enabled = stage51_config_payload(Stage51Config(caption_dynamic_emphasis=True))
+    assert _fp() != _fp(stage51_config=enabled)
 
     rechunked = stage51_config_payload(Stage51Config(caption_max_words_per_event=12))
     assert _fp() != _fp(stage51_config=rechunked)

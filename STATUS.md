@@ -498,8 +498,10 @@ Versions: policy `stage5.1-v1`, schema `stage5.1-schema-v1`, framing
 `stage5.1-ass-v5`, caption BiDi `stage5.1-caption-bidi-v2`, background fill
 `stage5.1-background-fill-v1`, safe zone
 `shorts-reels-safe-zone-v1`. The default caption style is phone-first (font size
-88, outline 7, shadow 3, max 2 lines, compact <=7-word chunks) with modern
-active-word emphasis: the word currently being spoken is highlighted in a
+88, outline 7, shadow 3, max 2 lines, compact <=7-word chunks) with per-word
+emphasis off by default: captions render as plain static single-color phrase
+text. Setting `CLIPFACTORY_VISUAL_CAPTION_DYNAMIC_EMPHASIS=true` re-enables
+active-word emphasis, highlighting the word currently being spoken in a
 configurable accent color on a stationary block using the exact FINAL_CLIP word
 timings, degrading to static captions on unreliable timing. Because the deployed
 libass build does not reorder mixed-direction text (measured), the derived ASS

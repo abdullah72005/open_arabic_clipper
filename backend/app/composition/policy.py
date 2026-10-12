@@ -315,7 +315,7 @@ class Stage51Config:
     caption_font_family: str = "Noto Sans Arabic"
     caption_max_lines: int = 2
     caption_active_color: str = "&H0000FFFF"
-    caption_dynamic_emphasis: bool = True
+    caption_dynamic_emphasis: bool = False
     caption_max_words_per_event: int = 7
     safe_zone_profile_key: str = "SHORTS_VERTICAL_SAFE_ZONE_V1"
     preview_enabled: bool = True

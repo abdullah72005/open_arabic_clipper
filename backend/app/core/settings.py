@@ -223,7 +223,7 @@ class Settings(BaseSettings):
     visual_caption_font_family: str = Field(default="Noto Sans Arabic", max_length=256)
     visual_caption_max_lines: int = Field(default=2, gt=0, le=10)
     visual_caption_active_color: str = Field(default="&H0000FFFF", pattern=r"^&H[0-9A-Fa-f]{8}$")
-    visual_caption_dynamic_emphasis: bool = True
+    visual_caption_dynamic_emphasis: bool = False
     visual_caption_max_words_per_event: int = Field(default=7, gt=0, le=12)
     visual_preview_enabled: bool = True
     # Stage 5.2 deterministic render-execution configuration. CPU-only delivery
