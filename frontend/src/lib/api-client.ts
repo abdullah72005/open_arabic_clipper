@@ -346,6 +346,18 @@ export interface RenderExecution {
   live_freshness: string;
 }
 
+export interface RenderArtifact {
+  id: string;
+  source_video_id: string;
+  clip_candidate_id: string;
+  artifact_purpose: string;
+  lifecycle: string;
+  qc_status: string | null;
+  cache_eligible: boolean;
+  is_current: boolean;
+  created_at: string;
+}
+
 type Fetcher = typeof fetch;
 
 export class ApiError extends Error {
@@ -498,6 +510,8 @@ export function createApiClient(baseUrl: string, fetcher: Fetcher = fetch) {
       ),
     renderExecutionArtifactUrl: (renderExecutionId: string) =>
       `${baseUrl.replace(/\/$/, "")}/api/render-executions/${encodeURIComponent(renderExecutionId)}/artifact`,
+    listRenderArtifacts: (limit = 50) =>
+      request<RenderArtifact[]>(`/api/render-executions?limit=${limit}`),
     listJobs: () => request<Job[]>("/jobs"),
     getJob: (id: string) => request<Job>(`/jobs/${encodeURIComponent(id)}`),
     cancelJob: (id: string) => request<Job>(`/jobs/${encodeURIComponent(id)}/cancel`, { method: "POST" }),

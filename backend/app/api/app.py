@@ -742,6 +742,21 @@ class RenderExecutionQueueResponse(BaseModel):
     model_config = {"extra": "allow"}
 
 
+class RenderArtifactResponse(BaseModel):
+    """One completed, downloadable Stage 5.2 render artifact for a results list."""
+
+    id: UUID
+    source_video_id: UUID
+    clip_candidate_id: UUID
+    artifact_purpose: str
+    lifecycle: str
+    qc_status: str | None
+    cache_eligible: bool
+    is_current: bool
+    created_at: datetime
+    model_config = {"extra": "allow"}
+
+
 class JobResponse(BaseModel):
     id: UUID
     source_video_id: UUID
@@ -1769,6 +1784,42 @@ def create_app(
         if not path.is_file() or path.stat().st_size <= 0:
             raise HTTPException(status_code=404, detail="artifact is not available")
         return FileResponse(path, media_type="video/mp4", filename=path.name)
+
+    @app.get("/api/render-executions", response_model=list[RenderArtifactResponse])
+    def list_render_executions(
+        source_id: UUID | None = None,
+        limit: int = 50,
+        database: Session = Depends(session),
+    ) -> list[RenderArtifactResponse]:
+        """List completed, cache-eligible render artifacts for a results view."""
+
+        statement = select(RenderExecution).where(
+            RenderExecution.lifecycle == RenderExecutionLifecycle.COMPLETE,
+            RenderExecution.cache_eligible.is_(True),
+        )
+        if source_id is not None:
+            statement = statement.where(RenderExecution.source_video_id == source_id)
+        statement = statement.order_by(RenderExecution.created_at.desc()).limit(
+            min(max(limit, 1), 200)
+        )
+        return [
+            RenderArtifactResponse(
+                id=row.id,
+                source_video_id=row.source_video_id,
+                clip_candidate_id=row.clip_candidate_id,
+                artifact_purpose=getattr(row.artifact_purpose, "value", row.artifact_purpose),
+                lifecycle=getattr(row.lifecycle, "value", row.lifecycle),
+                qc_status=(
+                    None
+                    if row.qc_status is None
+                    else getattr(row.qc_status, "value", row.qc_status)
+                ),
+                cache_eligible=row.cache_eligible,
+                is_current=row.is_current,
+                created_at=row.created_at,
+            )
+            for row in database.scalars(statement)
+        ]
 
     @app.patch("/api/sources/{source_id}/provenance", response_model=SourceResponse)
     def update_source_provenance(
