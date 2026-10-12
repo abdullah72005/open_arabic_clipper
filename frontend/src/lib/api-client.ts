@@ -216,6 +216,136 @@ export interface RefinementQueueResponse {
   active: boolean;
 }
 
+export interface TransformationQueueResponse {
+  analysis_id: string;
+  job_id: string | null;
+  status: string;
+  queued: boolean;
+  cached: boolean;
+  active: boolean;
+}
+
+export interface TransformationAnalysis {
+  id: string;
+  execution_status: string;
+  eligibility_outcome: string | null;
+  eligibility_reasons: string[];
+  cache_eligible: boolean;
+  recommended_strategies: Array<Record<string, unknown>>;
+  rejected_strategies: Array<Record<string, unknown>>;
+}
+
+export interface PlanningQueueResponse {
+  plan_set_id: string;
+  job_id: string | null;
+  status: string;
+  queued: boolean;
+  cached: boolean;
+  active: boolean;
+}
+
+export interface TransformationPlan {
+  id: string;
+  plan_key: string;
+  status: string;
+  strategy_type: string;
+  intensity: string;
+  planner_confidence: number;
+}
+
+export interface TransformationPlanSet {
+  id: string;
+  execution_status: string;
+  planning_outcome: string | null;
+  outcome_reasons: string[];
+  cache_eligible: boolean;
+  plans: TransformationPlan[];
+}
+
+export interface GovernanceQueueResponse {
+  governance_set_id: string;
+  job_id: string | null;
+  status: string;
+  queued: boolean;
+  cached: boolean;
+  active: boolean;
+}
+
+export interface GovernanceSet {
+  id: string;
+  execution_status: string;
+  semantic_outcome: string | null;
+  outcome_reasons: string[];
+  results: Array<Record<string, unknown>>;
+}
+
+export interface TransformationSelection {
+  id: string;
+  selected_plan_id: string | null;
+  status: string;
+  is_current: boolean;
+  effective: boolean;
+  selected_with_caution: boolean;
+  selection_reason_codes: string[];
+  live_freshness: string;
+}
+
+export interface RenderContract {
+  id: string;
+  status: string;
+  is_current: boolean;
+  effective: boolean;
+  contract_ready: boolean;
+  compatibility_outcome: string | null;
+  reason_codes: string[];
+  live_freshness: string;
+}
+
+export interface VisualCompositionQueueResponse {
+  plan_id: string;
+  job_id: string | null;
+  status: string;
+  queued: boolean;
+  cached: boolean;
+  active: boolean;
+}
+
+export interface VisualComposition {
+  id: string;
+  status: string;
+  execution_status: string;
+  plan_ready: boolean;
+  is_current: boolean;
+  effective: boolean;
+  cache_eligible: boolean;
+  reason_codes: string[];
+  live_freshness: string;
+}
+
+export interface RenderExecutionQueueResponse {
+  render_execution_id: string;
+  job_id: string | null;
+  status: string;
+  queued: boolean;
+  cached: boolean;
+  active: boolean;
+  artifact_purpose: string;
+  delivery_profile_key: string;
+}
+
+export interface RenderExecution {
+  id: string;
+  lifecycle: string;
+  qc_status: string | null;
+  is_current: boolean;
+  cache_eligible: boolean;
+  effective: boolean;
+  publication_ready: boolean;
+  reason_codes: string[];
+  error_code: string | null;
+  live_freshness: string;
+}
+
 type Fetcher = typeof fetch;
 
 export class ApiError extends Error {
@@ -311,6 +441,63 @@ export function createApiClient(baseUrl: string, fetcher: Fetcher = fetch) {
     },
     deleteSource: (id: string) => request<void>(`/sources/${encodeURIComponent(id)}`, { method: "DELETE" }),
     retrySource: (id: string) => request<Job>(`/sources/${encodeURIComponent(id)}/retry`, { method: "POST" }),
+    queueTransformationAnalysis: (candidateId: string, force = false) =>
+      request<TransformationQueueResponse>(
+        `/api/candidates/${encodeURIComponent(candidateId)}/transformation-analyses?force=${force}`,
+        { method: "POST" }
+      ),
+    getCandidateTransformationAnalysis: (candidateId: string) =>
+      request<TransformationAnalysis>(
+        `/api/candidates/${encodeURIComponent(candidateId)}/transformation-analysis`
+      ),
+    queueTransformationPlans: (candidateId: string, force = false) =>
+      request<PlanningQueueResponse>(
+        `/api/candidates/${encodeURIComponent(candidateId)}/transformation-plans?force=${force}`,
+        { method: "POST" }
+      ),
+    getCandidateTransformationPlans: (candidateId: string) =>
+      request<TransformationPlanSet>(
+        `/api/candidates/${encodeURIComponent(candidateId)}/transformation-plans`
+      ),
+    queueTransformationGovernance: (candidateId: string, force = false) =>
+      request<GovernanceQueueResponse>(
+        `/api/candidates/${encodeURIComponent(candidateId)}/transformation-governance?force=${force}`,
+        { method: "POST" }
+      ),
+    getCandidateTransformationGovernance: (candidateId: string) =>
+      request<GovernanceSet>(
+        `/api/candidates/${encodeURIComponent(candidateId)}/transformation-governance`
+      ),
+    createTransformationSelection: (candidateId: string) =>
+      request<TransformationSelection>(
+        `/api/candidates/${encodeURIComponent(candidateId)}/transformation-selection`,
+        { method: "POST" }
+      ),
+    createRenderContract: (candidateId: string) =>
+      request<RenderContract>(
+        `/api/candidates/${encodeURIComponent(candidateId)}/render-contract`,
+        { method: "POST" }
+      ),
+    queueVisualComposition: (candidateId: string, force = false) =>
+      request<VisualCompositionQueueResponse>(
+        `/api/candidates/${encodeURIComponent(candidateId)}/visual-composition?force=${force}`,
+        { method: "POST" }
+      ),
+    getCandidateVisualComposition: (candidateId: string) =>
+      request<VisualComposition>(
+        `/api/candidates/${encodeURIComponent(candidateId)}/visual-composition`
+      ),
+    queueRenderExecution: (candidateId: string, force = false) =>
+      request<RenderExecutionQueueResponse>(
+        `/api/candidates/${encodeURIComponent(candidateId)}/render-execution?force=${force}`,
+        { method: "POST" }
+      ),
+    getCandidateRenderExecution: (candidateId: string) =>
+      request<RenderExecution>(
+        `/api/candidates/${encodeURIComponent(candidateId)}/render-execution`
+      ),
+    renderExecutionArtifactUrl: (renderExecutionId: string) =>
+      `${baseUrl.replace(/\/$/, "")}/api/render-executions/${encodeURIComponent(renderExecutionId)}/artifact`,
     listJobs: () => request<Job[]>("/jobs"),
     getJob: (id: string) => request<Job>(`/jobs/${encodeURIComponent(id)}`),
     cancelJob: (id: string) => request<Job>(`/jobs/${encodeURIComponent(id)}/cancel`, { method: "POST" }),

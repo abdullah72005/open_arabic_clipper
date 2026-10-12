@@ -48,6 +48,15 @@ for the API. Stop services with `docker compose down`; add `-v` only when you
 intentionally want to remove database and Redis volumes. Local media remains
 under `./storage`.
 
+From the dashboard: **Add source** (`/sources/add`) ingests a local file or URL
+through transcript and candidate analysis. **Produce** (`/produce`) takes a
+public, permitted media link and runs the full pipeline end-to-end — ingest and
+transcribe, candidate selection, Stage 3.5 refinement, Stage 4.0–4.3
+transformation planning/selection, and Stage 5.0–5.2 composition/render — then
+plays the rendered MP4. Work runs in the worker; URL ingest needs internet and a
+link you are authorized to process, and the first transcription downloads the
+Whisper model.
+
 ## Development checks
 
 GitHub Actions runs these quality gates on every push and pull request: backend
