@@ -2,7 +2,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import AliasChoices, Field, SecretStr, model_validator
+from pydantic import AliasChoices, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.candidates.gemini import GeminiSemanticProvider
@@ -243,6 +243,25 @@ class Settings(BaseSettings):
     render_qc_sample_luma_dimension: int = Field(default=160, ge=32, le=1_024)
     transcription_queue_concurrency: int = Field(default=1, gt=0)
     cors_origins: list[str] = ["http://localhost:3301"]
+
+    @field_validator(
+        "whisper_language",
+        "whisper_initial_prompt",
+        "whisper_hotwords",
+        mode="before",
+    )  # type: ignore[untyped-decorator]
+    @classmethod
+    def _blank_optional_whisper_string_is_unset(cls, value: object) -> object:
+        """Treat an empty value as unset so ``cp .env.example .env`` stays valid.
+
+        ``.env.example`` ships these three keys blank to mean "auto/unset"; an
+        empty string must not be validated as a short language code or passed to
+        the engine as an empty prompt.
+        """
+
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
 
     @model_validator(mode="after")  # type: ignore[untyped-decorator]
     def _validate_heavy_model_lease(self) -> "Settings":

@@ -47,6 +47,23 @@ def test_settings_accept_forced_transcription_language(monkeypatch: pytest.Monke
     assert Settings().whisper_language == "ar"
 
 
+def test_settings_treat_blank_optional_whisper_strings_as_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`cp .env.example .env` ships blank whisper keys that must mean auto/unset."""
+
+    monkeypatch.setenv("CLIPFACTORY_WHISPER_LANGUAGE", "")
+    monkeypatch.setenv("CLIPFACTORY_WHISPER_INITIAL_PROMPT", "")
+    monkeypatch.setenv("CLIPFACTORY_WHISPER_HOTWORDS", "")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.whisper_language is None
+    assert settings.whisper_initial_prompt is None
+    assert settings.whisper_hotwords is None
+    assert settings.transcription_options().language is None
+
+
 def test_settings_builds_auto_transcription_options() -> None:
     """Auto mode defers device selection while preserving configured output options."""
 
