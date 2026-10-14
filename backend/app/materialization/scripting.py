@@ -376,6 +376,14 @@ def validate_authored_block(
             )
         )
 
+    # A deterministic hard failure is never model-overridable: an invalid
+    # grounding reference, unsupported essential claim, invented number,
+    # protected-token mutation, or presentation-only copy must never be cleared
+    # by a favorable semantic critique.
+    hard_failure = any(finding.level == QualityLevel.UNMET.value for finding in findings)
+    if hard_failure:
+        requires_semantic_review = False
+
     claim = ClaimLedgerEntry(
         claim_id=str(block.get("claim_id", f"claim-{index}")),
         block_index=index,

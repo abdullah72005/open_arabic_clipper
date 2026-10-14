@@ -20,13 +20,16 @@ from app.core.enums import (
 )
 from app.materialization.policy import (
     REASON_HERO_DAMAGED,
+    REASON_LOUDNESS_OUT_OF_POLICY,
     REASON_MANUAL_TRANSCRIPT_REVIEW,
+    REASON_MISSING_MEASUREMENT,
     REASON_MISSING_RENDER_EVIDENCE,
     REASON_MISSING_REQUIRED_VALUE,
     REASON_NONFINITE_MEASUREMENT,
     REASON_OVEREDIT_RISK,
     REASON_PROFILE_CONTEXT_MISMATCH,
     REASON_STALE_CRITICAL_EVIDENCE,
+    REASON_TRUE_PEAK_EXCEEDED,
     REASON_UNREADABLE_REQUIRED_COPY,
     REASON_UNSUITABLE_ASSET_RIGHTS,
     REASON_UNSUPPORTED_ESSENTIAL_CLAIM,
@@ -160,39 +163,76 @@ def assess_materialization(
     if not context.script_audio_match:
         add(QualityDimension.FIDELITY_ATTRIBUTION, QualityLevel.UNMET, "SCRIPT_AUDIO_MISMATCH")
 
+    critical_evidence_missing = False
     if context.critical_fidelity_unknown:
-        add(QualityDimension.FIDELITY_ATTRIBUTION, QualityLevel.CONCERN, None)
+        add(QualityDimension.FIDELITY_ATTRIBUTION, QualityLevel.UNKNOWN, None)
+        critical_evidence_missing = True
 
-    # Readiness requires actual render/QC/loudness evidence. Absent render
-    # evidence is never treated as a passing measurement.
+    # Final readiness requires actual, complete render/QC/loudness evidence.
+    # Missing or non-finite critical evidence defers; a genuine mastering-policy
+    # violation is assessed as unmet.
     if not context.render_complete:
         add(QualityDimension.AUDIO_MASTERING_INTELLIGIBILITY, QualityLevel.UNKNOWN, None)
     elif context.render_qc_status is None:
         add(
             QualityDimension.AUDIO_MASTERING_INTELLIGIBILITY,
-            QualityLevel.UNMET,
+            QualityLevel.UNKNOWN,
             REASON_MISSING_RENDER_EVIDENCE,
         )
+        critical_evidence_missing = True
+    elif context.measured_loudness_lufs is None or context.measured_true_peak_dbtp is None:
+        add(
+            QualityDimension.AUDIO_MASTERING_INTELLIGIBILITY,
+            QualityLevel.UNKNOWN,
+            REASON_MISSING_MEASUREMENT,
+        )
+        critical_evidence_missing = True
     elif not _finite(context.measured_loudness_lufs) or not _finite(
         context.measured_true_peak_dbtp
     ):
         add(
             QualityDimension.AUDIO_MASTERING_INTELLIGIBILITY,
-            QualityLevel.UNMET,
+            QualityLevel.UNKNOWN,
             REASON_NONFINITE_MEASUREMENT,
         )
+        critical_evidence_missing = True
     else:
-        level = {
-            "PASS": QualityLevel.SATISFIED,
-            "WARN": QualityLevel.CONCERN,
-            "FAIL": QualityLevel.UNMET,
-        }.get(context.render_qc_status, QualityLevel.UNKNOWN)
-        add(
-            QualityDimension.AUDIO_MASTERING_INTELLIGIBILITY,
-            level,
-            None if level != QualityLevel.UNMET else "RENDER_QC_FAIL",
-            {"qc_status": context.render_qc_status},
+        loudness = float(context.measured_loudness_lufs)
+        true_peak = float(context.measured_true_peak_dbtp)
+        loudness_ok = (
+            abs(loudness - config.target_integrated_lufs) <= config.mastering_loudness_tolerance_lu
         )
+        peak_ok = true_peak <= config.true_peak_ceiling_dbtp
+        if context.render_qc_status == "FAIL":
+            add(
+                QualityDimension.AUDIO_MASTERING_INTELLIGIBILITY,
+                QualityLevel.UNMET,
+                "RENDER_QC_FAIL",
+                {"qc_status": context.render_qc_status},
+            )
+        elif not loudness_ok:
+            add(
+                QualityDimension.AUDIO_MASTERING_INTELLIGIBILITY,
+                QualityLevel.UNMET,
+                REASON_LOUDNESS_OUT_OF_POLICY,
+                {"measured_loudness_lufs": loudness, "target": config.target_integrated_lufs},
+            )
+        elif not peak_ok:
+            add(
+                QualityDimension.AUDIO_MASTERING_INTELLIGIBILITY,
+                QualityLevel.UNMET,
+                REASON_TRUE_PEAK_EXCEEDED,
+                {"measured_true_peak_dbtp": true_peak, "ceiling": config.true_peak_ceiling_dbtp},
+            )
+        else:
+            add(
+                QualityDimension.AUDIO_MASTERING_INTELLIGIBILITY,
+                QualityLevel.SATISFIED
+                if context.render_qc_status == "PASS"
+                else QualityLevel.CONCERN,
+                None,
+                {"qc_status": context.render_qc_status},
+            )
 
     if context.audio_conflicts:
         add(
@@ -224,7 +264,11 @@ def assess_materialization(
     unknown = [finding for finding in findings if finding.level == QualityLevel.UNKNOWN.value]
 
     outcome, human_review_required = _map_outcome(
-        context, unmet=unmet, concern=concern, unknown=unknown
+        context,
+        unmet=unmet,
+        concern=concern,
+        unknown=unknown,
+        critical_evidence_missing=critical_evidence_missing,
     )
 
     return MaterializationAssessment(
@@ -251,6 +295,7 @@ def _map_outcome(
     unmet: Sequence[QualityFinding],
     concern: Sequence[QualityFinding],
     unknown: Sequence[QualityFinding],
+    critical_evidence_missing: bool,
 ) -> tuple[MaterializationOutcome, bool]:
     if context.profile_mismatch_fields:
         return MaterializationOutcome.UPSTREAM_REVALIDATION_REQUIRED, False
@@ -266,6 +311,10 @@ def _map_outcome(
         return MaterializationOutcome.DEFERRED_PROVIDER, False
     if not context.required_slots_fulfilled:
         return MaterializationOutcome.NO_OUTPUT, False
+    if critical_evidence_missing:
+        # Final review cannot proceed on missing/unknown critical evidence; the
+        # materialization is truthfully deferred rather than rejected or approved.
+        return MaterializationOutcome.DEFERRED_EVIDENCE, False
     if unmet:
         return MaterializationOutcome.REJECTED_QUALITY, False
     if not context.render_complete:

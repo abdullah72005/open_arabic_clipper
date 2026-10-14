@@ -9,7 +9,9 @@ WAV is never double-wrapped, raw PCM is wrapped exactly once.
 
 from __future__ import annotations
 
+import difflib
 import io
+import re
 import struct
 import wave
 from collections.abc import Mapping, Sequence
@@ -25,6 +27,7 @@ from app.materialization.types import (
     NarrationAudio,
     NarrationSynthesisRequest,
 )
+from app.render.binding import expand_contractions
 
 
 @dataclass(frozen=True)
@@ -167,18 +170,30 @@ def _is_number(token: str) -> bool:
     return any(character.isdigit() for character in token)
 
 
+def _is_latin(token: str) -> bool:
+    return any(character.isascii() and character.isalpha() for character in token)
+
+
+def _tokenize(text: str) -> list[str]:
+    expanded = expand_contractions(text.casefold())
+    return [token for token in re.findall(r"[\w\u0600-\u06ff']+", expanded) if token]
+
+
 def transcription_matches(expected: str, actual: str, *, threshold: float = 0.6) -> bool:
     """Deterministic ASR-vs-script comparison (never rewrites source evidence).
 
-    A bounded local ASR transcript is compared with the accepted copy. Removed
-    negation, changed numbers, and altered protected tokens are always rejected:
-    those carry meaning that a token-overlap score must never wash out.
+    A bounded local ASR transcript is compared with the accepted copy.
+    Contractions are expanded first, then meaning-critical content is checked
+    exactly: removed/added negation (including contracted forms), changed
+    numbers, and code-switch/Latin tokens must match in order. The overall token
+    *sequence* must align, so a reversed speaker attribution cannot pass even
+    when the token multiset is identical. Uncertain alignment never passes.
     """
 
-    expected_tokens = [token for token in expected.casefold().split() if token]
+    expected_tokens = _tokenize(expected)
     if not expected_tokens:
         return True
-    actual_tokens = [token for token in actual.casefold().split() if token]
+    actual_tokens = _tokenize(actual)
     actual_set = set(actual_tokens)
 
     expected_negation = {token for token in expected_tokens if token in _NEGATION_TOKENS}
@@ -191,8 +206,24 @@ def transcription_matches(expected: str, actual: str, *, threshold: float = 0.6)
     if expected_numbers != actual_numbers:
         return False
 
-    matched = sum(1 for token in expected_tokens if token in actual_set)
-    return matched / len(expected_tokens) >= threshold
+    # Code-switch / Latin tokens must be present and in the same order.
+    expected_latin = [token for token in expected_tokens if _is_latin(token)]
+    actual_latin = [token for token in actual_tokens if _is_latin(token)]
+    if expected_latin and not _is_subsequence(expected_latin, actual_latin):
+        return False
+
+    # Order-sensitive overall alignment: a reversed attribution has a low
+    # sequence ratio even though its token multiset is identical.
+    ratio = difflib.SequenceMatcher(None, expected_tokens, actual_tokens).ratio()
+    if ratio < threshold:
+        return False
+    # Every expected token must be present; a dropped word is never accepted.
+    return all(token in actual_set for token in expected_tokens)
+
+
+def _is_subsequence(needle: Sequence[str], haystack: Sequence[str]) -> bool:
+    iterator = iter(haystack)
+    return all(token in iterator for token in needle)
 
 
 @runtime_checkable

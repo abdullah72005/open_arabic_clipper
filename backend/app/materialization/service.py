@@ -94,12 +94,13 @@ from app.models import (
     SourceVideo,
     TransformationPlan,
     TransformationPlanSelection,
+    TransformationPlanSet,
 )
 from app.models.visual_composition_plan import VisualCompositionPlan as VisualCompositionPlanRow
 from app.render.policy import EXECUTABLE_STATUSES
-from app.render.service import get_current_render_contract
+from app.render.service import get_current_render_contract, read_render_contract
 
-_FINAL_READY = {"FINAL_TRANSCRIPT_READY", "CANDIDATE_REFINED", "NEEDS_MANUAL_TRANSCRIPT_REVIEW"}
+_FINAL_READY = {"FINAL_TRANSCRIPT_READY"}
 
 
 class MaterializationError(ValueError):
@@ -172,7 +173,13 @@ def _usable_final(session: Session, candidate_id: uuid.UUID) -> CandidateRefinem
 def resolve_prerequisites(
     session: Session, candidate_id: uuid.UUID | str, *, profile_key: str | None = None
 ) -> MaterializationPrerequisites:
-    """Validate and return every current upstream prerequisite for Stage 6."""
+    """Validate and return every current, live-effective upstream prerequisite.
+
+    Currentness and effectiveness are re-derived from the frozen upstream read
+    helpers (never a stored flag alone), and the exact contract
+    selection/plan/refinement/composition identities are bound before any Stage 6
+    work.
+    """
 
     candidate = session.get(ClipCandidate, _as_uuid(candidate_id))
     if candidate is None:
@@ -186,7 +193,11 @@ def resolve_prerequisites(
 
     selection_view = read_selection(session, candidate.id)
     selection = selection_view.row if selection_view is not None else None
-    if selection is None or selection.selected_plan_id is None:
+    if selection is None:
+        raise MaterializationError("candidate has no current selection")
+    if not selection_view.effective:
+        raise MaterializationStaleError("selection is not live-effective")
+    if selection.selected_plan_id is None:
         raise MaterializationError("candidate has no current selected Stage 4 plan")
     if selection.status.value not in {"PLAN_SELECTED", "PLAN_SELECTED_WITH_CAUTION"}:
         raise MaterializationError("selection is not a selected plan")
@@ -195,15 +206,26 @@ def resolve_prerequisites(
     if plan is None:
         raise MaterializationStaleError("selected plan no longer exists")
 
-    contract = get_current_render_contract(session, candidate.id)
-    if contract is None:
+    contract_row = get_current_render_contract(session, candidate.id)
+    if contract_row is None:
         raise MaterializationError("candidate has no Stage 5.0 render contract")
-    if not contract.contract_ready or contract.status.value not in EXECUTABLE_STATUSES:
+    contract_view = read_render_contract(session, candidate.id)
+    if contract_view is None or not contract_view.effective:
+        raise MaterializationStaleError("Stage 5.0 render contract is not current/effective")
+    if not contract_row.contract_ready or contract_row.status.value not in EXECUTABLE_STATUSES:
         raise MaterializationError("Stage 5.0 render contract is not executable")
+    if contract_row.selection_id != selection.id:
+        raise MaterializationStaleError("render contract is not bound to the current selection")
+    if contract_row.selected_plan_id != plan.id:
+        raise MaterializationStaleError("render contract is not bound to the current plan")
 
     final_clip = _usable_final(session, candidate.id)
     if final_clip is None:
         raise MaterializationError("candidate has no usable FINAL_CLIP refinement")
+    if contract_row.final_refinement_id != final_clip.id:
+        raise MaterializationStaleError(
+            "render contract is not bound to the current FINAL_CLIP refinement"
+        )
 
     visual_plan = session.scalars(
         select(VisualCompositionPlanRow)
@@ -215,6 +237,10 @@ def resolve_prerequisites(
     ).first()
     if visual_plan is None or not visual_plan.plan_ready:
         raise MaterializationError("candidate has no current ready Stage 5.1 composition")
+    if visual_plan.contract_output_fingerprint != contract_row.output_fingerprint:
+        raise MaterializationStaleError(
+            "Stage 5.1 composition is not bound to the current render contract"
+        )
 
     profile = _current_profile(session, profile_key)
     source = session.get(SourceVideo, candidate.source_video_id)
@@ -226,7 +252,7 @@ def resolve_prerequisites(
         source=source,
         selection=selection,
         plan=plan,
-        contract=contract,
+        contract=contract_row,
         final_clip=final_clip,
         visual_plan=visual_plan,
         profile=profile,
@@ -283,6 +309,17 @@ def _final_clip_evidence(row: CandidateRefinement) -> FinalClipEvidence:
         usable=True,
         manual_override=bool(row.manual_transcript),
     )
+
+
+def _plan_target_context(plan_set: TransformationPlanSet) -> dict[str, object]:
+    """Authoritative persisted planning context for a selected plan set.
+
+    The planning executor persists the target/audience/narration context on the
+    plan *set*; the individual plan row's ``target_context`` column is not the
+    authoritative source. Stage 6 must read the plan set's context.
+    """
+
+    return dict(plan_set.target_context or {})
 
 
 def _as_index(value: object) -> int:
@@ -384,6 +421,10 @@ def assemble_inputs(
     prereq = resolve_prerequisites(session, candidate_id, profile_key=profile_key)
     plan = prereq.plan
     blocks, bindings = _merge_blocks(prereq.contract, plan)
+    plan_set = session.get(TransformationPlanSet, plan.plan_set_id)
+    if plan_set is None:
+        raise MaterializationStaleError("selected plan set no longer exists")
+    plan_target_context = _plan_target_context(plan_set)
 
     source_media = _source_media_evidence(prereq.contract)
     visual_plan = _visual_plan_evidence(prereq.visual_plan)
@@ -415,7 +456,7 @@ def assemble_inputs(
         original_value_kinds=tuple(plan.original_value_kinds or []),
         required_context=tuple(plan.required_context or []),
         preservation_constraints=tuple(plan.preservation_constraints or []),
-        plan_target_context=dict(plan.target_context or {}),
+        plan_target_context=plan_target_context,
         contract_id=str(prereq.contract.id),
         contract_status=prereq.contract.status.value,
         contract_input_fingerprint=prereq.contract.input_fingerprint,
@@ -526,8 +567,12 @@ def run_materialization(
         )
 
     narration_blocks = frozenset(chunk.block_index for chunk in narration)
+    narration_slots = _narration_slot_ids(inputs, narration_blocks)
     slot_resolutions = resolve_slots(
-        inputs, script.authored_blocks, narration_satisfied_blocks=narration_blocks
+        inputs,
+        script.authored_blocks,
+        narration_satisfied_blocks=narration_blocks,
+        narration_satisfied_slots=narration_slots,
     )
 
     supporting = _select_supporting(inputs, supporting_assets, config)
@@ -603,6 +648,39 @@ def _narration_required(inputs: MaterializationInputs) -> bool:
     return need in {"RECOMMENDED", "REQUIRED"}
 
 
+def _narration_slot_ids(
+    inputs: MaterializationInputs, narration_blocks: frozenset[int]
+) -> frozenset[str]:
+    """Contract narration slots fulfilled by validated generated audio.
+
+    A required ``AUTHORED_NARRATION`` slot is bound to a generated chunk when the
+    slot names a block that was narrated, or, for a slot without a block index,
+    when the plan's narration placement block was narrated. One validated audio
+    asset fulfils both a block and a contract slot without duplicate narration.
+    """
+
+    placement = None
+    requirements = inputs.narration.get("requirements")
+    if isinstance(requirements, Mapping):
+        candidate = requirements.get("placement_block_index")
+        if isinstance(candidate, int) and not isinstance(candidate, bool):
+            placement = candidate
+    satisfied: set[str] = set()
+    for slot in inputs.execution_slots:
+        if str(slot.get("slot_kind", "")) != "AUTHORED_NARRATION":
+            continue
+        if not bool(slot.get("required", False)):
+            continue
+        slot_id = str(slot.get("slot_id", ""))
+        block_index = slot.get("block_index")
+        if isinstance(block_index, int) and not isinstance(block_index, bool):
+            if block_index in narration_blocks:
+                satisfied.add(slot_id)
+        elif placement is not None and placement in narration_blocks:
+            satisfied.add(slot_id)
+    return frozenset(satisfied)
+
+
 def _synthesize_narration(
     inputs: MaterializationInputs,
     script: MaterializationScript,
@@ -652,7 +730,7 @@ def _select_supporting(
 def _supporting_need(inputs: MaterializationInputs) -> SupportingNeed | None:
     for block in inputs.blocks:
         if str(block.get("block_type", "")) in {"ORIGINAL_VALUE", "TEXTUAL_ANNOTATION"}:
-            return SupportingNeed(block_index=int(block.get("index", -1)))
+            return SupportingNeed(block_index=_as_index(block.get("index")))
     return None
 
 
@@ -706,12 +784,17 @@ def persist_materialization(
     *,
     render_execution_id: uuid.UUID | None = None,
     runtime_identity: Mapping[str, object] | None = None,
+    active_job_id: uuid.UUID | None = None,
+    claim_version: int | None = None,
 ) -> ClipMaterialization:
-    """Persist one durable materialization row (history-preserving).
+    """Persist one durable materialization row (history-preserving, fenced).
 
     Identical ``(candidate, profile, input fingerprint)`` work updates the
     existing row in place instead of inserting a duplicate; a genuinely changed
-    input creates a new history row and demotes the previous current one.
+    input creates a new history row and demotes the previous current one. When a
+    claim token is supplied, a superseded worker (older/equal claim on a row
+    already owned by a newer claim) is rejected, and the existing repair
+    allowance and durable call budget are preserved rather than reset.
     """
 
     outcome = result.assessment.outcome
@@ -726,9 +809,28 @@ def persist_materialization(
     )
     input_fp = input_fingerprint(inputs)
     candidate_uuid = _as_uuid(inputs.candidate_id)
-    # Demote every current row in this scope *before* creating/updating the
-    # target row, so the scoped partial unique index is never transiently
-    # violated when a changed input creates a new history row.
+    row = session.scalars(
+        select(ClipMaterialization).where(
+            ClipMaterialization.clip_candidate_id == candidate_uuid,
+            ClipMaterialization.profile_key == inputs.profile.profile_key,
+            ClipMaterialization.input_fingerprint == input_fp,
+        )
+    ).first()
+
+    # Fence *before* touching any authoritative state: a superseded worker must
+    # never demote or replace a newer current row.
+    if (
+        claim_version is not None
+        and row is not None
+        and int(row.claim_version or 0) > claim_version
+    ):
+        raise MaterializationStaleError(
+            "a newer claim already owns this materialization; refusing a stale write"
+        )
+
+    # Demote every current row in this scope before creating/updating the target
+    # row, so the scoped partial unique index is never transiently violated when
+    # a changed input creates a new history row.
     session.execute(
         update(ClipMaterialization)
         .where(
@@ -738,13 +840,6 @@ def persist_materialization(
         .values(is_current=False)
         .execution_options(synchronize_session="fetch")
     )
-    row = session.scalars(
-        select(ClipMaterialization).where(
-            ClipMaterialization.clip_candidate_id == candidate_uuid,
-            ClipMaterialization.profile_key == inputs.profile.profile_key,
-            ClipMaterialization.input_fingerprint == input_fp,
-        )
-    ).first()
     if row is None:
         row = ClipMaterialization(
             source_video_id=_as_uuid(inputs.source_id),
@@ -753,6 +848,12 @@ def persist_materialization(
         )
         session.add(row)
 
+    # Preserve the single repair allowance and the durable call budget across
+    # retries of identical work; a re-submission never resets either.
+    preserved_repair = int(row.repair_count or 0)
+    preserved_ledger = CallLedger.from_dict(row.call_ledger)
+    preserved_repair_actions = list(row.repair_actions or [])
+
     row.channel_production_profile_id = _optional_uuid(inputs.profile.profile_id)
     row.selection_id = _optional_uuid(inputs.selection_id)
     row.selected_plan_id = _optional_uuid(inputs.plan_id)
@@ -760,6 +861,10 @@ def persist_materialization(
     row.render_contract_id = _optional_uuid(inputs.contract_id)
     row.visual_composition_plan_id = _optional_uuid(inputs.visual_plan.visual_plan_id)
     row.render_execution_id = render_execution_id
+    if active_job_id is not None:
+        row.active_job_id = active_job_id
+    if claim_version is not None:
+        row.claim_version = claim_version
     row.priority = MaterializationPriority(inputs.priority)
     row.lifecycle = lifecycle
     row.semantic_outcome = MaterializationOutcome(outcome)
@@ -767,7 +872,7 @@ def persist_materialization(
     row.publication_ready = False
     row.cache_eligible = False
     row.is_current = True
-    row.repair_count = 0
+    row.repair_count = preserved_repair
     row.reason_codes = list(result.reason_codes)
     row.upstream_fingerprints = {
         "selection_output_fingerprint": inputs.selection_output_fingerprint,
@@ -792,7 +897,7 @@ def persist_materialization(
         timeline_fp=_checkpoint_fingerprint(result.component_checkpoints, "TIMELINE"),
     )
     row.component_checkpoints = dict(result.component_checkpoints)
-    row.call_ledger = result.ledger.as_dict()
+    row.call_ledger = _merge_call_ledger(preserved_ledger, result.ledger)
     row.authored_blocks = [block.as_dict() for block in result.script.authored_blocks]
     row.claim_ledger = [
         block.as_dict() for block in result.script.authored_blocks if block.claim_class
@@ -805,7 +910,7 @@ def persist_materialization(
     row.timeline_payload = result.timeline.as_dict()
     row.audio_recipe = result.audio_recipe.as_dict()
     row.quality_findings = [finding.as_dict() for finding in result.assessment.findings]
-    row.repair_actions = []
+    row.repair_actions = preserved_repair_actions
     row.metrics = {
         "segments": len(result.timeline.segments),
         "output_duration": round(result.timeline.output_duration, 6),
@@ -818,6 +923,15 @@ def persist_materialization(
     session.commit()
     session.refresh(row)
     return row
+
+
+def _merge_call_ledger(preserved: CallLedger, current: CallLedger) -> dict[str, object]:
+    return CallLedger(
+        semantic=max(preserved.semantic, current.semantic),
+        strong=max(preserved.strong, current.strong),
+        synthesis=max(preserved.synthesis, current.synthesis),
+        ledger_entries=[*preserved.ledger_entries, *current.ledger_entries],
+    ).as_dict()
 
 
 def _checkpoint_fingerprint(checkpoints: Mapping[str, object], name: str) -> str:

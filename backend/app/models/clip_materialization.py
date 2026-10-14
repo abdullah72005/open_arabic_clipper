@@ -134,6 +134,11 @@ class ClipMaterialization(Base):
     active_job_id: Mapped[UUID | None] = mapped_column(
         ForeignKey("processing_jobs.id", ondelete="SET NULL"), index=True
     )
+    # Durable ownership token. Every successful claim advances it, so a
+    # superseded worker can never replace a newer current materialization.
+    claim_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
 
     priority: Mapped[MaterializationPriority] = mapped_column(
         Enum(

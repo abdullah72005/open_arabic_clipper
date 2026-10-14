@@ -58,6 +58,21 @@ def test_stage_6_migration_declares_revision_metadata() -> None:
     assert module.down_revision == "20260918_0022"
 
 
+def test_stage_6_fencing_migration_declares_revision_metadata() -> None:
+    path = (
+        Path(__file__).parents[1]
+        / "alembic"
+        / "versions"
+        / "20261014_0024_stage_6_materialization_fencing.py"
+    )
+    specification = importlib.util.spec_from_file_location("stage_6_fencing_migration", path)
+    assert specification is not None and specification.loader is not None
+    module = importlib.util.module_from_spec(specification)
+    specification.loader.exec_module(module)
+    assert module.revision == "20261014_0024"
+    assert module.down_revision == "20261014_0023"
+
+
 def test_stage_6_migration_is_reversible_and_preserves_prior_stages() -> None:
     backend_root = Path(__file__).parents[1]
     config = Config()
@@ -106,6 +121,9 @@ def test_stage_6_migration_is_reversible_and_preserves_prior_stages() -> None:
         inspector = inspect(engine)
         assert "clip_materializations" in inspector.get_table_names()
         assert "channel_production_profiles" in inspector.get_table_names()
+        assert "claim_version" in {
+            column["name"] for column in inspector.get_columns("clip_materializations")
+        }
         assert "materialization_id" in {
             column["name"] for column in inspector.get_columns("processing_jobs")
         }

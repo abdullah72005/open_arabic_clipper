@@ -415,15 +415,19 @@ def test_missing_required_slot_is_no_output() -> None:
     assert assessment.outcome == MaterializationOutcome.NO_OUTPUT.value
 
 
-def test_nonfinite_measurement_is_unmet_not_success() -> None:
+def test_nonfinite_measurement_defers_not_success() -> None:
     assessment = assess_materialization(
-        AssessmentContext(render_qc_status="PASS", measured_loudness_lufs=float("nan")),
+        AssessmentContext(
+            render_qc_status="PASS",
+            measured_loudness_lufs=float("nan"),
+            measured_true_peak_dbtp=-2.0,
+        ),
         output_duration=30.0,
         config=DEFAULT_CONFIG,
     )
-    assert assessment.outcome == MaterializationOutcome.REJECTED_QUALITY.value
+    assert assessment.outcome == MaterializationOutcome.DEFERRED_EVIDENCE.value
     assert any(
-        finding.level == QualityLevel.UNMET.value
+        finding.level == QualityLevel.UNKNOWN.value
         and "NONFINITE_MEASUREMENT" in finding.reason_codes
         for finding in assessment.findings
     )
@@ -431,6 +435,12 @@ def test_nonfinite_measurement_is_unmet_not_success() -> None:
 
 def test_oversize_timeline_is_rejected_not_truncated() -> None:
     assessment = assess_materialization(
-        AssessmentContext(), output_duration=200.0, config=DEFAULT_CONFIG
+        AssessmentContext(
+            render_qc_status="PASS",
+            measured_loudness_lufs=-16.0,
+            measured_true_peak_dbtp=-2.0,
+        ),
+        output_duration=200.0,
+        config=DEFAULT_CONFIG,
     )
     assert assessment.outcome == MaterializationOutcome.REJECTED_QUALITY.value
