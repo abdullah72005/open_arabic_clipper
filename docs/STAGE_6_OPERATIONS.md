@@ -1,9 +1,11 @@
 # Stage 6 transformed-short materialization operations
 
-Status: **IN PROGRESS.** The durable persistence and the deterministic
-materialization core are implemented and tested. The DB-assembly
-service/queue/executor, the semantic/TTS provider adapters, the authored renderer
-integration, the candidate-scoped API/CLI/UI, and real manual acceptance are not
+Status: **IN PROGRESS.** The durable persistence, the deterministic
+materialization core, and the candidate-scoped queue/executor/worker/API/CLI are
+implemented and tested (the executor assembles inputs through genuine persisted
+ORM relationships and persists a fenced current row). The Stage 5.2
+`TRANSFORMED_SHORT` authored renderer, the idempotent finalizer, the semantic/TTS
+provider adapters, the review UI integration, and real manual acceptance are not
 yet implemented. Stage 6 remains awaiting human media review and SOL review; it
 is not frozen.
 

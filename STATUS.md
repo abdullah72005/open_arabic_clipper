@@ -1,5 +1,52 @@
 # Runtime status
 
+## Stage 6 third-review corrections and production dispatch path (2026-10-14)
+
+Status: **the three third-round SOL-review defects are corrected with regressions
+(commit `9084370`), and the production dispatch path is implemented: a
+candidate-scoped Stage 6 queue, durable executor, Celery task, API, and CLI drive
+`assemble_inputs` through genuine persisted ORM relationships into a fenced,
+current `clip_materializations` row (commits `fa8961c`, `71400db`). The reusable
+Stage 5.2 `TRANSFORMED_SHORT` renderer (authored cards/overlays, mixed/mastered
+audio, final-purpose QC), the idempotent Stage 6 finalizer, hosted
+writing/critique/TTS adapters, the review UI integration, and the genuine
+manual-acceptance package remain outstanding. No transformed-short MP4 exists.
+Stage 6 is NOT FROZEN.**
+
+- **Third-round corrections (`9084370`).** (1) `persist_materialization` fences the
+  whole candidate/profile scope before any authoritative mutation: a newer/equal
+  claim on a different current generation can never be demoted by a historical
+  token, and a worker mutation must present its exact active job identity, claim
+  token, and a RUNNING executing job. (2) `CallLedger` is replay-safe and
+  durable: each raw attempt is reserved under a unique identity before
+  invocation; replayed/crashed attempts stay budget-consumed and are never
+  re-invoked; merging unions attempts by identity (no blind addition or max of
+  partial counters); ceilings hold across the whole generation. (3)
+  `transcription_matches` folds Arabic orthographic variants and uses order- and
+  occurrence-aware alignment (negation/number set-and-order, Latin order,
+  first-occurrence order of distinct content tokens, ordered-LCS coverage),
+  rejecting reversed participant attribution and changed number attribution.
+- **Production dispatch path (`fa8961c`, `71400db`).** `queue_materialization`
+  validates every current live-effective prerequisite and claims a single
+  `MATERIALIZATION` job per candidate/refinement scope via an atomic CAS on the
+  durable dispatch token. `MaterializationExecutor` claims/fences the job,
+  re-derives prerequisites, assembles inputs through persisted ORM rows, resumes
+  the durable call ledger, runs the bounded deterministic pipeline, and persists
+  a fenced current row; it observes cancellation and releases providers on every
+  exit path. `run_materialization_job` wraps it with the existing job
+  ownership/retry conventions; `POST/GET /api/candidates/{id}/materialization`
+  and `materialize`/`materialization-status` expose it. A latent `RenderContract`
+  binding bug (`transformation_selection_id`, not `selection_id`) was fixed.
+- **Remaining acceptance blockers (concrete).** The Stage 5.2 `TRANSFORMED_SHORT`
+  renderer (authored-timeline execution, cards/overlays, explicit audio tracks
+  and gain envelopes, final mix measurement/mastering at `-16 LUFS`/`-1.5 dBTP`,
+  final-purpose QC), the idempotent Stage 6 finalizer, hosted writing/critique/TTS
+  adapters (the default bundle is deterministic and network-free), review UI
+  integration, and the genuine manual-acceptance package. Required verification
+  under Python 3.12 and disposable PostgreSQL was not run (host Python 3.10.12
+  only); the renderer is the load-bearing prerequisite for any transformed MP4
+  and needs real FFmpeg execution.
+
 ## Stage 6 second-review corrections (2026-10-14)
 
 Status: **the seven second-round SOL-review defects are corrected with
