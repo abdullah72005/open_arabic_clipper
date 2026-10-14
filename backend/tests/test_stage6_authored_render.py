@@ -200,23 +200,35 @@ def _spec(source: Path, narration: Path) -> RenderSpec:
         ],
         "assets": list(assets),
         "tracks": [
+            # source 0-3s -> output 0-3s
             {
-                "track_id": "t-src",
+                "track_id": "t-src-a",
                 "asset_id": "src",
                 "source_start_seconds": 0.0,
-                "source_end_seconds": 6.0,
+                "source_end_seconds": 3.0,
                 "output_start_sample": 0,
-                "output_end_sample": 336000,
+                "output_end_sample": 144000,
                 "gain_points": [{"sample_index": 0, "gain_db": 0.0}],
             },
+            # narration 0-1s -> output 3-4s (inside the inserted card)
             {
                 "track_id": "t-narr",
                 "asset_id": "narr",
                 "source_start_seconds": 0.0,
                 "source_end_seconds": 1.0,
-                "output_start_sample": 168000,
-                "output_end_sample": 216000,
-                "gain_points": [{"sample_index": 168000, "gain_db": 0.0}],
+                "output_start_sample": 144000,
+                "output_end_sample": 192000,
+                "gain_points": [{"sample_index": 144000, "gain_db": 0.0}],
+            },
+            # source 3-6s -> output 4-7s
+            {
+                "track_id": "t-src-b",
+                "asset_id": "src",
+                "source_start_seconds": 3.0,
+                "source_end_seconds": 6.0,
+                "output_start_sample": 192000,
+                "output_end_sample": 336000,
+                "gain_points": [{"sample_index": 192000, "gain_db": 0.0}],
             },
         ],
         "authored_ass": {
@@ -322,6 +334,33 @@ def _mean_luma(video: Path, timestamp: float) -> float:
     return (sum(data) / len(data)) if data else 0.0
 
 
+def _decoded_audio_samples(video: Path) -> int:
+    """Decode the audio stream and count real interleaved stereo samples."""
+
+    settings = get_settings()
+    completed = subprocess.run(  # noqa: S603
+        [
+            settings.ffmpeg_binary,
+            "-v",
+            "error",
+            "-i",
+            str(video),
+            "-map",
+            "0:a",
+            "-f",
+            "s16le",
+            "-ac",
+            "2",
+            "-ar",
+            "48000",
+            "-",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    return len(completed.stdout) // 4
+
+
 def test_authored_render_produces_one_real_mp4(workspace: Path) -> None:
     source = workspace / "source.mp4"
     narration = workspace / "narr.wav"
@@ -332,6 +371,7 @@ def test_authored_render_produces_one_real_mp4(workspace: Path) -> None:
     assert compiled.compiler_version.startswith("stage6-authored")
     assert compiled.authored_ass_localized_name == "authored.ass"
     assert compiled.input_relative_paths == ("narr.wav",)
+    assert compiled.audio_preparation is not None
 
     context = AttemptContext(
         attempt_directory=workspace,
@@ -348,7 +388,18 @@ def test_authored_render_produces_one_real_mp4(workspace: Path) -> None:
     assert artifacts.probe["audio_sample_rate"] == 48000
     assert artifacts.probe["audio_channels"] == 2
     assert artifacts.frame_count > 0
-    assert abs(artifacts.duration_seconds - 7.0) < 0.4
+
+    # Actual stream timing (not only container duration): the audio stream must
+    # cover the same 7.0 s as the video, with the inserted card's 1 s gap present.
+    assert abs(artifacts.probe["video_duration"] - 7.0) < 0.05
+    assert abs(artifacts.probe["audio_duration"] - 7.0) < 0.05
+    assert abs(artifacts.probe["audio_duration"] - artifacts.probe["video_duration"]) < 0.05
+    samples = _decoded_audio_samples(output)
+    assert abs(samples - 336000) <= 2048
+
+    # The lossless mix is mastered and re-encoded exactly once.
+    assert (workspace / "mix-unmastered.wav").is_file()
+    assert (workspace / "mix-master.wav").is_file()
 
     # Card frames actually appear: the card interval is a near-black authored
     # card with legible text, so its mean luma is far below the animated source.
@@ -356,3 +407,105 @@ def test_authored_render_produces_one_real_mp4(workspace: Path) -> None:
     source_luma = _mean_luma(output, 1.5)
     assert card_luma < source_luma
     assert card_luma < 60.0
+
+
+def test_authored_audio_recipe_places_source_and_narration_at_samples(workspace: Path) -> None:
+    source = workspace / "source.mp4"
+    narration = workspace / "narr.wav"
+    spec = _spec(source, narration)
+    compiled = compile_render(spec, _runtime(source, workspace))
+    plan = compiled.audio_preparation
+    assert plan is not None
+    graph = plan.mix_filtergraph
+    # Two distinct source intervals (0-3s and 3-6s) over one decoded source input.
+    assert "asplit=2" in graph
+    assert "atrim=start=0:end=3" in graph
+    assert "atrim=start=3:end=6" in graph
+    assert "atrim=start=0:end=1" in graph
+    # Sample-based placement: narration delayed exactly 3.0 s = 144000 samples.
+    assert "adelay=delays=144000S" in graph
+    assert "adelay=delays=192000S" in graph
+    # The mix is float and trimmed to the authoritative sample count (336000).
+    assert "pcm_f32le" in plan.mix_argv
+    assert "atrim=0:7" in graph
+
+
+def test_authored_nonconstant_gain_envelope_is_executed(workspace: Path) -> None:
+    source = workspace / "source.mp4"
+    narration = workspace / "narr.wav"
+    spec = _spec(source, narration)
+    payload = spec.authored
+    assert payload is not None
+    tracks = []
+    for track in payload.tracks:
+        data = track.as_dict()
+        if track.track_id == "t-narr":
+            data["gain_points"] = [
+                {"sample_index": 144000, "gain_db": 0.0},
+                {"sample_index": 168000, "gain_db": -9.0},
+                {"sample_index": 192000, "gain_db": -9.0},
+            ]
+        tracks.append(data)
+    payload_dict = payload.as_dict()
+    payload_dict["tracks"] = tracks
+    from dataclasses import replace
+
+    from app.render.execution.authored import AuthoredRenderPayload
+
+    spec = replace(spec, authored=AuthoredRenderPayload.from_dict(payload_dict))
+    compiled = compile_render(spec, _runtime(source, workspace))
+    plan = compiled.audio_preparation
+    assert plan is not None
+    # Every gain point is executed as an explicit ramp, never silently dropped.
+    assert "volume='pow(10" in plan.mix_filtergraph
+    assert "eval=frame" in plan.mix_filtergraph
+
+    context = AttemptContext(
+        attempt_directory=workspace,
+        ass_bytes=_CANONICAL_ASS.encode("utf-8"),
+        authored_ass_bytes=_AUTHORED_ASS.encode("utf-8"),
+        timeout_seconds=120.0,
+    )
+    artifacts = run_compiled_render(compiled, context)
+    assert abs(artifacts.probe["audio_duration"] - 7.0) < 0.05
+
+
+def test_later_source_scene_framing_changes_the_filtergraph(workspace: Path) -> None:
+    """Every accepted SOURCE scene must be executed, in source order."""
+
+    from dataclasses import replace
+
+    from app.render.execution.types import CropKeyframeSpec, SceneSpec, TimelineOccurrence
+
+    source = workspace / "source.mp4"
+    narration = workspace / "narr.wav"
+    base = _spec(source, narration)
+
+    wide = (CropKeyframeSpec(t=0.0, cx=0.5, cy=0.5, height_fraction=0.5, mode="STATIC"),)
+    tall = (CropKeyframeSpec(t=0.0, cx=0.5, cy=0.5, height_fraction=1.0, mode="STATIC"),)
+    hero_scenes = (
+        SceneSpec(0, 0, 0.0, 1.5, "STATIC", "NONE", tall),
+        SceneSpec(1, 0, 1.5, 3.0, "STATIC", "NONE", wide),
+    )
+    hero = TimelineOccurrence("occ-0", 0, 0.0, 3.0, 0.0, 3.0, "HERO", True, hero_scenes)
+    occurrences = (hero, base.occurrences[1])
+
+    spec_two = replace(base, occurrences=occurrences)
+    compiled_two = compile_render(spec_two, _runtime(source, workspace))
+
+    # Changing only the *second* scene's framing must change the executed graph.
+    hero_scenes_flat = (
+        SceneSpec(0, 0, 0.0, 1.5, "STATIC", "NONE", tall),
+        SceneSpec(1, 0, 1.5, 3.0, "STATIC", "NONE", tall),
+    )
+    occurrences_flat = (
+        TimelineOccurrence("occ-0", 0, 0.0, 3.0, 0.0, 3.0, "HERO", True, hero_scenes_flat),
+        base.occurrences[1],
+    )
+    compiled_flat = compile_render(
+        replace(base, occurrences=occurrences_flat), _runtime(source, workspace)
+    )
+    assert compiled_two.filtergraph != compiled_flat.filtergraph
+    assert compiled_two.fingerprint != compiled_flat.fingerprint
+    # Both scenes are present (two framing segments for the hero unit).
+    assert compiled_two.filtergraph.count("crop=") >= 2

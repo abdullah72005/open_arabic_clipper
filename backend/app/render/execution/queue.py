@@ -99,6 +99,7 @@ def queue_render_execution(
     row = _get_or_create_envelope(
         session,
         candidate,
+        artifact_purpose=artifact_purpose,
         spec=spec,
         input_fingerprint=fingerprint,
         delivery_profile_key=delivery_profile_key,
@@ -117,6 +118,7 @@ def queue_render_execution(
                 session,
                 candidate.id,
                 resolved,
+                artifact_purpose=artifact_purpose,
                 expected_input_fingerprint=fingerprint,
             )
             if cached is not None and cached.id == row.id:
@@ -127,6 +129,7 @@ def queue_render_execution(
                     queued=False,
                     cached=True,
                     active=False,
+                    artifact_purpose=artifact_purpose,
                     delivery_profile_key=delivery_profile_key,
                 )
         job = ProcessingJob(
@@ -147,6 +150,7 @@ def queue_render_execution(
                 queued=True,
                 cached=False,
                 active=False,
+                artifact_purpose=artifact_purpose,
                 delivery_profile_key=delivery_profile_key,
             )
         session.rollback()
@@ -195,6 +199,7 @@ def _get_or_create_envelope(
     session: Session,
     candidate: ClipCandidate,
     *,
+    artifact_purpose: str,
     spec: object,
     input_fingerprint: str,
     delivery_profile_key: str,
@@ -207,8 +212,14 @@ def _get_or_create_envelope(
     if existing is not None:
         _reactivate(session, existing, delivery_profile_key)
         return cast(RenderExecution, existing)
+    # Current lookup is scoped by (candidate, artifact_purpose, delivery profile):
+    # creating a transformed row must never demote a coexisting core validation
+    # row (and vice versa).
     current = get_current_render_execution(
-        session, candidate.id, delivery_profile_key=delivery_profile_key
+        session,
+        candidate.id,
+        artifact_purpose=artifact_purpose,
+        delivery_profile_key=delivery_profile_key,
     )
     if current is not None:
         current.is_current = False
@@ -297,6 +308,7 @@ def _active_outcome(row: RenderExecution, job: ProcessingJob) -> RenderQueueOutc
         queued=False,
         cached=False,
         active=True,
+        artifact_purpose=row.artifact_purpose.value,
         delivery_profile_key=row.delivery_profile_key,
     )
 

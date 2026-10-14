@@ -646,7 +646,7 @@ def _validate_tracks(payload: AuthoredRenderPayload, assets: Mapping[str, MediaA
 _SOURCE_ASS_LOCAL_NAME = "captions.ass"
 _AUTHORED_ASS_LOCAL_NAME = "authored.ass"
 _AUTHORED_OUTPUT_NAME = "output.mp4"
-_AUTHORED_FILTERGRAPH_NAME = "filtergraph.txt"
+_AUTHORED_FILTERGRAPH_NAME = "authored-filtergraph.txt"
 _AUTHORED_AUDIO_CODEC = "aac"
 _AUTHORED_AUDIO_BITRATE = "192k"
 
@@ -656,18 +656,125 @@ def _num(value: float) -> str:
     return text or "0"
 
 
-def compile_authored_render(spec: Any, runtime_identity: RuntimeIdentity) -> CompiledRender:
-    """Compile a TRANSFORMED_SHORT authored render into one FFmpeg command.
+def _esc(expression: str) -> str:
+    return expression.replace(",", "\\,").replace(":", "\\:")
 
-    Builds an ordered visual concat of SOURCE units (framed and captioned in
-    source time with the canonical Stage 5.1 ASS, exactly as the core compiler)
-    and CARD units, applies the Stage 6 authored ASS in output time after
-    concatenation, and mixes the explicit audio tracks (source + narration
-    inputs) with an explicit mastering pass, then performs exactly one
-    H.264/AAC encode.
+
+def _validate_source_units(
+    spec: Any,
+    payload: AuthoredRenderPayload,
+    fps_value: float,
+) -> dict[str, Any]:
+    """Validate SOURCE-unit/occurrence/frame mappings and full hero coverage."""
+
+    from app.render.execution.policy import (
+        AUTHORED_HERO_COVERAGE_MISSING,
+        AUTHORED_SOURCE_MAPPING_INVALID,
+    )
+
+    occurrences = {occurrence.occurrence_id: occurrence for occurrence in spec.occurrences}
+    tolerance = max(0.5 / fps_value, 0.05)
+    referenced: dict[str, Any] = {}
+    for unit in payload.units:
+        if unit.kind != UNIT_SOURCE:
+            continue
+        occurrence = occurrences.get(unit.occurrence_id or "")
+        if occurrence is None or not occurrence.scenes:
+            raise AuthoredPayloadError(
+                AUTHORED_SOURCE_MAPPING_INVALID, "SOURCE unit has no occurrence"
+            )
+        if occurrence.occurrence_id in referenced:
+            raise AuthoredPayloadError(
+                AUTHORED_SOURCE_MAPPING_INVALID, "occurrence referenced twice"
+            )
+        unit_duration = (unit.end_frame - unit.start_frame) / fps_value
+        occurrence_duration = occurrence.source_end - occurrence.source_start
+        if abs(unit_duration - occurrence_duration) > tolerance:
+            raise AuthoredPayloadError(
+                AUTHORED_SOURCE_MAPPING_INVALID, "unit frames do not match the occurrence span"
+            )
+        scenes = sorted(occurrence.scenes, key=lambda scene: scene.source_start)
+        if scenes[0].source_start > occurrence.source_start + tolerance:
+            raise AuthoredPayloadError(AUTHORED_SOURCE_MAPPING_INVALID, "scene coverage gap")
+        if scenes[-1].source_end < occurrence.source_end - tolerance:
+            raise AuthoredPayloadError(AUTHORED_SOURCE_MAPPING_INVALID, "scene coverage gap")
+        previous_end: float | None = None
+        for scene in scenes:
+            if scene.source_end <= scene.source_start:
+                raise AuthoredPayloadError(AUTHORED_SOURCE_MAPPING_INVALID, "empty scene")
+            if previous_end is not None and abs(scene.source_start - previous_end) > tolerance:
+                raise AuthoredPayloadError(
+                    AUTHORED_SOURCE_MAPPING_INVALID, "scenes are not contiguous"
+                )
+            previous_end = scene.source_end
+        referenced[occurrence.occurrence_id] = occurrence
+    heroes = [occurrence for occurrence in spec.occurrences if occurrence.is_hero]
+    if not heroes:
+        raise AuthoredPayloadError(AUTHORED_HERO_COVERAGE_MISSING, "no hero occurrence")
+    for hero in heroes:
+        if hero.occurrence_id not in referenced:
+            raise AuthoredPayloadError(
+                AUTHORED_HERO_COVERAGE_MISSING, "hero occurrence is not fully covered"
+            )
+    return occurrences
+
+
+def _volume_filter(track: Any, sample_rate: int) -> str:
+    """Build the explicit gain envelope for one track (all points, or nothing)."""
+
+    points = list(track.gain_points)
+    if not points:
+        return ""
+    if len(points) == 1:
+        gain = points[0].gain_db
+        return "" if abs(gain) < 1e-9 else f"volume={_num(gain)}dB"
+    if all(abs(point.gain_db - points[0].gain_db) < 1e-9 for point in points):
+        gain = points[0].gain_db
+        return "" if abs(gain) < 1e-9 else f"volume={_num(gain)}dB"
+    # Local time (relative to the track's own zero PTS) for each gain point.
+    local = [
+        ((point.sample_index - track.output_start_sample) / sample_rate, point.gain_db)
+        for point in points
+    ]
+    expression = _num(local[-1][1])
+    for index in range(len(local) - 2, -1, -1):
+        left_t, left_g = local[index]
+        right_t, right_g = local[index + 1]
+        if abs(right_t - left_t) < 1e-12:
+            segment = _num(left_g)
+        else:
+            segment = (
+                f"({_num(left_g)}+(({_num(right_g)})-({_num(left_g)}))*"
+                f"((t-({_num(left_t)}))/({_num(right_t - left_t)})))"
+            )
+        expression = f"if(lt(t\\,{_num(right_t)})\\,{segment}\\,{expression})"
+    expression = f"if(lt(t\\,{_num(local[0][0])})\\,{_num(local[0][1])}\\,{expression})"
+    return f"volume='pow(10\\,({expression})/20)':eval=frame"
+
+
+def compile_authored_render(spec: Any, runtime_identity: RuntimeIdentity) -> CompiledRender:
+    """Compile a TRANSFORMED_SHORT authored render into typed FFmpeg commands.
+
+    Builds an ordered visual concat of SOURCE units (every accepted scene, framed
+    and captioned in source time with the canonical Stage 5.1 ASS, exactly as the
+    core compiler) and CARD units, applies the Stage 6 authored ASS in output time
+    after concatenation, and returns the final H.264/AAC encode command plus an
+    explicit lossless audio-preparation plan (mix -> measure -> master). The
+    runner executes the plan phases under one shared deadline before the encode.
     """
 
-    from app.render.execution.compiler import _framing_segment  # local: avoid cycle
+    from app.render.execution.audio import (
+        AUDIO_SAMPLE_FORMAT,
+        MASTER_MIX_FILTERGRAPH_NAME,
+        MASTER_RELATIVE_NAME,
+        UNMASTERED_RELATIVE_NAME,
+        AudioPreparationPlan,
+    )
+    from app.render.execution.compiler import (  # local: avoid cycle
+        _SOURCE_START_EPSILON,
+        _framing_segment,
+        _occurrence_leading_gap,
+    )
     from app.render.execution.policy import delivery_profile_for
     from app.render.execution.types import (
         CompiledRender,
@@ -689,11 +796,11 @@ def compile_authored_render(spec: Any, runtime_identity: RuntimeIdentity) -> Com
     fps_value = frame_rate.numerator / frame_rate.denominator
     sample_rate = 48000
 
-    occurrences = {occurrence.occurrence_id: occurrence for occurrence in spec.occurrences}
+    occurrences = _validate_source_units(spec, payload, fps_value)
     assets = {asset.asset_id: asset for asset in payload.assets}
     localized = dict(getattr(runtime_identity, "asset_localized_paths", {}) or {})
 
-    # Extra FFmpeg inputs (after the source at index 0), deterministic by asset id.
+    # Extra FFmpeg inputs for the lossless mix (after the source at index 0).
     referenced_assets: list[str] = []
     for track in payload.tracks:
         asset = assets.get(track.asset_id)
@@ -713,41 +820,77 @@ def compile_authored_render(spec: Any, runtime_identity: RuntimeIdentity) -> Com
         input_index[asset_id] = offset
         extra_inputs.append(name)
 
+    # --- Video graph: every accepted source scene, then ordered cards ---
+    source_units = [unit for unit in payload.units if unit.kind == UNIT_SOURCE]
+    total_scenes = sum(len(occurrences[unit.occurrence_id or ""].scenes) for unit in source_units)
     lines: list[str] = []
     nodes: list[FilterNode] = []
+    if total_scenes <= 1:
+        video_sources = ["0:v"]
+    else:
+        labels = "".join(f"[vin{index}]" for index in range(total_scenes))
+        lines.append(f"[0:v]split={total_scenes}{labels}")
+        video_sources = [f"vin{index}" for index in range(total_scenes)]
+
+    scene_cursor = 0
     unit_video: list[str] = []
     for unit in payload.units:
         label = f"vu_{unit.unit_id}"
         if unit.kind == UNIT_SOURCE:
-            occurrence = occurrences.get(unit.occurrence_id or "")
-            if occurrence is None or not occurrence.scenes:
-                raise AuthoredPayloadError(_REASON_UNIT, "SOURCE unit has no occurrence")
-            scene = occurrence.scenes[0]
-            trimmed = f"vtr_{unit.unit_id}"
-            framed = f"vfr_{unit.unit_id}"
-            lines.append(
-                f"[0:v]trim=start={_num(occurrence.source_start)}:"
-                f"end={_num(occurrence.source_end)}[{trimmed}]"
-            )
-            segment_lines, geometry = _framing_segment(spec, scene, trimmed, framed)
-            lines.extend(segment_lines)
-            lines.append(
-                f"[{framed}]ass={_SOURCE_ASS_LOCAL_NAME},setsar=1,"
-                f"format={profile.pixel_format},setpts=PTS-STARTPTS[{label}]"
-            )
-            nodes.append(
-                FilterNode(
-                    kind="authored_source",
-                    inputs=(trimmed,),
-                    output=label,
-                    params={"occurrence_id": occurrence.occurrence_id, **geometry},
+            occurrence = occurrences[unit.occurrence_id or ""]
+            scenes = sorted(occurrence.scenes, key=lambda scene: scene.source_start)
+            scene_outputs: list[str] = []
+            for scene in scenes:
+                source_label = video_sources[scene_cursor]
+                scene_cursor += 1
+                trimmed = f"vtr_{unit.unit_id}_{scene.scene_index}"
+                framed = f"vfr_{unit.unit_id}_{scene.scene_index}"
+                scene_out = f"vsc_{unit.unit_id}_{scene.scene_index}"
+                lines.append(
+                    f"[{source_label}]trim=start={_num(scene.source_start)}:"
+                    f"end={_num(scene.source_end)}[{trimmed}]"
                 )
+                segment_lines, geometry = _framing_segment(spec, scene, trimmed, framed)
+                lines.extend(segment_lines)
+                leading = _occurrence_leading_gap(
+                    spec.source_video_start_seconds, scene.source_start
+                )
+                tpad = (
+                    f",tpad=start_duration={_num(leading)}:start_mode=clone"
+                    if leading > _SOURCE_START_EPSILON
+                    else ""
+                )
+                lines.append(
+                    f"[{framed}]ass={_SOURCE_ASS_LOCAL_NAME},setsar=1,"
+                    f"format={profile.pixel_format}{tpad},setpts=PTS-STARTPTS[{scene_out}]"
+                )
+                scene_outputs.append(scene_out)
+                nodes.append(
+                    FilterNode(
+                        kind="authored_source_scene",
+                        inputs=(source_label,),
+                        output=scene_out,
+                        params={
+                            "occurrence_id": occurrence.occurrence_id,
+                            "scene_index": scene.scene_index,
+                            **geometry,
+                        },
+                    )
+                )
+            if len(scene_outputs) == 1:
+                scene_concat = scene_outputs[0]
+            else:
+                scene_concat = f"voc_{unit.unit_id}"
+                inputs = "".join(f"[{scene_output}]" for scene_output in scene_outputs)
+                lines.append(f"{inputs}concat=n={len(scene_outputs)}:v=1:a=0[{scene_concat}]")
+            lines.append(
+                f"[{scene_concat}]fps={_num(fps_value)},setsar=1,"
+                f"format={profile.pixel_format}[{label}]"
             )
         else:
             duration = (unit.end_frame - unit.start_frame) / fps_value
-            background = "0x101010"
             lines.append(
-                f"color=c={background}:s={width}x{height}:r={_num(fps_value)}:"
+                f"color=c=0x101010:s={width}x{height}:r={_num(fps_value)}:"
                 f"d={_num(duration)},format={profile.pixel_format}[{label}]"
             )
             nodes.append(FilterNode(kind="authored_card", inputs=(), output=label, params={}))
@@ -756,41 +899,69 @@ def compile_authored_render(spec: Any, runtime_identity: RuntimeIdentity) -> Com
     concat_inputs = "".join(f"[{unit}]" for unit in unit_video)
     lines.append(f"{concat_inputs}concat=n={len(unit_video)}:v=1:a=0[vcat]")
     lines.append(f"[vcat]ass={_AUTHORED_ASS_LOCAL_NAME},format={profile.pixel_format}[outv]")
+    video_filtergraph = ";".join(lines)
 
-    audio_inputs: list[str] = []
+    # --- Lossless mix graph: every track, every gain point, sample placement ---
+    if not payload.tracks:
+        raise AuthoredPayloadError(_REASON_TRACK, "at least one audio track is required")
+    track_input_use: dict[int, int] = {}
     for track in payload.tracks:
-        asset = assets.get(track.asset_id)
-        if asset is None:
-            raise AuthoredPayloadError(_REASON_TRACK, "unknown track asset")
+        index = input_index.get(track.asset_id, 0)
+        track_input_use[index] = track_input_use.get(index, 0) + 1
+    audio_split_labels: dict[int, list[str]] = {}
+    mix_lines: list[str] = []
+    for index, count in sorted(track_input_use.items()):
+        if count <= 1:
+            audio_split_labels[index] = [f"{index}:a"]
+        else:
+            split_labels = [f"ain{index}_{position}" for position in range(count)]
+            joined = "".join(f"[{label}]" for label in split_labels)
+            mix_lines.append(f"[{index}:a]asplit={count}{joined}")
+            audio_split_labels[index] = split_labels
+
+    audio_use_cursor: dict[int, int] = {}
+    total_seconds = payload.sample_count / sample_rate
+    track_labels: list[str] = []
+    for track in payload.tracks:
         source_index = input_index.get(track.asset_id, 0)
+        position = audio_use_cursor.get(source_index, 0)
+        audio_use_cursor[source_index] = position + 1
+        source_label = audio_split_labels[source_index][position]
         label = f"at_{track.track_id}"
-        gain = track.gain_points[0].gain_db if track.gain_points else 0.0
-        gain_filter = "" if abs(gain) < 1e-9 else f",volume={_num(gain)}dB"
-        delay_ms = int(round(track.output_start_sample * 1000.0 / sample_rate))
-        delay_filter = f",adelay={delay_ms}|{delay_ms}" if delay_ms > 0 else ""
-        lines.append(
-            f"[{source_index}:a]atrim=start={_num(track.source_start_seconds)}:"
-            f"end={_num(track.source_end_seconds)},asetpts=PTS-STARTPTS{gain_filter}"
-            f"{delay_filter},aresample={profile.audio_sample_rate},"
-            f"aformat=sample_fmts=fltp:sample_rates={profile.audio_sample_rate}:"
-            f"channel_layouts=stereo[{label}]"
+        output_duration = (track.output_end_sample - track.output_start_sample) / sample_rate
+        chain = (
+            f"[{source_label}]atrim=start={_num(track.source_start_seconds)}:"
+            f"end={_num(track.source_end_seconds)},asetpts=PTS-STARTPTS,"
+            f"aresample={sample_rate},"
+            f"aformat=sample_fmts=fltp:sample_rates={sample_rate}:channel_layouts=stereo,"
+            f"atrim=0:{_num(output_duration)},apad=whole_dur={_num(output_duration)}"
         )
-        audio_inputs.append(label)
+        volume = _volume_filter(track, sample_rate)
+        if volume:
+            chain += f",{volume}"
+        if track.output_start_sample > 0:
+            chain += f",adelay=delays={track.output_start_sample}S:all=1"
+        mix_lines.append(f"{chain}[{label}]")
+        track_labels.append(label)
 
-    mastering = payload.mastering
-    mix_inputs = "".join(f"[{label}]" for label in audio_inputs)
-    lines.append(
-        f"{mix_inputs}amix=inputs={len(audio_inputs)}:normalize=0:dropout_transition=0,"
-        f"atrim=0:{_num(payload.sample_count / sample_rate)},"
-        f"aformat=sample_fmts=fltp:sample_rates={profile.audio_sample_rate}:"
-        f"channel_layouts=stereo,"
-        f"loudnorm=I={_num(mastering.target_lufs)}:TP={_num(mastering.ceiling_dbtp)}:"
-        f"LRA=11[aout]"
-    )
+    mix_inputs = "".join(f"[{label}]" for label in track_labels)
+    if len(track_labels) == 1:
+        mix_lines.append(
+            f"[{track_labels[0]}]apad=whole_dur={_num(total_seconds)},"
+            f"atrim=0:{_num(total_seconds)},"
+            f"aformat=sample_fmts=fltp:sample_rates={sample_rate}:"
+            f"channel_layouts=stereo[mixout]"
+        )
+    else:
+        mix_lines.append(
+            f"{mix_inputs}amix=inputs={len(track_labels)}:normalize=0:dropout_transition=0,"
+            f"apad=whole_dur={_num(total_seconds)},atrim=0:{_num(total_seconds)},"
+            f"aformat=sample_fmts=fltp:sample_rates={sample_rate}:"
+            f"channel_layouts=stereo[mixout]"
+        )
+    mix_filtergraph = ";".join(mix_lines)
 
-    filtergraph = ";".join(lines)
-
-    argv: list[str] = [
+    mix_argv: list[str] = [
         runtime_identity.ffmpeg_binary,
         "-nostdin",
         "-hide_banner",
@@ -804,7 +975,41 @@ def compile_authored_render(spec: Any, runtime_identity: RuntimeIdentity) -> Com
         runtime_identity.source_absolute_path,
     ]
     for name in extra_inputs:
-        argv.extend(["-i", name])
+        mix_argv.extend(["-i", name])
+    mix_argv.extend(
+        [
+            "-filter_complex_script",
+            MASTER_MIX_FILTERGRAPH_NAME,
+            "-map",
+            "[mixout]",
+            "-c:a",
+            AUDIO_SAMPLE_FORMAT,
+            "-ar",
+            str(sample_rate),
+            "-ac",
+            "2",
+            "-y",
+            UNMASTERED_RELATIVE_NAME,
+        ]
+    )
+
+    # --- Final encode: video graph + the lossless master as the only audio ---
+    master_input_index = 1
+    argv: list[str] = [
+        runtime_identity.ffmpeg_binary,
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-filter_threads",
+        str(max(1, runtime_identity.filter_threads)),
+        "-filter_complex_threads",
+        str(max(1, runtime_identity.filter_complex_threads)),
+        "-i",
+        runtime_identity.source_absolute_path,
+        "-i",
+        MASTER_RELATIVE_NAME,
+    ]
     argv.extend(
         [
             "-filter_complex_script",
@@ -812,7 +1017,7 @@ def compile_authored_render(spec: Any, runtime_identity: RuntimeIdentity) -> Com
             "-map",
             "[outv]",
             "-map",
-            "[aout]",
+            f"{master_input_index}:a",
             "-c:v",
             profile.video_codec,
             "-preset",
@@ -839,6 +1044,19 @@ def compile_authored_render(spec: Any, runtime_identity: RuntimeIdentity) -> Com
         argv.extend(["-movflags", "+faststart"])
     argv.extend(["-y", _AUTHORED_OUTPUT_NAME])
 
+    audio_plan = AudioPreparationPlan(
+        mix_argv=tuple(mix_argv),
+        mix_filtergraph=mix_filtergraph,
+        mix_filtergraph_name=MASTER_MIX_FILTERGRAPH_NAME,
+        unmastered_name=UNMASTERED_RELATIVE_NAME,
+        master_name=MASTER_RELATIVE_NAME,
+        mastering=payload.mastering,
+        sample_count=payload.sample_count,
+        sample_rate=sample_rate,
+        source_relative_paths=tuple(extra_inputs),
+        diagnostics={"tracks": len(track_labels)},
+    )
+
     output_duration = payload.frame_count / fps_value
     manifest = TimelineManifest(
         occurrences=spec.occurrences,
@@ -855,7 +1073,8 @@ def compile_authored_render(spec: Any, runtime_identity: RuntimeIdentity) -> Com
         {
             "spec": spec.as_dict(),
             "runtime": runtime_identity.as_dict(),
-            "filtergraph": filtergraph,
+            "filtergraph": video_filtergraph,
+            "mix_filtergraph": mix_filtergraph,
             "compiler_version": AUTHORED_COMPILER_VERSION,
         }
     )
@@ -868,7 +1087,7 @@ def compile_authored_render(spec: Any, runtime_identity: RuntimeIdentity) -> Com
         output_relative_path=_AUTHORED_OUTPUT_NAME,
         ass_localized_name=_SOURCE_ASS_LOCAL_NAME,
         argv=tuple(argv),
-        filtergraph=filtergraph,
+        filtergraph=video_filtergraph,
         filtergraph_relative_path=_AUTHORED_FILTERGRAPH_NAME,
         nodes=tuple(nodes),
         expected_output_duration=output_duration,
@@ -885,11 +1104,16 @@ def compile_authored_render(spec: Any, runtime_identity: RuntimeIdentity) -> Com
             "output_duration": output_duration,
             "frame_count": payload.frame_count,
             "sample_count": payload.sample_count,
+            "frame_rate": {
+                "numerator": frame_rate.numerator,
+                "denominator": frame_rate.denominator,
+            },
             "artifact_purpose": spec.artifact_purpose,
         },
         diagnostics={"authored": True, "units": len(payload.units)},
         authored_ass_localized_name=_AUTHORED_ASS_LOCAL_NAME,
         input_relative_paths=tuple(extra_inputs),
+        audio_preparation=audio_plan,
     )
 
 

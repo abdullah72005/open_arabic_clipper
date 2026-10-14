@@ -1412,6 +1412,7 @@ def cache_hit(
     candidate_id: uuid.UUID,
     settings: Settings,
     *,
+    artifact_purpose: str = CORE_SOURCE_VALIDATION,
     expected_input_fingerprint: str | None = None,
     runtime_identity: RuntimeIdentity | None = None,
 ) -> RenderExecution | None:
@@ -1424,7 +1425,7 @@ def cache_hit(
     """
 
     config = settings.stage52_config()
-    row = get_current_render_execution(session, candidate_id)
+    row = get_current_render_execution(session, candidate_id, artifact_purpose=artifact_purpose)
     if row is None:
         return None
     if (

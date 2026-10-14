@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import NoReturn
 
 from app.composition.policy import FramingMode
 from app.render.execution.policy import (
@@ -19,6 +20,9 @@ from app.render.execution.policy import (
     ASS_MALFORMED,
     ASS_METADATA_MISMATCH,
     ASS_MISSING,
+    AUTHORED_MATERIALIZATION_BINDING_INVALID,
+    AUTHORED_PAYLOAD_REQUIRED,
+    AUTHORED_PAYLOAD_UNEXPECTED,
     CONTRADICTORY_FRAMING_EVIDENCE,
     EXOTIC_PIXEL_ASPECT,
     KEYFRAME_GEOMETRY_INVALID,
@@ -35,6 +39,7 @@ from app.render.execution.policy import (
     SCENE_COVERAGE_GAP,
     SCENE_OVERLAP,
     SUPPORTED_ARTIFACT_PURPOSES,
+    TRANSFORMED_SHORT,
     UNSUPPORTED_ARTIFACT_PURPOSE,
     UNSUPPORTED_DELIVERY_PROFILE,
     UNSUPPORTED_FRAMING_MODE,
@@ -83,7 +88,7 @@ class AssFileFacts:
     has_canonical_header: bool
 
 
-def _fail(reason_code: str) -> None:
+def _fail(reason_code: str) -> NoReturn:
     raise RenderValidationError(reason_code)
 
 
@@ -91,11 +96,33 @@ def _is_finite(value: object) -> bool:
     return not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(value)
 
 
+def _validate_purpose_payload(spec: RenderSpec) -> None:
+    """Fail closed on contradictory or missing purpose/payload combinations.
+
+    A ``TRANSFORMED_SHORT`` request is only executable with an authored payload
+    that is exactly materialization-bound; it must never silently fall through to
+    the source-only core compiler. Conversely a core request must never carry an
+    authored payload. This is enforced in validation, the compiler, and the
+    service/queue boundaries so no path can emit source-only content labelled
+    ``TRANSFORMED_SHORT``.
+    """
+
+    if spec.artifact_purpose == TRANSFORMED_SHORT:
+        payload = spec.authored
+        if payload is None:
+            _fail(AUTHORED_PAYLOAD_REQUIRED)
+        if not payload.materialization_id or not payload.materialization_output_fingerprint:
+            _fail(AUTHORED_MATERIALIZATION_BINDING_INVALID)
+    elif spec.authored is not None:
+        _fail(AUTHORED_PAYLOAD_UNEXPECTED)
+
+
 def validate_spec(spec: RenderSpec) -> None:
     """Run every strict structural validation over a render spec."""
 
     if spec.artifact_purpose not in SUPPORTED_ARTIFACT_PURPOSES:
         _fail(UNSUPPORTED_ARTIFACT_PURPOSE)
+    _validate_purpose_payload(spec)
     if delivery_profile_for(spec.delivery_profile_key) is None:
         _fail(UNSUPPORTED_DELIVERY_PROFILE)
     if spec.output_width != OUTPUT_PROFILE_WIDTH or spec.output_height != OUTPUT_PROFILE_HEIGHT:

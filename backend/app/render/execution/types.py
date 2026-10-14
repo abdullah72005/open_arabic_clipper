@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 from app.render.execution.policy import CORE_SOURCE_VALIDATION
 
 if TYPE_CHECKING:
+    from app.render.execution.audio import AudioPreparationPlan
     from app.render.execution.authored import AuthoredRenderPayload
 
 
@@ -389,6 +390,10 @@ class CompiledRender:
     diagnostics: Mapping[str, object] = field(default_factory=dict)
     authored_ass_localized_name: str = ""
     input_relative_paths: tuple[str, ...] = ()
+    #: Optional typed Stage 6 lossless audio-preparation plan. When present the
+    #: runner executes the mix/measure/master phases before the final encode;
+    #: the core source path leaves this ``None`` and is byte-for-byte unchanged.
+    audio_preparation: "AudioPreparationPlan | None" = None
 
     def as_dict(self) -> dict[str, object]:
         return {

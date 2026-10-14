@@ -220,3 +220,76 @@ def test_inverted_track_interval_is_rejected() -> None:
 def test_narration_asset_role_is_accepted() -> None:
     data = _valid_payload_dict()
     assert any(a["role"] == ASSET_ROLE_NARRATION for a in data["assets"])  # type: ignore[index]
+
+
+def _minimal_spec(*, artifact_purpose: str, authored: object) -> object:
+    from app.render.execution.types import AssAsset, RenderSpec
+
+    return RenderSpec(
+        render_execution_id="re-1",
+        candidate_id="cand-1",
+        source_id="src-1",
+        render_contract_id="contract-1",
+        visual_plan_id="vis-1",
+        artifact_purpose=artifact_purpose,
+        source_media_relative_path="source.mp4",
+        source_content_hash=_HASH,
+        source_size_bytes=1,
+        source_mtime_ns=0,
+        source_duration=7.0,
+        source_frame_rate=F(30, 1),
+        display_width=1080,
+        display_height=1920,
+        encoded_width=1080,
+        encoded_height=1920,
+        rotation_degrees=0,
+        pixel_aspect_ratio=1.0,
+        output_width=1080,
+        output_height=1920,
+        output_frame_rate=F(30, 1),
+        output_profile={"width": 1080, "height": 1920},
+        delivery_profile_key="MP4_H264_AAC_1080X1920_V1",
+        plan_input_fingerprint="in",
+        plan_output_fingerprint="out",
+        ass=AssAsset(
+            relative_path="a.ass", sha256=_HASH, event_count=0, line_count=0, policy_version="v"
+        ),
+        caption_events=(),
+        occurrences=(),
+        authored=authored,
+    )
+
+
+def test_transformed_short_without_authored_payload_fails_closed() -> None:
+    from app.render.execution.compiler import CompileError, compile_render
+    from app.render.execution.policy import (
+        AUTHORED_PAYLOAD_REQUIRED,
+        TRANSFORMED_SHORT,
+    )
+    from app.render.execution.validation import RenderValidationError, validate_spec
+
+    spec = _minimal_spec(artifact_purpose=TRANSFORMED_SHORT, authored=None)
+    with pytest.raises(RenderValidationError) as excinfo:
+        validate_spec(spec)
+    assert excinfo.value.reason_code == AUTHORED_PAYLOAD_REQUIRED
+
+    class _Runtime:  # never reached: the purpose gate fails first
+        pass
+
+    with pytest.raises(CompileError) as compile_excinfo:
+        compile_render(spec, _Runtime())
+    assert compile_excinfo.value.reason_code == AUTHORED_PAYLOAD_REQUIRED
+
+
+def test_core_purpose_with_authored_payload_fails_closed() -> None:
+    from app.render.execution.policy import (
+        AUTHORED_PAYLOAD_UNEXPECTED,
+        CORE_SOURCE_VALIDATION,
+    )
+    from app.render.execution.validation import RenderValidationError, validate_spec
+
+    payload = _payload()
+    spec = _minimal_spec(artifact_purpose=CORE_SOURCE_VALIDATION, authored=payload)
+    with pytest.raises(RenderValidationError) as excinfo:
+        validate_spec(spec)
+    assert excinfo.value.reason_code == AUTHORED_PAYLOAD_UNEXPECTED
