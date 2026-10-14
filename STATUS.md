@@ -42,10 +42,16 @@ Stage 6 is NOT FROZEN.**
   and gain envelopes, final mix measurement/mastering at `-16 LUFS`/`-1.5 dBTP`,
   final-purpose QC), the idempotent Stage 6 finalizer, hosted writing/critique/TTS
   adapters (the default bundle is deterministic and network-free), review UI
-  integration, and the genuine manual-acceptance package. Required verification
-  under Python 3.12 and disposable PostgreSQL was not run (host Python 3.10.12
-  only); the renderer is the load-bearing prerequisite for any transformed MP4
-  and needs real FFmpeg execution.
+  integration, and the genuine manual-acceptance package. The renderer is the
+  load-bearing prerequisite for any transformed MP4 and needs real FFmpeg
+  execution.
+- **Verification evidence (Docker Python 3.12.14 + real PostgreSQL 16).** The
+  Stage 6 set (second/third-round regressions, Postgres ownership regressions,
+  blocker regressions, core, providers, supporting/narration, service, migration,
+  integration, settings) ran `131 passed` with `0 skipped` and `0 failed`; `ruff`
+  and `mypy app/materialization` are clean. Migrations `20261014_0023`/`0024`
+  apply and reverse on PostgreSQL. No FFmpeg render, hosted provider call, or
+  manual-acceptance artifact was produced.
 
 ## Stage 6 second-review corrections (2026-10-14)
 
