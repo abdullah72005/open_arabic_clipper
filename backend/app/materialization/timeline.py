@@ -60,10 +60,10 @@ def _estimate_authored_seconds(
     block: Mapping[str, object], copy: str, narration_seconds: float
 ) -> float:
     if narration_seconds > 0:
-        return max(MIN_AUTHORED_CARD_SECONDS, min(MAX_AUTHORED_CARD_SECONDS, narration_seconds))
+        return max(MIN_AUTHORED_CARD_SECONDS, narration_seconds)
     if copy:
         estimate = len(copy) / READING_CHARS_PER_SECOND
-        return max(MIN_AUTHORED_CARD_SECONDS, min(MAX_AUTHORED_CARD_SECONDS, estimate))
+        return max(MIN_AUTHORED_CARD_SECONDS, estimate)
     duration = block.get("estimated_duration")
     if isinstance(duration, (int, float)) and not isinstance(duration, bool) and duration > 0:
         return float(duration)
@@ -95,6 +95,7 @@ def build_timeline(
     narration_by_block = {chunk.block_index: chunk for chunk in narration}
     supporting_by_block = dict(supporting_by_block or {})
     trims = {item.block_index: item for item in trim_evidence}
+    bindings = _binding_map(inputs)
     hero_index = inputs.hero_block_index
 
     segments: list[TimelineSegment] = []
@@ -110,10 +111,17 @@ def build_timeline(
         segment_id = f"seg-{occurrence}-{index}"
 
         if block_type == "SOURCE_EXCERPT":
-            start = _float(block.get("source_start"))
-            end = _float(block.get("source_end"))
-            if end <= start:
-                conflicts.append({"block_index": index, "reason": "INVALID_SOURCE_SPAN"})
+            # Stage 5.0 rebound bindings are the execution truth: the planning
+            # block timestamps are estimates only. A missing or invalid binding is
+            # reported, never silently replaced with plan timestamps.
+            binding = bindings.get(index)
+            if binding is None or not _bool(binding.get("rebind_valid", False)):
+                conflicts.append({"block_index": index, "reason": "INVALID_SOURCE_BINDING"})
+                continue
+            start = _optional_float(binding.get("final_clip_start"))
+            end = _optional_float(binding.get("final_clip_end"))
+            if start is None or end is None or end <= start:
+                conflicts.append({"block_index": index, "reason": "INVALID_SOURCE_BINDING"})
                 continue
             is_hero = index == hero_index
             trim = trims.get(index)
@@ -147,8 +155,8 @@ def build_timeline(
                     output_end=output_end,
                     source_start=round(start, 6),
                     source_end=round(end, 6),
-                    word_start_index=_optional_int(block.get("word_start_index")),
-                    word_end_index=_optional_int(block.get("word_end_index")),
+                    word_start_index=_optional_int(binding.get("final_clip_word_start")),
+                    word_end_index=_optional_int(binding.get("final_clip_word_end")),
                     is_hero=is_hero,
                 )
             )
@@ -234,7 +242,12 @@ def hero_is_protected(timeline: AuthoredTimeline, inputs: MaterializationInputs)
     if hero.kind != "SOURCE" or hero.source_start is None or hero.source_end is None:
         return False
     source_duration = hero.source_end - hero.source_start
-    if abs(hero.output_duration - source_duration) > 1e-6:
+    # Output boundaries are frame-quantized, so an intact unit-speed hero may
+    # differ from the exact source duration by up to one frame; that is not a
+    # rejection. A larger difference means the hero was retimed.
+    frame_rate = timeline.frame_rate
+    tolerance = (1.0 / float(frame_rate)) if frame_rate and frame_rate > 0 else 1e-6
+    if abs(hero.output_duration - source_duration) > tolerance + 1e-9:
         return False
     hero_start, hero_end = hero.output_start, hero.output_end
     for segment in timeline.segments:
@@ -343,6 +356,25 @@ def _float(value: object) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return 0.0
     return float(value)
+
+
+def _bool(value: object) -> bool:
+    return value if isinstance(value, bool) else False
+
+
+def _optional_float(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def _binding_map(inputs: MaterializationInputs) -> dict[int, Mapping[str, object]]:
+    bindings: dict[int, Mapping[str, object]] = {}
+    for binding in inputs.contract_source_bindings:
+        index = _optional_int(binding.get("block_index"))
+        if index is not None:
+            bindings[index] = binding
+    return bindings
 
 
 def _int(value: object) -> int:

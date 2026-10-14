@@ -89,7 +89,20 @@ def make_inputs(**overrides: object) -> MaterializationInputs:
         "contract_input_fingerprint": "contract-in",
         "contract_output_fingerprint": "contract-out",
         "execution_slots": (),
-        "contract_source_bindings": (),
+        "contract_source_bindings": (
+            {
+                "block_index": 0,
+                "final_clip_start": 21.0,
+                "final_clip_end": 27.0,
+                "final_clip_word_start": 0,
+                "final_clip_word_end": 10,
+                "final_clip_text": TRANSCRIPT,
+                "source_role": "HERO",
+                "is_hero": True,
+                "rebind_valid": True,
+                "compatibility_outcome": "EXACT_MATCH",
+            },
+        ),
         "final_clip": FinalClipEvidence(
             refinement_id="ref-1",
             priority="FINAL_CLIP",
@@ -246,7 +259,7 @@ def test_presentation_only_copy_is_rejected() -> None:
     assert not result.accepted
 
 
-def test_genuinely_additive_copy_is_accepted_and_classified() -> None:
+def test_genuinely_additive_copy_requires_semantic_review() -> None:
     inputs = make_inputs()
     result = validate_authored_block(
         {
@@ -259,9 +272,11 @@ def test_genuinely_additive_copy_is_accepted_and_classified() -> None:
         inputs,
         DEFAULT_CONFIG,
     )
-    assert result.accepted
+    assert result.requires_semantic_review
+    assert not result.accepted
     assert result.claim is not None
-    assert result.claim.claim_class in {"SOURCE_GROUNDED_INFERENCE", "SOURCE_SUPPORTED"}
+    assert result.claim.claim_class == "SOURCE_GROUNDED_INFERENCE"
+    assert result.claim.resolved is False
 
 
 def test_short_word_is_not_treated_as_protected_mutation() -> None:
@@ -346,7 +361,13 @@ def test_no_narration_makes_zero_tts_and_no_competing_overlap() -> None:
 
 def test_ready_outcome_requires_complete_favorable_evidence() -> None:
     assessment = assess_materialization(
-        AssessmentContext(), output_duration=30.0, config=DEFAULT_CONFIG
+        AssessmentContext(
+            render_qc_status="PASS",
+            measured_loudness_lufs=-16.0,
+            measured_true_peak_dbtp=-2.0,
+        ),
+        output_duration=30.0,
+        config=DEFAULT_CONFIG,
     )
     assert assessment.outcome == MaterializationOutcome.READY_FOR_HUMAN_REVIEW.value
     assert assessment.human_review_required is True
@@ -396,7 +417,7 @@ def test_missing_required_slot_is_no_output() -> None:
 
 def test_nonfinite_measurement_is_unmet_not_success() -> None:
     assessment = assess_materialization(
-        AssessmentContext(measured_loudness_lufs=float("nan")),
+        AssessmentContext(render_qc_status="PASS", measured_loudness_lufs=float("nan")),
         output_duration=30.0,
         config=DEFAULT_CONFIG,
     )

@@ -106,6 +106,7 @@ class SlotResolution:
     slot_kind: str
     resolution: str
     reason_code: str | None = None
+    required: bool = True
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -114,6 +115,7 @@ class SlotResolution:
             "slot_kind": self.slot_kind,
             "resolution": self.resolution,
             "reason_code": self.reason_code,
+            "required": self.required,
         }
 
 

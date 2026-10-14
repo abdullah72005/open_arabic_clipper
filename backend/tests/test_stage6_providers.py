@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
-from test_stage6_materialization_core import make_inputs
+from test_stage6_materialization_core import TRANSCRIPT, make_inputs
 
 from app.materialization.inputs import MaterializationInputs
 from app.materialization.policy import DEFAULT_CONFIG, CallLedger
 from app.materialization.providers import (
     DeterministicWritingProvider,
+    FakeCritiqueProvider,
     FakeWritingProvider,
     build_writing_request,
     materialize_script,
 )
+
+NOVEL_COPY = "The mechanism is that mentorship loss compounds"
 
 
 def _inputs_with_draft(draft: str | None) -> MaterializationInputs:
@@ -21,8 +24,8 @@ def _inputs_with_draft(draft: str | None) -> MaterializationInputs:
     return make_inputs(blocks=tuple(blocks))
 
 
-def test_deterministic_provider_reuses_authored_draft() -> None:
-    inputs = _inputs_with_draft("The mechanism is that mentorship loss compounds")
+def test_deterministic_provider_defers_novel_copy_without_critique() -> None:
+    inputs = _inputs_with_draft(NOVEL_COPY)
     script = materialize_script(
         DeterministicWritingProvider(),
         inputs,
@@ -30,13 +33,33 @@ def test_deterministic_provider_reuses_authored_draft() -> None:
         config=DEFAULT_CONFIG,
         allow_hosted=False,
     )
+    assert script.deferred
+    assert script.authored_blocks == ()
+
+
+def test_deterministic_provider_accepts_draft_after_semantic_critique() -> None:
+    inputs = _inputs_with_draft(NOVEL_COPY)
+    script = materialize_script(
+        DeterministicWritingProvider(),
+        inputs,
+        ledger=CallLedger(),
+        config=DEFAULT_CONFIG,
+        allow_hosted=True,
+        critique_provider=FakeCritiqueProvider(accepted={1: True}),
+    )
     assert script.accepted
-    assert len(script.authored_blocks) == 1
-    assert script.authored_blocks[0].copy == "The mechanism is that mentorship loss compounds"
+    assert script.authored_blocks[0].copy == NOVEL_COPY
+
+
+def test_writing_request_carries_bounded_actual_evidence() -> None:
+    inputs = _inputs_with_draft(NOVEL_COPY)
+    request = build_writing_request(inputs, config=DEFAULT_CONFIG)
+    assert request.targets[0].source_evidence
+    assert TRANSCRIPT.split()[0] in request.targets[0].source_evidence
 
 
 def test_deterministic_provider_makes_no_hosted_calls() -> None:
-    inputs = _inputs_with_draft("The mechanism is that mentorship loss compounds")
+    inputs = _inputs_with_draft(NOVEL_COPY)
     ledger = CallLedger()
     materialize_script(
         DeterministicWritingProvider(),
@@ -63,8 +86,6 @@ def test_deterministic_provider_without_draft_produces_nothing() -> None:
 
 
 def test_paraphrase_copy_is_rejected_by_orchestration() -> None:
-    from test_stage6_materialization_core import TRANSCRIPT
-
     inputs = _inputs_with_draft(TRANSCRIPT)
     script = materialize_script(
         DeterministicWritingProvider(),
@@ -78,8 +99,8 @@ def test_paraphrase_copy_is_rejected_by_orchestration() -> None:
 
 
 def test_hosted_disabled_defers_without_calling_provider() -> None:
-    inputs = _inputs_with_draft("The mechanism is that mentorship loss compounds")
-    provider = FakeWritingProvider(copies={1: "The mechanism is that mentorship loss compounds"})
+    inputs = _inputs_with_draft(NOVEL_COPY)
+    provider = FakeWritingProvider(copies={1: NOVEL_COPY})
     script = materialize_script(
         provider, inputs, ledger=CallLedger(), config=DEFAULT_CONFIG, allow_hosted=False
     )
@@ -87,21 +108,41 @@ def test_hosted_disabled_defers_without_calling_provider() -> None:
     assert provider.calls == []
 
 
-def test_raw_call_is_accounted_before_invocation() -> None:
-    inputs = _inputs_with_draft("The mechanism is that mentorship loss compounds")
-    provider = FakeWritingProvider(copies={1: "The mechanism is that mentorship loss compounds"})
+def test_raw_calls_are_accounted_before_invocation() -> None:
+    inputs = _inputs_with_draft(NOVEL_COPY)
+    provider = FakeWritingProvider(copies={1: NOVEL_COPY})
     ledger = CallLedger()
     script = materialize_script(
-        provider, inputs, ledger=ledger, config=DEFAULT_CONFIG, allow_hosted=True
+        provider,
+        inputs,
+        ledger=ledger,
+        config=DEFAULT_CONFIG,
+        allow_hosted=True,
+        critique_provider=FakeCritiqueProvider(accepted={1: True}),
     )
     assert script.accepted
-    assert ledger.semantic == 1
+    # One writing call plus one bounded critique call.
+    assert ledger.semantic == 2
     assert len(provider.calls) == 1
 
 
+def test_unavailable_critique_defers_novel_copy() -> None:
+    inputs = _inputs_with_draft(NOVEL_COPY)
+    provider = FakeWritingProvider(copies={1: NOVEL_COPY})
+    script = materialize_script(
+        provider,
+        inputs,
+        ledger=CallLedger(),
+        config=DEFAULT_CONFIG,
+        allow_hosted=True,
+        critique_provider=FakeCritiqueProvider(available=False),
+    )
+    assert script.deferred
+
+
 def test_semantic_budget_ceiling_defers() -> None:
-    inputs = _inputs_with_draft("The mechanism is that mentorship loss compounds")
-    provider = FakeWritingProvider(copies={1: "The mechanism is that mentorship loss compounds"})
+    inputs = _inputs_with_draft(NOVEL_COPY)
+    provider = FakeWritingProvider(copies={1: NOVEL_COPY})
     ledger = CallLedger(semantic=DEFAULT_CONFIG.max_raw_semantic_calls)
     script = materialize_script(
         provider, inputs, ledger=ledger, config=DEFAULT_CONFIG, allow_hosted=True
@@ -111,7 +152,7 @@ def test_semantic_budget_ceiling_defers() -> None:
 
 
 def test_missing_provider_key_defers() -> None:
-    inputs = _inputs_with_draft("The mechanism is that mentorship loss compounds")
+    inputs = _inputs_with_draft(NOVEL_COPY)
     provider = FakeWritingProvider(available=False)
     script = materialize_script(
         provider, inputs, ledger=CallLedger(), config=DEFAULT_CONFIG, allow_hosted=True
@@ -120,7 +161,7 @@ def test_missing_provider_key_defers() -> None:
 
 
 def test_writing_request_batches_substantive_blocks() -> None:
-    inputs = _inputs_with_draft("The mechanism is that mentorship loss compounds")
+    inputs = _inputs_with_draft(NOVEL_COPY)
     request = build_writing_request(inputs, config=DEFAULT_CONFIG)
     assert [target.block_index for target in request.targets] == [1]
     assert request.tier == "ROUTINE"

@@ -143,19 +143,55 @@ def validate_narration_audio(
     }
 
 
+_NEGATION_TOKENS = frozenset(
+    {
+        "not",
+        "no",
+        "never",
+        "neither",
+        "nor",
+        "without",
+        "none",
+        "cannot",
+        "لا",
+        "لم",
+        "لن",
+        "ما",
+        "مش",
+        "غير",
+    }
+)
+
+
+def _is_number(token: str) -> bool:
+    return any(character.isdigit() for character in token)
+
+
 def transcription_matches(expected: str, actual: str, *, threshold: float = 0.6) -> bool:
     """Deterministic ASR-vs-script comparison (never rewrites source evidence).
 
-    A bounded local ASR transcript is compared with the accepted copy,
-    particularly names, numbers, negation, and English; unknown pronunciation or
-    fidelity remains a review finding rather than a silent acceptance.
+    A bounded local ASR transcript is compared with the accepted copy. Removed
+    negation, changed numbers, and altered protected tokens are always rejected:
+    those carry meaning that a token-overlap score must never wash out.
     """
 
     expected_tokens = [token for token in expected.casefold().split() if token]
     if not expected_tokens:
         return True
-    actual_tokens = set(actual.casefold().split())
-    matched = sum(1 for token in expected_tokens if token in actual_tokens)
+    actual_tokens = [token for token in actual.casefold().split() if token]
+    actual_set = set(actual_tokens)
+
+    expected_negation = {token for token in expected_tokens if token in _NEGATION_TOKENS}
+    actual_negation = {token for token in actual_tokens if token in _NEGATION_TOKENS}
+    if expected_negation != actual_negation:
+        return False
+
+    expected_numbers = {token for token in expected_tokens if _is_number(token)}
+    actual_numbers = {token for token in actual_tokens if _is_number(token)}
+    if expected_numbers != actual_numbers:
+        return False
+
+    matched = sum(1 for token in expected_tokens if token in actual_set)
     return matched / len(expected_tokens) >= threshold
 
 
@@ -216,17 +252,36 @@ class FakeNarrationSynthesizer:
         self.released += 1
 
 
-def write_narration_asset(root: Path, relative_path: str, data: bytes) -> str:
-    """Atomically write one immutable narration asset and return its sha256."""
+def _safe_filename(name: str) -> str:
+    if not name or name in {".", ".."}:
+        raise ValueError("invalid narration filename")
+    if "/" in name or "\\" in name or ".." in name:
+        raise ValueError("narration filename must not contain path separators")
+    if Path(name).is_absolute():
+        raise ValueError("absolute narration paths are not allowed")
+    return name
+
+
+def write_narration_asset(
+    storage: object, source_id: str, relative_path: str, data: bytes
+) -> tuple[str, str]:
+    """Atomically write one immutable narration asset through StorageService.
+
+    Returns ``(storage_relative_path, sha256)``. The filename must be a plain
+    name (no separators or traversal) and the write goes through the sole
+    filesystem owner, never a raw path join.
+    """
 
     from app.materialization.fingerprints import hash_bytes
+    from app.services.storage import StorageCategory, StorageService
 
-    target = root / relative_path
-    target.parent.mkdir(parents=True, exist_ok=True)
-    tmp = target.with_suffix(target.suffix + ".tmp")
-    tmp.write_bytes(data)
-    tmp.replace(target)
-    return hash_bytes(data)
+    if not isinstance(storage, StorageService):
+        raise TypeError("write_narration_asset requires a StorageService")
+    filename = _safe_filename(relative_path)
+    relative = f"{source_id}/materializations/narration/{filename}"
+    target = storage.resolve(StorageCategory.SOURCES, relative)
+    storage.atomic_write(target, [data])
+    return storage.storage_relative(target), hash_bytes(data)
 
 
 def narration_requests(

@@ -29,7 +29,7 @@ def _asset(**overrides: object) -> SupportingAsset:
     defaults: dict[str, object] = {
         "asset_id": "asset-1",
         "relative_path": "supporting/asset-1.mp4",
-        "sha256": "abc",
+        "sha256": "a" * 64,
         "kind": "ABSTRACT_LOOP",
         "duration_seconds": 8.0,
         "width": 1920,
@@ -61,7 +61,14 @@ def test_manifest_requires_schema_and_identity() -> None:
                 {
                     "asset_id": "a1",
                     "relative_path": "supporting/a1.mp4",
-                    "sha256": "deadbeef",
+                    "sha256": "a" * 64,
+                    "kind": "ABSTRACT_LOOP",
+                    "owner": "studio",
+                    "creator": "studio",
+                    "origin": "internal",
+                    "license": "internal",
+                    "permission": "granted",
+                    "allowed_uses": ["background"],
                     "rights": "EXPLICIT_COMPATIBLE",
                 }
             ],

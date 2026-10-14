@@ -16,6 +16,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from app.core.enums import SupportingAssetRights, SupportingVisualMode, SupportingVisualStyle
+from app.materialization.policy import (
+    REASON_INVALID_ASSET_HASH,
+    REASON_MISSING_ATTRIBUTION,
+    REASON_MISSING_PROVENANCE,
+    REASON_UNSUITABLE_ASSET_RIGHTS,
+)
 from app.materialization.types import SupportingAssetSelection
 
 MANIFEST_SCHEMA_VERSION = "stage6-supporting-manifest-v1"
@@ -42,14 +48,56 @@ class SupportingAsset:
     restrictions: tuple[str, ...]
     suitability_tags: tuple[str, ...]
     rights: str
+    attribution_required: bool = False
 
     @property
     def rights_compatible(self) -> bool:
         return bool(self.rights == SupportingAssetRights.EXPLICIT_COMPATIBLE.value)
 
     @property
+    def provenance_complete(self) -> bool:
+        return bool(
+            self.owner.strip()
+            and self.creator.strip()
+            and self.origin.strip()
+            and self.license.strip()
+            and self.permission.strip()
+        )
+
+    @property
+    def hash_valid(self) -> bool:
+        if len(self.sha256) != 64:
+            return False
+        return all(character in "0123456789abcdefABCDEF" for character in self.sha256)
+
+    @property
+    def attribution_satisfied(self) -> bool:
+        return (not self.attribution_required) or bool(self.required_attribution.strip())
+
+    @property
     def usable(self) -> bool:
-        return self.rights_compatible and bool(self.sha256) and bool(self.relative_path)
+        return bool(
+            self.rights_compatible
+            and self.hash_valid
+            and self.relative_path.strip()
+            and self.allowed_uses
+            and self.provenance_complete
+            and self.attribution_satisfied
+        )
+
+    def rights_blockers(self) -> tuple[str, ...]:
+        blockers: list[str] = []
+        if not self.rights_compatible:
+            blockers.append(REASON_UNSUITABLE_ASSET_RIGHTS)
+        if not self.provenance_complete:
+            blockers.append(REASON_MISSING_PROVENANCE)
+        if not self.hash_valid:
+            blockers.append(REASON_INVALID_ASSET_HASH)
+        if not self.allowed_uses:
+            blockers.append(REASON_MISSING_PROVENANCE)
+        if not self.attribution_satisfied:
+            blockers.append(REASON_MISSING_ATTRIBUTION)
+        return tuple(blockers)
 
     def identity(self) -> dict[str, object]:
         return {
@@ -109,7 +157,7 @@ def _parse_entry(entry: Mapping[str, object]) -> SupportingAsset:
     sha256 = str(entry.get("sha256", "")).strip()
     if not asset_id or not relative_path or not sha256:
         raise ValueError("supporting asset requires asset_id, relative_path, and sha256")
-    return SupportingAsset(
+    asset = SupportingAsset(
         asset_id=asset_id,
         relative_path=relative_path,
         sha256=sha256,
@@ -127,7 +175,17 @@ def _parse_entry(entry: Mapping[str, object]) -> SupportingAsset:
         restrictions=tuple(str(item) for item in _sequence(entry.get("restrictions"))),
         suitability_tags=tuple(str(item) for item in _sequence(entry.get("suitability_tags"))),
         rights=str(entry.get("rights", SupportingAssetRights.UNKNOWN.value)),
+        attribution_required=bool(entry.get("attribution_required", False)),
     )
+    # A manifest entry that claims explicit compatible rights must actually carry
+    # complete provenance, a valid content hash, an allowed use, and any required
+    # attribution; otherwise it is a malformed rights claim, not a usable asset.
+    if asset.rights_compatible and not asset.usable:
+        raise ValueError(
+            "explicit-compatible supporting asset is missing required provenance: "
+            + ",".join(asset.rights_blockers())
+        )
+    return asset
 
 
 @dataclass(frozen=True)

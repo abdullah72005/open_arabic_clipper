@@ -21,6 +21,7 @@ from app.core.enums import (
 from app.materialization.policy import (
     REASON_HERO_DAMAGED,
     REASON_MANUAL_TRANSCRIPT_REVIEW,
+    REASON_MISSING_RENDER_EVIDENCE,
     REASON_MISSING_REQUIRED_VALUE,
     REASON_NONFINITE_MEASUREMENT,
     REASON_OVEREDIT_RISK,
@@ -58,6 +59,7 @@ class AssessmentContext:
     measured_loudness_lufs: float | None = None
     measured_true_peak_dbtp: float | None = None
     critical_evidence_current: bool = True
+    critical_fidelity_unknown: bool = False
     repair_count: int = 0
     extra_findings: tuple[QualityFinding, ...] = field(default_factory=tuple)
 
@@ -157,13 +159,26 @@ def assess_materialization(
     if not context.script_audio_match:
         add(QualityDimension.FIDELITY_ATTRIBUTION, QualityLevel.UNMET, "SCRIPT_AUDIO_MISMATCH")
 
-    if not _finite(context.measured_loudness_lufs) or not _finite(context.measured_true_peak_dbtp):
+    if context.critical_fidelity_unknown:
+        add(QualityDimension.FIDELITY_ATTRIBUTION, QualityLevel.CONCERN, None)
+
+    # Readiness requires actual render/QC/loudness evidence. Absent render
+    # evidence is never treated as a passing measurement.
+    if context.render_qc_status is None:
+        add(
+            QualityDimension.AUDIO_MASTERING_INTELLIGIBILITY,
+            QualityLevel.UNMET,
+            REASON_MISSING_RENDER_EVIDENCE,
+        )
+    elif not _finite(context.measured_loudness_lufs) or not _finite(
+        context.measured_true_peak_dbtp
+    ):
         add(
             QualityDimension.AUDIO_MASTERING_INTELLIGIBILITY,
             QualityLevel.UNMET,
             REASON_NONFINITE_MEASUREMENT,
         )
-    elif context.render_qc_status is not None:
+    else:
         level = {
             "PASS": QualityLevel.SATISFIED,
             "WARN": QualityLevel.CONCERN,
@@ -243,6 +258,8 @@ def _map_outcome(
     if context.required_narration_required and not context.narration_accepted:
         if not context.tts_available:
             return MaterializationOutcome.TTS_UNAVAILABLE, False
+        return MaterializationOutcome.DEFERRED_PROVIDER, False
+    if context.provider_deferred:
         return MaterializationOutcome.DEFERRED_PROVIDER, False
     if not context.required_slots_fulfilled:
         return MaterializationOutcome.NO_OUTPUT, False

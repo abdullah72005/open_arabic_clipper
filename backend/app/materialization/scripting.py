@@ -19,6 +19,8 @@ from app.core.enums import ClaimClass, QualityLevel, SubstantiveValueKind
 from app.materialization.inputs import MaterializationInputs
 from app.materialization.policy import (
     REASON_GENERIC_FILLER,
+    REASON_GROUNDED_INFERENCE_REQUIRES_REVIEW,
+    REASON_INVALID_GROUNDING_REFERENCE,
     REASON_INVENTED_NUMBER,
     REASON_PARAPHRASE_ONLY,
     REASON_PRESENTATION_ONLY,
@@ -98,10 +100,25 @@ class BlockValidation:
     findings: tuple[QualityFinding, ...]
     claim: ClaimLedgerEntry | None
     accepted: bool
+    requires_semantic_review: bool = False
 
     @property
     def blocking(self) -> bool:
         return any(finding.level == QualityLevel.UNMET.value for finding in self.findings)
+
+
+@dataclass(frozen=True)
+class GroundingResolution:
+    """Resolved grounding evidence for one authored block.
+
+    ``declared`` records whether the block declared any grounding reference;
+    ``unresolved`` records references that could not be resolved to real source
+    text. There is never a fallback to the whole transcript.
+    """
+
+    text: str
+    declared: bool
+    unresolved: tuple[str, ...]
 
 
 def _content_tokens(text: str) -> list[str]:
@@ -121,22 +138,71 @@ def _numbers(text: str) -> set[str]:
     return {match.group(0) for match in _NUMBER_RE.finditer(text)}
 
 
-def grounding_source_text(inputs: MaterializationInputs, refs: Sequence[GroundingRef]) -> str:
-    """Resolve the actual source text a grounding reference points at."""
+def resolve_grounding(
+    inputs: MaterializationInputs, refs: Sequence[GroundingRef]
+) -> GroundingResolution:
+    """Resolve the exact source text a grounding reference points at.
+
+    An unresolvable reference is reported as unresolved and contributes no text.
+    The whole transcript is never used as a fallback: unrelated authored copy must
+    never look grounded because its reference was invalid.
+    """
 
     chunks: list[str] = []
+    unresolved: list[str] = []
     for ref in refs:
-        if ref.block_index is not None:
-            block = inputs.plan_block(ref.block_index)
-            if block is not None and block.get("block_type") == "SOURCE_EXCERPT":
-                text = str(block.get("source_text", "") or "")
-                if text:
-                    chunks.append(text)
         if ref.kind == "FINAL_CLIP":
-            chunks.append(inputs.final_clip.text)
-    if not chunks and inputs.final_clip.text:
-        chunks.append(inputs.final_clip.text)
-    return " ".join(chunks).strip()
+            if inputs.final_clip.text.strip():
+                chunks.append(inputs.final_clip.text)
+            else:
+                unresolved.append("empty_final_clip")
+            continue
+        if ref.block_index is None:
+            unresolved.append("missing_block_index")
+            continue
+        block = inputs.plan_block(ref.block_index)
+        if block is None:
+            unresolved.append(f"missing_block:{ref.block_index}")
+            continue
+        if str(block.get("block_type", "")) != "SOURCE_EXCERPT":
+            unresolved.append(f"non_source_block:{ref.block_index}")
+            continue
+        text = str(block.get("source_text", "") or "").strip()
+        if not text:
+            unresolved.append(f"empty_source_block:{ref.block_index}")
+            continue
+        chunks.append(text)
+    return GroundingResolution(
+        text=" ".join(chunks).strip(),
+        declared=bool(refs),
+        unresolved=tuple(unresolved),
+    )
+
+
+def grounding_source_text(inputs: MaterializationInputs, refs: Sequence[GroundingRef]) -> str:
+    """Resolved grounding text (never a whole-transcript fallback)."""
+
+    return resolve_grounding(inputs, refs).text
+
+
+_NEGATION_TOKENS = frozenset(
+    {
+        "not",
+        "no",
+        "never",
+        "neither",
+        "nor",
+        "without",
+        "none",
+        "cannot",
+        "لا",
+        "لم",
+        "لن",
+        "ما",
+        "مش",
+        "غير",
+    }
+)
 
 
 def classify_claim(
@@ -144,24 +210,58 @@ def classify_claim(
     *,
     grounding_text: str,
     verification_dependency_id: str | None,
+    grounding_declared: bool = True,
+    grounding_unresolved: bool = False,
 ) -> ClaimClass:
-    """Classify authored copy into the claim ledger vocabulary."""
+    """Classify authored copy into the claim ledger vocabulary.
+
+    Deterministic classification cannot establish entailment: novel content is
+    classified as a source-grounded inference that still requires semantic review,
+    never as a resolved claim. A missing/invalid grounding reference, an
+    unsupported number, or an unsupported proper noun makes the copy an external
+    claim requiring verification.
+    """
 
     if verification_dependency_id:
         return ClaimClass.EXTERNAL_REQUIRES_VERIFICATION
-    if not grounding_text.strip():
-        # Copy that cites no source evidence and needs no verification dependency
-        # is treated as a clearly-framed inference, never silently "supported".
-        return ClaimClass.SOURCE_GROUNDED_INFERENCE
-    copy_numbers = _numbers(copy)
-    if copy_numbers and not copy_numbers.issubset(_numbers(grounding_text)):
+    if not grounding_declared or grounding_unresolved or not grounding_text.strip():
+        # No real, resolvable source evidence: the copy can never be a resolved
+        # inference on deterministic grounds alone.
+        return ClaimClass.EXTERNAL_REQUIRES_VERIFICATION
+    if _unsupported_facts(copy, grounding_text):
         return ClaimClass.EXTERNAL_REQUIRES_VERIFICATION
     copy_tokens = set(_content_tokens(copy))
     source_tokens = set(_content_tokens(grounding_text))
     novel = copy_tokens - source_tokens
-    if novel and len(novel) >= max(1, len(copy_tokens) // 4):
+    if novel:
         return ClaimClass.SOURCE_GROUNDED_INFERENCE
     return ClaimClass.SOURCE_SUPPORTED
+
+
+def _unsupported_facts(copy: str, grounding_text: str) -> bool:
+    if not _numbers(copy).issubset(_numbers(grounding_text)):
+        return True
+    copy_proper = _proper_nouns(copy)
+    source_lower = {token.casefold() for token in _WORD_RE.findall(grounding_text)}
+    for noun in copy_proper:
+        if noun.casefold() not in source_lower:
+            return True
+    return False
+
+
+def _proper_nouns(text: str) -> set[str]:
+    nouns: set[str] = set()
+    for sentence in re.split(r"[.!?؟\n]+", text):
+        words = sentence.split()
+        for position, word in enumerate(words):
+            stripped = word.strip("\"'()[]،,;:")
+            if not stripped or not stripped[0].isupper():
+                continue
+            if position == 0:
+                continue
+            if stripped.isupper() or (len(stripped) > 1 and stripped[1:].islower()):
+                nouns.add(stripped)
+    return nouns
 
 
 def validate_authored_block(
@@ -177,7 +277,8 @@ def validate_authored_block(
     block_type = str(block.get("block_type", ""))
     refs = _grounding_refs(block.get("grounding_refs"))
     dependency_id = _optional_str(block.get("verification_dependency_id"))
-    grounding_text = grounding_source_text(inputs, refs)
+    resolution = resolve_grounding(inputs, refs)
+    grounding_text = resolution.text
 
     findings: list[QualityFinding] = []
     if not copy:
@@ -187,6 +288,16 @@ def validate_authored_block(
                 level=QualityLevel.UNMET.value,
                 reason_codes=("MISSING_REQUIRED_VALUE",),
                 evidence={"block_index": index},
+            )
+        )
+
+    if resolution.unresolved:
+        findings.append(
+            QualityFinding(
+                dimension="GROUNDING_VERIFICATION",
+                level=QualityLevel.UNMET.value,
+                reason_codes=(REASON_INVALID_GROUNDING_REFERENCE,),
+                evidence={"block_index": index, "unresolved": list(resolution.unresolved)},
             )
         )
 
@@ -229,18 +340,39 @@ def validate_authored_block(
                 )
 
     claim_class = classify_claim(
-        copy, grounding_text=grounding_text, verification_dependency_id=dependency_id
+        copy,
+        grounding_text=grounding_text,
+        verification_dependency_id=dependency_id,
+        grounding_declared=resolution.declared,
+        grounding_unresolved=bool(resolution.unresolved),
     )
     essential = block_type in _SUBSTANTIVE_BLOCK_TYPES and kind not in {
         SubstantiveValueKind.SOURCE_AS_EVIDENCE.value,
     }
-    if claim_class == ClaimClass.EXTERNAL_REQUIRES_VERIFICATION and essential:
+    requires_semantic_review = False
+    if claim_class == ClaimClass.EXTERNAL_REQUIRES_VERIFICATION:
+        if essential:
+            findings.append(
+                QualityFinding(
+                    dimension="GROUNDING_VERIFICATION",
+                    level=QualityLevel.UNMET.value,
+                    reason_codes=(REASON_UNSUPPORTED_ESSENTIAL_CLAIM,),
+                    evidence={"block_index": index, "verification_dependency_id": dependency_id},
+                )
+            )
+        else:
+            requires_semantic_review = True
+    elif claim_class == ClaimClass.SOURCE_GROUNDED_INFERENCE:
+        # Deterministic checks cannot establish entailment or substantive value,
+        # so a genuinely novel contribution is routed to bounded semantic review
+        # rather than accepted on lexical novelty alone.
+        requires_semantic_review = True
         findings.append(
             QualityFinding(
                 dimension="GROUNDING_VERIFICATION",
-                level=QualityLevel.UNMET.value,
-                reason_codes=(REASON_UNSUPPORTED_ESSENTIAL_CLAIM,),
-                evidence={"block_index": index, "verification_dependency_id": dependency_id},
+                level=QualityLevel.CONCERN.value,
+                reason_codes=(REASON_GROUNDED_INFERENCE_REQUIRES_REVIEW,),
+                evidence={"block_index": index},
             )
         )
 
@@ -251,14 +383,20 @@ def validate_authored_block(
         text=copy,
         grounding_refs=refs,
         verification_dependency_id=dependency_id,
-        resolved=claim_class != ClaimClass.EXTERNAL_REQUIRES_VERIFICATION,
+        resolved=claim_class == ClaimClass.SOURCE_SUPPORTED,
         essential=essential,
     )
-    accepted = bool(copy) and not any(
-        finding.level == QualityLevel.UNMET.value for finding in findings
+    accepted = (
+        bool(copy)
+        and not requires_semantic_review
+        and not any(finding.level == QualityLevel.UNMET.value for finding in findings)
     )
     return BlockValidation(
-        block_index=index, findings=tuple(findings), claim=claim, accepted=accepted
+        block_index=index,
+        findings=tuple(findings),
+        claim=claim,
+        accepted=accepted,
+        requires_semantic_review=requires_semantic_review,
     )
 
 
@@ -387,13 +525,14 @@ def resolve_slots(
     authored: Sequence[AuthoredBlock],
     *,
     narration_satisfied_blocks: frozenset[int] = frozenset(),
+    narration_satisfied_slots: frozenset[str] = frozenset(),
 ) -> tuple[SlotResolution, ...]:
     """Resolve every required authored/contract slot explicitly.
 
-    Required substantive blocks must be fulfilled by an authored block or, when
-    the plan allows narration and a single audio asset fulfils both, by an
-    accepted narration chunk. Optional slots are recorded as declined rather than
-    silently dropped.
+    Required substantive blocks and required contract slots (including
+    ``AUTHORED_NARRATION``) must be fulfilled or they block. Optional slots are
+    recorded as declined rather than silently dropped. One audio asset may fulfil
+    both a block and a contract narration requirement.
     """
 
     authored_by_index = {block.block_index: block for block in authored}
@@ -404,16 +543,7 @@ def resolve_slots(
         if block_type not in _SUBSTANTIVE_BLOCK_TYPES:
             continue
         slot_id = f"block-{index}"
-        if index in authored_by_index:
-            resolutions.append(
-                SlotResolution(
-                    slot_id=slot_id,
-                    block_index=index,
-                    slot_kind=block_type,
-                    resolution="FULFILLED",
-                )
-            )
-        elif index in narration_satisfied_blocks:
+        if index in authored_by_index or index in narration_satisfied_blocks:
             resolutions.append(
                 SlotResolution(
                     slot_id=slot_id,
@@ -432,18 +562,80 @@ def resolve_slots(
                     reason_code="MISSING_REQUIRED_VALUE",
                 )
             )
+
+    for slot in inputs.execution_slots:
+        slot_kind = str(slot.get("slot_kind", ""))
+        slot_id = str(slot.get("slot_id", "")) or f"{slot_kind}-{slot.get('block_index')}"
+        block_index = _optional_int(slot.get("block_index"))
+        required = bool(slot.get("required", False))
+        if not required:
+            resolutions.append(
+                SlotResolution(
+                    slot_id=slot_id,
+                    block_index=block_index,
+                    slot_kind=slot_kind,
+                    resolution="DECLINED",
+                    required=False,
+                )
+            )
+            continue
+        if slot_kind == "AUTHORED_NARRATION":
+            fulfilled = (block_index in narration_satisfied_blocks) or (
+                slot_id in narration_satisfied_slots
+            )
+            resolutions.append(
+                SlotResolution(
+                    slot_id=slot_id,
+                    block_index=block_index,
+                    slot_kind=slot_kind,
+                    resolution="FULFILLED" if fulfilled else "DEFERRED",
+                    reason_code=None if fulfilled else "MISSING_REQUIRED_NARRATION",
+                )
+            )
+        elif slot_kind == "AUTHORED_TEXT":
+            fulfilled = block_index is not None and block_index in authored_by_index
+            resolutions.append(
+                SlotResolution(
+                    slot_id=slot_id,
+                    block_index=block_index,
+                    slot_kind=slot_kind,
+                    resolution="FULFILLED" if fulfilled else "DEFERRED",
+                    reason_code=None if fulfilled else "MISSING_REQUIRED_VALUE",
+                )
+            )
+        elif slot_kind == "VERIFICATION_EVIDENCE":
+            resolutions.append(
+                SlotResolution(
+                    slot_id=slot_id,
+                    block_index=block_index,
+                    slot_kind=slot_kind,
+                    resolution="BLOCKED",
+                    reason_code="EXTERNAL_VERIFICATION_REQUIRED",
+                )
+            )
+        else:
+            resolutions.append(
+                SlotResolution(
+                    slot_id=slot_id,
+                    block_index=block_index,
+                    slot_kind=slot_kind,
+                    resolution="FULFILLED",
+                )
+            )
     return tuple(resolutions)
 
 
 def all_required_slots_fulfilled(resolutions: Sequence[SlotResolution]) -> bool:
-    return all(item.resolution == "FULFILLED" for item in resolutions)
+    return all(item.resolution == "FULFILLED" for item in resolutions if item.required)
 
 
 __all__ = [
     "BlockValidation",
+    "GroundingResolution",
     "all_required_slots_fulfilled",
     "classify_claim",
     "grounding_source_text",
+    "resolve_grounding",
     "resolve_slots",
     "validate_authored_block",
 ]

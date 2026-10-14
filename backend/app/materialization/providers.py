@@ -16,7 +16,7 @@ changing callers.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
@@ -28,7 +28,7 @@ from app.materialization.policy import (
     CallLedger,
     Stage6Config,
 )
-from app.materialization.scripting import validate_authored_block
+from app.materialization.scripting import resolve_grounding, validate_authored_block
 from app.materialization.types import AuthoredBlock, GroundingRef
 
 _SUBSTANTIVE_BLOCK_TYPES = frozenset({"ORIGINAL_VALUE", "TEXTUAL_ANNOTATION"})
@@ -44,6 +44,7 @@ class WritingTarget:
     semantic_intent: str
     draft_line: str | None
     grounding_refs: tuple[GroundingRef, ...]
+    source_evidence: str = ""
     verification_dependency_id: str | None = None
 
     def as_dict(self) -> dict[str, object]:
@@ -54,8 +55,56 @@ class WritingTarget:
             "semantic_intent": self.semantic_intent,
             "draft_line": self.draft_line,
             "grounding_refs": [ref.as_dict() for ref in self.grounding_refs],
+            "source_evidence": self.source_evidence,
             "verification_dependency_id": self.verification_dependency_id,
         }
+
+
+@dataclass(frozen=True)
+class CritiqueTarget:
+    """One authored block the semantic critique must assess for grounding."""
+
+    block_index: int
+    copy: str
+    substantive_value_kind: str
+    semantic_intent: str
+    claim_class: str
+    source_evidence: str = ""
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "block_index": self.block_index,
+            "copy": self.copy,
+            "substantive_value_kind": self.substantive_value_kind,
+            "semantic_intent": self.semantic_intent,
+            "claim_class": self.claim_class,
+            "source_evidence": self.source_evidence,
+        }
+
+
+@dataclass(frozen=True)
+class CritiqueRequest:
+    """One batched semantic-critique request for grounded authored copy."""
+
+    targets: tuple[CritiqueTarget, ...]
+    tier: str = SEMANTIC_ROUTINE_TIER
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "tier": self.tier,
+            "targets": [target.as_dict() for target in self.targets],
+        }
+
+
+@dataclass(frozen=True)
+class CritiqueResult:
+    """Semantic-critique outcome: whether each grounded block is supported."""
+
+    accepted: Mapping[int, bool]
+    provider_identity: Mapping[str, object]
+    notes: str = ""
+    deferred: bool = False
+    reason_code: str | None = None
 
 
 @dataclass(frozen=True)
@@ -173,8 +222,73 @@ class FakeWritingProvider:
         self.released += 1
 
 
+@runtime_checkable
+class MaterializationCritiqueProvider(Protocol):
+    """Provider-neutral semantic critique for grounded authored copy."""
+
+    provider_name: str
+
+    def available(self) -> bool: ...
+
+    def runtime_identity(self) -> dict[str, object]: ...
+
+    def critique(self, request: CritiqueRequest) -> CritiqueResult: ...
+
+    def release(self) -> None: ...
+
+
+class FakeCritiqueProvider:
+    """Deterministic in-memory critique provider for tests."""
+
+    provider_name = "fake-critique"
+
+    def __init__(
+        self,
+        accepted: Mapping[int, bool] | None = None,
+        *,
+        available: bool = True,
+        deferred: bool = False,
+        model: str = "fake-critique-model",
+    ) -> None:
+        self._accepted = dict(accepted or {})
+        self._available = available
+        self._deferred = deferred
+        self.model = model
+        self.calls: list[CritiqueRequest] = []
+        self.released = 0
+
+    def available(self) -> bool:
+        return self._available
+
+    def runtime_identity(self) -> dict[str, object]:
+        return {"provider": self.provider_name, "model": self.model, "api_version": "v1"}
+
+    def critique(self, request: CritiqueRequest) -> CritiqueResult:
+        self.calls.append(request)
+        if self._deferred:
+            return CritiqueResult(
+                accepted={},
+                provider_identity=self.runtime_identity(),
+                deferred=True,
+                reason_code="DEFERRED_PROVIDER",
+            )
+        return CritiqueResult(
+            accepted=dict(self._accepted),
+            provider_identity=self.runtime_identity(),
+            notes="fake",
+        )
+
+    def release(self) -> None:
+        self.released += 1
+
+
 def build_writing_request(inputs: MaterializationInputs, *, config: Stage6Config) -> WritingRequest:
-    """Build one bounded writing request from the plan's substantive blocks."""
+    """Build one bounded writing request from the plan's substantive blocks.
+
+    Each target carries bounded *actual* resolved source evidence (never only a
+    semantic instruction or a reference label) so the provider writes grounded
+    copy, and a later critique assesses that copy against real evidence.
+    """
 
     targets: list[WritingTarget] = []
     for block in inputs.blocks:
@@ -182,6 +296,8 @@ def build_writing_request(inputs: MaterializationInputs, *, config: Stage6Config
         if block_type not in _SUBSTANTIVE_BLOCK_TYPES:
             continue
         index = _int(block.get("index", -1))
+        refs = _refs(block.get("grounding_refs"))
+        evidence = resolve_grounding(inputs, refs).text[: config.max_evidence_chars_per_target]
         targets.append(
             WritingTarget(
                 block_index=index,
@@ -189,7 +305,8 @@ def build_writing_request(inputs: MaterializationInputs, *, config: Stage6Config
                 substantive_value_kind=str(block.get("substantive_value_kind", "")),
                 semantic_intent=str(block.get("semantic_intent", "")),
                 draft_line=_optional_str(block.get("draft_line")),
-                grounding_refs=_refs(block.get("grounding_refs")),
+                grounding_refs=refs,
+                source_evidence=evidence,
                 verification_dependency_id=_first_dependency(block, inputs),
             )
         )
@@ -224,8 +341,14 @@ def materialize_script(
     ledger: CallLedger,
     config: Stage6Config,
     allow_hosted: bool,
+    critique_provider: MaterializationCritiqueProvider | None = None,
 ) -> MaterializationScript:
-    """Run exactly one bounded writing request and validate its copy."""
+    """Run exactly one bounded writing request and validate its copy.
+
+    Copy that is lexically novel is not accepted on novelty alone: it is routed
+    to a bounded semantic critique that assesses the grounded copy. Without an
+    available critique, such copy defers honestly.
+    """
 
     request = build_writing_request(inputs, config=config)
     identity = provider.runtime_identity()
@@ -258,7 +381,9 @@ def materialize_script(
         )
 
     authored: list[AuthoredBlock] = []
+    review_targets: list[CritiqueTarget] = []
     reasons: list[str] = []
+    accepted_indexes: dict[int, bool] = {}
     for target in request.targets:
         copy = result.copies.get(target.block_index, "")
         block_payload = {
@@ -273,23 +398,54 @@ def materialize_script(
         for finding in validation.findings:
             reasons.extend(finding.reason_codes)
         if validation.accepted:
-            authored.append(
-                AuthoredBlock(
+            accepted_indexes[target.block_index] = True
+        elif validation.requires_semantic_review and validation.claim is not None:
+            review_targets.append(
+                CritiqueTarget(
                     block_index=target.block_index,
-                    block_type=target.block_type,
-                    slot_id=f"block-{target.block_index}",
-                    substantive_value_kind=target.substantive_value_kind,
                     copy=copy,
-                    adds_beyond_source=target.semantic_intent,
-                    claim_class=(
-                        validation.claim.claim_class
-                        if validation.claim is not None
-                        else ClaimClass.SOURCE_GROUNDED_INFERENCE.value
-                    ),
-                    grounding_refs=target.grounding_refs,
-                    validation_evidence={"accepted": True},
+                    substantive_value_kind=target.substantive_value_kind,
+                    semantic_intent=target.semantic_intent,
+                    claim_class=validation.claim.claim_class,
+                    source_evidence=target.source_evidence,
                 )
             )
+
+    if review_targets:
+        reviewed = _run_critique(
+            critique_provider,
+            review_targets,
+            ledger=ledger,
+            config=config,
+            allow_hosted=allow_hosted,
+        )
+        if reviewed is None:
+            return MaterializationScript(
+                (),
+                False,
+                identity,
+                True,
+                ("GROUNDED_INFERENCE_REQUIRES_REVIEW",),
+            )
+        accepted_indexes.update(reviewed)
+
+    for target in request.targets:
+        if not accepted_indexes.get(target.block_index, False):
+            continue
+        copy = result.copies.get(target.block_index, "")
+        authored.append(
+            AuthoredBlock(
+                block_index=target.block_index,
+                block_type=target.block_type,
+                slot_id=f"block-{target.block_index}",
+                substantive_value_kind=target.substantive_value_kind,
+                copy=copy,
+                adds_beyond_source=target.semantic_intent,
+                claim_class=ClaimClass.SOURCE_GROUNDED_INFERENCE.value,
+                grounding_refs=target.grounding_refs,
+                validation_evidence={"accepted": True},
+            )
+        )
     return MaterializationScript(
         authored_blocks=tuple(authored),
         accepted=len(authored) == len(request.targets),
@@ -297,6 +453,28 @@ def materialize_script(
         deferred=False,
         reason_codes=tuple(dict.fromkeys(reasons)),
     )
+
+
+def _run_critique(
+    critique_provider: MaterializationCritiqueProvider | None,
+    targets: Sequence[CritiqueTarget],
+    *,
+    ledger: CallLedger,
+    config: Stage6Config,
+    allow_hosted: bool,
+) -> dict[int, bool] | None:
+    if critique_provider is None or not allow_hosted:
+        return None
+    if ledger.semantic >= config.max_raw_semantic_calls:
+        return None
+    if not critique_provider.available():
+        return None
+    ledger.semantic += 1
+    ledger.ledger_entries.append({"kind": "critique", "tier": SEMANTIC_ROUTINE_TIER})
+    result = critique_provider.critique(CritiqueRequest(targets=tuple(targets)))
+    if result.deferred:
+        return None
+    return {int(index): bool(value) for index, value in result.accepted.items()}
 
 
 def _refs(value: object) -> tuple[GroundingRef, ...]:
@@ -352,8 +530,13 @@ def _optional_str(value: object) -> str | None:
 
 
 __all__ = [
+    "CritiqueRequest",
+    "CritiqueResult",
+    "CritiqueTarget",
     "DeterministicWritingProvider",
+    "FakeCritiqueProvider",
     "FakeWritingProvider",
+    "MaterializationCritiqueProvider",
     "MaterializationScript",
     "MaterializationWritingProvider",
     "WritingRequest",
