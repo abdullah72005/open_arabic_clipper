@@ -181,7 +181,7 @@ def build_writing_request(inputs: MaterializationInputs, *, config: Stage6Config
         block_type = str(block.get("block_type", ""))
         if block_type not in _SUBSTANTIVE_BLOCK_TYPES:
             continue
-        index = int(block.get("index", -1))
+        index = _int(block.get("index", -1))
         targets.append(
             WritingTarget(
                 block_index=index,
@@ -329,6 +329,12 @@ def _first_dependency(block: Mapping[str, object], inputs: MaterializationInputs
 def _optional_int(value: object) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int):
         return None
+    return value
+
+
+def _int(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return -1
     return value
 
 

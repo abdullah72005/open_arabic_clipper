@@ -171,7 +171,7 @@ def validate_authored_block(
 ) -> BlockValidation:
     """Deterministically validate one authored block's final copy."""
 
-    index = int(block.get("block_index", block.get("index", -1)))
+    index = _int(block.get("block_index", block.get("index", -1)))
     copy = str(block.get("copy", "") or "").strip()
     kind = str(block.get("substantive_value_kind", ""))
     block_type = str(block.get("block_type", ""))
@@ -363,6 +363,12 @@ def _optional_int(value: object) -> int | None:
     return value
 
 
+def _int(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return -1
+    return value
+
+
 def _optional_float(value: object) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
@@ -393,7 +399,7 @@ def resolve_slots(
     authored_by_index = {block.block_index: block for block in authored}
     resolutions: list[SlotResolution] = []
     for block in inputs.blocks:
-        index = int(block.get("index", -1))
+        index = _int(block.get("index", -1))
         block_type = str(block.get("block_type", ""))
         if block_type not in _SUBSTANTIVE_BLOCK_TYPES:
             continue

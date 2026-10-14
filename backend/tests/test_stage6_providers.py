@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from test_stage6_materialization_core import make_inputs
 
+from app.materialization.inputs import MaterializationInputs
 from app.materialization.policy import DEFAULT_CONFIG, CallLedger
 from app.materialization.providers import (
     DeterministicWritingProvider,
@@ -13,7 +14,7 @@ from app.materialization.providers import (
 )
 
 
-def _inputs_with_draft(draft: str | None):
+def _inputs_with_draft(draft: str | None) -> MaterializationInputs:
     inputs = make_inputs()
     blocks = list(inputs.blocks)
     blocks[1] = {**blocks[1], "draft_line": draft, "grounding_refs": ["block:0"]}

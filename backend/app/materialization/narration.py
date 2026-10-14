@@ -239,7 +239,7 @@ def narration_requests(
 
     requests: list[NarrationSynthesisRequest] = []
     for item in accepted_script[: config.max_narration_chunks]:
-        block_index = int(item.get("block_index", -1))
+        block_index = _int(item.get("block_index", -1))
         text = str(item.get("copy", "") or "").strip()
         if not text:
             continue
@@ -254,10 +254,22 @@ def narration_requests(
                 api_version=str(identity.get("api_version", "")),
                 voice=str(identity.get("voice", "")),
                 style=str(identity.get("style", "")),
-                settings=dict(identity.get("settings", {}) or {}),
+                settings=_mapping(identity.get("settings")),
             )
         )
     return tuple(requests)
+
+
+def _int(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return -1
+    return value
+
+
+def _mapping(value: object) -> dict[str, object]:
+    if isinstance(value, Mapping):
+        return {str(key): item for key, item in value.items()}
+    return {}
 
 
 def _optional_str(value: object) -> str | None:

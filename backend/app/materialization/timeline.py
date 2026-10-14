@@ -104,7 +104,7 @@ def build_timeline(
     occurrence = 0
 
     for block in inputs.blocks:
-        index = int(block.get("index", -1))
+        index = _int(block.get("index", -1))
         block_type = str(block.get("block_type", ""))
         occurrence += 1
         segment_id = f"seg-{occurrence}-{index}"
@@ -343,6 +343,12 @@ def _float(value: object) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return 0.0
     return float(value)
+
+
+def _int(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return -1
+    return value
 
 
 def _optional_int(value: object) -> int | None:

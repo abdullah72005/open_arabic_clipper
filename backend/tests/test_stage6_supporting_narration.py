@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 import pytest
 
 from app.materialization.narration import (
@@ -136,7 +138,7 @@ def test_wav_roundtrip_and_silence_detection() -> None:
     silent_validation = validate_narration_audio(
         silent_info, expected_text="hello", config=DEFAULT_CONFIG
     )
-    assert "SILENT_AUDIO" in silent_validation["findings"]
+    assert "SILENT_AUDIO" in cast("list[str]", silent_validation["findings"])
 
 
 def test_fake_synthesizer_produces_valid_lossless_audio() -> None:

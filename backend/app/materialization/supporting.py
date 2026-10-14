@@ -45,7 +45,7 @@ class SupportingAsset:
 
     @property
     def rights_compatible(self) -> bool:
-        return self.rights == SupportingAssetRights.EXPLICIT_COMPATIBLE.value
+        return bool(self.rights == SupportingAssetRights.EXPLICIT_COMPATIBLE.value)
 
     @property
     def usable(self) -> bool:
