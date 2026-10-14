@@ -2,7 +2,9 @@ from app.models.audio_analysis import AudioAnalysis
 from app.models.audio_artifact import AudioArtifact
 from app.models.candidate_analysis import CandidateAnalysis
 from app.models.candidate_refinement import CandidateRefinement
+from app.models.channel_production_profile import ChannelProductionProfile
 from app.models.clip_candidate import ClipCandidate
+from app.models.clip_materialization import ClipMaterialization
 from app.models.pipeline_run import PipelineRun
 from app.models.processing_job import ProcessingJob
 from app.models.render_contract import RenderContract
@@ -28,7 +30,9 @@ __all__ = [
     "AudioArtifact",
     "CandidateAnalysis",
     "CandidateRefinement",
+    "ChannelProductionProfile",
     "ClipCandidate",
+    "ClipMaterialization",
     "PipelineRun",
     "ProcessingJob",
     "RenderContract",

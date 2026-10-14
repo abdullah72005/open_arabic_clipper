@@ -1,0 +1,169 @@
+"""Stage 6 deterministic materialization policy, versions, and bounds.
+
+Stage 6 owns the semantic decisions (what is authored, whether narration is
+needed, the timeline and audio recipe). The Stage 5.2 renderer executes a frozen
+recipe; it never chooses strategies, writes scripts, or decides originality.
+
+Everything here is code-defined and versioned. No value is a runtime secret, an
+absolute path, or a transient quota.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+STAGE6_POLICY_VERSION = "stage6-v1"
+STAGE6_SCHEMA_VERSION = "stage6-schema-v1"
+STAGE6_VALIDATION_VERSION = "stage6-validation-v1"
+STAGE6_TIMELINE_SCHEMA_VERSION = "stage6-timeline-v1"
+STAGE6_QUALITY_POLICY_VERSION = "stage6-quality-v1"
+STAGE6_NATURALNESS_POLICY_VERSION = "stage6-naturalness-v1"
+FINGERPRINT_VERSION = "1"
+
+# Hard Stage 6 budgets (ceilings, never default call counts).
+MAX_RAW_SEMANTIC_CALLS = 4
+MAX_STRONG_TIER_SEMANTIC_CALLS = 2
+SEMANTIC_ROUTINE_TIER = "ROUTINE"
+SEMANTIC_STRONG_TIER = "STRONG"
+
+# Narration bounds.
+MAX_NARRATION_CHUNKS = 3
+MAX_NARRATION_SECONDS = 60.0
+MAX_RAW_SYNTHESIS_CALLS = 6
+NARRATION_DURATION_TOLERANCE_SECONDS = 0.35
+
+# Delivery bounds.
+MAX_CLIP_SECONDS = 180.0
+
+# One repair per materialization generation, allocated by CAS.
+MAX_REPAIR_COUNT = 1
+
+# Mastering target (versioned). Conservative dynamics preservation.
+TARGET_INTEGRATED_LUFS = -16.0
+TRUE_PEAK_CEILING_DBTP = -1.5
+TARGET_SAMPLE_RATE = 48_000
+TARGET_CHANNELS = 2
+MASTERING_LOUDNESS_TOLERANCE_LU = 1.0
+
+# Conservative optional non-hero boundary-silence trimming.
+MAX_BOUNDARY_TRIM_SECONDS = 0.6
+MIN_RETAINED_BREATHING_ROOM_SECONDS = 0.2
+
+# Supporting-visual bounds.
+MAX_SUPPORTING_ASSETS_PER_MATERIALIZATION = 1
+
+# Default neutral profile semantic context.
+DEFAULT_TARGET_MARKET = "UNSPECIFIED"
+DEFAULT_OUTPUT_LANGUAGE_POLICY = "SOURCE_LANGUAGE"
+DEFAULT_REGISTER_INTENT = "SOURCE_COMPATIBLE"
+
+# Reason codes surfaced by Stage 6 assessment and lifecycle.
+REASON_UPSTREAM_REVALIDATION_REQUIRED = "UPSTREAM_REVALIDATION_REQUIRED"
+REASON_PROFILE_CONTEXT_MISMATCH = "PROFILE_CONTEXT_MISMATCH"
+REASON_NO_USABLE_PLAN = "NO_USABLE_PLAN"
+REASON_NO_USABLE_FINAL_CLIP = "NO_USABLE_FINAL_CLIP"
+REASON_CONTRACT_NOT_EXECUTABLE = "CONTRACT_NOT_EXECUTABLE"
+REASON_VISUAL_PLAN_NOT_READY = "VISUAL_PLAN_NOT_READY"
+REASON_MISSING_REQUIRED_VALUE = "MISSING_REQUIRED_VALUE"
+REASON_MISSING_REQUIRED_NARRATION = "MISSING_REQUIRED_NARRATION"
+REASON_TTS_UNAVAILABLE = "TTS_UNAVAILABLE"
+REASON_UNSUPPORTED_ESSENTIAL_CLAIM = "UNSUPPORTED_ESSENTIAL_CLAIM"
+REASON_PARAPHRASE_ONLY = "PARAPHRASE_ONLY"
+REASON_GENERIC_FILLER = "GENERIC_FILLER"
+REASON_PRESENTATION_ONLY = "PRESENTATION_ONLY"
+REASON_INVENTED_NUMBER = "INVENTED_NUMBER"
+REASON_PROTECTED_TOKEN_MUTATED = "PROTECTED_TOKEN_MUTATED"
+REASON_SCRIPT_AUDIO_MISMATCH = "SCRIPT_AUDIO_MISMATCH"
+REASON_HERO_DAMAGED = "HERO_DAMAGED"
+REASON_UNREADABLE_REQUIRED_COPY = "UNREADABLE_REQUIRED_COPY"
+REASON_UNSUITABLE_ASSET_RIGHTS = "UNSUITABLE_ASSET_RIGHTS"
+REASON_OVEREDIT_RISK = "OVEREDIT_RISK"
+REASON_STALE_CRITICAL_EVIDENCE = "STALE_CRITICAL_EVIDENCE"
+REASON_NONFINITE_MEASUREMENT = "NONFINITE_MEASUREMENT"
+REASON_MANUAL_TRANSCRIPT_REVIEW = "MANUAL_TRANSCRIPT_REVIEW"
+REASON_REPAIR_SPENT = "REPAIR_SPENT"
+
+# Protected-token preservation is delegated to the shared Stage 2.5 / Stage 2.7
+# primitives; Stage 6 only asserts the accepted copy preserves them verbatim.
+PROTECTED_TOKEN_POLICY_VERSION = "stage2.7.1-protected-tokens-v1"
+
+
+@dataclass(frozen=True)
+class Stage6Config:
+    """Versioned deterministic Stage 6 bounds (never mutates frozen stages)."""
+
+    policy_version: str = STAGE6_POLICY_VERSION
+    schema_version: str = STAGE6_SCHEMA_VERSION
+    validation_version: str = STAGE6_VALIDATION_VERSION
+    timeline_schema_version: str = STAGE6_TIMELINE_SCHEMA_VERSION
+    quality_policy_version: str = STAGE6_QUALITY_POLICY_VERSION
+    naturalness_policy_version: str = STAGE6_NATURALNESS_POLICY_VERSION
+
+    max_raw_semantic_calls: int = MAX_RAW_SEMANTIC_CALLS
+    max_strong_tier_semantic_calls: int = MAX_STRONG_TIER_SEMANTIC_CALLS
+    max_narration_chunks: int = MAX_NARRATION_CHUNKS
+    max_narration_seconds: float = MAX_NARRATION_SECONDS
+    max_raw_synthesis_calls: int = MAX_RAW_SYNTHESIS_CALLS
+    max_clip_seconds: float = MAX_CLIP_SECONDS
+    max_repair_count: int = MAX_REPAIR_COUNT
+    max_boundary_trim_seconds: float = MAX_BOUNDARY_TRIM_SECONDS
+    min_retained_breathing_room_seconds: float = MIN_RETAINED_BREATHING_ROOM_SECONDS
+    narration_duration_tolerance_seconds: float = NARRATION_DURATION_TOLERANCE_SECONDS
+    paraphrase_overlap_threshold: float = 0.7
+
+    target_integrated_lufs: float = TARGET_INTEGRATED_LUFS
+    true_peak_ceiling_dbtp: float = TRUE_PEAK_CEILING_DBTP
+    target_sample_rate: int = TARGET_SAMPLE_RATE
+    target_channels: int = TARGET_CHANNELS
+    mastering_loudness_tolerance_lu: float = MASTERING_LOUDNESS_TOLERANCE_LU
+
+    # Ordering: the least-intrusive sufficient transformation wins ties.
+    strategy_intensity_preference: tuple[str, ...] = ("MINIMAL", "MODERATE", "STRONG")
+
+
+DEFAULT_CONFIG = Stage6Config()
+
+
+@dataclass
+class CallLedger:
+    """Durable raw-call budget ledger for one materialization generation.
+
+    Raw calls are accounted *before* invocation so a crash mid-request can never
+    under-count the budget. ``semantic`` and ``strong`` track the semantic
+    ceilings; ``synthesis`` tracks narration TTS calls.
+    """
+
+    semantic: int = 0
+    strong: int = 0
+    synthesis: int = 0
+    ledger_entries: list[dict[str, object]] = field(default_factory=list)
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "semantic": self.semantic,
+            "strong": self.strong,
+            "synthesis": self.synthesis,
+            "entries": [dict(entry) for entry in self.ledger_entries],
+        }
+
+    @staticmethod
+    def from_dict(data: object) -> "CallLedger":
+        if not isinstance(data, dict):
+            return CallLedger()
+        entries = data.get("entries")
+        return CallLedger(
+            semantic=int(data.get("semantic", 0) or 0),
+            strong=int(data.get("strong", 0) or 0),
+            synthesis=int(data.get("synthesis", 0) or 0),
+            ledger_entries=[dict(item) for item in entries] if isinstance(entries, list) else [],
+        )
+
+
+__all__ = [
+    "DEFAULT_CONFIG",
+    "CallLedger",
+    "Stage6Config",
+    "STAGE6_POLICY_VERSION",
+    "STAGE6_SCHEMA_VERSION",
+    "STAGE6_VALIDATION_VERSION",
+]

@@ -108,6 +108,9 @@ class RenderExecution(Base):
     final_refinement_id: Mapped[UUID | None] = mapped_column(
         ForeignKey("candidate_refinements.id", ondelete="SET NULL"), index=True
     )
+    materialization_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("clip_materializations.id", ondelete="SET NULL"), index=True
+    )
 
     artifact_purpose: Mapped[RenderArtifactPurpose] = mapped_column(
         Enum(
