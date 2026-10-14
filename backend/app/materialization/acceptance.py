@@ -60,6 +60,7 @@ class AssessmentContext:
     measured_true_peak_dbtp: float | None = None
     critical_evidence_current: bool = True
     critical_fidelity_unknown: bool = False
+    render_complete: bool = True
     repair_count: int = 0
     extra_findings: tuple[QualityFinding, ...] = field(default_factory=tuple)
 
@@ -164,7 +165,9 @@ def assess_materialization(
 
     # Readiness requires actual render/QC/loudness evidence. Absent render
     # evidence is never treated as a passing measurement.
-    if context.render_qc_status is None:
+    if not context.render_complete:
+        add(QualityDimension.AUDIO_MASTERING_INTELLIGIBILITY, QualityLevel.UNKNOWN, None)
+    elif context.render_qc_status is None:
         add(
             QualityDimension.AUDIO_MASTERING_INTELLIGIBILITY,
             QualityLevel.UNMET,
@@ -265,6 +268,10 @@ def _map_outcome(
         return MaterializationOutcome.NO_OUTPUT, False
     if unmet:
         return MaterializationOutcome.REJECTED_QUALITY, False
+    if not context.render_complete:
+        # Content is materialized and awaiting the renderer; it is not yet
+        # human-review-ready because no render/QC/loudness evidence exists.
+        return MaterializationOutcome.MATERIALIZED_WITH_CAUTION, False
     if not context.critical_evidence_current:
         return MaterializationOutcome.UPSTREAM_REVALIDATION_REQUIRED, False
     if concern or unknown:
