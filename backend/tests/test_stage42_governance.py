@@ -703,6 +703,78 @@ def test_supported_claim_requires_no_semantic_review():
     assert evaluation.requires_semantic_review is False
 
 
+def _paraphrase_revision_plan():
+    transcript = (
+        "The guest argues that remote work collapsed productivity because managers lost "
+        "the ability to mentor junior staff."
+    )
+    plan = make_plan(
+        blocks=[
+            source_block(0),
+            original_block(1, intent=transcript, kind="SYNTHESIS"),
+        ],
+        original_value_kinds=("SYNTHESIS",),
+    )
+    return plan, make_inputs([plan], transcript=transcript)
+
+
+def test_revision_plan_without_provider_is_not_reviewed():
+    plan, inputs = _paraphrase_revision_plan()
+    evaluation = evaluate_plan(plan, inputs, DEFAULT_CONFIG, provider_mode_deterministic=True)
+    assert evaluation.requires_semantic_review is False
+    governance = build_plan_governance(evaluation, input_fingerprint="in", output_fingerprint="out")
+    assert governance.status is GovernancePlanStatus.REVISION_REQUIRED
+
+
+def test_revision_plan_is_reviewed_and_cleared_by_favorable_critique():
+    plan, inputs = _paraphrase_revision_plan()
+    evaluation = evaluate_plan(plan, inputs, DEFAULT_CONFIG, provider_mode_deterministic=False)
+    assert evaluation.requires_semantic_review is True
+    assert "REDUNDANT_PARAPHRASE_ONLY" in {finding["code"] for finding in evaluation.revisions}
+
+    apply_semantic_review(evaluation, make_critique(plan), SEMANTIC_AVAILABLE)
+
+    governance = build_plan_governance(evaluation, input_fingerprint="in", output_fingerprint="out")
+    assert governance.eligible_for_stage4_3 is True
+    assert governance.status in {
+        GovernancePlanStatus.APPROVED_FOR_SELECTION,
+        GovernancePlanStatus.APPROVED_WITH_CAUTION,
+    }
+    assert "REDUNDANT_PARAPHRASE_ONLY" not in governance.reason_codes
+
+
+def test_revision_plan_stays_revision_required_when_critique_confirms_problem():
+    plan, inputs = _paraphrase_revision_plan()
+    evaluation = evaluate_plan(plan, inputs, DEFAULT_CONFIG, provider_mode_deterministic=False)
+    apply_semantic_review(evaluation, make_critique(plan, value="REDUNDANT"), SEMANTIC_AVAILABLE)
+    governance = build_plan_governance(evaluation, input_fingerprint="in", output_fingerprint="out")
+    assert governance.status is GovernancePlanStatus.REVISION_REQUIRED
+    assert governance.eligible_for_stage4_3 is False
+
+
+def test_hard_failure_plan_is_never_sent_for_semantic_review():
+    plan = make_plan(
+        blocks=[
+            original_block(
+                0,
+                intent="This is interesting and important to note",
+                kind="SYNTHESIS",
+                duration=12.0,
+            ),
+            source_block(1),
+        ],
+        hero_index=1,
+        original_value_kinds=("SYNTHESIS",),
+    )
+    evaluation = evaluate_plan(
+        plan, make_inputs([plan]), DEFAULT_CONFIG, provider_mode_deterministic=False
+    )
+    assert evaluation.requires_semantic_review is False
+    assert evaluation.hard_failures
+    governance = build_plan_governance(evaluation, input_fingerprint="in", output_fingerprint="out")
+    assert governance.status is GovernancePlanStatus.REJECTED_BY_GOVERNOR
+
+
 def test_arbitrary_grounding_labels_do_not_approve_external_claim():
     for label in ("strategy", "source_excerpt", "excerpt", "evidence", "label"):
         plan = make_plan(

@@ -282,9 +282,9 @@ not change its truthful state.
 
 Immutable, code-defined profile (never a dynamic engine, never runtime scraping):
 
-- governor policy: `stage4.2-v5`
+- governor policy: `stage4.2-v6`
 - schema: `stage4.2-schema-v1`
-- validation: `stage4.2-validation-v5`
+- validation: `stage4.2-validation-v6`
 - platform profile: `stage4.2-platform-policy-2026-09-17-v1`
 - checked date: `2026-09-17`
 
@@ -661,3 +661,13 @@ regime.
     review. Permitted attribution framing and faithful identical restatements
     remain grounded with zero hosted calls. Policy/validation versions advanced to
     `stage4.2-v5`/`stage4.2-validation-v5` so prior governance is invalidated.
+- **Revision-level semantic adjudication.** In adaptive mode with a provider, a
+  plan whose only deterministic findings are revision-level (no hard failure and
+  no blocking condition) is sent to the semantic review instead of being rejected
+  outright. A favorable critique (one that raises no new hard-failure or revision
+  finding) clears the advisory deterministic revisions so the plan can be
+  approved or approved-with-caution; a critique that confirms a problem keeps
+  both its finding and the deterministic revision. Hard failures and blocking
+  conditions are never sent for review and are never cleared by a review.
+  Without a provider the deterministic revisions stand as before. Versions
+  advanced to `stage4.2-v6`/`stage4.2-validation-v6`.
