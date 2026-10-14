@@ -516,6 +516,76 @@ def run_render_execution(
         session.close()
 
 
+@celery_app.task(  # type: ignore[untyped-decorator]
+    bind=True, autoretry_for=(), name="clipfactory.run_materialization_job"
+)
+def run_materialization_job(
+    self: Task,
+    candidate_id: str,
+    job_id: str | None = None,
+    priority: str = "CANDIDATE",
+    profile_key: str | None = None,
+    supporting_requested: str = "OFF",
+    force: bool = False,
+) -> dict[str, str | bool | None]:
+    """Run one explicit candidate-scoped Stage 6 materialization.
+
+    This extends the existing job system, not the pipeline: it creates no
+    ``PipelineRun``, schedules no next stage, and never touches the whole-source
+    stage chain.
+    """
+
+    from uuid import UUID as _UUID
+
+    from app.materialization.executor import build_materialization_executor
+
+    parsed_job = _UUID(job_id) if job_id else None
+    session = create_session_factory()()
+    try:
+        settings = get_settings()
+        storage = StorageService(settings.storage_root)
+        if parsed_job is not None:
+            job = session.get(ProcessingJob, parsed_job)
+            if job is not None and job.status is JobStatus.CANCELLED:
+                return {"candidate_id": candidate_id, "cancelled": True}
+        executor = build_materialization_executor(session, storage, settings)
+        executor.set_active_job(parsed_job)
+        try:
+            executor.execute(
+                candidate_id,
+                priority=priority,
+                profile_key=profile_key,
+                supporting_requested=supporting_requested,
+                force=force,
+            )
+        except StageCancelled:
+            return {"candidate_id": candidate_id, "cancelled": True}
+        except Exception as error:
+            if parsed_job is not None and not getattr(executor, "skipped_duplicate", False):
+                executor.record_failure(error)
+            if getattr(error, "retryable", False):
+                raise self.retry(
+                    args=[
+                        candidate_id,
+                        job_id,
+                        priority,
+                        profile_key,
+                        supporting_requested,
+                        force,
+                    ],
+                    exc=error,
+                    max_retries=MAX_RETRIES,
+                ) from error
+            raise
+        return {
+            "candidate_id": candidate_id,
+            "job_id": str(parsed_job) if parsed_job else None,
+            "skipped": bool(getattr(executor, "skipped_duplicate", False)),
+        }
+    finally:
+        session.close()
+
+
 @celery_app.task(name="clipfactory.worker_heartbeat")  # type: ignore[untyped-decorator]
 def worker_heartbeat() -> dict[str, str]:
     """Expose latest worker liveness timestamp for health checks."""

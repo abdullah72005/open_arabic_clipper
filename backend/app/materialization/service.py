@@ -215,7 +215,7 @@ def resolve_prerequisites(
         raise MaterializationStaleError("Stage 5.0 render contract is not current/effective")
     if not contract_row.contract_ready or contract_row.status.value not in EXECUTABLE_STATUSES:
         raise MaterializationError("Stage 5.0 render contract is not executable")
-    if contract_row.selection_id != selection.id:
+    if contract_row.transformation_selection_id != selection.id:
         raise MaterializationStaleError("render contract is not bound to the current selection")
     if contract_row.selected_plan_id != plan.id:
         raise MaterializationStaleError("render contract is not bound to the current plan")

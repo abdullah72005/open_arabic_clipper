@@ -11,6 +11,7 @@ from app.candidates.policy import Stage3Config
 from app.candidates.providers import SemanticProvider
 from app.composition.policy import Stage51Config, stage51_config_payload
 from app.core.enums import SemanticProviderMode
+from app.materialization.policy import Stage6Config
 from app.refinement.policy import AdmissionPolicy, Stage35Config
 from app.render.execution.policy import Stage52Config, stage52_config_payload
 from app.render.policy import Stage50Config
@@ -660,6 +661,11 @@ class Settings(BaseSettings):
 
         payload: dict[str, object] = stage51_config_payload(self.stage51_config())
         return payload
+
+    def stage6_config(self) -> Stage6Config:
+        """Build bounded Stage 6 materialization configuration (no providers)."""
+
+        return Stage6Config()
 
     def stage52_config(self) -> Stage52Config:
         """Build bounded Stage 5.2 render-execution configuration."""
