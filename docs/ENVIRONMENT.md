@@ -320,7 +320,7 @@ CLIPFACTORY_REFINEMENT_FINAL_BEAM_SIZE=8
 CLIPFACTORY_REFINEMENT_BATCH_DEFAULT_LIMIT=5
 CLIPFACTORY_REFINEMENT_BATCH_MAX_LIMIT=10
 CLIPFACTORY_GEMINI_TRANSCRIPTION_MODEL=gemini-3.5-transcribe
-CLIPFACTORY_GEMINI_TRANSCRIPTION_API_VERSION=v1
+CLIPFACTORY_GEMINI_TRANSCRIPTION_API_VERSION=v1beta
 CLIPFACTORY_GEMINI_TRANSCRIPTION_MAX_OUTPUT_TOKENS=2048
 CLIPFACTORY_GEMINI_ADJUDICATION_MAX_OUTPUT_TOKENS=1024
 CLIPFACTORY_GEMINI_ADMISSION_WINDOW_SECONDS=60
@@ -336,7 +336,12 @@ CLIPFACTORY_GEMINI_ADMISSION_MAX_RETRY_AFTER_SECONDS=3600
 material uncertainty; `local_only` never calls Gemini; `gemini_only` prefers
 hosted transcription. Adaptive never silently uses Qwen. The dedicated
 transcription model uses the Interactions API in verbatim mode with word
-timestamps; custom vocabulary is never combined with timestamps in the same
+timestamps; the Interactions surface is served from `v1beta`, so
+`CLIPFACTORY_GEMINI_TRANSCRIPTION_API_VERSION` defaults to `v1beta` and only the
+dedicated transcription provider uses it. Adjudication and the Stage 2.7/Stage 4
+providers keep the stable `v1` generateContent surface on their own
+independently configured `CLIPFACTORY_GEMINI_API_VERSION`. There is no global
+beta switch; custom vocabulary is never combined with timestamps in the same
 pass. Adjudication reuses `CLIPFACTORY_GEMINI_MODEL` (default
 `gemini-3.8-flash`). Admission reserves are validated against total capacity and
 cannot exceed it; Redis unavailability fails closed for hosted work while local

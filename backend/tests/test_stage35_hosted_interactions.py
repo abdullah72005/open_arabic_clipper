@@ -209,11 +209,52 @@ def test_adjudication_uses_stable_v1_generate_content() -> None:
     results = provider.adjudicate(requests)
 
     assert capturing.requests, "no HTTP request was issued"
-    assert (
-        capturing.requests[0]["url"]
-        == f"{_BASE_URL}/v1/models/gemini-3.8-flash:generateContent"
-    )
+    assert capturing.requests[0]["url"] == f"{_BASE_URL}/v1/models/gemini-3.8-flash:generateContent"
     assert results["a1"].selected_reading == "خمسة وعشرين"
+
+
+def test_settings_factory_effective_transcription_surface(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The production Settings factory must produce an effective ``v1beta`` URL.
+
+    This asserts the *effective* HTTP surface produced by the full settings →
+    provider → SDK chain, so a regression in the settings default (previously
+    ``v1``) fails here even though the provider constructor default is already
+    ``v1beta``.
+    """
+
+    from app.core.settings import Settings
+
+    monkeypatch.delenv("CLIPFACTORY_GEMINI_TRANSCRIPTION_API_VERSION", raising=False)
+    monkeypatch.setenv("CLIPFACTORY_GEMINI_API_KEY", "fake-key")
+
+    settings = Settings(_env_file=None)
+    provider = settings.hosted_transcription_provider()
+    assert isinstance(provider, GeminiAudioTranscriptionProvider)
+    assert provider.runtime_identity()["api_version"] == "v1beta"
+
+    capturing = _CapturingTransport(_transcription_responder)
+    real_client = _real_client(capturing, api_version=str(provider._api_version))
+    provider._client = _HybridClient(real_client)
+    provider._owns_client = False
+
+    audio = tmp_path / "candidate.wav"
+    audio.write_bytes(b"RIFF")
+    provider.transcribe(audio, language_codes=["ar-EG"])
+
+    assert capturing.requests, "no HTTP request was issued"
+    assert capturing.requests[0]["url"] == f"{_BASE_URL}/v1beta/interactions"
+    body = capturing.requests[0]["json"]
+    assert isinstance(body, dict)
+    mode = body["generation_config"]["transcription_config"]["mode"]  # type: ignore[index]
+    assert mode["type"] == "verbatim"
+    assert mode["timestamp_granularities"] == ["word"]
+
+    # Adjudication stays on the stable v1 generateContent surface.
+    adjudication = settings.adjudication_provider()
+    assert adjudication is not None
+    assert adjudication.runtime_identity()["api_version"] == "v1"
 
 
 def test_provider_clients_keep_isolated_api_versions() -> None:

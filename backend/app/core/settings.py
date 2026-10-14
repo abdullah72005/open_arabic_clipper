@@ -152,7 +152,11 @@ class Settings(BaseSettings):
     refinement_batch_default_limit: int = Field(default=5, gt=0, le=10)
     refinement_batch_max_limit: int = Field(default=10, gt=0, le=20)
     gemini_transcription_model: str = Field(default="gemini-3.5-transcribe", max_length=256)
-    gemini_transcription_api_version: str = Field(default="v1", min_length=1, max_length=32)
+    # The dedicated Gemini 3.5 Transcribe model is served from the Interactions
+    # API, which is published on the ``v1beta`` surface. This is independent of
+    # the stable ``v1`` generateContent surface used by adjudication and the
+    # Stage 2.7/Stage 4 providers; no global beta switch exists.
+    gemini_transcription_api_version: str = Field(default="v1beta", min_length=1, max_length=32)
     gemini_transcription_max_output_tokens: int = Field(default=2_048, gt=0, le=8_192)
     gemini_adjudication_max_output_tokens: int = Field(default=1_024, gt=0, le=4_096)
     gemini_admission_window_seconds: float = Field(default=60.0, gt=0, le=86_400)
