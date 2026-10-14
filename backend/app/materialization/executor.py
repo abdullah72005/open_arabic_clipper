@@ -24,14 +24,16 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.enums import (
     JobStatus,
-    MaterializationLifecycle,
-    MaterializationOutcome,
     MaterializationPriority,
 )
 from app.core.settings import Settings
-from app.materialization.fingerprints import input_fingerprint, output_fingerprint
+from app.materialization.components import (
+    ComponentContext,
+    ComponentProviders,
+    prepare_materialization,
+)
 from app.materialization.inputs import MaterializationInputs
-from app.materialization.policy import CallLedger, Stage6Config
+from app.materialization.policy import Stage6Config
 from app.materialization.providers import (
     DeterministicWritingProvider,
     MaterializationCritiqueProvider,
@@ -39,7 +41,6 @@ from app.materialization.providers import (
 )
 from app.materialization.repository import (
     MaterializationOwner,
-    PreparedMaterialization,
     bind_active_job,
     claim_materialization,
     commit_prepared,
@@ -47,12 +48,7 @@ from app.materialization.repository import (
 )
 from app.materialization.service import (
     MaterializationError,
-    MaterializationResult,
     assemble_inputs,
-    run_materialization,
-)
-from app.materialization.service import (
-    _checkpoint_fingerprint as _checkpoint_fp,
 )
 from app.models import ClipMaterialization, ProcessingJob
 from app.pipeline.executor import StageCancelled, StageExecutionResult
@@ -347,20 +343,6 @@ class MaterializationExecutor:
 
     # -- execution -------------------------------------------------------------
 
-    def _preserved_ledger(self, inputs: MaterializationInputs) -> CallLedger:
-        """Resume the durable call ledger for the exact current generation."""
-
-        row = self._session.scalars(
-            select(ClipMaterialization).where(
-                ClipMaterialization.clip_candidate_id == uuid.UUID(inputs.candidate_id),
-                ClipMaterialization.profile_key == inputs.profile.profile_key,
-                ClipMaterialization.input_fingerprint == input_fingerprint(inputs),
-            )
-        ).first()
-        if row is None:
-            return CallLedger()
-        return CallLedger.from_dict(row.call_ledger)
-
     def _claim_envelope(
         self,
         inputs: MaterializationInputs,
@@ -392,55 +374,22 @@ class MaterializationExecutor:
         )
         return owner
 
-    def _prepared_from_result(
-        self,
-        inputs: MaterializationInputs,
-        result: MaterializationResult,
-        envelope: ClipMaterialization,
-    ) -> PreparedMaterialization:
-        checkpoints = dict(result.component_checkpoints)
-        out_fp = output_fingerprint(
-            inputs,
-            script_fp=_checkpoint_fp(checkpoints, "SCRIPT"),
-            narration_fp=_checkpoint_fp(checkpoints, "NARRATION"),
-            supporting_fp=_checkpoint_fp(checkpoints, "SUPPORTING"),
-            timeline_fp=_checkpoint_fp(checkpoints, "TIMELINE"),
-        )
-        outcome = result.assessment.outcome
-        lifecycle = (
-            MaterializationLifecycle.AWAITING_RENDER
-            if outcome
-            in {
-                MaterializationOutcome.READY_FOR_HUMAN_REVIEW.value,
-                MaterializationOutcome.MATERIALIZED_WITH_CAUTION.value,
-            }
-            else MaterializationLifecycle.COMPLETE
-        )
-        return PreparedMaterialization(
-            lifecycle=lifecycle,
-            semantic_outcome=outcome,
-            human_review_required=bool(result.assessment.human_review_required),
-            repair_count=int(envelope.repair_count or 0),
-            reason_codes=tuple(result.reason_codes),
-            component_checkpoints=checkpoints,
-            authored_blocks=[block.as_dict() for block in result.script.authored_blocks],
-            claim_ledger=[
-                block.as_dict() for block in result.script.authored_blocks if block.claim_class
-            ],
-            slot_resolutions=[item.as_dict() for item in result.slot_resolutions],
-            narration_references=[chunk.as_dict() for chunk in result.narration],
-            asset_references=[item.as_dict() for item in result.supporting],
-            timeline_payload=result.timeline.as_dict(),
-            audio_recipe=result.audio_recipe.as_dict(),
-            quality_findings=[finding.as_dict() for finding in result.assessment.findings],
-            provider_identity=dict(result.script.provider_identity),
-            upstream_snapshot=dict(result.upstream_snapshot),
-            metrics={
-                "segments": len(result.timeline.segments),
-                "output_duration": round(result.timeline.output_duration, 6),
-                "removals": [dict(item) for item in result.removals],
-            },
-            output_fingerprint=out_fp,
+    def _component_context(
+        self, inputs: MaterializationInputs, owner: MaterializationOwner
+    ) -> ComponentContext:
+        return ComponentContext(
+            session=self._session,
+            owner=owner,
+            inputs=inputs,
+            config=self._config,
+            storage=self._storage,
+            providers=ComponentProviders(
+                writing=self._providers.writing,
+                critique=self._providers.critique,
+                narration=self._providers.narration,  # type: ignore[arg-type]
+            ),
+            allow_hosted=self._providers.critique is not None,
+            cancelled=self._should_stop,
         )
 
     def execute(
@@ -485,17 +434,9 @@ class MaterializationExecutor:
             if owner is None:
                 self.skipped_duplicate = True
                 return StageExecutionResult("", None)
-            ledger = self._preserved_ledger(inputs)
+            context = self._component_context(inputs, owner)
             try:
-                result = run_materialization(
-                    inputs,
-                    provider=self._providers.writing,
-                    critique_provider=self._providers.critique,
-                    narration_synthesizer=self._providers.narration,
-                    config=self._config,
-                    allow_hosted=self._providers.critique is not None,
-                    ledger=ledger,
-                )
+                prepared = prepare_materialization(context)
             except Exception as error:
                 self._finish_job(JobStatus.FAILED, error)
                 raise
@@ -509,7 +450,6 @@ class MaterializationExecutor:
             if envelope is None:
                 self._session.rollback()
                 return StageExecutionResult("", None)
-            prepared = self._prepared_from_result(inputs, result, envelope)
             if not commit_prepared(self._session, owner, prepared):
                 self._session.rollback()
                 return StageExecutionResult("", None)
@@ -523,19 +463,6 @@ class MaterializationExecutor:
             if heartbeat is not None:
                 heartbeat.stop()
             self._release_resources()
-
-    def _runtime_identity(self) -> dict[str, object]:
-        identity: dict[str, object] = {
-            "policy_version": self._config.policy_version,
-            "schema_version": self._config.schema_version,
-        }
-        runtime = getattr(self._providers.writing, "runtime_identity", None)
-        if callable(runtime):
-            try:
-                identity["writing"] = dict(runtime())
-            except Exception:
-                pass
-        return identity
 
     def record_failure(self, error: Exception) -> None:
         """Best-effort fenced sanitized FAILED finalization for the task wrapper."""

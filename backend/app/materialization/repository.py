@@ -529,6 +529,33 @@ def save_local_component(
     return save_component_checkpoint(session, owner, component, checkpoint)
 
 
+def merge_component_checkpoint(
+    session: Session,
+    owner: MaterializationOwner,
+    component: str,
+    patch: Mapping[str, object],
+) -> bool:
+    """Read-modify-write one component checkpoint under the owner fence.
+
+    Preserves existing keys so an accepted intermediate subcomponent (for
+    example an accepted writing response recorded before critique) survives a
+    later partial update. Uses a fresh dict assignment for JSON mutation tracking.
+    """
+
+    row = session.get(ClipMaterialization, owner.materialization_id)
+    if row is None:
+        return False
+    checkpoints = dict(row.component_checkpoints or {})
+    existing = checkpoints.get(component)
+    merged: dict[str, object] = dict(existing) if isinstance(existing, Mapping) else {}
+    merged.update(dict(patch))
+    checkpoints[component] = merged
+    ok = guarded_update(session, owner, {"component_checkpoints": checkpoints})
+    if ok:
+        session.commit()
+    return ok
+
+
 def commit_prepared(
     session: Session, owner: MaterializationOwner, prepared: PreparedMaterialization
 ) -> bool:
@@ -601,6 +628,7 @@ __all__ = [
     "ledger_counts",
     "ledger_entries",
     "load_component",
+    "merge_component_checkpoint",
     "new_ledger",
     "owner_is_current",
     "reserve_attempt",

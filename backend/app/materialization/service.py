@@ -574,6 +574,37 @@ def run_materialization(
             attempt_scope=attempt_scope,
         )
 
+    supporting = _select_supporting(inputs, supporting_assets, config)
+    return assemble_result(
+        inputs,
+        script=script,
+        narration=narration,
+        supporting=supporting,
+        config=config,
+        ledger=active_ledger,
+        tts_available=tts_available,
+        narration_required=narration_required,
+    )
+
+
+def assemble_result(
+    inputs: MaterializationInputs,
+    *,
+    script: MaterializationScript,
+    narration: Sequence[NarrationAudio],
+    supporting: Sequence[SupportingAssetSelection],
+    config: Stage6Config,
+    ledger: CallLedger,
+    tts_available: bool,
+    narration_required: bool,
+) -> MaterializationResult:
+    """Assemble the final materialization result from resolved components.
+
+    Shared by the all-in-one fixture path and the durable component path so the
+    timeline/audio/assessment semantics are identical regardless of how the
+    script and narration were obtained.
+    """
+
     narration_blocks = frozenset(chunk.block_index for chunk in narration)
     narration_slots = _narration_slot_ids(inputs, narration_blocks)
     slot_resolutions = resolve_slots(
@@ -582,8 +613,6 @@ def run_materialization(
         narration_satisfied_blocks=narration_blocks,
         narration_satisfied_slots=narration_slots,
     )
-
-    supporting = _select_supporting(inputs, supporting_assets, config)
 
     build = build_timeline(
         inputs,
@@ -638,13 +667,13 @@ def run_materialization(
     return MaterializationResult(
         script=script,
         slot_resolutions=slot_resolutions,
-        narration=narration,
-        supporting=supporting,
+        narration=tuple(narration),
+        supporting=tuple(supporting),
         timeline=build.timeline,
         audio_recipe=recipe,
         assessment=assessment,
         component_checkpoints=checkpoints,
-        ledger=active_ledger,
+        ledger=ledger,
         reason_codes=reasons,
         timeline_conflicts=build.conflicts,
         removals=build.removals,
