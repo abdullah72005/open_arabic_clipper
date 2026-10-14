@@ -1,5 +1,41 @@
 # Runtime status
 
+## Stage 6 second-review corrections (2026-10-14)
+
+Status: **the seven second-round SOL-review defects are corrected with
+regressions (commit `f3a79df`; migration `20261014_0024`). The production
+vertical slice beyond DB assembly/orchestration/persistence is NOT implemented:
+the MATERIALIZATION queue/executor, hosted semantic/critique and TTS adapters,
+the reusable Stage 5.2 `TRANSFORMED_SHORT` renderer (authored cards/overlays,
+mixed/mastered audio, final-purpose QC), the idempotent finalizer, the candidate
+API/CLI/UI, and the genuine manual-acceptance package are outstanding. No
+transformed-short MP4 exists. Stage 6 is NOT FROZEN.**
+
+- **Corrections (`f3a79df`).** (1) `resolve_prerequisites` re-derives live
+  effectiveness/currentness from the frozen upstream read helpers and binds the
+  exact contract selection/plan/FINAL_CLIP/composition identities; only a
+  frozen-ready `FINAL_TRANSCRIPT_READY` FINAL_CLIP is usable (not
+  `NEEDS_MANUAL_TRANSCRIPT_REVIEW`). (2) `assemble_inputs` reads the
+  authoritative plan-set target context; the plan row has no `target_context`.
+  (3) A deterministic hard failure is never clearable by a favorable critique.
+  (4) Final readiness requires complete, in-policy render/QC/loudness evidence;
+  missing/unknown critical evidence defers (`DEFERRED_EVIDENCE`) and genuine
+  mastering-policy violations are unmet; pre-render state is separated from
+  final review readiness. (5) Generated narration is bound to required contract
+  narration slots with validated audio. (6) ASR/script matching expands
+  contractions and validates sequence and protected meaning (removed contracted
+  negation, reversed attribution). (7) Persistence preserves the repair allowance
+  and durable call budget across retries and fences stale workers via a durable
+  `claim_version`.
+- **Remaining acceptance blockers (concrete).** MATERIALIZATION queue/executor
+  with claim fencing/cancellation/resume; hosted writing/critique and TTS
+  adapters; the reusable-renderer `TRANSFORMED_SHORT` extension and complete
+  audio mix/mastering + final-purpose QC; idempotent finalizer; candidate
+  API/CLI/UI; and the genuine manual-acceptance package. Required verification
+  under Python 3.12 and disposable PostgreSQL was not run (host Python 3.10.12
+  only). The renderer extension is the load-bearing prerequisite for any
+  transformed MP4 and needs real FFmpeg execution.
+
 ## Stage 6 review corrections and production-path service (2026-10-14)
 
 Status: **eight SOL-review defects are corrected with regressions (commit
