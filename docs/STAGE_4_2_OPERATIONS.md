@@ -282,9 +282,9 @@ not change its truthful state.
 
 Immutable, code-defined profile (never a dynamic engine, never runtime scraping):
 
-- governor policy: `stage4.2-v7`
+- governor policy: `stage4.2-v8`
 - schema: `stage4.2-schema-v1`
-- validation: `stage4.2-validation-v7`
+- validation: `stage4.2-validation-v8`
 - platform profile: `stage4.2-platform-policy-2026-09-17-v1`
 - checked date: `2026-09-17`
 
@@ -669,6 +669,14 @@ regime.
   known finding for the matching dimension (a known positive substantive-value
   finding for paraphrase/filler; `LOW` template feel for template findings).
   `UNKNOWN`, concern, unavailable, or malformed review evidence clears nothing.
+  No heuristic revision is cleared at all unless the *whole* review is genuinely
+  complete and favorable: fidelity `PASS`, known positive substantive value,
+  retention `PRESERVED`, coherence `COHERENT`, template feel `LOW`,
+  unsupported-claim `NONE`, and narration `APPROPRIATE` when narration is
+  relevant (or `APPROPRIATE`/`NOT_NEEDED` when it is not). Any `UNKNOWN` or
+  concerning decision-critical dimension defers governance instead of producing a
+  selectable approval, and a later weaker review restores a previously cleared
+  revision rather than inheriting a stale clearance.
   Measured retention/proportionality violations (hero delay, source-moment
   damage, payoff interruption, duration/over-edit, fragmentation) are
   deterministic requirements and are never model-overridable. A critique that
@@ -677,4 +685,4 @@ regime.
   (`provider_evidence.adjudicated_revisions`) with its exact adjudication. Hard
   failures and blocking conditions are never sent for review and are never
   cleared by a review. Without a provider the deterministic revisions stand as
-  before. Versions advanced to `stage4.2-v7`/`stage4.2-validation-v7`.
+  before. Versions advanced to `stage4.2-v8`/`stage4.2-validation-v8`.

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pytest
 from stage42_support import (
     make_critique,
     make_inputs,
@@ -1020,9 +1021,7 @@ def test_quote_with_added_claim_is_blocked_when_external_dependency_exists():
 
 
 def _review(plan, inputs, *, critique, state=SEMANTIC_AVAILABLE):
-    evaluation = evaluate_plan(
-        plan, inputs, DEFAULT_CONFIG, provider_mode_deterministic=False
-    )
+    evaluation = evaluate_plan(plan, inputs, DEFAULT_CONFIG, provider_mode_deterministic=False)
     apply_semantic_review(evaluation, critique, state)
     return evaluation
 
@@ -1058,9 +1057,7 @@ def test_favorable_critique_clears_generic_filler_revision() -> None:
             "the ability to mentor junior staff."
         ),
     )
-    evaluation = evaluate_plan(
-        plan, inputs, DEFAULT_CONFIG, provider_mode_deterministic=False
-    )
+    evaluation = evaluate_plan(plan, inputs, DEFAULT_CONFIG, provider_mode_deterministic=False)
     assert "GENERIC_FILLER_ONLY" in _revision_codes(evaluation)
     apply_semantic_review(evaluation, make_critique(plan), SEMANTIC_AVAILABLE)
     assert "GENERIC_FILLER_ONLY" not in _revision_codes(evaluation)
@@ -1169,3 +1166,135 @@ def test_unavailable_review_does_not_clear_revision() -> None:
     evaluation = _review(plan, inputs, critique=make_critique(plan), state="UNAVAILABLE")
     assert "REDUNDANT_PARAPHRASE_ONLY" in _revision_codes(evaluation)
     assert evaluation.adjudicated_revisions == []
+
+
+def test_original_unknown_dimension_case_is_not_cleared() -> None:
+    """The exact original reproduction: UNKNOWN coherence/narration must not clear.
+
+    Before the correction, a critique that left coherence and narration UNKNOWN
+    still cleared REDUNDANT_PARAPHRASE_ONLY and produced
+    APPROVED_FOR_SELECTION/eligible_for_stage4_3=True.
+    """
+
+    plan, inputs = _paraphrase_revision_plan()
+    evaluation = evaluate_plan(plan, inputs, DEFAULT_CONFIG, provider_mode_deterministic=False)
+    assert "REDUNDANT_PARAPHRASE_ONLY" in _revision_codes(evaluation)
+
+    apply_semantic_review(
+        evaluation,
+        make_critique(plan, coherence="UNKNOWN", narration="UNKNOWN"),
+        SEMANTIC_AVAILABLE,
+    )
+
+    assert "REDUNDANT_PARAPHRASE_ONLY" in _revision_codes(evaluation)
+    governance = build_plan_governance(evaluation, input_fingerprint="in", output_fingerprint="out")
+    assert governance.status is GovernancePlanStatus.REVISION_REQUIRED
+    assert governance.eligible_for_stage4_3 is False
+    assert governance.provider_evidence["adjudicated_revisions"] == []
+
+
+@pytest.mark.parametrize(
+    "dimension",
+    [
+        "fidelity",
+        "value",
+        "retention",
+        "coherence",
+        "narration",
+        "unsupported_claim",
+        "template_feel",
+    ],
+)
+def test_each_unknown_decision_dimension_blocks_clearance(dimension: str) -> None:
+    plan, inputs = _paraphrase_revision_plan()
+    evaluation = _review(plan, inputs, critique=make_critique(plan, **{dimension: "UNKNOWN"}))
+    assert "REDUNDANT_PARAPHRASE_ONLY" in _revision_codes(evaluation)
+    governance = build_plan_governance(evaluation, input_fingerprint="in", output_fingerprint="out")
+    assert governance.eligible_for_stage4_3 is False
+    assert governance.provider_evidence["adjudicated_revisions"] == []
+
+
+@pytest.mark.parametrize(
+    "dimension,concern",
+    [
+        ("fidelity", "CONCERN"),
+        ("retention", "MIXED"),
+        ("coherence", "MIXED"),
+        ("template_feel", "MODERATE"),
+        ("unsupported_claim", "POSSIBLE"),
+    ],
+)
+def test_each_concerning_decision_dimension_blocks_clearance(dimension: str, concern: str) -> None:
+    plan, inputs = _paraphrase_revision_plan()
+    evaluation = _review(plan, inputs, critique=make_critique(plan, **{dimension: concern}))
+    assert "REDUNDANT_PARAPHRASE_ONLY" in _revision_codes(evaluation)
+    governance = build_plan_governance(evaluation, input_fingerprint="in", output_fingerprint="out")
+    assert governance.eligible_for_stage4_3 is False
+
+
+def test_narration_unknown_blocks_a_relevant_narration_dimension() -> None:
+    from dataclasses import replace
+
+    plan, inputs = _paraphrase_revision_plan()
+    plan = replace(
+        plan,
+        narration={
+            "need": "RECOMMENDED",
+            "requirements": {"placement_block_index": 1, "overlaps_source_audio": False},
+        },
+    )
+    evaluation = evaluate_plan(plan, inputs, DEFAULT_CONFIG, provider_mode_deterministic=False)
+    assert "REDUNDANT_PARAPHRASE_ONLY" in _revision_codes(evaluation)
+    apply_semantic_review(evaluation, make_critique(plan, narration="UNKNOWN"), SEMANTIC_AVAILABLE)
+    assert "REDUNDANT_PARAPHRASE_ONLY" in _revision_codes(evaluation)
+
+
+def test_complete_favorable_review_clears_with_relevant_narration() -> None:
+    from dataclasses import replace
+
+    plan, inputs = _paraphrase_revision_plan()
+    plan = replace(
+        plan,
+        narration={
+            "need": "RECOMMENDED",
+            "requirements": {"placement_block_index": 1, "overlaps_source_audio": False},
+        },
+    )
+    evaluation = evaluate_plan(plan, inputs, DEFAULT_CONFIG, provider_mode_deterministic=False)
+    apply_semantic_review(evaluation, make_critique(plan), SEMANTIC_AVAILABLE)
+    assert "REDUNDANT_PARAPHRASE_ONLY" not in _revision_codes(evaluation)
+    governance = build_plan_governance(evaluation, input_fingerprint="in", output_fingerprint="out")
+    assert governance.eligible_for_stage4_3 is True
+
+
+def test_repeated_weaker_review_does_not_preserve_prior_clearance() -> None:
+    plan, inputs = _paraphrase_revision_plan()
+    evaluation = evaluate_plan(plan, inputs, DEFAULT_CONFIG, provider_mode_deterministic=False)
+
+    apply_semantic_review(evaluation, make_critique(plan), SEMANTIC_AVAILABLE)
+    assert "REDUNDANT_PARAPHRASE_ONLY" not in _revision_codes(evaluation)
+    approved = build_plan_governance(evaluation, input_fingerprint="in", output_fingerprint="out")
+    assert approved.eligible_for_stage4_3 is True
+
+    # A stronger follow-up review that returns UNKNOWN must not inherit the
+    # earlier clearance: the original finding is restored and still blocks.
+    apply_semantic_review(
+        evaluation,
+        make_critique(plan, coherence="UNKNOWN", narration="UNKNOWN"),
+        SEMANTIC_AVAILABLE,
+    )
+    assert "REDUNDANT_PARAPHRASE_ONLY" in _revision_codes(evaluation)
+    regressed = build_plan_governance(evaluation, input_fingerprint="in", output_fingerprint="out")
+    assert regressed.status is GovernancePlanStatus.REVISION_REQUIRED
+    assert regressed.eligible_for_stage4_3 is False
+    assert regressed.provider_evidence["adjudicated_revisions"] == []
+
+
+def test_governance_policy_version_advanced_beyond_v7() -> None:
+    from app.transformation.governance.policy import (
+        GOVERNOR_POLICY_VERSION,
+        GOVERNOR_VALIDATION_VERSION,
+    )
+
+    assert GOVERNOR_POLICY_VERSION != "stage4.2-v7"
+    assert GOVERNOR_VALIDATION_VERSION != "stage4.2-validation-v7"
