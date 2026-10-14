@@ -47,10 +47,13 @@ from app.core.enums import (
 )
 from app.core.settings import get_settings
 from app.db.session import create_session_factory
+from app.materialization.queue import queue_materialization
+from app.materialization.service import MaterializationError
 from app.models import (
     CandidateAnalysis,
     CandidateRefinement,
     ClipCandidate,
+    ClipMaterialization,
     ProcessingJob,
     RenderContract,
     RenderExecution,
@@ -656,6 +659,35 @@ class VisualCompositionQueueResponse(BaseModel):
     queued: bool
     cached: bool
     active: bool
+    model_config = {"extra": "allow"}
+
+
+class MaterializationQueueResponse(BaseModel):
+    job_id: UUID | None
+    status: str
+    queued: bool
+    cached: bool
+    active: bool
+    model_config = {"extra": "allow"}
+
+
+class MaterializationResponse(BaseModel):
+    id: UUID
+    source_video_id: UUID
+    clip_candidate_id: UUID
+    profile_key: str
+    priority: str
+    lifecycle: str
+    semantic_outcome: str | None
+    human_review_required: bool
+    publication_ready: bool
+    is_current: bool
+    repair_count: int
+    reason_codes: list[str]
+    input_fingerprint: str
+    output_fingerprint: str
+    policy_version: str
+    schema_version: str
     model_config = {"extra": "allow"}
 
 
@@ -1687,6 +1719,52 @@ def create_app(
             raise HTTPException(status_code=404, detail="visual composition not found")
         return _visual_composition_response(view.row, view.live_freshness, view.effective)
 
+    @app.post(
+        "/api/candidates/{candidate_id}/materialization",
+        response_model=MaterializationQueueResponse,
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    def queue_candidate_materialization(
+        candidate_id: UUID,
+        priority: str = "CANDIDATE",
+        profile_key: str | None = None,
+        supporting_requested: str = "OFF",
+        force: bool = False,
+        database: Session = Depends(session),
+    ) -> MaterializationQueueResponse:
+        """Explicitly queue one candidate-scoped Stage 6 materialization run."""
+
+        try:
+            outcome = queue_materialization(
+                database,
+                candidate_id,
+                priority=priority,
+                profile_key=profile_key,
+                supporting_requested=supporting_requested,
+                force=force,
+            )
+        except MaterializationError as error:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
+        return MaterializationQueueResponse(
+            job_id=outcome.job_id,
+            status=outcome.status,
+            queued=outcome.queued,
+            cached=outcome.cached,
+            active=outcome.active,
+        )
+
+    @app.get(
+        "/api/candidates/{candidate_id}/materialization",
+        response_model=MaterializationResponse,
+    )
+    def get_candidate_materialization(
+        candidate_id: UUID, database: Session = Depends(session)
+    ) -> MaterializationResponse:
+        row = _current_materialization(database, candidate_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="materialization not found")
+        return _materialization_response(row)
+
     @app.get(
         "/api/candidates/{candidate_id}/stage5-2-handoff",
         response_model=Stage52HandoffResponse,
@@ -2344,6 +2422,38 @@ def _composition_http(error: CompositionQueueError) -> HTTPException:
     detail = str(error)
     code = 404 if "does not exist" in detail else 409
     return HTTPException(status_code=code, detail=detail)
+
+
+def _current_materialization(database: Session, candidate_id: UUID) -> ClipMaterialization | None:
+    return database.scalars(
+        select(ClipMaterialization)
+        .where(
+            ClipMaterialization.clip_candidate_id == candidate_id,
+            ClipMaterialization.is_current.is_(True),
+        )
+        .order_by(ClipMaterialization.created_at.desc())
+    ).first()
+
+
+def _materialization_response(row: ClipMaterialization) -> MaterializationResponse:
+    return MaterializationResponse(
+        id=row.id,
+        source_video_id=row.source_video_id,
+        clip_candidate_id=row.clip_candidate_id,
+        profile_key=row.profile_key,
+        priority=row.priority.value,
+        lifecycle=row.lifecycle.value,
+        semantic_outcome=row.semantic_outcome.value if row.semantic_outcome else None,
+        human_review_required=bool(row.human_review_required),
+        publication_ready=bool(row.publication_ready),
+        is_current=bool(row.is_current),
+        repair_count=int(row.repair_count or 0),
+        reason_codes=list(row.reason_codes or []),
+        input_fingerprint=row.input_fingerprint,
+        output_fingerprint=row.output_fingerprint,
+        policy_version=row.policy_version,
+        schema_version=row.schema_version,
+    )
 
 
 def _visual_composition_response(

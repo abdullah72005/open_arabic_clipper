@@ -31,6 +31,8 @@ from app.core.enums import (
 )
 from app.core.settings import get_settings
 from app.db.session import create_session_factory
+from app.materialization.queue import queue_materialization
+from app.materialization.service import MaterializationError
 from app.models import (
     AudioAnalysis,
     AudioArtifact,
@@ -988,6 +990,75 @@ def visual_composition_status(candidate_id: UUID) -> None:
         payload = _visual_composition_payload(view.row)
         payload["live_freshness"] = view.live_freshness
         payload["effective"] = view.effective
+    typer.echo(json.dumps(payload, ensure_ascii=False, default=str))
+
+
+@app.command("materialize")
+def materialize(
+    candidate_id: UUID,
+    priority: str = typer.Option("CANDIDATE", "--priority"),
+    profile_key: str | None = typer.Option(None, "--profile-key"),
+    supporting: str = typer.Option("OFF", "--supporting"),
+    force: bool = typer.Option(False, "--force/--no-force"),
+) -> None:
+    """Queue one explicit candidate-scoped Stage 6 materialization run."""
+
+    with create_session_factory()() as session:
+        try:
+            outcome = queue_materialization(
+                session,
+                candidate_id,
+                priority=priority,
+                profile_key=profile_key,
+                supporting_requested=supporting,
+                force=force,
+            )
+        except MaterializationError as error:
+            raise typer.BadParameter(str(error)) from error
+    typer.echo(
+        json.dumps(
+            {
+                "job_id": str(outcome.job_id) if outcome.job_id else None,
+                "status": outcome.status,
+                "queued": outcome.queued,
+                "cached": outcome.cached,
+                "active": outcome.active,
+            }
+        )
+    )
+
+
+@app.command("materialization-status")
+def materialization_status(candidate_id: UUID) -> None:
+    """Print the current Stage 6 materialization without mutating anything."""
+
+    from sqlalchemy import select
+
+    from app.models import ClipMaterialization
+
+    with create_session_factory()() as session:
+        row = session.scalars(
+            select(ClipMaterialization)
+            .where(
+                ClipMaterialization.clip_candidate_id == candidate_id,
+                ClipMaterialization.is_current.is_(True),
+            )
+            .order_by(ClipMaterialization.created_at.desc())
+        ).first()
+        if row is None:
+            raise typer.BadParameter("materialization does not exist")
+        payload = {
+            "id": str(row.id),
+            "priority": row.priority.value,
+            "lifecycle": row.lifecycle.value,
+            "semantic_outcome": row.semantic_outcome.value if row.semantic_outcome else None,
+            "human_review_required": bool(row.human_review_required),
+            "publication_ready": bool(row.publication_ready),
+            "repair_count": int(row.repair_count or 0),
+            "reason_codes": list(row.reason_codes or []),
+            "input_fingerprint": row.input_fingerprint,
+            "output_fingerprint": row.output_fingerprint,
+        }
     typer.echo(json.dumps(payload, ensure_ascii=False, default=str))
 
 
