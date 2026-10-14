@@ -85,6 +85,11 @@ def _localize_ass(
     if not data:
         raise RenderProcessError("ASS_MISSING", "no canonical ASS bytes were supplied")
     (attempt_directory / compiled.ass_localized_name).write_bytes(data)
+    if compiled.authored_ass_localized_name:
+        authored = context.authored_ass_bytes
+        if not authored:
+            raise RenderProcessError("ASS_MISSING", "no authored ASS bytes were supplied")
+        (attempt_directory / compiled.authored_ass_localized_name).write_bytes(authored)
 
 
 def run_compiled_render(compiled: CompiledRender, context: AttemptContext) -> RenderArtifacts:

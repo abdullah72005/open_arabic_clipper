@@ -235,6 +235,9 @@ class RuntimeIdentity:
     filter_complex_threads: int = 1
     source_absolute_path: str = ""
     attempt_directory: str = ""
+    #: Execution-only localized asset names (asset_id -> filename inside the
+    #: attempt directory). Absolute paths are excluded from every fingerprint.
+    asset_localized_paths: Mapping[str, str] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -384,6 +387,8 @@ class CompiledRender:
     expected_sample_count: int
     expected: Mapping[str, object] = field(default_factory=dict)
     diagnostics: Mapping[str, object] = field(default_factory=dict)
+    authored_ass_localized_name: str = ""
+    input_relative_paths: tuple[str, ...] = ()
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -494,6 +499,7 @@ class AttemptContext:
     timeout_seconds: float = 0.0
     poll_seconds: float = 0.5
     ass_bytes: bytes = b""
+    authored_ass_bytes: bytes = b""
     #: Absolute monotonic deadline shared by the whole expensive attempt
     #: (encode, post-encode probing, and QC). ``None`` falls back to a per-phase
     #: ``timeout_seconds`` budget when set.
