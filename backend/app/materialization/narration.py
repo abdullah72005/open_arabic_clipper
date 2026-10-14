@@ -9,7 +9,6 @@ WAV is never double-wrapped, raw PCM is wrapped exactly once.
 
 from __future__ import annotations
 
-import difflib
 import io
 import re
 import struct
@@ -165,6 +164,12 @@ _NEGATION_TOKENS = frozenset(
     }
 )
 
+# Clear non-lexical fillers only. Meaningful discourse markers such as "يعني"
+# ("means") are deliberately NOT dropped.
+_FILLER_TOKENS = frozenset({"امم", "ام", "اه", "آه", "ممم", "مم", "uh", "um", "er", "erm", "hmm"})
+
+_ARABIC_DIACRITICS = re.compile("[\u064b-\u0652\u0670\u0640]")
+
 
 def _is_number(token: str) -> bool:
     return any(character.isdigit() for character in token)
@@ -174,51 +179,108 @@ def _is_latin(token: str) -> bool:
     return any(character.isascii() and character.isalpha() for character in token)
 
 
+def _normalize_arabic(text: str) -> str:
+    """Fold Arabic orthographic variants for comparison (never for evidence)."""
+
+    text = _ARABIC_DIACRITICS.sub("", text)
+    for variant in ("أ", "إ", "آ", "ٱ"):
+        text = text.replace(variant, "ا")
+    return text.replace("ى", "ي")
+
+
 def _tokenize(text: str) -> list[str]:
-    expanded = expand_contractions(text.casefold())
+    expanded = expand_contractions(_normalize_arabic(text.casefold()))
     return [token for token in re.findall(r"[\w\u0600-\u06ff']+", expanded) if token]
+
+
+def _content_tokens(tokens: Sequence[str]) -> list[str]:
+    return [token for token in tokens if token not in _FILLER_TOKENS]
+
+
+def _distinct_order(tokens: Sequence[str]) -> list[str]:
+    """Order of first occurrence of distinct tokens (participant attribution)."""
+
+    seen: set[str] = set()
+    order: list[str] = []
+    for token in tokens:
+        if token not in seen:
+            seen.add(token)
+            order.append(token)
+    return order
+
+
+def _lcs_length(left: Sequence[str], right: Sequence[str]) -> int:
+    """Longest common subsequence length (bounded sentences, order-aware)."""
+
+    if not left or not right:
+        return 0
+    previous = [0] * (len(right) + 1)
+    for token in left:
+        current = [0] * (len(right) + 1)
+        for index, other in enumerate(right, start=1):
+            if token == other:
+                current[index] = previous[index - 1] + 1
+            else:
+                current[index] = max(previous[index], current[index - 1])
+        previous = current
+    return previous[-1]
 
 
 def transcription_matches(expected: str, actual: str, *, threshold: float = 0.6) -> bool:
     """Deterministic ASR-vs-script comparison (never rewrites source evidence).
 
-    A bounded local ASR transcript is compared with the accepted copy.
-    Contractions are expanded first, then meaning-critical content is checked
-    exactly: removed/added negation (including contracted forms), changed
-    numbers, and code-switch/Latin tokens must match in order. The overall token
-    *sequence* must align, so a reversed speaker attribution cannot pass even
-    when the token multiset is identical. Uncertain alignment never passes.
+    A bounded local ASR transcript is compared with the accepted copy. Arabic
+    orthographic variants are folded, contractions expanded, and clear
+    non-lexical fillers dropped. Meaning-critical content is then checked with
+    order- and occurrence-aware alignment: negation and numbers must match in
+    set *and* order (so a swapped negation scope or number attribution fails),
+    code-switch/Latin tokens must keep their order, the first-occurrence order of
+    distinct content tokens must be identical (so a reversed participant
+    attribution fails even when the token multiset is unchanged), every expected
+    token must be present, and the ordered LCS must cover the expected sequence.
+    Uncertain alignment never passes.
     """
 
     expected_tokens = _tokenize(expected)
     if not expected_tokens:
         return True
     actual_tokens = _tokenize(actual)
-    actual_set = set(actual_tokens)
+    expected_content = _content_tokens(expected_tokens)
+    actual_content = _content_tokens(actual_tokens)
 
-    expected_negation = {token for token in expected_tokens if token in _NEGATION_TOKENS}
-    actual_negation = {token for token in actual_tokens if token in _NEGATION_TOKENS}
+    expected_negation = [token for token in expected_content if token in _NEGATION_TOKENS]
+    actual_negation = [token for token in actual_content if token in _NEGATION_TOKENS]
     if expected_negation != actual_negation:
         return False
 
-    expected_numbers = {token for token in expected_tokens if _is_number(token)}
-    actual_numbers = {token for token in actual_tokens if _is_number(token)}
+    expected_numbers = [token for token in expected_content if _is_number(token)]
+    actual_numbers = [token for token in actual_content if _is_number(token)]
     if expected_numbers != actual_numbers:
         return False
 
     # Code-switch / Latin tokens must be present and in the same order.
-    expected_latin = [token for token in expected_tokens if _is_latin(token)]
-    actual_latin = [token for token in actual_tokens if _is_latin(token)]
+    expected_latin = [token for token in expected_content if _is_latin(token)]
+    actual_latin = [token for token in actual_content if _is_latin(token)]
     if expected_latin and not _is_subsequence(expected_latin, actual_latin):
         return False
 
-    # Order-sensitive overall alignment: a reversed attribution has a low
-    # sequence ratio even though its token multiset is identical.
-    ratio = difflib.SequenceMatcher(None, expected_tokens, actual_tokens).ratio()
-    if ratio < threshold:
+    # Participant attribution: the first-occurrence order of distinct content
+    # tokens must be identical. A reversed attribution has a different distinct
+    # order even though its token multiset is unchanged.
+    if _distinct_order(expected_content) != _distinct_order(actual_content):
         return False
+
     # Every expected token must be present; a dropped word is never accepted.
-    return all(token in actual_set for token in expected_tokens)
+    actual_set = set(actual_tokens)
+    if not all(token in actual_set for token in expected_tokens):
+        return False
+
+    # Order-sensitive coverage of the expected sequence.
+    if expected_content:
+        coverage = _lcs_length(expected_content, actual_content) / len(expected_content)
+        if coverage < threshold:
+            return False
+    return True
 
 
 def _is_subsequence(needle: Sequence[str], haystack: Sequence[str]) -> bool:

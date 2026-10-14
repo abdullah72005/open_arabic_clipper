@@ -24,6 +24,7 @@ from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from app.core.enums import (
+    JobStatus,
     MaterializationLifecycle,
     MaterializationOutcome,
     MaterializationPriority,
@@ -549,12 +550,14 @@ def run_materialization(
     """Run the bounded deterministic materialization pipeline over inputs."""
 
     active_ledger = ledger or CallLedger()
+    attempt_scope = input_fingerprint(inputs)
     script = materialize_script(
         provider,
         inputs,
         ledger=active_ledger,
         config=config,
         allow_hosted=allow_hosted,
+        attempt_scope=attempt_scope,
         critique_provider=critique_provider,
     )
 
@@ -563,7 +566,12 @@ def run_materialization(
     narration_required = _narration_required(inputs)
     if script.accepted and narration_required and inputs.profile.narration_allowed:
         narration = _synthesize_narration(
-            inputs, script, narration_synthesizer, active_ledger, config
+            inputs,
+            script,
+            narration_synthesizer,
+            active_ledger,
+            config,
+            attempt_scope=attempt_scope,
         )
 
     narration_blocks = frozenset(chunk.block_index for chunk in narration)
@@ -687,6 +695,8 @@ def _synthesize_narration(
     synthesizer: NarrationSynthesizer | None,
     ledger: CallLedger,
     config: Stage6Config,
+    *,
+    attempt_scope: str,
 ) -> tuple[NarrationAudio, ...]:
     if synthesizer is None or not synthesizer.available():
         return ()
@@ -699,8 +709,10 @@ def _synthesize_narration(
     for request in requests:
         if ledger.synthesis >= config.max_raw_synthesis_calls:
             break
-        ledger.synthesis += 1
-        ledger.ledger_entries.append({"kind": "synthesis", "chunk_id": request.chunk_id})
+        if not ledger.reserve(f"{attempt_scope}:synth:{request.chunk_id}", kind="synthesis"):
+            # Already reserved by a prior attempt: stay budget-consumed and do
+            # not synthesize twice.
+            break
         try:
             chunks.append(synthesizer.synthesize(request))
         except Exception:
@@ -809,42 +821,69 @@ def persist_materialization(
     )
     input_fp = input_fingerprint(inputs)
     candidate_uuid = _as_uuid(inputs.candidate_id)
+    profile_key = inputs.profile.profile_key
+
+    # A worker mutation must present its exact active job identity, claim token,
+    # and a genuinely RUNNING executing job; optional ownership arguments can
+    # never be used to bypass this.
+    if active_job_id is not None:
+        if claim_version is None:
+            raise MaterializationStaleError(
+                "a worker mutation requires its claim token alongside the job identity"
+            )
+        _require_running_job_claim(session, active_job_id, claim_version)
+
     row = session.scalars(
         select(ClipMaterialization).where(
             ClipMaterialization.clip_candidate_id == candidate_uuid,
-            ClipMaterialization.profile_key == inputs.profile.profile_key,
+            ClipMaterialization.profile_key == profile_key,
             ClipMaterialization.input_fingerprint == input_fp,
         )
     ).first()
 
-    # Fence *before* touching any authoritative state: a superseded worker must
-    # never demote or replace a newer current row.
-    if (
-        claim_version is not None
-        and row is not None
-        and int(row.claim_version or 0) > claim_version
-    ):
-        raise MaterializationStaleError(
-            "a newer claim already owns this materialization; refusing a stale write"
+    # Serialize authoritative transitions within the candidate/profile scope.
+    # Fence *before* touching any authoritative state: a superseded worker (older
+    # or equal claim) must never demote or replace a newer current generation,
+    # and a historical row's token can never authorize demoting a newer one.
+    scope_current = session.scalars(
+        select(ClipMaterialization).where(
+            ClipMaterialization.clip_candidate_id == candidate_uuid,
+            ClipMaterialization.profile_key == profile_key,
+            ClipMaterialization.is_current.is_(True),
         )
+    ).all()
+    if claim_version is not None:
+        for current in scope_current:
+            current_claim = int(current.claim_version or 0)
+            if current_claim > claim_version:
+                raise MaterializationStaleError(
+                    "a newer claim already owns this materialization; refusing a stale write"
+                )
+            # A different current generation (a changed input) holding an equal or
+            # higher claim can never be demoted by this write: a historical row's
+            # token must not revert a newer generation.
+            if current.input_fingerprint != input_fp and current_claim >= claim_version:
+                raise MaterializationStaleError(
+                    "a newer generation already owns this materialization; "
+                    "refusing to demote it with a historical token"
+                )
 
     # Demote every current row in this scope before creating/updating the target
     # row, so the scoped partial unique index is never transiently violated when
-    # a changed input creates a new history row.
-    session.execute(
-        update(ClipMaterialization)
-        .where(
-            ClipMaterialization.clip_candidate_id == candidate_uuid,
-            ClipMaterialization.profile_key == inputs.profile.profile_key,
-        )
-        .values(is_current=False)
-        .execution_options(synchronize_session="fetch")
+    # a changed input creates a new history row. The demotion is guarded so a
+    # historical token can never demote a newer generation.
+    demote = update(ClipMaterialization).where(
+        ClipMaterialization.clip_candidate_id == candidate_uuid,
+        ClipMaterialization.profile_key == profile_key,
     )
+    if claim_version is not None:
+        demote = demote.where(ClipMaterialization.claim_version < claim_version)
+    session.execute(demote.values(is_current=False).execution_options(synchronize_session="fetch"))
     if row is None:
         row = ClipMaterialization(
             source_video_id=_as_uuid(inputs.source_id),
             clip_candidate_id=candidate_uuid,
-            profile_key=inputs.profile.profile_key,
+            profile_key=profile_key,
         )
         session.add(row)
 
@@ -925,13 +964,29 @@ def persist_materialization(
     return row
 
 
+def _require_running_job_claim(session: Session, job_id: uuid.UUID, claim_version: int) -> None:
+    """Fail closed unless the exact executing job owns this claim and is RUNNING."""
+
+    from app.models import ProcessingJob
+
+    job = session.get(ProcessingJob, _as_uuid(job_id))
+    if job is None:
+        raise MaterializationStaleError("the executing job no longer exists")
+    if job.status is not JobStatus.RUNNING:
+        raise MaterializationStaleError("the executing job is not RUNNING")
+    if int(job.claim_version or 0) != int(claim_version):
+        raise MaterializationStaleError("the executing job no longer owns this claim")
+
+
 def _merge_call_ledger(preserved: CallLedger, current: CallLedger) -> dict[str, object]:
-    return CallLedger(
-        semantic=max(preserved.semantic, current.semantic),
-        strong=max(preserved.strong, current.strong),
-        synthesis=max(preserved.synthesis, current.synthesis),
-        ledger_entries=[*preserved.ledger_entries, *current.ledger_entries],
-    ).as_dict()
+    """Union the preserved and current ledgers by attempt identity.
+
+    Replaying an already-recorded attempt counts zero new calls; genuinely new
+    attempts union in exactly once. Counters are re-derived from the distinct
+    attempt identities, never blind-added or maximised from partial counters.
+    """
+
+    return preserved.merge(current).as_dict()
 
 
 def _checkpoint_fingerprint(checkpoints: Mapping[str, object], name: str) -> str:

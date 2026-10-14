@@ -137,17 +137,74 @@ DEFAULT_CONFIG = Stage6Config()
 
 @dataclass
 class CallLedger:
-    """Durable raw-call budget ledger for one materialization generation.
+    """Durable, replay-safe raw-call budget ledger for one generation.
 
-    Raw calls are accounted *before* invocation so a crash mid-request can never
-    under-count the budget. ``semantic`` and ``strong`` track the semantic
-    ceilings; ``synthesis`` tracks narration TTS calls.
+    Every raw provider attempt carries a unique ``attempt_id`` and is reserved
+    *before* invocation, so a crash mid-request can never under-count the budget
+    and a replayed checkpoint can never double-count it. ``semantic``/``strong``
+    track the semantic ceilings and ``synthesis`` the narration TTS ceiling; the
+    counters are always derived from the distinct reserved attempt identities, so
+    merging two ledgers unions attempts rather than adding or maximising partial
+    counters.
     """
 
     semantic: int = 0
     strong: int = 0
     synthesis: int = 0
     ledger_entries: list[dict[str, object]] = field(default_factory=list)
+
+    def attempt_ids(self) -> set[str]:
+        return {
+            str(entry["attempt_id"])
+            for entry in self.ledger_entries
+            if isinstance(entry.get("attempt_id"), str)
+        }
+
+    def reserve(self, attempt_id: str, *, kind: str, tier: str | None = None) -> bool:
+        """Reserve one raw attempt under its unique identity.
+
+        Returns ``True`` when the identity is new (the caller must invoke the
+        provider exactly once). Returns ``False`` when the identity is already
+        recorded — a replayed checkpoint or an uncertain/crashed invocation — in
+        which case the budget is already consumed and the provider must never be
+        called again.
+        """
+
+        if attempt_id in self.attempt_ids():
+            return False
+        entry: dict[str, object] = {"attempt_id": attempt_id, "kind": kind}
+        if tier is not None:
+            entry["tier"] = tier
+        self.ledger_entries.append(entry)
+        self._recount()
+        return True
+
+    def merge(self, other: "CallLedger") -> "CallLedger":
+        """Union two ledgers by attempt identity and re-derive the counters.
+
+        Legacy entries without an ``attempt_id`` (from before identity accounting)
+        are retained under a positional key so no historical attempt is lost.
+        """
+
+        merged = CallLedger()
+        seen: dict[str, dict[str, object]] = {}
+        for index, entry in enumerate([*self.ledger_entries, *other.ledger_entries]):
+            identity = entry.get("attempt_id")
+            if not isinstance(identity, str):
+                identity = f"legacy:{index}:{entry.get('kind')}:{entry.get('tier')}"
+            seen[identity] = dict(entry)
+        merged.ledger_entries = list(seen.values())
+        merged._recount()
+        return merged
+
+    def _recount(self) -> None:
+        self.semantic = sum(
+            1 for entry in self.ledger_entries if entry.get("kind") in {"semantic", "critique"}
+        )
+        self.strong = sum(
+            1 for entry in self.ledger_entries if entry.get("tier") == SEMANTIC_STRONG_TIER
+        )
+        self.synthesis = sum(1 for entry in self.ledger_entries if entry.get("kind") == "synthesis")
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -162,12 +219,11 @@ class CallLedger:
         if not isinstance(data, dict):
             return CallLedger()
         entries = data.get("entries")
-        return CallLedger(
-            semantic=int(data.get("semantic", 0) or 0),
-            strong=int(data.get("strong", 0) or 0),
-            synthesis=int(data.get("synthesis", 0) or 0),
+        ledger = CallLedger(
             ledger_entries=[dict(item) for item in entries] if isinstance(entries, list) else [],
         )
+        ledger._recount()
+        return ledger
 
 
 __all__ = [

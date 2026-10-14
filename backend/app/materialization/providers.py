@@ -341,13 +341,16 @@ def materialize_script(
     ledger: CallLedger,
     config: Stage6Config,
     allow_hosted: bool,
+    attempt_scope: str = "",
     critique_provider: MaterializationCritiqueProvider | None = None,
 ) -> MaterializationScript:
     """Run exactly one bounded writing request and validate its copy.
 
     Copy that is lexically novel is not accepted on novelty alone: it is routed
     to a bounded semantic critique that assesses the grounded copy. Without an
-    available critique, such copy defers honestly.
+    available critique, such copy defers honestly. Each hosted raw request is
+    reserved under a stable ``attempt_scope``-derived identity before invocation,
+    so a replayed checkpoint or a crashed attempt never spends the budget twice.
     """
 
     request = build_writing_request(inputs, config=config)
@@ -368,11 +371,13 @@ def materialize_script(
             return MaterializationScript((), False, identity, True, ("STRONG_BUDGET_EXHAUSTED",))
         if not provider.available():
             return MaterializationScript((), False, identity, True, ("PROVIDER_UNAVAILABLE",))
-        # Account the raw call before invocation so a crash can never under-count.
-        ledger.semantic += 1
-        ledger.ledger_entries.append({"kind": "semantic", "tier": request.tier})
-        if request.tier == SEMANTIC_STRONG_TIER:
-            ledger.strong += 1
+        # Reserve the raw attempt before invocation so a crash can never
+        # under-count; a replayed/crashed attempt stays budget-consumed and is
+        # never invoked a second time.
+        if not ledger.reserve(
+            f"{attempt_scope}:write:{request.tier}", kind="semantic", tier=request.tier
+        ):
+            return MaterializationScript((), False, identity, True, ("ATTEMPT_ALREADY_RESERVED",))
 
     result = provider.write(request)
     if result.deferred:
@@ -418,6 +423,7 @@ def materialize_script(
             ledger=ledger,
             config=config,
             allow_hosted=allow_hosted,
+            attempt_scope=attempt_scope,
         )
         if reviewed is None:
             return MaterializationScript(
@@ -462,6 +468,7 @@ def _run_critique(
     ledger: CallLedger,
     config: Stage6Config,
     allow_hosted: bool,
+    attempt_scope: str,
 ) -> dict[int, bool] | None:
     if critique_provider is None or not allow_hosted:
         return None
@@ -469,8 +476,8 @@ def _run_critique(
         return None
     if not critique_provider.available():
         return None
-    ledger.semantic += 1
-    ledger.ledger_entries.append({"kind": "critique", "tier": SEMANTIC_ROUTINE_TIER})
+    if not ledger.reserve(f"{attempt_scope}:critique", kind="critique"):
+        return None
     result = critique_provider.critique(CritiqueRequest(targets=tuple(targets)))
     if result.deferred:
         return None
