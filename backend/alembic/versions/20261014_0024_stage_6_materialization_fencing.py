@@ -67,9 +67,40 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.execute(
-        "DELETE FROM clip_materializations WHERE semantic_outcome = 'DEFERRED_EVIDENCE'"
-    )
+    # Preserve history: a ``DEFERRED_EVIDENCE`` sample cannot exist under the
+    # older outcome vocabulary, so map it to the older ``FAILED`` outcome while
+    # retaining ``DEFERRED_EVIDENCE`` in reason_codes/history, forcing lifecycle
+    # BLOCKED and every review/cache/publication flag false. Rows and their
+    # foreign-key relationships are never deleted.
+    import json
+
+    bind = op.get_bind()
+    rows = bind.execute(
+        sa.text(
+            "SELECT id, reason_codes FROM clip_materializations "
+            "WHERE semantic_outcome = 'DEFERRED_EVIDENCE'"
+        )
+    ).fetchall()
+    for row in rows:
+        reasons = row.reason_codes
+        if isinstance(reasons, str):
+            try:
+                reasons = json.loads(reasons)
+            except ValueError:
+                reasons = []
+        if not isinstance(reasons, list):
+            reasons = []
+        if "DEFERRED_EVIDENCE" not in reasons:
+            reasons.append("DEFERRED_EVIDENCE")
+        bind.execute(
+            sa.text(
+                "UPDATE clip_materializations SET semantic_outcome = 'FAILED', "
+                "lifecycle = 'BLOCKED', cache_eligible = false, "
+                "human_review_required = false, publication_ready = false, "
+                "reason_codes = :reasons WHERE id = :row_id"
+            ),
+            {"reasons": json.dumps(reasons), "row_id": row.id},
+        )
     with op.batch_alter_table("clip_materializations") as batch:
         batch.alter_column(
             "semantic_outcome",

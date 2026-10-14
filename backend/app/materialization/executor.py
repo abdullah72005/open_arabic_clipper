@@ -22,9 +22,14 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import and_, or_, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
-from app.core.enums import JobStatus, MaterializationPriority
+from app.core.enums import (
+    JobStatus,
+    MaterializationLifecycle,
+    MaterializationOutcome,
+    MaterializationPriority,
+)
 from app.core.settings import Settings
-from app.materialization.fingerprints import input_fingerprint
+from app.materialization.fingerprints import input_fingerprint, output_fingerprint
 from app.materialization.inputs import MaterializationInputs
 from app.materialization.policy import CallLedger, Stage6Config
 from app.materialization.providers import (
@@ -32,11 +37,22 @@ from app.materialization.providers import (
     MaterializationCritiqueProvider,
     MaterializationWritingProvider,
 )
+from app.materialization.repository import (
+    MaterializationOwner,
+    PreparedMaterialization,
+    bind_active_job,
+    claim_materialization,
+    commit_prepared,
+    get_or_create_envelope,
+)
 from app.materialization.service import (
     MaterializationError,
+    MaterializationResult,
     assemble_inputs,
-    persist_materialization,
     run_materialization,
+)
+from app.materialization.service import (
+    _checkpoint_fingerprint as _checkpoint_fp,
 )
 from app.models import ClipMaterialization, ProcessingJob
 from app.pipeline.executor import StageCancelled, StageExecutionResult
@@ -345,6 +361,88 @@ class MaterializationExecutor:
             return CallLedger()
         return CallLedger.from_dict(row.call_ledger)
 
+    def _claim_envelope(
+        self,
+        inputs: MaterializationInputs,
+        *,
+        priority: str,
+        profile_key: str | None,
+        supporting_requested: str,
+    ) -> MaterializationOwner | None:
+        """Create/bind the durable envelope and claim it for the executing job."""
+
+        if self._active_job_id is None:
+            return None
+        request_identity = {
+            "priority": priority,
+            "profile_key": inputs.profile.profile_key,
+            "supporting_requested": supporting_requested,
+        }
+        envelope = get_or_create_envelope(self._session, inputs, request_identity)
+        job = self._session.get(ProcessingJob, self._active_job_id)
+        if job is None:
+            return None
+        if job.materialization_id != envelope.id:
+            if envelope.active_job_id is None:
+                bind_active_job(self._session, envelope.id, job.id)
+            job.materialization_id = envelope.id
+            self._session.commit()
+        owner = claim_materialization(
+            self._session, envelope.id, uuid.UUID(str(self._active_job_id))
+        )
+        return owner
+
+    def _prepared_from_result(
+        self,
+        inputs: MaterializationInputs,
+        result: MaterializationResult,
+        envelope: ClipMaterialization,
+    ) -> PreparedMaterialization:
+        checkpoints = dict(result.component_checkpoints)
+        out_fp = output_fingerprint(
+            inputs,
+            script_fp=_checkpoint_fp(checkpoints, "SCRIPT"),
+            narration_fp=_checkpoint_fp(checkpoints, "NARRATION"),
+            supporting_fp=_checkpoint_fp(checkpoints, "SUPPORTING"),
+            timeline_fp=_checkpoint_fp(checkpoints, "TIMELINE"),
+        )
+        outcome = result.assessment.outcome
+        lifecycle = (
+            MaterializationLifecycle.AWAITING_RENDER
+            if outcome
+            in {
+                MaterializationOutcome.READY_FOR_HUMAN_REVIEW.value,
+                MaterializationOutcome.MATERIALIZED_WITH_CAUTION.value,
+            }
+            else MaterializationLifecycle.COMPLETE
+        )
+        return PreparedMaterialization(
+            lifecycle=lifecycle,
+            semantic_outcome=outcome,
+            human_review_required=bool(result.assessment.human_review_required),
+            repair_count=int(envelope.repair_count or 0),
+            reason_codes=tuple(result.reason_codes),
+            component_checkpoints=checkpoints,
+            authored_blocks=[block.as_dict() for block in result.script.authored_blocks],
+            claim_ledger=[
+                block.as_dict() for block in result.script.authored_blocks if block.claim_class
+            ],
+            slot_resolutions=[item.as_dict() for item in result.slot_resolutions],
+            narration_references=[chunk.as_dict() for chunk in result.narration],
+            asset_references=[item.as_dict() for item in result.supporting],
+            timeline_payload=result.timeline.as_dict(),
+            audio_recipe=result.audio_recipe.as_dict(),
+            quality_findings=[finding.as_dict() for finding in result.assessment.findings],
+            provider_identity=dict(result.script.provider_identity),
+            upstream_snapshot=dict(result.upstream_snapshot),
+            metrics={
+                "segments": len(result.timeline.segments),
+                "output_duration": round(result.timeline.output_duration, 6),
+                "removals": [dict(item) for item in result.removals],
+            },
+            output_fingerprint=out_fp,
+        )
+
     def execute(
         self,
         candidate_id: str,
@@ -378,13 +476,22 @@ class MaterializationExecutor:
             if self._should_stop():
                 self._finish_job(JobStatus.CANCELLED)
                 raise StageCancelled("Stage 6 materialization cancelled before execution")
+            owner = self._claim_envelope(
+                inputs,
+                priority=priority,
+                profile_key=profile_key,
+                supporting_requested=supporting_requested,
+            )
+            if owner is None:
+                self.skipped_duplicate = True
+                return StageExecutionResult("", None)
             ledger = self._preserved_ledger(inputs)
             try:
                 result = run_materialization(
                     inputs,
                     provider=self._providers.writing,
                     critique_provider=self._providers.critique,
-                    narration_synthesizer=self._providers.narration,  # type: ignore[arg-type]
+                    narration_synthesizer=self._providers.narration,
                     config=self._config,
                     allow_hosted=self._providers.critique is not None,
                     ledger=ledger,
@@ -398,29 +505,17 @@ class MaterializationExecutor:
             if not self._claim_guard(require_running=True):
                 self._session.rollback()
                 return StageExecutionResult("", None)
-            try:
-                row = persist_materialization(
-                    self._session,
-                    inputs,
-                    result,
-                    runtime_identity=self._runtime_identity(),
-                    active_job_id=self._active_job_id,  # type: ignore[arg-type]
-                    claim_version=self._claim_version,
-                )
-            except Exception as error:
+            envelope = self._session.get(ClipMaterialization, owner.materialization_id)
+            if envelope is None:
                 self._session.rollback()
-                self._finish_job(JobStatus.FAILED, error)
-                raise
-            if self._active_job_id is not None:
-                self._session.execute(
-                    update(ProcessingJob)
-                    .where(ProcessingJob.id == self._active_job_id)
-                    .values(materialization_id=row.id)
-                    .execution_options(synchronize_session=False)
-                )
-                self._session.commit()
+                return StageExecutionResult("", None)
+            prepared = self._prepared_from_result(inputs, result, envelope)
+            if not commit_prepared(self._session, owner, prepared):
+                self._session.rollback()
+                return StageExecutionResult("", None)
+            self._session.commit()
             self._finish_job(JobStatus.SUCCEEDED)
-            return StageExecutionResult(row.output_fingerprint, row)
+            return StageExecutionResult(prepared.output_fingerprint, envelope)
         except StageCancelled:
             self._finish_job(JobStatus.CANCELLED)
             raise
