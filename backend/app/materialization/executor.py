@@ -24,6 +24,8 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.enums import (
     JobStatus,
+    MaterializationLifecycle,
+    MaterializationOutcome,
     MaterializationPriority,
 )
 from app.core.settings import Settings
@@ -32,8 +34,9 @@ from app.materialization.components import (
     ComponentProviders,
     prepare_materialization,
 )
+from app.materialization.fingerprints import input_fingerprint
 from app.materialization.inputs import MaterializationInputs
-from app.materialization.policy import Stage6Config
+from app.materialization.policy import REASON_UPSTREAM_REVALIDATION_REQUIRED, Stage6Config
 from app.materialization.providers import (
     DeterministicWritingProvider,
     MaterializationCritiqueProvider,
@@ -44,7 +47,9 @@ from app.materialization.repository import (
     bind_active_job,
     claim_materialization,
     commit_prepared,
+    finish_owner_job,
     get_or_create_envelope,
+    guarded_update,
 )
 from app.materialization.service import (
     MaterializationError,
@@ -361,7 +366,7 @@ class MaterializationExecutor:
             "supporting_requested": supporting_requested,
         }
         envelope = get_or_create_envelope(self._session, inputs, request_identity)
-        job = self._session.get(ProcessingJob, self._active_job_id)
+        job = self._session.get(ProcessingJob, self._active_job_id, populate_existing=True)
         if job is None:
             return None
         if job.materialization_id != envelope.id:
@@ -369,10 +374,77 @@ class MaterializationExecutor:
                 bind_active_job(self._session, envelope.id, job.id)
             job.materialization_id = envelope.id
             self._session.commit()
+        if self._claim_version is None:
+            return None
         owner = claim_materialization(
-            self._session, envelope.id, uuid.UUID(str(self._active_job_id))
+            self._session,
+            envelope.id,
+            uuid.UUID(str(self._active_job_id)),
+            expected_job_claim_version=self._claim_version,
         )
         return owner
+
+    def _revalidate_upstream(
+        self,
+        candidate_id: str,
+        *,
+        priority: str,
+        profile_key: str | None,
+        supporting_requested: str,
+        inputs: MaterializationInputs,
+    ) -> bool:
+        """Freshly re-derive upstream effectiveness and exact input identity.
+
+        Owner predicates alone do not prove the upstream candidate/plan/contract/
+        FINAL_CLIP/composition are still current. Expire cached state, re-run the
+        frozen prerequisite read helpers, and compare the exact input fingerprint
+        before any authoritative output is written.
+        """
+
+        try:
+            self._session.expire_all()
+            current = assemble_inputs(
+                self._session,
+                candidate_id,
+                priority=priority,
+                profile_key=profile_key,
+                supporting_requested=supporting_requested,
+            )
+        except MaterializationError:
+            return False
+        return input_fingerprint(current) == input_fingerprint(inputs)
+
+    def _finish_superseded(self, owner: MaterializationOwner) -> None:
+        """Record a superseded run truthfully: no output, one atomic transition."""
+
+        try:
+            envelope = self._session.get(
+                ClipMaterialization, owner.materialization_id, populate_existing=True
+            )
+            reasons = list(envelope.reason_codes or []) if envelope is not None else []
+            if REASON_UPSTREAM_REVALIDATION_REQUIRED not in reasons:
+                reasons.append(REASON_UPSTREAM_REVALIDATION_REQUIRED)
+            ok = guarded_update(
+                self._session,
+                owner,
+                {
+                    "lifecycle": MaterializationLifecycle.BLOCKED,
+                    "semantic_outcome": MaterializationOutcome.UPSTREAM_REVALIDATION_REQUIRED,
+                    "output_fingerprint": "",
+                    "cache_eligible": False,
+                    "human_review_required": False,
+                    "publication_ready": False,
+                    "active_job_id": None,
+                    "reason_codes": reasons,
+                },
+            )
+            if not ok:
+                self._session.rollback()
+                return
+            finish_owner_job(self._session, owner, JobStatus.SUCCEEDED)
+            self._session.commit()
+        except Exception:
+            self._session.rollback()
 
     def _component_context(
         self, inputs: MaterializationInputs, owner: MaterializationOwner
@@ -446,15 +518,32 @@ class MaterializationExecutor:
             if not self._claim_guard(require_running=True):
                 self._session.rollback()
                 return StageExecutionResult("", None)
-            envelope = self._session.get(ClipMaterialization, owner.materialization_id)
+            # Upstream can change during provider work; revalidate before any
+            # authoritative output is written or a render is bound.
+            if not self._revalidate_upstream(
+                candidate_id,
+                priority=priority,
+                profile_key=profile_key,
+                supporting_requested=supporting_requested,
+                inputs=inputs,
+            ):
+                self._session.rollback()
+                self._finish_superseded(owner)
+                return StageExecutionResult("", None)
+            envelope = self._session.get(
+                ClipMaterialization, owner.materialization_id, populate_existing=True
+            )
             if envelope is None:
                 self._session.rollback()
                 return StageExecutionResult("", None)
             if not commit_prepared(self._session, owner, prepared):
                 self._session.rollback()
                 return StageExecutionResult("", None)
+            if not finish_owner_job(self._session, owner, JobStatus.SUCCEEDED):
+                self._session.rollback()
+                return StageExecutionResult("", None)
             self._session.commit()
-            self._finish_job(JobStatus.SUCCEEDED)
+            self._job_owner = False
             return StageExecutionResult(prepared.output_fingerprint, envelope)
         except StageCancelled:
             self._finish_job(JobStatus.CANCELLED)

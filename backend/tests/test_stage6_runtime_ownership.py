@@ -338,3 +338,54 @@ def test_input_fingerprint_distinguishes_generations(engine: Engine, monkeypatch
         inputs_candidate = assemble_inputs(session, candidate_id, priority="CANDIDATE")
         inputs_final = assemble_inputs(session, candidate_id, priority="FINAL_CLIP")
         assert input_fingerprint(inputs_candidate) != input_fingerprint(inputs_final)
+
+
+def test_historical_generation_reactivation_preserves_history(
+    engine: Engine, monkeypatch: Any
+) -> None:
+    candidate_id = _seed_ready(engine, monkeypatch)
+    monkeypatch.setattr(queue_module, "_dispatch", lambda cid, jid, **kwargs: None)
+
+    with Session(engine) as session:
+        candidate = queue_materialization(session, candidate_id, priority="CANDIDATE")
+        session.commit()
+        candidate_env = candidate.materialization_id
+        assert candidate_env is not None
+
+    with Session(engine) as session:
+        final = queue_materialization(session, candidate_id, priority="FINAL_CLIP")
+        session.commit()
+        assert final.materialization_id != candidate_env
+        # The FINAL_CLIP generation became current; CANDIDATE is demoted history.
+        current = session.scalars(
+            select(ClipMaterialization).where(
+                ClipMaterialization.clip_candidate_id == candidate_id,
+                ClipMaterialization.is_current.is_(True),
+            )
+        ).all()
+        assert [row.id for row in current] == [final.materialization_id]
+
+    # Reactivating the historical CANDIDATE generation must not raise and must
+    # demote FINAL_CLIP atomically, reusing the original row (history preserved).
+    with Session(engine) as session:
+        reactivated = queue_materialization(session, candidate_id, priority="CANDIDATE")
+        session.commit()
+        assert reactivated.materialization_id == candidate_env
+        current = session.scalars(
+            select(ClipMaterialization).where(
+                ClipMaterialization.clip_candidate_id == candidate_id,
+                ClipMaterialization.is_current.is_(True),
+            )
+        ).all()
+        assert [row.id for row in current] == [candidate_env]
+        assert (
+            len(
+                session.scalars(
+                    select(ClipMaterialization).where(
+                        ClipMaterialization.clip_candidate_id == candidate_id
+                    )
+                ).all()
+            )
+            == 2
+        )
+        assert count_active_materialization_jobs(session, candidate_id) == 1

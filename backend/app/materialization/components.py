@@ -49,6 +49,7 @@ from app.materialization.repository import (
     ledger_counts,
     merge_component_checkpoint,
     owner_is_current,
+    record_attempt_response,
     reserve_attempt,
     save_attempt_result,
 )
@@ -151,7 +152,11 @@ class DurableRequestGateway:
     def _ledger(self) -> Mapping[str, object] | None:
         from app.models import ClipMaterialization
 
-        row = self._context.session.get(ClipMaterialization, self._context.owner.materialization_id)
+        row = self._context.session.get(
+            ClipMaterialization,
+            self._context.owner.materialization_id,
+            populate_existing=True,
+        )
         return row.call_ledger if row is not None else None
 
     def _budget_allows(self, kind: str, tier: str | None) -> bool:
@@ -176,6 +181,8 @@ class DurableRequestGateway:
         tier: str | None,
         hosted: bool,
         operation: Callable[[], Any],
+        on_response: Callable[[Any], Mapping[str, object] | None] | None = None,
+        checkpoint_component: str | None = None,
     ) -> tuple[Any | None, str, str | None]:
         """Run one raw attempt. Returns ``(response, status, attempt_id)``.
 
@@ -184,6 +191,11 @@ class DurableRequestGateway:
         cancellation) and, when admission was denied, no local attempt was
         consumed. A reserved attempt whose provider call raised is durably
         ``UNCERTAIN`` (the request may have reached the provider).
+
+        ``on_response`` computes the reusable checkpoint patch for an accepted
+        response; it returns ``None`` for a deferred/rejected response so nothing
+        replayable is persisted. The attempt outcome and its checkpoint commit
+        atomically.
         """
 
         if self._cancel():
@@ -222,12 +234,15 @@ class DurableRequestGateway:
                     status=ATTEMPT_UNCERTAIN,
                 )
                 return None, "DEFERRED", attempt_id
-            save_attempt_result(
+            patch = on_response(response) if on_response is not None else None
+            record_attempt_response(
                 self._context.session,
                 self._context.owner,
                 attempt_id,
                 status=ATTEMPT_RESPONDED,
+                component=checkpoint_component or component,
                 response_fingerprint=stable_digest(_response_identity(response)),
+                checkpoint_patch=patch,
             )
             return response, "RESPONDED", attempt_id
         return operation(), "RESPONDED", None
@@ -344,7 +359,9 @@ def _narration_audio_from_dict(data: Mapping[str, object]) -> NarrationAudio:
 def _script_checkpoint(gateway: DurableRequestGateway) -> Mapping[str, object]:
     from app.models import ClipMaterialization
 
-    row = gateway.context.session.get(ClipMaterialization, gateway.context.owner.materialization_id)
+    row = gateway.context.session.get(
+        ClipMaterialization, gateway.context.owner.materialization_id, populate_existing=True
+    )
     if row is None or not isinstance(row.component_checkpoints, Mapping):
         return {}
     entry = row.component_checkpoints.get("SCRIPT")
@@ -382,13 +399,33 @@ class CheckpointedWritingProvider:
             self.reused = True
             return stored
         hosted = self._provider.provider_name != "deterministic"
-        response, status, attempt_id = self._gateway.run(
+
+        def on_response(result: Any) -> Mapping[str, object] | None:
+            if not isinstance(result, WritingResult) or result.deferred:
+                # Deferred/rejected output is never reusable: record the status
+                # truthfully without an accepted response so a later run retries.
+                return {
+                    "dependency_fingerprint": self._dep,
+                    "status": "DEFERRED",
+                }
+            return {
+                "dependency_fingerprint": self._dep,
+                "status": "PENDING",
+                "writing": {
+                    "dependency_fingerprint": self._dep,
+                    "response": _writing_result_to_dict(result),
+                },
+            }
+
+        response, status, _attempt_id = self._gateway.run(
             component="SCRIPT.WRITE",
             dependency_fingerprint=self._dep,
             kind="semantic",
             tier=request.tier,
             hosted=hosted,
             operation=lambda: self._provider.write(request),
+            on_response=on_response,
+            checkpoint_component="SCRIPT",
         )
         if status != "RESPONDED" or response is None:
             self.deferred_reason = "DEFERRED_PROVIDER"
@@ -400,23 +437,11 @@ class CheckpointedWritingProvider:
             )
         result = response
         assert isinstance(result, WritingResult)
-        merge_component_checkpoint(
-            self._gateway.context.session,
-            self._gateway.context.owner,
-            "SCRIPT",
-            {
-                "dependency_fingerprint": self._dep,
-                "status": "PENDING",
-                "writing": {
-                    "dependency_fingerprint": self._dep,
-                    "attempt_id": attempt_id,
-                    "response": _writing_result_to_dict(result),
-                },
-            },
-        )
         return result
 
     def _stored_writing(self) -> WritingResult | None:
+        # A valid reusable response exists only when the accepted writing
+        # subcomponent was persisted; deferred/rejected calls store no `writing`.
         writing = _script_checkpoint(self._gateway).get("writing")
         if not isinstance(writing, Mapping):
             return None
@@ -457,13 +482,31 @@ class CheckpointedCritiqueProvider:
         if stored is not None:
             self.reused = True
             return stored
-        response, status, attempt_id = self._gateway.run(
+
+        def on_response(result: Any) -> Mapping[str, object] | None:
+            if not isinstance(result, CritiqueResult) or result.deferred:
+                return {
+                    "dependency_fingerprint": self._dep,
+                    "status": "DEFERRED",
+                }
+            return {
+                "dependency_fingerprint": self._dep,
+                "status": "PENDING",
+                "critique": {
+                    "dependency_fingerprint": self._dep,
+                    "response": _critique_result_to_dict(result),
+                },
+            }
+
+        response, status, _attempt_id = self._gateway.run(
             component="SCRIPT.CRITIQUE",
             dependency_fingerprint=self._dep,
             kind="critique",
             tier=request.tier,
             hosted=True,
             operation=lambda: self._provider.critique(request),
+            on_response=on_response,
+            checkpoint_component="SCRIPT",
         )
         if status != "RESPONDED" or response is None:
             return CritiqueResult(
@@ -474,20 +517,6 @@ class CheckpointedCritiqueProvider:
             )
         result = response
         assert isinstance(result, CritiqueResult)
-        merge_component_checkpoint(
-            self._gateway.context.session,
-            self._gateway.context.owner,
-            "SCRIPT",
-            {
-                "dependency_fingerprint": self._dep,
-                "status": "PENDING",
-                "critique": {
-                    "dependency_fingerprint": self._dep,
-                    "attempt_id": attempt_id,
-                    "response": _critique_result_to_dict(result),
-                },
-            },
-        )
         return result
 
     def _stored_critique(self) -> CritiqueResult | None:
@@ -532,43 +561,46 @@ class CheckpointedNarrationSynthesizer:
         if stored is not None:
             self.reused = True
             return stored
-        response, status, attempt_id = self._gateway.run(
-            component=f"NARRATION.{request.chunk_id}",
-            dependency_fingerprint=dep,
-            kind="synthesis",
-            tier=None,
-            hosted=True,
-            operation=lambda: self._synthesizer.synthesize(request),
-        )
-        if status != "RESPONDED" or response is None:
-            raise RuntimeError("TTS_UNAVAILABLE")
-        audio = response
-        assert isinstance(audio, NarrationAudio)
-        merge_component_checkpoint(
-            self._gateway.context.session,
-            self._gateway.context.owner,
-            "NARRATION",
-            {
+
+        def on_response(result: Any) -> Mapping[str, object] | None:
+            if not isinstance(result, NarrationAudio):
+                return None
+            return {
                 "dependency_fingerprint": dep,
                 "chunks": {
                     request.chunk_id: {
                         "dependency_fingerprint": dep,
                         "synthesis": {
                             "status": "ACCEPTED",
-                            "attempt_id": attempt_id,
-                            "asset": audio.as_dict(),
+                            "asset": result.as_dict(),
                         },
                     }
                 },
-            },
+            }
+
+        response, status, _attempt_id = self._gateway.run(
+            component=f"NARRATION.{request.chunk_id}",
+            dependency_fingerprint=dep,
+            kind="synthesis",
+            tier=None,
+            hosted=True,
+            operation=lambda: self._synthesizer.synthesize(request),
+            on_response=on_response,
+            checkpoint_component="NARRATION",
         )
+        if status != "RESPONDED" or response is None:
+            raise RuntimeError("TTS_UNAVAILABLE")
+        audio = response
+        assert isinstance(audio, NarrationAudio)
         return audio
 
     def _stored_chunk(self, chunk_id: str, dep: str) -> NarrationAudio | None:
         from app.models import ClipMaterialization
 
         row = self._gateway.context.session.get(
-            ClipMaterialization, self._gateway.context.owner.materialization_id
+            ClipMaterialization,
+            self._gateway.context.owner.materialization_id,
+            populate_existing=True,
         )
         if row is None or not isinstance(row.component_checkpoints, Mapping):
             return None
@@ -656,22 +688,28 @@ def _record_script_checkpoint(
 ) -> None:
     if not owner_is_current(context.session, context.owner):
         return
-    merge_component_checkpoint(
-        context.session,
-        context.owner,
-        "SCRIPT",
-        {
-            "dependency_fingerprint": script_dep,
-            "status": "ACCEPTED",
-            "provider_identity": dict(script.provider_identity),
-            "result": {
-                "authored_blocks": [block.as_dict() for block in script.authored_blocks],
-            },
-            "result_fingerprint": stable_digest(
-                [block.as_dict() for block in script.authored_blocks]
-            ),
+    if script.accepted:
+        status = "ACCEPTED"
+        result_fingerprint: str | None = stable_digest(
+            [block.as_dict() for block in script.authored_blocks]
+        )
+    elif script.deferred:
+        status = "DEFERRED"
+        result_fingerprint = None
+    else:
+        status = "REJECTED"
+        result_fingerprint = None
+    patch: dict[str, object] = {
+        "dependency_fingerprint": script_dep,
+        "status": status,
+        "provider_identity": dict(script.provider_identity),
+        "result": {
+            "authored_blocks": [block.as_dict() for block in script.authored_blocks],
         },
-    )
+    }
+    if result_fingerprint is not None:
+        patch["result_fingerprint"] = result_fingerprint
+    merge_component_checkpoint(context.session, context.owner, "SCRIPT", patch)
 
 
 def _prepared_from_result(
@@ -681,7 +719,9 @@ def _prepared_from_result(
     checkpoints = dict(result.component_checkpoints)
     from app.models import ClipMaterialization
 
-    row = context.session.get(ClipMaterialization, context.owner.materialization_id)
+    row = context.session.get(
+        ClipMaterialization, context.owner.materialization_id, populate_existing=True
+    )
     if row is not None and isinstance(row.component_checkpoints, Mapping):
         for name in ("SCRIPT", "NARRATION"):
             stored = row.component_checkpoints.get(name)

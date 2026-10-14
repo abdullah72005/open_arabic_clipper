@@ -188,28 +188,35 @@ def get_or_create_envelope(
     input_fp = input_fingerprint(inputs)
 
     existing = session.scalars(
-        select(ClipMaterialization).where(
+        select(ClipMaterialization)
+        .where(
             ClipMaterialization.clip_candidate_id == candidate_uuid,
             ClipMaterialization.profile_key == profile_key,
             ClipMaterialization.input_fingerprint == input_fp,
         )
+        .with_for_update()
+        .execution_options(populate_existing=True)
     ).first()
+
+    # Demote every *other* current row in this scope before reactivating or
+    # creating the target generation, so the scoped partial unique index is never
+    # transiently violated (historical CANDIDATE -> FINAL_CLIP -> CANDIDATE
+    # reactivation) and history/checkpoints/budgets are preserved in place.
+    demote = update(ClipMaterialization).where(
+        ClipMaterialization.clip_candidate_id == candidate_uuid,
+        ClipMaterialization.profile_key == profile_key,
+        ClipMaterialization.is_current.is_(True),
+    )
+    if existing is not None:
+        demote = demote.where(ClipMaterialization.id != existing.id)
+    session.execute(demote.values(is_current=False).execution_options(synchronize_session=False))
+
     if existing is not None:
         if not existing.is_current:
             existing.is_current = True
             session.flush()
         return existing
 
-    session.execute(
-        update(ClipMaterialization)
-        .where(
-            ClipMaterialization.clip_candidate_id == candidate_uuid,
-            ClipMaterialization.profile_key == profile_key,
-            ClipMaterialization.is_current.is_(True),
-        )
-        .values(is_current=False)
-        .execution_options(synchronize_session=False)
-    )
     row = ClipMaterialization(
         source_video_id=_as_uuid(inputs.source_id),
         clip_candidate_id=candidate_uuid,
@@ -249,22 +256,30 @@ def _apply_identity(
 
 
 def claim_materialization(
-    session: Session, materialization_id: uuid.UUID | str, job_id: uuid.UUID | str
+    session: Session,
+    materialization_id: uuid.UUID | str,
+    job_id: uuid.UUID | str,
+    *,
+    expected_job_claim_version: int,
 ) -> MaterializationOwner | None:
     """Atomically claim one envelope for a RUNNING MATERIALIZATION job.
 
     Advances only the envelope's local ``claim_version`` and binds the job's
-    ``materialization_id`` to the envelope. Returns ``None`` when the job is not
-    RUNNING, is the wrong kind, or the envelope is not the one the job already
-    owns via the queue CAS.
+    ``materialization_id`` to the envelope. The caller's *expected* job claim
+    token is verified against a fresh row read (never the stale identity map,
+    never whichever token happens to be stored). Returns ``None`` when the job is
+    not RUNNING, is the wrong kind, the expected token is stale, or the envelope
+    is not the one the job already owns via the queue CAS.
     """
 
     envelope_id = _as_uuid(materialization_id)
     job_uuid = _as_uuid(job_id)
-    job = session.get(ProcessingJob, job_uuid)
+    job = _fresh_get(session, ProcessingJob, job_uuid)
     if job is None or job.kind is not JobKind.MATERIALIZATION:
         return None
     if job.status is not JobStatus.RUNNING:
+        return None
+    if int(job.claim_version or 0) != int(expected_job_claim_version):
         return None
 
     result = session.execute(
@@ -291,20 +306,17 @@ def claim_materialization(
         .execution_options(synchronize_session=False)
     )
     # Fresh scalar reads: the identity map still holds the pre-increment values
-    # because the guarded update ran with synchronize_session=False.
+    # because the updates ran with synchronize_session=False.
     envelope_claim = session.scalar(
         select(ClipMaterialization.claim_version).where(ClipMaterialization.id == envelope_id)
     )
-    job_claim = session.scalar(
-        select(ProcessingJob.claim_version).where(ProcessingJob.id == job_uuid)
-    )
-    if envelope_claim is None or job_claim is None:
+    if envelope_claim is None:
         session.rollback()
         return None
     owner = MaterializationOwner(
         materialization_id=envelope_id,
         job_id=job_uuid,
-        job_claim_version=int(job_claim),
+        job_claim_version=int(expected_job_claim_version),
         materialization_claim_version=int(envelope_claim),
     )
     session.commit()
@@ -368,11 +380,26 @@ def ledger_counts(ledger: Mapping[str, object] | None) -> dict[str, int]:
 
 
 def _lock_envelope(session: Session, envelope_id: uuid.UUID) -> ClipMaterialization | None:
-    return session.scalars(
-        select(ClipMaterialization)
-        .where(ClipMaterialization.id == envelope_id, ClipMaterialization.is_current.is_(True))
-        .with_for_update()
-    ).first()
+    """Load the envelope's *current* row values under a row lock.
+
+    The application session uses ``autoflush=False``/``expire_on_commit=False``,
+    so a plain ``session.get`` could return stale identity-map attributes.
+    ``populate_existing`` forces a fresh row read and ``with_for_update`` locks it
+    for the read-modify-write that follows.
+    """
+
+    return session.get(
+        ClipMaterialization,
+        envelope_id,
+        populate_existing=True,
+        with_for_update=True,
+    )
+
+
+def _fresh_get(session: Session, model: Any, pk: uuid.UUID) -> Any:
+    """Read one row freshly, bypassing stale identity-map attributes."""
+
+    return session.get(model, pk, populate_existing=True)
 
 
 def reserve_attempt(
@@ -459,6 +486,63 @@ def save_attempt_result(
     return True
 
 
+def record_attempt_response(
+    session: Session,
+    owner: MaterializationOwner,
+    attempt_id: str,
+    *,
+    status: str,
+    component: str,
+    response_fingerprint: str | None = None,
+    provider_identity: Mapping[str, object] | None = None,
+    checkpoint_patch: Mapping[str, object] | None = None,
+) -> bool:
+    """Atomically persist an attempt's terminal status and its reusable checkpoint.
+
+    The locked, freshly-read envelope is read once so the attempt entry and the
+    component checkpoint (e.g. an accepted writing response) commit together, and
+    existing subcomponents/chunks are preserved rather than overwritten by stale
+    identity-map state.
+    """
+
+    if status not in ATTEMPT_STATUSES:
+        raise ValueError("unknown attempt status")
+    row = _lock_envelope(session, owner.materialization_id)
+    if row is None:
+        session.rollback()
+        return False
+    entries = ledger_entries(row.call_ledger)
+    found = False
+    for entry in entries:
+        if entry.get("attempt_id") == attempt_id:
+            entry["status"] = status
+            if response_fingerprint is not None:
+                entry["response_fingerprint"] = response_fingerprint
+            if provider_identity is not None:
+                entry["provider_identity"] = dict(provider_identity)
+            found = True
+            break
+    if not found:
+        session.rollback()
+        return False
+    values: dict[str, object] = {
+        "call_ledger": {"version": ATTEMPT_LEDGER_VERSION, "entries": entries}
+    }
+    if checkpoint_patch is not None:
+        checkpoints = dict(row.component_checkpoints or {})
+        existing = checkpoints.get(component)
+        merged = dict(existing) if isinstance(existing, Mapping) else {}
+        merged.update(dict(checkpoint_patch))
+        checkpoints[component] = merged
+        values["component_checkpoints"] = checkpoints
+    ok = guarded_update(session, owner, values)
+    if not ok:
+        session.rollback()
+        return False
+    session.commit()
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Component checkpoints
 # ---------------------------------------------------------------------------
@@ -475,7 +559,7 @@ def load_component(
     This is a read: it performs no network calls and mutates no state.
     """
 
-    row = session.get(ClipMaterialization, _as_uuid(materialization_id))
+    row = _fresh_get(session, ClipMaterialization, _as_uuid(materialization_id))
     if row is None:
         return None
     checkpoints = row.component_checkpoints
@@ -504,7 +588,7 @@ def save_component_checkpoint(
     validated result.
     """
 
-    row = session.get(ClipMaterialization, owner.materialization_id)
+    row = _lock_envelope(session, owner.materialization_id)
     if row is None:
         return False
     checkpoints = dict(row.component_checkpoints or {})
@@ -542,7 +626,7 @@ def merge_component_checkpoint(
     later partial update. Uses a fresh dict assignment for JSON mutation tracking.
     """
 
-    row = session.get(ClipMaterialization, owner.materialization_id)
+    row = _lock_envelope(session, owner.materialization_id)
     if row is None:
         return False
     checkpoints = dict(row.component_checkpoints or {})
@@ -598,6 +682,46 @@ def commit_prepared(
     return guarded_update(session, owner, values)
 
 
+def finish_owner_job(
+    session: Session,
+    owner: MaterializationOwner,
+    status: JobStatus,
+    *,
+    error_code: str | None = None,
+    error_message: str | None = None,
+) -> bool:
+    """Transition the owned RUNNING job (no commit; caller commits atomically).
+
+    Fences on the exact claim token and a RUNNING status so a superseded worker
+    cannot finalize another worker's job.
+    """
+
+    values: dict[str, object] = {
+        "status": status,
+        "completed_at": _utcnow(),
+    }
+    if status is JobStatus.FAILED:
+        values["error_code"] = error_code
+        values["error_message"] = error_message
+    result = session.execute(
+        update(ProcessingJob)
+        .where(
+            ProcessingJob.id == owner.job_id,
+            ProcessingJob.claim_version == owner.job_claim_version,
+            ProcessingJob.status == JobStatus.RUNNING,
+        )
+        .values(**values)
+        .execution_options(synchronize_session=False)
+    )
+    return int(result.rowcount) == 1
+
+
+def _utcnow() -> Any:
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc)
+
+
 def _optional_uuid(value: object) -> uuid.UUID | None:
     if value is None:
         return None
@@ -623,6 +747,7 @@ __all__ = [
     "bind_active_job",
     "claim_materialization",
     "commit_prepared",
+    "finish_owner_job",
     "get_or_create_envelope",
     "guarded_update",
     "ledger_counts",
@@ -631,6 +756,7 @@ __all__ = [
     "merge_component_checkpoint",
     "new_ledger",
     "owner_is_current",
+    "record_attempt_response",
     "reserve_attempt",
     "save_attempt_result",
     "save_component_checkpoint",

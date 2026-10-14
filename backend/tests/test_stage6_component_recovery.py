@@ -175,7 +175,9 @@ def component_fixture(
     session.flush()
     envelope.active_job_id = job.id
     session.commit()
-    owner = claim_materialization(session, envelope.id, job.id)
+    owner = claim_materialization(
+        session, envelope.id, job.id, expected_job_claim_version=1
+    )
     assert owner is not None
     session.commit()
     try:
@@ -374,7 +376,9 @@ def test_accepted_synthesis_is_reused_on_resume(component_fixture: Any) -> None:
     session.flush()
     envelope.active_job_id = job.id
     session.commit()
-    owner = claim_materialization(session, envelope.id, job.id)
+    owner = claim_materialization(
+        session, envelope.id, job.id, expected_job_claim_version=1
+    )
     assert owner is not None
 
     writing = ScriptedWritingProvider()
