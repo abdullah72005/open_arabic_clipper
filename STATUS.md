@@ -707,8 +707,8 @@ Deterministic verification: 108 focused Stage 4.2 tests (governor, providers,
 service, executor/queue/cache/concurrency/cancellation, API/CLI/handoff/migration)
 plus the full backend suite in Docker Python 3.12 with the repository compose/.env
 files mounted, with no live provider calls in the automated suite. Versions:
-governor `stage4.2-v6`, schema `stage4.2-schema-v1`, validation
-`stage4.2-validation-v6`. See [docs/STAGE_4_2_OPERATIONS.md](docs/STAGE_4_2_OPERATIONS.md).
+governor `stage4.2-v7`, schema `stage4.2-schema-v1`, validation
+`stage4.2-validation-v7`. See [docs/STAGE_4_2_OPERATIONS.md](docs/STAGE_4_2_OPERATIONS.md).
 
 ### Stage 4.2 corrective patch (2026-09-17)
 
@@ -734,12 +734,17 @@ governor `stage4.2-v6`, schema `stage4.2-schema-v1`, validation
 - **Revision-level semantic adjudication (2026-10-14).** In adaptive mode with a
   provider, a plan whose only deterministic findings are revision-level (no hard
   failure, no blocking condition) is sent to the semantic review instead of being
-  rejected outright. A favorable critique clears the advisory deterministic
-  revisions so the plan can be approved or approved-with-caution; a critique that
-  confirms a problem keeps both its finding and the deterministic revision. Hard
+  rejected outright. Clearance is **reason-specific**: only heuristic
+  paraphrase/filler/template opinions are cleared, and only when the critique
+  supplies a positive, known finding for the matching dimension; `UNKNOWN`,
+  concern, unavailable, or malformed evidence clears nothing. Measured
+  retention/proportionality violations (hero delay, interruption, duration,
+  over-edit, fragmentation) stay deterministic requirements and are never
+  model-overridable. Cleared findings are retained on the audit record
+  (`provider_evidence.adjudicated_revisions`) with their adjudication. Hard
   failures and blocking conditions are never reviewed away. Without a provider the
   deterministic revisions stand unchanged. Versions advanced to
-  `stage4.2-v6`/`stage4.2-validation-v6`.
+  `stage4.2-v7`/`stage4.2-validation-v7`.
 - **Strict hero thresholds** (`short_moment_seconds`,
   `high_moment_density_floor`) now actually govern strict hero-window
   classification and remain fingerprint-invalidating.

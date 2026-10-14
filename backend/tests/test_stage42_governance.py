@@ -1012,3 +1012,160 @@ def test_quote_with_added_claim_is_blocked_when_external_dependency_exists():
     assert governance.verification["claim_state"] == "EXTERNAL_REQUIRED_UNRESOLVED"
     assert governance.status is GovernancePlanStatus.BLOCKED_PENDING_VERIFICATION
     assert governance.eligible_for_stage4_3 is False
+
+
+# ---------------------------------------------------------------------------
+# Reason-specific semantic adjudication of heuristic revisions
+# ---------------------------------------------------------------------------
+
+
+def _review(plan, inputs, *, critique, state=SEMANTIC_AVAILABLE):
+    evaluation = evaluate_plan(
+        plan, inputs, DEFAULT_CONFIG, provider_mode_deterministic=False
+    )
+    apply_semantic_review(evaluation, critique, state)
+    return evaluation
+
+
+def _revision_codes(evaluation):
+    return {str(finding.get("code")) for finding in evaluation.revisions}
+
+
+def test_favorable_critique_clears_only_heuristic_paraphrase_revision() -> None:
+    plan, inputs = _paraphrase_revision_plan()
+    evaluation = _review(plan, inputs, critique=make_critique(plan))
+    assert "REDUNDANT_PARAPHRASE_ONLY" not in _revision_codes(evaluation)
+    governance = build_plan_governance(evaluation, input_fingerprint="in", output_fingerprint="out")
+    assert governance.eligible_for_stage4_3 is True
+    # The original finding and its adjudication are retained for audit.
+    adjudicated = governance.provider_evidence["adjudicated_revisions"]
+    assert [entry["code"] for entry in adjudicated] == ["REDUNDANT_PARAPHRASE_ONLY"]
+    assert adjudicated[0]["adjudication"]["cleared_by"] == "SEMANTIC_REVIEW"
+
+
+def test_favorable_critique_clears_generic_filler_revision() -> None:
+    plan = make_plan(
+        blocks=[
+            source_block(0),
+            original_block(1, intent="This is interesting and important value", kind="SYNTHESIS"),
+        ],
+        original_value_kinds=("SYNTHESIS",),
+    )
+    inputs = make_inputs(
+        [plan],
+        transcript=(
+            "The guest argues that remote work collapsed productivity because managers lost "
+            "the ability to mentor junior staff."
+        ),
+    )
+    evaluation = evaluate_plan(
+        plan, inputs, DEFAULT_CONFIG, provider_mode_deterministic=False
+    )
+    assert "GENERIC_FILLER_ONLY" in _revision_codes(evaluation)
+    apply_semantic_review(evaluation, make_critique(plan), SEMANTIC_AVAILABLE)
+    assert "GENERIC_FILLER_ONLY" not in _revision_codes(evaluation)
+
+
+def test_unknown_relevant_finding_does_not_clear_revision() -> None:
+    plan, inputs = _paraphrase_revision_plan()
+    evaluation = _review(plan, inputs, critique=make_critique(plan, value="UNKNOWN"))
+    assert "REDUNDANT_PARAPHRASE_ONLY" in _revision_codes(evaluation)
+    governance = build_plan_governance(evaluation, input_fingerprint="in", output_fingerprint="out")
+    assert governance.eligible_for_stage4_3 is False
+    assert governance.provider_evidence["adjudicated_revisions"] == []
+
+
+def test_confirmed_paraphrase_keeps_revision_required() -> None:
+    plan, inputs = _paraphrase_revision_plan()
+    evaluation = _review(plan, inputs, critique=make_critique(plan, value="REDUNDANT"))
+    assert "REDUNDANT_PARAPHRASE_ONLY" in _revision_codes(evaluation)
+    governance = build_plan_governance(evaluation, input_fingerprint="in", output_fingerprint="out")
+    assert governance.status is GovernancePlanStatus.REVISION_REQUIRED
+
+
+def test_high_template_feel_confirms_template_revision() -> None:
+    plan, inputs = _paraphrase_revision_plan()
+    evaluation = _review(plan, inputs, critique=make_critique(plan, template_feel="HIGH"))
+    assert "TEMPLATE_MASS_PRODUCED_FEEL" in _revision_codes(evaluation)
+    governance = build_plan_governance(evaluation, input_fingerprint="in", output_fingerprint="out")
+    assert governance.status is GovernancePlanStatus.REVISION_REQUIRED
+
+
+def test_measured_payoff_interruption_is_never_cleared_by_review() -> None:
+    plan = make_plan(
+        blocks=[original_block(0, interrupts=True), source_block(1)],
+        hero_index=1,
+    )
+    inputs = make_inputs([plan], source_moment_structure="JOKE")
+    evaluation = _review(plan, inputs, critique=make_critique(plan))
+    assert "PAYOFF_INTERRUPTED" in _revision_codes(evaluation)
+    assert "EXCESSIVE_PREAMBLE" in _revision_codes(evaluation)
+    governance = build_plan_governance(evaluation, input_fingerprint="in", output_fingerprint="out")
+    assert governance.status is GovernancePlanStatus.REVISION_REQUIRED
+    assert governance.eligible_for_stage4_3 is False
+    assert governance.provider_evidence["adjudicated_revisions"] == []
+
+
+def test_measured_over_edit_is_never_cleared_by_review() -> None:
+    plan = make_plan(
+        blocks=[source_block(0, duration=3.0), original_block(1, duration=8.0)],
+        hero_index=0,
+    )
+    inputs = make_inputs([plan], source_moment_structure="JOKE")
+    evaluation = _review(plan, inputs, critique=make_critique(plan))
+    assert "TRANSFORMATION_OVER_EDIT" in _revision_codes(evaluation)
+    governance = build_plan_governance(evaluation, input_fingerprint="in", output_fingerprint="out")
+    assert governance.status is GovernancePlanStatus.REVISION_REQUIRED
+
+
+def test_hard_failure_is_never_cleared_by_review() -> None:
+    plan = make_plan(
+        blocks=[
+            original_block(
+                0,
+                intent="This is interesting and important to note",
+                kind="SYNTHESIS",
+                duration=12.0,
+            ),
+            source_block(1),
+        ],
+        hero_index=1,
+        original_value_kinds=("SYNTHESIS",),
+    )
+    evaluation = _review(plan, make_inputs([plan]), critique=make_critique(plan))
+    assert evaluation.hard_failures
+    governance = build_plan_governance(evaluation, input_fingerprint="in", output_fingerprint="out")
+    assert governance.status is GovernancePlanStatus.REJECTED_BY_GOVERNOR
+
+
+def test_verification_block_is_never_cleared_by_review() -> None:
+    plan = make_plan(
+        blocks=[
+            source_block(0),
+            original_block(
+                1,
+                intent="Counter the claim using a linked external statistic",
+                kind="COUNTERPOINT",
+                grounding=(),
+                dependency_ids=("claim-1",),
+            ),
+            verification_block(2, claim_id="claim-1", dependent=(1,)),
+        ],
+        original_value_kinds=("COUNTERPOINT",),
+        verification_dependencies=(
+            {"claim_id": "claim-1", "block_indexes": [1], "must_verify_before_execution": True},
+        ),
+    )
+    inputs = make_inputs([plan])
+    evaluation = _review(plan, inputs, critique=make_critique(plan))
+    assert evaluation.blocking
+    governance = build_plan_governance(evaluation, input_fingerprint="in", output_fingerprint="out")
+    assert governance.status is GovernancePlanStatus.BLOCKED_PENDING_VERIFICATION
+    assert governance.eligible_for_stage4_3 is False
+
+
+def test_unavailable_review_does_not_clear_revision() -> None:
+    plan, inputs = _paraphrase_revision_plan()
+    evaluation = _review(plan, inputs, critique=make_critique(plan), state="UNAVAILABLE")
+    assert "REDUNDANT_PARAPHRASE_ONLY" in _revision_codes(evaluation)
+    assert evaluation.adjudicated_revisions == []
