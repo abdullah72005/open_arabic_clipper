@@ -1,5 +1,59 @@
 # Runtime status
 
+## Stage 6 durable ownership + component gateway, authored payload (2026-10-15)
+
+Status: **the six structural gaps in the inspected Stage 6 code are corrected
+with real-PostgreSQL regressions, and the production executor now drives a
+durable reserve-before-invoke component gateway. The frozen authored render
+payload and cumulative timing are implemented. The Stage 5.2 `TRANSFORMED_SHORT`
+renderer execution (video/audio/QC), the finalizer, hosted writing/critique/TTS
+adapters, API/CLI/UI completion, and the genuine manual-acceptance package remain
+outstanding. No transformed-short MP4 exists. Stage 6 is NOT FROZEN.**
+
+- **Envelope-first ownership (`2360ee8`).** New `materialization/repository.py`
+  defines `MaterializationOwner` and the paired job/envelope predicates (two
+  local claim tokens, never compared across jobs). The envelope is created before
+  any provider work; the queue locks the candidate, finds-or-creates the
+  generation envelope, and CASes `active_job_id` so concurrent/retried requests
+  share one envelope and one job. Failed broker dispatch is marked and recovered
+  by the next request; a read never dispatches. Migration `0024` downgrade now
+  preserves `DEFERRED_EVIDENCE` rows (`FAILED`/`BLOCKED`, all flags false) instead
+  of deleting them. Regressions: `test_stage6_runtime_ownership.py` (real
+  PostgreSQL: concurrent enqueue, fresh generations with independent local claim
+  counters, stale-worker rejection, dispatch recovery, envelope-before-provider).
+- **Durable component gateway (`0e5c0d5`).** New `materialization/components.py`
+  reserves a unique attempt durably before each provider call and persists the
+  accepted writing/critique/synthesis subcomponent immediately, so a crash resumes
+  the last accepted work without repeating providers. Reserved-but-unanswered
+  attempts become `UNCERTAIN` and stay budget-consumed; denied admission or
+  exhausted budget defers without consuming a local attempt. The production
+  executor routes through `prepare_materialization`; `run_materialization`
+  remains the fixture helper. Regressions: `test_stage6_component_recovery.py`
+  (observer-before-provider reservation, writing-before-critique and
+  synthesis-before-ASR replay, cancellation without a next call, exhausted
+  budget, real executor resume).
+- **Frozen authored payload (`682483e`).** `render/execution/authored.py` adds the
+  typed `MediaAssetRef`/`RenderUnit`/`GainPoint`/`AudioTrackSpec`/`MasteringSpec`/
+  `AuthoredRenderPayload` value objects with strict parsing and structural
+  validation (contiguous complete visual units, at least one SOURCE and the
+  complete hero, per-SOURCE occurrence binding, bounded non-overlapping
+  gain-monotonic tracks), plus exact `Fraction` cumulative frame/sample
+  boundaries. `RenderSpec.authored` is optional and leaves core serialization and
+  fingerprints unchanged when absent. Regressions: `test_stage6_authored_spec.py`.
+- **Remaining blockers (concrete).** The Stage 5.2 `TRANSFORMED_SHORT` compiler
+  branch and real video/audio execution (cards/overlays, explicit tracks and gain
+  envelopes, final `-16 LUFS`/`-1.5 dBTP` mastering and decoded-AAC QC),
+  `materialization/rendering.py`+`overlays.py`, the idempotent finalizer and
+  bounded repair, hosted writing/critique/TTS adapters, the candidate
+  API/CLI/UI completion, and the manual-acceptance package remain. Real FFmpeg
+  execution is the load-bearing next step.
+- **Verification evidence (Docker Python 3.12.14 + PostgreSQL 16).** `pytest -k
+  stage6` runs `130 passed`; the adjacent Stage 5.1/5.2 renderer suites pass
+  (`407 passed, 20 skipped`) after the Stage 5.2 migration test was retargeted
+  explicitly below Stage 6's new head. `ruff` and `mypy app/materialization` are
+  clean. Migrations `0023`/`0024` apply and reverse on PostgreSQL. No FFmpeg
+  render, hosted provider call, or manual-acceptance artifact was produced.
+
 ## Stage 6 third-review corrections and production dispatch path (2026-10-14)
 
 Status: **the three third-round SOL-review defects are corrected with regressions
