@@ -1,5 +1,52 @@
 # Runtime status
 
+## Stage 6 session/ownership corrections + authored renderer (2026-10-15)
+
+Status: **the four SOL PostgreSQL-probe corrections are fixed with regressions,
+and a real authored renderer path now produces an actual authored MP4 (synthetic
+fixture) through the frozen compiler/runner. The remaining integration — DB
+mapping (`materialization/rendering.py`) and wiring the authored purpose through
+the existing `RenderExecutionExecutor`/queue/QC, plus two-phase lossless audio
+mastering and Tasks 5–9 — is not done. No production-path transformed MP4 or
+manual-acceptance package exists. Stage 6 is NOT FROZEN.**
+
+- **Corrections (`b048c6c`).** (1) Application-session semantics: repository
+  reads/locked refresh now use fresh SQL (`populate_existing`/`with_for_update`)
+  so the production session (`autoflush=False`, `expire_on_commit=False`) no
+  longer rejects a just-claimed job or loses sequential SUPPORTING/TIMELINE
+  checkpoints; `claim_materialization` verifies the caller's *expected* job claim
+  token. (2) Historical reactivation demotes+flush then reactivates the target
+  row atomically (CANDIDATE/FINAL_CLIP/CANDIDATE). (3) Deferred/rejected
+  writing/critique responses are persisted truthfully, never replayed as
+  accepted, retried with a fresh bounded attempt, and commit with their reusable
+  checkpoint atomically. (4) The executor freshly revalidates upstream
+  effectiveness/identity before `commit_prepared` and records supersession
+  (`BLOCKED`/`UPSTREAM_REVALIDATION_REQUIRED`, no output) with the job transition
+  in one transaction. Regressions: `test_stage6_runtime_corrections.py`
+  (real Celery wrapper + production session factory, sequential checkpoint/attempt
+  updates, deferred recovery, stale-during-writing) and a PostgreSQL historical
+  reactivation test.
+- **Authored renderer (`c197ad1`, `1443eb3`).** `compile_authored_render`
+  produces one H.264/AAC output from ordered SOURCE (framed, canonical Stage 5.1
+  ASS burned in source time) and CARD units (near-black), applies the Stage 6
+  authored ASS in output time after concat, and mixes explicit source+narration
+  tracks. `compile_render` dispatches on `TRANSFORMED_SHORT`; core behavior and
+  fingerprints are unchanged. `build_authored_ass` emits output-time cards/
+  annotations with escaping/bidi safety and readability findings. A real-FFmpeg
+  integration test produces and probes an actual authored MP4 with visible card
+  frames (synthetic fixture, explicitly NOT product acceptance).
+- **Remaining blockers.** `materialization/rendering.py`
+  (`build_transformed_render_spec` from the persisted materialization/contract/
+  composition) and full purpose wiring through the render queue/service/executor
+  and purpose-aware QC; the specified two-phase lossless mix→measure→master→encode
+  (current authored path applies single-pass `loudnorm`); the Stage 6 finalizer and
+  bounded repair, hosted writing/critique/TTS adapters, candidate API/CLI/UI
+  completion, and the genuine manual-acceptance package.
+- **Verification evidence (Docker Python 3.12.14 + PostgreSQL 16).** `pytest -k
+  "stage6 or stage52 or stage51"` ran `565 passed`; `mypy app/materialization`
+  and `ruff` are clean. No hosted provider call or manual-acceptance artifact was
+  produced.
+
 ## Stage 6 durable ownership + component gateway, authored payload (2026-10-15)
 
 Status: **the six structural gaps in the inspected Stage 6 code are corrected
