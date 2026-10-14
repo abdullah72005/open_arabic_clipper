@@ -1,5 +1,44 @@
 # Runtime status
 
+## Stage 6 review corrections and production-path service (2026-10-14)
+
+Status: **eight SOL-review defects are corrected with regressions (commit
+`7d37cd7`); the DB-assembly/orchestration/persistence service is implemented
+(commit `d38e274`). The MATERIALIZATION queue/executor, semantic/TTS provider
+adapters, authored renderer integration (cards/overlays, mixed/mastered audio,
+final-purpose QC), idempotent finalizer, candidate API/CLI/UI, and real
+manual-acceptance package are NOT implemented. Stage 6 is NOT FROZEN; no
+transformed-short MP4 exists.**
+
+- **Defects corrected (`7d37cd7`).** (1) Invalid/unresolvable grounding
+  references no longer fall back to the whole transcript and unrelated factual
+  copy is no longer a resolved inference; novel copy routes to bounded semantic
+  review and is never accepted on lexical novelty alone. (2) The authored
+  timeline uses Stage 5.0 rebound contract bindings as the execution truth, never
+  copied plan timestamps; a missing/invalid binding is reported. (3) Measured
+  narration/reading durations are no longer capped at eight seconds and
+  fractional-duration heroes are not falsely rejected by frame quantization. (4)
+  ASR/script matching rejects removed negation and changed numbers. (5) Slot
+  resolution includes required contract narration slots. (6) Assessment requires
+  render/QC/loudness evidence for readiness, honours provider deferral, and
+  treats unknown critical fidelity as a concern. (7) Supporting assets require
+  complete provenance, a valid content hash, an allowed use, and required
+  attribution. (8) Narration assets are written through StorageService with a
+  safe filename. Writing requests now carry bounded actual resolved source
+  evidence and a provider-neutral semantic critique assesses grounded copy.
+- **Service (`d38e274`).** `app/materialization/service.py` assembles immutable
+  inputs from current persisted evidence, revalidates currentness, runs the
+  bounded deterministic pipeline, and persists a durable `ClipMaterialization`
+  with component checkpoints, a durable call ledger, fingerprints, and a
+  truthful outcome (identical work updates in place; changed input creates a
+  history row and demotes the previous current one).
+- **Remaining (explicit acceptance blockers).** DB-assembly queue/executor and
+  the idempotent finalizer; hosted semantic writing/critique and TTS adapters;
+  the reusable-renderer `TRANSFORMED_SHORT` extension and complete audio
+  mix/mastering + final-purpose QC; candidate API/CLI and Produce/Results UI; and
+  the genuine manual-acceptance package. Required verification under Python 3.12
+  and disposable PostgreSQL was not run (host Python 3.10.12 only).
+
 ## Stage 6 materialization persistence and deterministic core (2026-10-14)
 
 Status: **two prerequisite corrections are committed; the Stage 6 durable
