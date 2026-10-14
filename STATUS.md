@@ -1,5 +1,54 @@
 # Runtime status
 
+## Stage 6 materialization persistence and deterministic core (2026-10-14)
+
+Status: **two prerequisite corrections are committed; the Stage 6 durable
+persistence and deterministic materialization core are implemented and tested;
+the DB-assembly service/queue/executor, semantic/TTS provider adapters, authored
+renderer integration, API/CLI/UI, and real acceptance are NOT implemented. Stage 6
+is NOT FROZEN and is awaiting human media review and SOL review.**
+
+- **Prerequisite A (fixed, commit `ab9d0bc`).** Production transcription
+  configuration defaulted to `v1` and overrode the dedicated provider's `v1beta`
+  default, so the effective Interactions request used the wrong surface. The
+  Settings default and `.env.example`/`docs/ENVIRONMENT.md` now use `v1beta`
+  (the surface that serves the Interactions API); the local `.env` explicit
+  legacy override was corrected too. Adjudication and the Stage 2.7/Stage 4
+  providers keep their independently configured `v1` generateContent surface.
+  A regression asserts the *effective* URL/body through the production Settings
+  factory and the real installed SDK with a fake HTTP transport. No live hosted
+  transcription success has been established.
+- **Prerequisite B (fixed, commit `fb401cb`).** Stage 4.2 governance cleared a
+  heuristic revision on an incomplete review (UNKNOWN coherence/narration still
+  produced `APPROVED_FOR_SELECTION`, `eligible_for_stage4_3=True`). A heuristic
+  revision is now cleared only by a genuinely complete, favorable review; any
+  `UNKNOWN`/concerning decision-critical dimension defers governance; a later
+  weaker review restores a previously cleared revision. Measured hero/payoff/
+  duration/over-edit findings stay deterministic and non-clearable. Policy and
+  validation advanced to `stage4.2-v8` (commit `fb401cb`).
+- **Persistence (commit `fac3d22`).** Migration `20261014_0023` adds a
+  `MATERIALIZATION` job kind, the `TRANSFORMED_SHORT` render purpose,
+  `channel_production_profiles` and `clip_materializations` (one current row per
+  candidate/profile scope, `repair_count` 0..1, cache/readiness consistency), and
+  nullable `materialization_id` FKs on `processing_jobs` and `render_executions`.
+  No `PipelineStage`, `PipelineRun`, `_NEXT_STAGE` entry, or source-lifecycle
+  change. Migration upgrade/downgrade is covered on SQLite (PostgreSQL gated by
+  `CLIPFACTORY_TEST_POSTGRES_URL`).
+- **Deterministic core (commits `fac3d22`, `848f872`).** `app/materialization/`
+  provides versioned policy/budgets, immutable types, DB-independent inputs,
+  stable fingerprints (voice-only changes never invalidate no-narration output),
+  profile semantic-context matching, authored-copy validation with a claim ledger
+  and slot resolution, authored timeline/audio-recipe construction with hero
+  protection, a rights-gated supporting-visual library, a provider-neutral
+  narration synthesis interface, and categorical assessment that is always
+  `publication_ready=false` with `human_review_required=true` on success.
+- **Remaining (explicit blockers for acceptance).** Semantic writing/critique
+  provider adapter, Gemini TTS adapter, DB-assembly service/queue/executor and
+  idempotent finalizer, `TRANSFORMED_SHORT` renderer extension (authored
+  cards/output overlays, mixed/mastered audio, final-purpose QC),
+  candidate-scoped API/CLI/UI, and real manual acceptance. No transformed-short
+  MP4 exists; no acceptance or live-provider success is claimed.
+
 ## Stage 5.2 tracked-crop defect remediation (2026-10-08)
 
 Status: **the confirmed production TRACKED_CROP execution defect is remediated
