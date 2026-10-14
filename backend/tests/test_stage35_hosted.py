@@ -103,9 +103,10 @@ def test_transcription_is_verbatim_one_clip_and_deletes_upload(tmp_path: Path) -
     assert len(client.interactions.calls) == 1
     call = client.interactions.calls[0]
     assert call["model"] == "gemini-3.5-transcribe"
+    assert call["api_version"] == "v1beta"
     config = call["generation_config"]["transcription_config"]  # type: ignore[index]
-    assert config["mode"] == {"type": "verbatim"}
-    assert config["timestamp_granularities"] == ["word"]
+    assert config["mode"] == {"type": "verbatim", "timestamp_granularities": ["word"]}
+    assert "timestamp_granularities" not in config
     assert "custom_vocabulary" not in config
     # The remote URI is never persisted on the result.
     assert "example.invalid" not in repr(result)
