@@ -72,6 +72,37 @@ def _coverage_sufficient(
     return (span / duration) >= 0.5
 
 
+# Matches Stage 4.1 span validation: a selected span may sit this far outside the
+# refined window before it is rejected as ``INVALID_SOURCE_SPAN``.
+_SPAN_TOLERANCE_SECONDS = 0.75
+
+
+def _selectable_window_words(
+    raw: Sequence[object], refined_start: float, refined_end: float
+) -> tuple[Mapping[str, object], ...]:
+    """Keep only words that a provider may legally select as a source span.
+
+    The refinement carries bounded nearby context outside the refined window.
+    A provider that selects those context words produces an out-of-window span
+    that validation rejects, so context words are never offered as selectable
+    indexes. Index ``0`` is therefore always the first in-window word.
+    """
+
+    window_start = refined_start - _SPAN_TOLERANCE_SECONDS
+    window_end = refined_end + _SPAN_TOLERANCE_SECONDS
+    selected: list[Mapping[str, object]] = []
+    for item in raw:
+        if not isinstance(item, Mapping):
+            continue
+        start = item.get("start")
+        end = item.get("end")
+        if not isinstance(start, (int, float)) or not isinstance(end, (int, float)):
+            continue
+        if float(start) >= window_start and float(end) <= window_end:
+            selected.append(item)
+    return tuple(selected)
+
+
 def build_planning_inputs(
     session: object,
     candidate: ClipCandidate,
@@ -106,6 +137,9 @@ def build_planning_inputs(
 
     raw_words = tuple(
         item for item in (refinement.word_timestamps or []) if isinstance(item, Mapping)
+    )
+    raw_words = _selectable_window_words(
+        raw_words, stage40.effective_start, stage40.effective_end
     )
     words, _has_words = _bounded_words(raw_words, config)
     coverage = _coverage_sufficient(words, stage40.effective_start, stage40.effective_end)

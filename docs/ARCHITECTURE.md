@@ -246,3 +246,31 @@ is delegated to the real libass/FriBidi/HarfBuzz renderer with real rendered
 regression tests, never manual BiDi rewriting. See
 `docs/STAGE_5_1_OPERATIONS.md`.
 
+## Stage 5.2 render execution, audio, and technical QC
+
+Stage 5.2 is a new deterministic `app/render/execution` package. Its low-level
+engine (`compile_render`, `run_compiled_render`, and `check_render_artifact`) is
+independent of candidate/database discovery and never authors media: it consumes
+a validated `RenderSpec` and produces `CompiledRender`, `RenderArtifacts`, and a
+`TechnicalQCResult`. `timeline.py` maps contract-ordered occurrences at unit
+speed with cumulative frame/sample boundaries; `compiler.py` generates an
+allow-listed filtergraph (per-scene framing, source-local ASS burn, explicit
+audio trimming, and occurrence-boundary joins) and safe `ffmpeg` argument
+arrays; `runner.py` executes it as a bounded, cancellable child process group;
+`qc.py` runs deterministic structural and bounded appearance/audio checks;
+`concurrency.py` provides one PostgreSQL advisory-lock admission on a dedicated
+connection; `fingerprints.py` composes request/runtime/compiler/QC/output
+fingerprints.
+
+`service.py`, `queue.py`, and `executor.py` adapt the engine to durable
+candidate-scoped work: the request is frozen at queue time, duplicate deliveries
+are fenced by an advancing `claim_version`, cancellation is read through fresh
+scalar queries, and the artifact pointer is published only after process
+success, hash/probe/decode/QC, source recheck, and a fenced finalization.
+Persistence is one table `render_executions` (one row per candidate + input
+fingerprint, one scoped current row per candidate/purpose/profile) plus the
+`RENDER_EXECUTION` job kind and a nullable `processing_jobs.render_execution_id`
+FK, added by migration `20260918_0022`. The current artifact purpose
+`CORE_SOURCE_VALIDATION` is source-core only and never publication-final. See
+`docs/STAGE_5_2_OPERATIONS.md`.
+

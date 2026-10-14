@@ -13,7 +13,7 @@ import hashlib
 import json
 import time
 from collections.abc import Callable, Sequence
-from typing import Any
+from typing import Any, Literal
 
 from google import genai
 from google.genai import types
@@ -47,10 +47,50 @@ _RETRYABLE = frozenset(
     }
 )
 
+# The structured-output schema must constrain closed vocabularies. Declaring the
+# enum fields as plain ``str`` let the hosted model emit unconstrained values
+# (for example ``original_value`` or ``hero``); the deterministic parser matches
+# enum values case-sensitively, so every block was dropped and every hosted plan
+# failed with ``NO_SOURCE_EXCERPT``. These ``Literal`` aliases mirror the parser's
+# closed enums and make Pydantic emit an inline ``enum`` in the Gemini schema, so
+# the model can only emit valid values. ``test_stage41_providers`` asserts each
+# alias equals its enum, so the two can never silently drift.
+_BlockTypeLiteral = Literal[
+    "SOURCE_EXCERPT",
+    "ORIGINAL_VALUE",
+    "TRANSITION",
+    "TEXTUAL_ANNOTATION",
+    "FACT_VERIFICATION_PLACEHOLDER",
+]
+_SourceRoleLiteral = Literal["HERO", "HOOK", "PAYOFF", "SUPPORT"]
+_ValueKindLiteral = Literal[
+    "MISSING_CONTEXT",
+    "INFERENCE",
+    "EXPLANATION",
+    "COMPARISON",
+    "COUNTERPOINT",
+    "VERIFICATION_CORRECTION",
+    "SYNTHESIS",
+    "AUTHORED_THESIS",
+    "USEFUL_TAKEAWAY",
+    "SOURCE_AS_EVIDENCE",
+]
+_DeliveryIntentLiteral = Literal["ON_SCREEN_TEXT", "NARRATION", "FLEXIBLE"]
+_NarrationNeedLiteral = Literal["NONE", "OPTIONAL", "RECOMMENDED", "REQUIRED"]
+_NarrationPurposeLiteral = Literal[
+    "CONTEXT",
+    "ANALYSIS",
+    "COUNTERPOINT",
+    "EXPLANATION",
+    "TAKEAWAY",
+    "HOOK",
+    "TRANSITION",
+]
+
 
 class _GeminiNarration(BaseModel):
-    need: str = "NONE"
-    purposes: list[str] = Field(default_factory=list)
+    need: _NarrationNeedLiteral = "NONE"
+    purposes: list[_NarrationPurposeLiteral] = Field(default_factory=list)
     language: str | None = None
     register_intent: str | None = None
     estimated_duration: float = 0.0
@@ -63,22 +103,22 @@ class _GeminiNarration(BaseModel):
 
 
 class _GeminiBlock(BaseModel):
-    block_type: str
+    block_type: _BlockTypeLiteral
     purpose: str = ""
     estimated_duration: float = 0.0
     interrupts_source: bool = False
     preservation_constraints: list[str] = Field(default_factory=list)
     dependency_ids: list[str] = Field(default_factory=list)
-    source_role: str | None = None
+    source_role: _SourceRoleLiteral | None = None
     word_start_index: int | None = None
     word_end_index: int | None = None
     use_full_window: bool = False
     continuity_rationale: str | None = None
-    substantive_value_kind: str | None = None
+    substantive_value_kind: _ValueKindLiteral | None = None
     semantic_intent: str = ""
     why_unavailable: str = ""
     grounding_refs: list[str] = Field(default_factory=list)
-    delivery_intent: str | None = None
+    delivery_intent: _DeliveryIntentLiteral | None = None
     draft_line: str | None = None
     claim_dependency: str | None = None
     verification_rationale: str | None = None

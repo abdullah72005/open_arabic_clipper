@@ -1,0 +1,90 @@
+"""Stage 5.2 deterministic render-execution engine (candidate/DB-independent)."""
+
+from app.render.execution.compiler import CompileError, compile_render
+from app.render.execution.concurrency import (
+    NullRenderAdmission,
+    PostgresRenderAdmission,
+    render_admission_for,
+)
+from app.render.execution.policy import (
+    CORE_SOURCE_VALIDATION,
+    DELIVERY_PROFILES,
+    EXECUTION_POLICY_VERSION,
+    MP4_H264_AAC_1080X1920,
+    Stage52Config,
+    delivery_profile_for,
+    stage52_config_payload,
+)
+from app.render.execution.qc import check_render_artifact
+from app.render.execution.runner import (
+    RenderCancelled,
+    RenderProcessError,
+    RenderTimeout,
+    run_compiled_render,
+)
+from app.render.execution.types import (
+    AssAsset,
+    AttemptContext,
+    AudioInstruction,
+    CaptionEventSpec,
+    CompiledRender,
+    CropKeyframeSpec,
+    FilterNode,
+    OmittedRequirement,
+    QCCheck,
+    RenderArtifacts,
+    RenderSpec,
+    RuntimeIdentity,
+    SceneSpec,
+    TechnicalQCResult,
+    TimelineManifest,
+    TimelineOccurrence,
+)
+from app.render.execution.validation import (
+    AssFileFacts,
+    RenderValidationError,
+    ass_file_facts,
+    validate_ass_asset,
+    validate_spec,
+)
+
+__all__ = [
+    "AssAsset",
+    "AssFileFacts",
+    "AttemptContext",
+    "AudioInstruction",
+    "CaptionEventSpec",
+    "CompileError",
+    "CompiledRender",
+    "CORE_SOURCE_VALIDATION",
+    "CropKeyframeSpec",
+    "DELIVERY_PROFILES",
+    "EXECUTION_POLICY_VERSION",
+    "FilterNode",
+    "MP4_H264_AAC_1080X1920",
+    "NullRenderAdmission",
+    "OmittedRequirement",
+    "PostgresRenderAdmission",
+    "QCCheck",
+    "RenderArtifacts",
+    "RenderCancelled",
+    "RenderProcessError",
+    "RenderSpec",
+    "RenderTimeout",
+    "RenderValidationError",
+    "RuntimeIdentity",
+    "SceneSpec",
+    "Stage52Config",
+    "TechnicalQCResult",
+    "TimelineManifest",
+    "TimelineOccurrence",
+    "ass_file_facts",
+    "check_render_artifact",
+    "compile_render",
+    "delivery_profile_for",
+    "render_admission_for",
+    "run_compiled_render",
+    "stage52_config_payload",
+    "validate_ass_asset",
+    "validate_spec",
+]

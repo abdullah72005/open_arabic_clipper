@@ -348,12 +348,16 @@ BiDi/black fixtures, so a validation fixture cannot look good while the real
 composition uses a different size. Defaults: font size 88, white primary text,
 black outline width 7, shadow 3, at most 2 lines, at 1080 x 1920 (a 1.25 line
 factor, 110 px line pitch). That keeps captions immediately readable on a
-360 x 640 preview without covering the subject. Dynamic emphasis is on by
-default: the active word uses the accent color `&H0000FFFF` (yellow) while
-inactive words stay white. The style (including active color, dynamic-emphasis
-enable, and max words per event) is part of the `stage51_config_payload()`
-fingerprint, so any value change invalidates prior plans at the correct
-boundary. TTS voice/provider/model are never fingerprint inputs.
+360 x 640 preview without covering the subject. Dynamic emphasis is off by
+default: captions render as plain static single-color phrase text, which reads
+more calmly than per-word karaoke highlighting, especially for mixed Arabic /
+Latin BiDi runs. Setting `CLIPFACTORY_VISUAL_CAPTION_DYNAMIC_EMPHASIS=true`
+re-enables per-word emphasis, where the active word uses the accent color
+`&H0000FFFF` (yellow) while inactive words stay white. The style (including
+active color, dynamic-emphasis enable, and max words per event) is part of the
+`stage51_config_payload()` fingerprint, so any value change invalidates prior
+plans at the correct boundary. TTS voice/provider/model are never fingerprint
+inputs.
 
 ## Detector
 
@@ -542,7 +546,7 @@ constraints shown; see `.env.example` for the comments.
 | `CLIPFACTORY_VISUAL_CAPTION_FONT_FAMILY` | `Noto Sans Arabic` | ASS caption font family. |
 | `CLIPFACTORY_VISUAL_CAPTION_MAX_LINES` | `2` | Maximum caption lines per event. |
 | `CLIPFACTORY_VISUAL_CAPTION_ACTIVE_COLOR` | `&H0000FFFF` | ASS `AABBGGRR` color for the actively spoken word. |
-| `CLIPFACTORY_VISUAL_CAPTION_DYNAMIC_EMPHASIS` | `true` | Highlight the actively spoken word; false renders plain static captions. |
+| `CLIPFACTORY_VISUAL_CAPTION_DYNAMIC_EMPHASIS` | `false` | Highlight the actively spoken word; false renders plain static captions. |
 | `CLIPFACTORY_VISUAL_CAPTION_MAX_WORDS_PER_EVENT` | `7` | Maximum words per caption chunk. |
 | `CLIPFACTORY_VISUAL_PREVIEW_ENABLED` | `true` | Allow PNG validation previews. |
 

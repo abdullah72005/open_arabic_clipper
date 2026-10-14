@@ -2061,11 +2061,20 @@ def evaluate_plan(
             "plan depends on an unsupported or fabricated critical claim",
         )
 
-    if not (evaluation.hard_failures or evaluation.blocking or evaluation.revisions):
+    if not (evaluation.hard_failures or evaluation.blocking):
         # A claim whose claim-to-evidence support is lexically unverifiable must
-        # be semantically reviewed; it can never be silently approved.
-        evaluation.requires_semantic_review = support_unverified or _requires_semantic_review(
-            plan, evidence, evaluation, config, provider_mode_deterministic
+        # be semantically reviewed; it can never be silently approved. In
+        # adaptive mode with a provider, a plan whose only deterministic findings
+        # are revision-level is also reviewed: the semantic critique adjudicates
+        # the heuristic revisions and a favorable critique clears them. Hard
+        # failures and blocking conditions are never sent for review.
+        revision_review = bool(evaluation.revisions) and not provider_mode_deterministic
+        evaluation.requires_semantic_review = (
+            revision_review
+            or support_unverified
+            or _requires_semantic_review(
+                plan, evidence, evaluation, config, provider_mode_deterministic
+            )
         )
     evaluation.semantic_state = (
         SEMANTIC_NOT_ATTEMPTED if evaluation.requires_semantic_review else SEMANTIC_NOT_REQUIRED
@@ -2118,6 +2127,35 @@ def apply_semantic_review(
         return
     evaluation.critique = critique
     evaluation.provider_evidence = {"state": state, "critique": critique.as_dict()}
+
+    # Revision-level deterministic findings are advisory once a semantic review
+    # runs. Snapshot them so a favorable critique (one that adds no new hard
+    # failure or revision finding) can clear exactly those heuristic revisions.
+    # Hard failures and blocking conditions are never cleared by a review.
+    revision_count_before = len(evaluation.revisions)
+    hard_failure_count_before = len(evaluation.hard_failures)
+
+    # A claim whose claim-to-evidence support the deterministic lexical check
+    # could not confirm is exactly what the semantic review resolves. When that
+    # review clears the unsupported-claim concern, the persisted verification
+    # evidence must be reconciled with the resulting approval; otherwise the
+    # governor approves a plan while leaving ``verification.unresolved`` set, and
+    # Stage 4.3 correctly refuses the internally inconsistent evidence forever
+    # (``INCONSISTENT_GOVERNANCE_EVIDENCE``).
+    if (
+        evaluation.verification.get("claim_state") == ClaimGroundingState.SUPPORT_UNVERIFIED.value
+        and critique.unsupported_claim == UnsupportedClaimFinding.NONE
+        and critique.fidelity != SemanticFidelityFinding.FAIL
+    ):
+        evaluation.verification = {
+            "claim_state": ClaimGroundingState.GROUNDED_IN_SOURCE.value,
+            "claims": [],
+            "unresolved": False,
+            "reason_codes": [],
+        }
+        evaluation.dimensions["verification_completeness"] = (
+            ClaimGroundingState.GROUNDED_IN_SOURCE.value
+        )
 
     dimensions = evaluation.dimensions
     dimensions["semantic_fidelity"] = {
@@ -2245,6 +2283,18 @@ def apply_semantic_review(
             _R.TEMPLATE_MASS_PRODUCED_FEEL,
             "semantic review found moderate template feel",
         )
+
+    # A favorable review supersedes the deterministic heuristic revisions that
+    # triggered it: if the critique added no new hard-failure or revision finding,
+    # the advisory deterministic revisions are cleared so the plan can be approved
+    # (or approved with caution). If the review itself raised a hard failure or
+    # revision, both it and the original revisions stand and the plan stays
+    # rejected/revision-required.
+    if (
+        len(evaluation.hard_failures) == hard_failure_count_before
+        and len(evaluation.revisions) == revision_count_before
+    ):
+        evaluation.revisions = []
 
 
 # ---------------------------------------------------------------------------

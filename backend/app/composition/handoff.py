@@ -154,7 +154,13 @@ def build_stage5_2_handoff(
     }
     base["display_geometry"] = display_geometry
     base["frames_per_second"] = geometry.get("frames_per_second")
-    base["output_profile"] = _mapping(payload.get("output_profile"))
+    # The authoritative output profile lives on the current Stage 5.0 render
+    # contract. The Stage 5.1 plan payload does not persist it at the top level,
+    # so fall back to the exact matching Stage 5.0 handoff profile rather than a
+    # misleading empty mapping. This is read-only and does not alter any Stage
+    # 5.1 output or fingerprint.
+    contract_profile = _mapping((stage51 or {}).get("output_profile"))
+    base["output_profile"] = _mapping(payload.get("output_profile")) or contract_profile
     base["blocks"] = contract_blocks
     base["bound_source_spans"] = _bound_spans(contract_blocks)
     base["scenes"] = _sequence(payload.get("scenes"))

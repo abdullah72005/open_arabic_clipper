@@ -142,12 +142,19 @@ class FakeStage51Settings:
         self.ffmpeg_binary = ffmpeg_binary
         self.ffprobe_binary = ffprobe_binary
         self.visual_composition_enabled = True
+        self.render_execution_enabled = True
 
     def stage51_config(self) -> Stage51Config:
         return self.config
 
     def stage51_config_payload(self) -> dict[str, object]:
         return stage51_config_payload(self.config)
+
+    def stage52_config(self) -> Any:
+        return get_settings().stage52_config()
+
+    def stage52_config_payload(self) -> dict[str, object]:
+        return get_settings().stage52_config_payload()
 
 
 @dataclass

@@ -255,6 +255,8 @@ class CandidateAudioWindowService:
             "16000",
             "-c:a",
             "pcm_s16le",
+            "-f",
+            "wav",
             str(temporary),
         ]
         try:

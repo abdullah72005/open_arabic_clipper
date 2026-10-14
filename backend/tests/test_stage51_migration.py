@@ -120,7 +120,7 @@ def test_stage_5_1_migration_is_reversible_and_preserves_prior_stages() -> None:
                 text("DELETE FROM processing_jobs WHERE kind = 'VISUAL_COMPOSITION'")
             )
 
-        command.downgrade(config, "-1")
+        command.downgrade(config, "20260918_0020")
 
         inspector = inspect(engine)
         assert "visual_composition_plans" not in inspector.get_table_names()
@@ -184,7 +184,7 @@ def test_stage_5_1_postgresql_alembic_upgrade(monkeypatch: pytest.MonkeyPatch) -
                 column["name"] for column in inspector.get_columns("processing_jobs")
             }
 
-            command.downgrade(config, "-1")
+            command.downgrade(config, "20260918_0020")
             inspector = inspect(engine)
             assert "visual_composition_plans" not in inspector.get_table_names()
             assert "render_contracts" in inspector.get_table_names()

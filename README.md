@@ -48,6 +48,15 @@ for the API. Stop services with `docker compose down`; add `-v` only when you
 intentionally want to remove database and Redis volumes. Local media remains
 under `./storage`.
 
+From the dashboard: **Add source** (`/sources/add`) ingests a local file or URL
+through transcript and candidate analysis. **Produce** (`/produce`) takes a
+public, permitted media link and runs the full pipeline end-to-end — ingest and
+transcribe, candidate selection, Stage 3.5 refinement, Stage 4.0–4.3
+transformation planning/selection, and Stage 5.0–5.2 composition/render — then
+plays the rendered MP4. Work runs in the worker; URL ingest needs internet and a
+link you are authorized to process, and the first transcription downloads the
+Whisper model.
+
 ## Development checks
 
 GitHub Actions runs these quality gates on every push and pull request: backend
@@ -472,6 +481,32 @@ remain `POST/GET /api/candidates/{id}/render-contract`, `GET
 See [Stage 5.0 operations](docs/STAGE_5_0_OPERATIONS.md) and
 [Stage 5.1 operations](docs/STAGE_5_1_OPERATIONS.md) for boundaries, bounds,
 fingerprints, jobs/concurrency/cancellation, and configuration.
+
+### Stage 5.2 render execution, audio, and technical QC
+
+Stage 5.2 is an explicit, candidate-scoped deterministic media execution engine.
+It consumes a current executable Stage 5.0 render contract and one current ready
+Stage 5.1 plan (with canonical ASS), executes the accepted ordered
+`SOURCE_MEDIA` occurrences at unit speed, burns canonical ASS while timestamps
+are source-local, joins audio only at real occurrence boundaries, and produces
+one final video encode and one final audio encode (CPU-only MP4/H.264+AAC,
+1080x1920, `+faststart`) plus a normalized manifest and deterministic technical
+QC. It extends the Celery/`ProcessingJob` platform with a `RENDER_EXECUTION` job
+kind (migration `20260918_0022`) and one `render_executions` table, and adds no
+`PipelineStage`, `PipelineRun`, or `_NEXT_STAGE` entry.
+
+The current purpose `CORE_SOURCE_VALIDATION` is source-core validation, not a
+publication-final artifact: authored material is omitted and reported,
+`publication_ready=false`, `stage6_implemented=false`, and the authored timeline
+stays unfrozen. Tracked-crop zoom uses a per-frame dynamic `scale` plus a fixed
+1080x1920 `crop` whose position and explicit clamp limits are computed from the
+current, identically rounded scale dimensions (never the `crop` filter's cached
+`in_w`/`in_h`), so varying-height tracking preserves the requested subject
+position. See [Stage 5.2 operations](docs/STAGE_5_2_OPERATIONS.md).
+
+CLI: `render-execution`, `render-execution-status`, `render-execution-artifact`.
+API: `POST/GET /api/candidates/{id}/render-execution`, `GET
+/api/render-executions/{id}`, `GET /api/render-executions/{id}/artifact`.
 
 
 Stage 3 semantic mode defaults to `deterministic`: zero Gemini calls and zero

@@ -22,3 +22,10 @@ table { width:100%; border-collapse:collapse; } th,td { padding:10px; text-align
 .candidate-refinement,.candidate-manual-review { display:grid; gap:8px; border-top:1px solid var(--line); padding-top:10px; }
 .candidate-refinement p,.candidate-manual-review p { margin:0; }
 .candidate-manual-review summary { cursor:pointer; color:var(--accent); }
+.produce-steps { list-style:none; display:grid; gap:8px; margin:0; padding:0; }
+.produce-step { display:grid; grid-template-columns:22px 1fr; gap:10px; align-items:start; color:var(--muted); }
+.produce-step strong { color:var(--text); }
+.produce-step-marker { font-weight:bold; text-align:center; }
+.produce-step.active strong,.produce-step.active .produce-step-marker { color:var(--accent); }
+.produce-step.done .produce-step-marker { color:var(--accent); }
+.produce-step.error strong,.produce-step.error .produce-step-marker { color:#ff9c9c; }

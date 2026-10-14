@@ -1,5 +1,292 @@
 # Runtime status
 
+## Stage 5.2 tracked-crop defect remediation (2026-10-08)
+
+Status: **the confirmed production TRACKED_CROP execution defect is remediated
+and verified; the Stage 3.5 extraction prerequisite is FIXED; the
+acceptance-generation boundary and provenance checks are corrected; three
+upstream Stage 4 planning/governance integration defects are fixed; one genuine
+production manual-acceptance MP4 is produced (partial coverage). Stage 5.2 NOT
+FROZEN. Stage 6 NOT STARTED.**
+
+- **Confirmed renderer defect (fixed).** `compiler.py::_tracked_crop_chain`
+  previously computed the fixed 1080x1920 crop position/clamps from the `crop`
+  filter's cached `in_w`/`in_h`, which retain the initially configured
+  dimensions while a per-frame dynamic `scale` changes the frame size. Varying
+  `height_fraction` therefore produced a stale crop position (the reviewed case
+  was ~706 scaled px too far left at 87.2 s). The chain now derives the scaled
+  width/height once (from authoritative display geometry, with the same
+  even-rounding as `scale`) and reuses those exact expressions for the crop
+  position and clamps. `COMPILER_VERSION` advanced to `stage5.2-compiler-v4`, so
+  cached outputs from the defective compiler cannot satisfy corrected requests.
+  Bounded requested-vs-derived geometry samples are emitted in the compiled
+  diagnostics. Regression coverage decodes encoded output frames and compares
+  them against an independently calculated source reference for simultaneous
+  pan/zoom, vertical movement, edge clamps, constant-height tracking, and
+  portrait display geometry; the reviewed case-01 geometry is included and the
+  new regressions fail on the old compiler.
+- **Stage 3.5 extraction prerequisite (fixed).**
+  `app/refinement/audio_window.py::_extract_window` wrote the extracted window to
+  `<destination>.wav.tmp` and passed it to FFmpeg without an explicit output
+  format; FFmpeg 7.1.5 cannot infer a WAV muxer from `.tmp`, so every genuine
+  `FINAL_CLIP` refinement failed with `RefinementAudioError`. The safe argv now
+  includes an explicit `-f wav`. Bounds/priority policies, mono 16 kHz PCM,
+  temporary-file validation/atomic replacement, cleanup, storage ownership, cache
+  behavior, and all transcription/provider routing/models/fingerprints are
+  unchanged. A real-FFmpeg regression exercises the actual helper through its
+  temporary filename for `CANDIDATE` and `FINAL_CLIP` and verifies WAV
+  properties, duration, content hash, temporary-file cleanup, and cache reuse.
+- **Acceptance boundary (fixed).** `acceptance.py` separates
+  `SYNTHETIC_REGRESSION` (hand-built specs/invented text, never the final gate)
+  from `PRODUCTION_MANUAL_ACCEPTANCE` (genuine persisted, audio-backed lineage
+  only, executed through the normal production adapter/queue/executor, full
+  evidence export). Production acceptance verifies real managed-audio
+  provenance (resolved file size and actual SHA-256 against the persisted
+  `audio_content_hash`, plus the recomputed `audio_extraction` and a `local_asr`
+  component fingerprint — component *names* never establish provenance), rejects
+  placeholder/absent/corrupt/mismatched evidence, revalidates the exact execution
+  through the production cache machinery before export (stale/upstream-changed
+  executions are rejected), makes `--no-queue` strictly read-only (no
+  execution/job/dispatch/claim/commit), and upserts each case into the package
+  manifest by `candidate_id` (several candidates coexist; regeneration is
+  stable). Existing package metadata is read/validated before any file is
+  touched and an unreadable/invalid manifest fails closed
+  (`MANIFEST_UNREADABLE`/`MANIFEST_INVALID`, including a non-list `cases` value);
+  the new manifest/README are staged before publication, then the case
+  directory, manifest, and README are replaced as one rollback unit with each
+  previous file retained as a filesystem backup and restored by rename, so a
+  partial or failing metadata write never reaches the live package and an
+  incomplete rollback surfaces `PACKAGE_ROLLBACK_INCOMPLETE` instead of being
+  swallowed. The gated
+  `test_stage52_live_contract.py` remains classified `SEEDED_PLUMBING`.
+- **Genuine media produced (partial coverage).** With the extraction fix and
+  three additional upstream integration fixes, genuine audio-backed `FINAL_CLIP`
+  refinements now drive a full genuine chain to an executable contract. The three
+  fixes: the hosted Gemini planning schema now constrains its closed
+  block/value/narration enums (previously the model emitted unconstrained values
+  such as `original_value`/`hero`, which the case-sensitive parser dropped,
+  failing every hosted plan `NO_SOURCE_EXCERPT`); the planning instruction now
+  requires `why_unavailable` on substantive blocks (else
+  `EMPTY_OR_GENERIC_INTENT`); and `apply_semantic_review` now reconciles the
+  persisted verification evidence when a passing review clears an ambiguous claim
+  (previously the governor approved a plan while leaving
+  `verification.unresolved` set, so Stage 4.3 deferred it forever with
+  `INCONSISTENT_GOVERNANCE_EVIDENCE`). One genuine production manual-acceptance
+  MP4 is exported for candidate `1827c524` (CONTEXT_HOOK plan; `BACKGROUND_FILL`
+  + `TRACKED_CROP`; single span 583.78-589.26 -> output 0-5.48; QC `WARN`
+  `QC_PEAK_CLIPPING_RISK`). Two of four attempted candidates remain blocked by
+  frozen Stage 5.0 behavior: `align_excerpt` raises `IndexError` when a
+  time-filtered window is indexed by a global word index (frozen Stage 5.0 code,
+  deliberately not modified), and one candidate's selected plan yields the frozen
+  `PAYOFF_NOT_COVERED` verdict. Mixed Arabic-English caption and multi-span
+  timeline coverage remain unproduced. See
+  `storage/benchmarks/stage-5-2/manual-acceptance/` and its
+  `upstream-evidence/blocker.json`.
+
+## Stage 5.2 render execution, audio, and technical QC (2026-10-05)
+
+Stage 5.2 turns one current executable Stage 5.0 render contract and one current
+ready Stage 5.1 visual-composition plan (with canonical ASS) into an encoded
+artifact, a normalized execution manifest, deterministic technical QC, and a
+durable fenced result. It is explicit and candidate-scoped and extends the
+existing Celery/`ProcessingJob` platform with a `RENDER_EXECUTION` job kind; it
+adds no `PipelineStage`, no `PipelineRun`, and no `_NEXT_STAGE` entry, and never
+touches the source lifecycle. Status: **remediated in a fifth focused pass
+(`stage5.2-v3`) against code review and technically verified; awaiting human
+media acceptance and Sol review. Not frozen.**
+
+- **Purpose.** `CORE_SOURCE_VALIDATION` executes only the ordered `SOURCE_MEDIA`
+  occurrences. Authored material is omitted and every omission is persisted and
+  exposed. `publication_ready=false`, `stage6_implemented=false`, final authored
+  timeline unfrozen. QC_PASS is not publishing eligibility.
+- **Engine.** `app/render/execution/` is DB/provider-independent:
+  `compile_render(spec, runtime_identity)`, `run_compiled_render(compiled,
+  attempt_context)`, `check_render_artifact(artifacts, manifest, qc_policy)`.
+  It uses safe argument arrays (`shell=False`, stdin disabled), generated
+  filtergraph/command files, and never accepts arbitrary provider FFmpeg flags.
+- **Timing.** Contract-ordered occurrences, unit-speed mapping, explicit
+  `trim`/`atrim`, per-scene `setpts`, audio joined only at occurrence
+  boundaries, cumulative frame/sample boundaries. Probe stream starts are
+  normalized to the shared source-local origin (the earliest stream start, the
+  same convention FFmpeg applies to input timestamps): the common container
+  offset is removed while the genuine relative A/V offset is preserved as a real
+  leading gap (video freeze, audio silence), so a video-5s/audio-5.25s container
+  renders a source-local 1 s span as ~1 s, not 6 s. Noncontiguous source gaps are
+  removed from video, audio, and captions. Missing/unusable stream-timing
+  evidence fails closed (`SOURCE_STREAMS_UNSUPPORTED`) rather than being replaced
+  by an invented zero origin; hermetic tests inject explicit stream facts. One
+  final video + one final audio encode per render; no mandatory intermediate
+  H.264.
+- **Framing.** All six accepted modes execute. Tracked crop uses a per-frame
+  dynamic `scale` plus a fixed 1080x1920 `crop`; the crop position and explicit
+  clamp limits are computed from the current, identically rounded scale
+  dimensions (never the `crop` filter's cached `in_w`/`in_h`), so varying-height
+  tracking preserves the requested subject position. Smoothstep pan/zoom is real
+  and verified from decoded frames against an independent geometry reference.
+  Native rotation applied once; exotic pixel aspect fails closed.
+- **Captions.** Canonical ASS is burned while source-local, before `setpts`,
+  preserving bytes and dynamic highlight states; never re-planned/re-ordered.
+  Asset must be managed, exist, and match SHA-256. A real render regression
+  builds the ASS through production `serialize_ass` for
+  `أنا كنت content creator لمدة سنتين`, then verifies structurally (one active
+  token per canonical state, every word active once, identical tag-stripped
+  layout) and from encoded frames (a yellow active token in every state, its
+  location changing across states, the surrounding ink bounding box stable, and
+  no ink before/after the event) — no OCR.
+- **Delivery.** Versioned MP4/H.264 (`veryfast`, CRF 20, `yuv420p`, 1080x1920,
+  contract FPS via `-r`), AAC 192 kb/s 48 kHz, mono/stereo preserved (wider
+  downmixed), `+faststart`, no publication loudness/narration/Stage 6 mixing.
+  Configured source/output duration ceilings are enforced; the complex-filter
+  thread limit uses `-filter_complex_threads` (with the non-complex
+  `-filter_threads` bound).
+- **Persistence.** `render_executions` (migration `20260918_0022`), scoped
+  partial unique current index, `JobKind.RENDER_EXECUTION`, nullable
+  `processing_jobs.render_execution_id`. Lifecycle `QUEUED`/`RENDERING`/
+  `QC_RUNNING`/`COMPLETE`/`BLOCKED`/`FAILED`/`CANCELLED`; QC `PASS`/`WARN`/
+  `FAIL`; only valid current `COMPLETE` is cache-eligible. Request frozen at
+  queue time; retries are new attempts, not new request identities. A forced
+  rerender enters a fenced new attempt that atomically resets cache eligibility,
+  QC verdict, and the prior artifact pointer, so an earlier success can never be
+  exposed as the result of a failed/cancelled new attempt. QC results are
+  persisted on FAIL as well as PASS/WARN.
+- **Ownership.** Every worker-owned mutation (claim, lifecycle, success,
+  failure, block, cancellation, retry state, active-job release) is a single
+  fenced UPDATE keyed on the execution row's authoritative `active_job_id`, the
+  executing job id, its `claim_version`, and permitted `RUNNING` status; a
+  separate ownership SELECT followed by an unfenced ORM update no longer
+  exists. The initial `QUEUED/FAILED -> RUNNING` claim advances `claim_version`
+  in the same statement, captures the allocated token, and cannot be overwritten
+  by a cancellation racing the claim. A superseded worker's `record_failure`
+  rolls back first and then no-ops against the newer claim. Cancellation uses a
+  dedicated fence that accepts a job already flipped to `CANCELLED` (as an API
+  cancel does) while still requiring the exact execution, active job, and
+  `claim_version`, so a running render/QC cancellation finalizes the owned row as
+  `CANCELLED` and releases ownership without touching a newer run. The
+  heartbeat-loss latch is sticky and authoritative in the stop predicate, and the
+  stop predicate freshly verifies the job is still `RUNNING`, the claim and
+  `active_job_id` still match, and admission is still held; lost ownership
+  records `RENDER_OWNERSHIP_LOST` distinctly from cancellation. An authoritative
+  cancellation wins over the heartbeat-loss latch: because an API/session cancel
+  flips the job to `CANCELLED`, the heartbeat's `RUNNING` update matches zero rows
+  and sets the latch, but the stop path still finalizes the owned execution as
+  `CANCELLED` (never a `RENDER_OWNERSHIP_LOST` failure the `RUNNING`-only fence
+  cannot apply). Cancellation observed at the output-probe exception boundary is
+  also honored: if the operator cancels while `ffprobe` runs and the probe then
+  times out, exits nonzero, fails to launch, or returns malformed output, the
+  runner re-checks cancellation/ownership on that exception exit and raises the
+  cancellation path instead of propagating `RENDER_TIMEOUT`/`QC_PROBE_FAILED`
+  (the executor re-checks again at its runner-error boundary, so a cancel
+  committed between the runner's last poll and its error exit cannot strand the
+  execution `RENDERING` with `active_job_id` retained). Without a stop, the
+  truthful timeout/probe-error classification is preserved; ownership loss keeps
+  its distinct `RENDER_OWNERSHIP_LOST` outcome, and a superseded worker no-ops
+  against the newer claim.
+- **Currentness.** Publication is a single short transaction that locks the
+  candidate, its bound contract, the bound selected Stage 4.1 `TransformationPlan`,
+  the visual plan, and the bound `FINAL_CLIP` refinement, rebuilds the frozen
+  request, compares fingerprints, re-checks the source stat and the exact ASS
+  bytes consumed, re-checks full ownership (fresh `RUNNING`/claim/`active_job_id`,
+  the sticky heartbeat-loss latch, and admission), and completes the job *inside*
+  the same transaction that writes the result. Only the contract and selection
+  writers serialize through the candidate lock; the selected plan and the
+  `FINAL_CLIP` refinement are joined explicitly because their writers
+  (`_persist_plans` and `apply_manual_transcript`) take no candidate lock, so a
+  planning rerun or a manual transcript edit either commits before the transaction
+  (and fails the rebuild) or blocks on the locked row and serializes after
+  publication. An upstream invalidation, a cancellation, an observed
+  ownership/admission loss, or a claim change committed at any point before
+  publication therefore prevents a stale `COMPLETE`; no upstream lock is held
+  during encoding or QC.
+- **Cache validity.** Queue-time and execute-time cache reuse validates managed
+  artifact existence/size/SHA-256, lifecycle/QC, current upstream dependencies,
+  rendering runtime identity, and QC identity. Runtime identity is truthful: the
+  loaded libass is resolved to its real shared object (filename + content hash,
+  never the `--enable-libass` configure flag), the effective primary *and* Latin
+  fallback font files are content-hashed (never a basename or empty hash), and
+  full library versions are parsed without whitespace truncation. Discovery is
+  cached under a signature that includes the binary/font/library stat, so a
+  dependency changed under an unchanged path cannot be concealed by the cache. A
+  changed QC policy invalidates the request/verdict; a deleted or corrupted
+  artifact forces a fresh render. A historical equivalent request reactivates its
+  row atomically within its purpose/profile scope, and that promotion is
+  committed before the queue returns so a cached/active response cannot leave an
+  uncommitted current-row flip that a request-session close would roll back.
+- **Concurrency/admission.** Scoped partial unique index + atomic
+  `active_job_id` claim; PostgreSQL session advisory lock on a dedicated
+  connection whose liveness is verified by an actual ping/advisory-lock query, so
+  a severed backend is reported not-held and the active child is reaped. Bounded
+  retries (max 3) only for transient failures; broker dispatch failure is
+  recorded and redispatched on the next request rather than stranding the job.
+- **QC.** Deterministic structural checks plus per-stream timing evidence
+  (video/audio start and duration, A/V duration delta, actual FPS/timebase
+  sanity, bounded decode). Silence is judged against the *selected* source
+  occurrences (bounded analysis), so a legitimately silent selected span is not a
+  hard failure; unavailable/decode-failure evidence is distinguished from
+  unexpected lost audio. One absolute monotonic deadline covers the whole
+  expensive attempt (encode, post-encode output probing, and QC); each bounded
+  subprocess is sized to the remaining budget, and once the deadline is exhausted
+  no further process starts. A frame or audio subprocess that consumes its shared
+  budget and raises `TimeoutExpired` is classified as exhaustion, not an ordinary
+  decode failure, and QC checks cancellation/deadline after every call (including
+  exception exits) and once more before returning the verdict, so a mandatory-QC
+  exhaustion is always a distinct `QCTimeout` persisted as a hard `QC_TIMEOUT`
+  failure — never downgraded into a `WARN` success. Post-encode output probing
+  raises `RENDER_TIMEOUT` and is skipped, and its budget is recomputed *after*
+  hashing (hashing can consume the remaining budget) with a deadline verification
+  after probing. Cancellation/ownership is polled before and after every bounded
+  QC subprocess (including each source-audio analysis call) and around output
+  probing, so no source-audio or probe subprocess starts after a stop is observed;
+  cancellation keeps precedence over an exhausted deadline. A publication/database error is never
+  swallowed as duplicate delivery: it propagates after rollback and is recorded
+  truthfully, so a failed commit can neither report a false success nor strand a
+  `RUNNING` job.
+- **API/CLI.** `POST/GET /api/candidates/{id}/render-execution`,
+  `GET /api/render-executions/{id}`, `GET /api/render-executions/{id}/artifact`
+  (served only for a current cache-eligible COMPLETE execution); CLI
+  `render-execution`, `render-execution-status`, `render-execution-artifact`;
+  Celery `clipfactory.run_render_execution` (cancellation finalizes through the
+  real task entry point). The generic source retry endpoint refuses to dispatch
+  a render job as INGEST. The Stage 5.2 handoff exposes the authoritative Stage
+  5.0 output profile (read-only correction).
+- **Verification.** Engine unit tests; real FFmpeg two-span, dynamic-zoom,
+  offset-preserving (both video-0/audio-0.25 and absolute video-5/audio-5.25),
+  canonical advancing-highlight, and source-aware silence tests; injected-seam
+  lifecycle tests (convergence, duplicate delivery, claim fencing,
+  force-after-success attempt reset, upstream invalidation during render, running
+  cancellation via render and QC, queued cancellation via the real task entry,
+  malformed-plan fail-closed, cache-artifact absence, QC-policy invalidation,
+  dispatch recovery, historical reactivation, sticky ownership loss, terminal
+  status/claim/active-job/admission stops, authoritative-cancel-wins-over-latch
+  (direct and end-to-end), publication ownership-latch and admission rechecks,
+  expired-deadline/no-subprocess and remaining-budget probing, `QC_TIMEOUT`
+  non-publication, deadline-exhaustion-during-frame/audio classified as
+  `QCTimeout` (unit + real-QC executor integration), cancellation-precedence at
+  the deadline boundary, hashing-consumes-budget-skips-probe and
+  probe-budget-recomputed-after-hashing, failing-output-probe cancellation
+  (probe timeout and nonzero exit after a cross-connection cancel, through the
+  real runner and real executor persistence, plus real-runner unit coverage;
+  truthful `RENDER_TIMEOUT`/`QC_PROBE_FAILED` without a stop; ownership-loss
+  distinct from cancellation; a superseded claim not overwritten), and
+  cross-connection historical-reactivation commit);
+  deterministic PostgreSQL publication and ownership race tests (concurrent
+  candidate invalidation, cancellation, claim supersession, a failing output
+  probe after a cross-connection cancel finalizing as CANCELLED, concurrent bound
+  `FINAL_CLIP` refinement update blocking a stale publication, concurrent
+  selected-plan update blocking a stale publication, and controlled
+  lock-serialization of a manual refinement edit and of a selected-plan update
+  against publication); SQLite and
+  gated PostgreSQL migration (populated downgrade); admission and concurrency
+  tests; a handoff regression test; and a gated Stage 5.2 live-contract run that
+  binds a uniquely named disposable database and drives the real Celery task
+  entry point through the real compiler/FFmpeg/QC to a persisted managed
+  artifact. Stage 5.0/5.1/models/migrations regression suites remain green.
+  Manual-acceptance MP4s (plus the live-contract artifact) were regenerated with
+  the remediated engine; see `docs/STAGE_5_2_OPERATIONS.md`.
+- **Limitations.** Subjective media inspection still requires the human; tracked
+  crop uses the documented dynamic-scale equivalent because the installed
+  FFmpeg `crop` exposes no runtime size commands. Human acceptance and Sol review
+  pending.
+
 ## Stage 5.0 deterministic execution preflight and render contract (2026-09-18)
 
 Stage 5.0 turns the current Stage 4.3 selection into a durable, evidence-bound
@@ -211,8 +498,10 @@ Versions: policy `stage5.1-v1`, schema `stage5.1-schema-v1`, framing
 `stage5.1-ass-v5`, caption BiDi `stage5.1-caption-bidi-v2`, background fill
 `stage5.1-background-fill-v1`, safe zone
 `shorts-reels-safe-zone-v1`. The default caption style is phone-first (font size
-88, outline 7, shadow 3, max 2 lines, compact <=7-word chunks) with modern
-active-word emphasis: the word currently being spoken is highlighted in a
+88, outline 7, shadow 3, max 2 lines, compact <=7-word chunks) with per-word
+emphasis off by default: captions render as plain static single-color phrase
+text. Setting `CLIPFACTORY_VISUAL_CAPTION_DYNAMIC_EMPHASIS=true` re-enables
+active-word emphasis, highlighting the word currently being spoken in a
 configurable accent color on a stationary block using the exact FINAL_CLIP word
 timings, degrading to static captions on unreliable timing. Because the deployed
 libass build does not reorder mixed-direction text (measured), the derived ASS
@@ -418,8 +707,8 @@ Deterministic verification: 108 focused Stage 4.2 tests (governor, providers,
 service, executor/queue/cache/concurrency/cancellation, API/CLI/handoff/migration)
 plus the full backend suite in Docker Python 3.12 with the repository compose/.env
 files mounted, with no live provider calls in the automated suite. Versions:
-governor `stage4.2-v5`, schema `stage4.2-schema-v1`, validation
-`stage4.2-validation-v5`. See [docs/STAGE_4_2_OPERATIONS.md](docs/STAGE_4_2_OPERATIONS.md).
+governor `stage4.2-v6`, schema `stage4.2-schema-v1`, validation
+`stage4.2-validation-v6`. See [docs/STAGE_4_2_OPERATIONS.md](docs/STAGE_4_2_OPERATIONS.md).
 
 ### Stage 4.2 corrective patch (2026-09-17)
 
@@ -442,6 +731,15 @@ governor `stage4.2-v5`, schema `stage4.2-schema-v1`, validation
   rerun with unchanged inputs reuses it with zero additional hosted calls; a
   failed second call preserves the first accepted checkpoint and stays
   truthfully deferred.
+- **Revision-level semantic adjudication (2026-10-14).** In adaptive mode with a
+  provider, a plan whose only deterministic findings are revision-level (no hard
+  failure, no blocking condition) is sent to the semantic review instead of being
+  rejected outright. A favorable critique clears the advisory deterministic
+  revisions so the plan can be approved or approved-with-caution; a critique that
+  confirms a problem keeps both its finding and the deterministic revision. Hard
+  failures and blocking conditions are never reviewed away. Without a provider the
+  deterministic revisions stand unchanged. Versions advanced to
+  `stage4.2-v6`/`stage4.2-validation-v6`.
 - **Strict hero thresholds** (`short_moment_seconds`,
   `high_moment_density_floor`) now actually govern strict hero-window
   classification and remain fingerprint-invalidating.

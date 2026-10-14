@@ -256,6 +256,11 @@
 
 ## Working agreements
 
+- Review code directly and keep investigation quota-aware: use focused reads,
+  bounded verification, and concrete evidence. Do not invoke the `code-review`
+  skill or automatic multi-agent review workflows. Delegate review work only
+  when the user explicitly requests it.
+
 - Keep implementation and tests in the monorepo boundaries documented below.
 - Add tests for each feature or bugfix; run formatting, linting, and relevant
   tests before completion claims.
