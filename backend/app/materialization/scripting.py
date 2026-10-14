@@ -266,23 +266,39 @@ def _protected_token_mutations(copy_tokens: Sequence[str], source: str) -> set[s
     """Copy tokens that look like a mutated source protected token.
 
     A genuinely new authored word (``mechanism``, ``mentorship``) is allowed; a
-    copy token that differs from a real source protected token by a single edit
-    (case aside) is treated as corruption and rejected.
+    copy token that differs from a *distinctive* source protected token (a name,
+    number, abbreviation, technical form, or long token) by a single edit (case
+    aside) is treated as corruption and rejected. Ordinary short words are never
+    treated as protected identities, so ``loss`` is not a mutation of ``lost``.
     """
 
-    source_tokens = {token.casefold(): token for token in extract_protected_tokens(source)}
+    source_tokens = {
+        token.casefold(): token
+        for token in extract_protected_tokens(source)
+        if _is_distinctive(token)
+    }
     mutated: set[str] = set()
     for token in copy_tokens:
         folded = token.casefold()
         if folded in source_tokens:
             continue
         for source_folded, _source_token in source_tokens.items():
-            if len(source_folded) < 4 or abs(len(folded) - len(source_folded)) > 1:
+            if abs(len(folded) - len(source_folded)) > 1:
                 continue
             if _edit_distance(folded, source_folded) == 1:
                 mutated.add(token)
                 break
     return mutated
+
+
+def _is_distinctive(token: str) -> bool:
+    if any(character.isdigit() for character in token):
+        return True
+    if any(character in "-_/+@#.:" for character in token):
+        return True
+    if any(character.isupper() for character in token):
+        return True
+    return len(token) >= 8
 
 
 def _edit_distance(left: str, right: str) -> int:

@@ -264,6 +264,41 @@ def test_genuinely_additive_copy_is_accepted_and_classified() -> None:
     assert result.claim.claim_class in {"SOURCE_GROUNDED_INFERENCE", "SOURCE_SUPPORTED"}
 
 
+def test_short_word_is_not_treated_as_protected_mutation() -> None:
+    inputs = make_inputs()
+    result = validate_authored_block(
+        {
+            "block_index": 1,
+            "block_type": "ORIGINAL_VALUE",
+            "substantive_value_kind": "SYNTHESIS",
+            "copy": "The mechanism is that mentorship loss compounds over time",
+            "grounding_refs": [{"kind": "SOURCE_EXCERPT", "block_index": 0}],
+        },
+        inputs,
+        DEFAULT_CONFIG,
+    )
+    assert not any("PROTECTED_TOKEN_MUTATED" in finding.reason_codes for finding in result.findings)
+
+
+def test_mutated_distinctive_source_token_is_rejected() -> None:
+    inputs = make_inputs()
+    blocks = list(inputs.blocks)
+    blocks[0] = {**blocks[0], "source_text": "The researcher cites Google Cloud adoption"}
+    inputs = make_inputs(blocks=tuple(blocks))
+    result = validate_authored_block(
+        {
+            "block_index": 1,
+            "block_type": "ORIGINAL_VALUE",
+            "substantive_value_kind": "SYNTHESIS",
+            "copy": "Adoption of Googl Cloud accelerated the shift",
+            "grounding_refs": [{"kind": "SOURCE_EXCERPT", "block_index": 0}],
+        },
+        inputs,
+        DEFAULT_CONFIG,
+    )
+    assert any("PROTECTED_TOKEN_MUTATED" in finding.reason_codes for finding in result.findings)
+
+
 def test_external_claim_requires_verification() -> None:
     claim = classify_claim(
         "A 2024 study shows remote work collapsed output",
