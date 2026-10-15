@@ -534,15 +534,23 @@ def resolve_slots(
     *,
     narration_satisfied_blocks: frozenset[int] = frozenset(),
     narration_satisfied_slots: frozenset[str] = frozenset(),
+    narration_slot_blocks: Mapping[str, int] | None = None,
 ) -> tuple[SlotResolution, ...]:
     """Resolve every required authored/contract slot explicitly.
 
     Required substantive blocks and required contract slots (including
     ``AUTHORED_NARRATION``) must be fulfilled or they block. Optional slots are
     recorded as declined rather than silently dropped. One audio asset may fulfil
-    both a block and a contract narration requirement.
+    both a block and a contract narration requirement. A contract narration slot
+    that names no block index still records the exact narration block it is
+    fulfilled by, so downstream material-presence verification can confirm the
+    accepted audio.
+
+    ``slot_blocks`` maps an ``AUTHORED_NARRATION`` slot id to the narration block
+    index that fulfils it (when the slot does not itself name one).
     """
 
+    slot_blocks = dict(narration_slot_blocks or {})
     authored_by_index = {block.block_index: block for block in authored}
     resolutions: list[SlotResolution] = []
     for block in inputs.blocks:
@@ -591,10 +599,15 @@ def resolve_slots(
             fulfilled = (block_index in narration_satisfied_blocks) or (
                 slot_id in narration_satisfied_slots
             )
+            resolved_index = block_index
+            if resolved_index is None:
+                resolved_index = slot_blocks.get(slot_id)
+            if resolved_index is None and len(narration_satisfied_blocks) == 1:
+                resolved_index = next(iter(narration_satisfied_blocks))
             resolutions.append(
                 SlotResolution(
                     slot_id=slot_id,
-                    block_index=block_index,
+                    block_index=resolved_index,
                     slot_kind=slot_kind,
                     resolution="FULFILLED" if fulfilled else "DEFERRED",
                     reason_code=None if fulfilled else "MISSING_REQUIRED_NARRATION",

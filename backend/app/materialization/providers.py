@@ -17,7 +17,7 @@ changing callers.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
 from app.core.enums import ClaimClass
@@ -32,6 +32,109 @@ from app.materialization.scripting import resolve_grounding, validate_authored_b
 from app.materialization.types import AuthoredBlock, GroundingRef, QualityFinding
 
 _SUBSTANTIVE_BLOCK_TYPES = frozenset({"ORIGINAL_VALUE", "TEXTUAL_ANNOTATION"})
+
+
+class MaterializationProviderError(Exception):
+    """Typed Stage 6 provider failure (category + truthful reason code)."""
+
+    def __init__(self, category: str, reason_code: str | None = None) -> None:
+        self.category = category
+        self.reason_code = reason_code or category
+        super().__init__(self.reason_code)
+
+
+#: Closed categorical critique dimensions (spec section 7.1). Each is resolved as
+#: PASS/CONCERN/FAIL/UNKNOWN with short evidence. There is no scalar score.
+CRITIQUE_DIMENSIONS = (
+    "GROUNDING_ENTAILMENT",
+    "SUBSTANTIVE_ADDED_VALUE",
+    "SEMANTIC_FIDELITY",
+    "UNSUPPORTED_FACTS",
+    "CODE_SWITCH_PRESERVATION",
+    "REDUNDANCY",
+    "DIALECT_REGISTER_FIT",
+    "NATURALNESS",
+    "LENGTH_NECESSITY",
+)
+
+CRITIQUE_LEVELS = ("PASS", "CONCERN", "FAIL", "UNKNOWN")
+
+#: Dimensions whose CONCERN/FAIL is a critical failure: no approval is possible.
+#: GROUNDING_ENTAILMENT and SUBSTANTIVE_ADDED_VALUE additionally must be a *known
+#: positive* PASS (an UNKNOWN/absent verdict defers, never approves).
+CRITICAL_CRITIQUE_DIMENSIONS = frozenset(
+    {
+        "GROUNDING_ENTAILMENT",
+        "SUBSTANTIVE_ADDED_VALUE",
+        "SEMANTIC_FIDELITY",
+        "UNSUPPORTED_FACTS",
+        "CODE_SWITCH_PRESERVATION",
+    }
+)
+_POSITIVE_REQUIRED_DIMENSIONS = ("GROUNDING_ENTAILMENT", "SUBSTANTIVE_ADDED_VALUE")
+
+
+@dataclass(frozen=True)
+class CritiqueDimensionFinding:
+    """One categorical critique finding for a single dimension."""
+
+    dimension: str
+    level: str
+    evidence: str = ""
+
+    def as_dict(self) -> dict[str, object]:
+        return {"dimension": self.dimension, "level": self.level, "evidence": self.evidence}
+
+
+@dataclass(frozen=True)
+class BlockCritique:
+    """Categorical critique for one authored block, with a derived decision."""
+
+    block_index: int
+    findings: tuple[CritiqueDimensionFinding, ...] = ()
+
+    def _level(self, dimension: str) -> str | None:
+        for finding in self.findings:
+            if finding.dimension == dimension:
+                return finding.level
+        return None
+
+    @property
+    def accepted(self) -> bool:
+        """Known-positive grounding + added value and no critical concern/failure."""
+
+        for dimension in _POSITIVE_REQUIRED_DIMENSIONS:
+            if self._level(dimension) != "PASS":
+                return False
+        for dimension in CRITICAL_CRITIQUE_DIMENSIONS:
+            if self._level(dimension) in {"CONCERN", "FAIL"}:
+                return False
+        return True
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "block_index": self.block_index,
+            "accepted": self.accepted,
+            "findings": [finding.as_dict() for finding in self.findings],
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, object]) -> "BlockCritique":
+        raw = data.get("findings")
+        findings: list[CritiqueDimensionFinding] = []
+        if isinstance(raw, list):
+            for item in raw:
+                if isinstance(item, Mapping):
+                    findings.append(
+                        CritiqueDimensionFinding(
+                            dimension=str(item.get("dimension", "")),
+                            level=str(item.get("level", "")),
+                            evidence=str(item.get("evidence", "")),
+                        )
+                    )
+        index = data.get("block_index")
+        block_index = index if isinstance(index, int) and not isinstance(index, bool) else -1
+        return cls(block_index=block_index, findings=tuple(findings))
 
 
 @dataclass(frozen=True)
@@ -98,13 +201,28 @@ class CritiqueRequest:
 
 @dataclass(frozen=True)
 class CritiqueResult:
-    """Semantic-critique outcome: whether each grounded block is supported."""
+    """Semantic-critique outcome: whether each grounded block is supported.
 
-    accepted: Mapping[int, bool]
-    provider_identity: Mapping[str, object]
+    ``blocks`` carries the full categorical findings; ``accepted`` is the legacy
+    bool-only map (kept for simple/fake providers). ``decision`` prefers the
+    categorical verdict and only falls back to ``accepted`` when no categorical
+    finding exists for the block.
+    """
+
+    accepted: Mapping[int, bool] = field(default_factory=dict)
+    provider_identity: Mapping[str, object] = field(default_factory=dict)
     notes: str = ""
     deferred: bool = False
     reason_code: str | None = None
+    blocks: Mapping[int, "BlockCritique"] = field(default_factory=dict)
+
+    def decision(self, index: int) -> bool | None:
+        block = self.blocks.get(index)
+        if block is not None:
+            return block.accepted
+        if index in self.accepted:
+            return bool(self.accepted[index])
+        return None
 
 
 @dataclass(frozen=True)
@@ -505,7 +623,12 @@ def _run_critique(
     result = critique_provider.critique(CritiqueRequest(targets=tuple(targets)))
     if result.deferred:
         return None
-    return {int(index): bool(value) for index, value in result.accepted.items()}
+    decisions: dict[int, bool] = {}
+    for target in targets:
+        verdict = result.decision(target.block_index)
+        if verdict is not None:
+            decisions[target.block_index] = verdict
+    return decisions
 
 
 def _refs(value: object) -> tuple[GroundingRef, ...]:
@@ -561,6 +684,11 @@ def _optional_str(value: object) -> str | None:
 
 
 __all__ = [
+    "CRITICAL_CRITIQUE_DIMENSIONS",
+    "CRITIQUE_DIMENSIONS",
+    "CRITIQUE_LEVELS",
+    "BlockCritique",
+    "CritiqueDimensionFinding",
     "CritiqueRequest",
     "CritiqueResult",
     "CritiqueTarget",
@@ -568,6 +696,7 @@ __all__ = [
     "FakeCritiqueProvider",
     "FakeWritingProvider",
     "MaterializationCritiqueProvider",
+    "MaterializationProviderError",
     "MaterializationScript",
     "MaterializationWritingProvider",
     "WritingRequest",

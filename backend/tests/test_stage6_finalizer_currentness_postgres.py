@@ -34,6 +34,7 @@ from app.core.settings import get_settings
 from app.db.base import Base
 from app.materialization.executor import build_materialization_executor
 from app.materialization.finalization import (
+    FINALIZATION_CANCELLED,
     FINALIZATION_SUPERSEDED,
     finalize_materialization,
 )
@@ -487,11 +488,41 @@ def test_change_after_revalidation_before_publication_refuses(
     monkeypatch.setattr(fin, "_build_assessment_context", hook)
     result, job_id = _finalize_in_production_session(engine, envelope_id)
     envelope = _envelope(engine, envelope_id)
+
+    # A pre-render semantic label (MATERIALIZED_WITH_CAUTION) is legal and is NOT
+    # review readiness: the label alone never authorizes artifact exposure or
+    # human review. Readiness requires an effective completed assessment plus the
+    # exact bindings and flags, so assert the exact disposition instead of
+    # conflating the pre-render label with readiness.
     assert envelope.human_review_required is False
     assert envelope.cache_eligible is False
-    assert envelope.semantic_outcome.value not in _REVIEWABLE
     assert envelope.publication_ready is False
-    assert _job_status(engine, job_id) is not JobStatus.RUNNING
+    # No effective completed assessment was ever published for the refused
+    # generation, so the render artifact is never eligible for review/cache.
+    assert not (envelope.metrics or {}).get("assessment_fingerprint")
+    assert envelope.render_execution_id is None or not envelope.cache_eligible
+
+    if mutation in {"final_clip", "plan"}:
+        # A changed authoritative prerequisite is refused under the lock and the
+        # generation is truthfully blocked for upstream revalidation.
+        assert result.outcome == FINALIZATION_SUPERSEDED
+        assert "UPSTREAM_REVALIDATION_REQUIRED" in result.reason_codes
+        assert envelope.lifecycle.value == "BLOCKED"
+        assert envelope.semantic_outcome.value == "UPSTREAM_REVALIDATION_REQUIRED"
+        assert _job_status(engine, job_id) is JobStatus.SUCCEEDED
+    elif mutation == "output_revision":
+        # The bound render no longer matches the changed output revision.
+        assert result.outcome == FINALIZATION_SUPERSEDED
+        assert "RENDER_BINDING_STALE" in result.reason_codes
+        assert envelope.lifecycle.value == "AWAITING_RENDER"
+        assert envelope.semantic_outcome.value == "MATERIALIZED_WITH_CAUTION"
+        assert _job_status(engine, job_id) is JobStatus.SUCCEEDED
+    else:  # cancel
+        assert result.outcome == FINALIZATION_CANCELLED
+        assert "MATERIALIZATION_CANCELLED" in result.reason_codes
+        assert envelope.lifecycle.value == "CANCELLED"
+        assert envelope.semantic_outcome.value == "MATERIALIZED_WITH_CAUTION"
+        assert _job_status(engine, job_id) is JobStatus.CANCELLED
 
 
 def test_unchanged_publication_with_production_session_reaches_review_ready(
@@ -505,4 +536,243 @@ def test_unchanged_publication_with_production_session_reaches_review_ready(
     assert envelope.semantic_outcome.value in _REVIEWABLE
     assert envelope.publication_ready is False
 
+
+
+def _autocommit_connection(engine: Engine) -> Any:
+    return engine.connect().execution_options(isolation_level="AUTOCOMMIT")
+
+
+def _wait_for_lock_waiter(engine: Engine, holder_xid: int, *, timeout: float = 15.0) -> bool:
+    """Block until a backend is waiting on the exact holder transaction id.
+
+    This is the deterministic boundary handshake: it proves the finalizer is
+    genuinely waiting on the intended PostgreSQL row lock (a not-granted lock on
+    the holder's transaction id) before the holder is released, rather than
+    relying on an elapsed sleep.
+    """
+
+    import time
+
+    from sqlalchemy import text
+
+    connection = _autocommit_connection(engine)
+    deadline = time.monotonic() + timeout
+    try:
+        while time.monotonic() < deadline:
+            waiting = connection.execute(
+                text(
+                    "SELECT count(*) FROM pg_locks "
+                    "WHERE NOT granted AND transactionid = :xid"
+                ),
+                {"xid": holder_xid},
+            ).scalar()
+            if waiting and int(waiting) > 0:
+                return True
+            time.sleep(0.05)
+    finally:
+        connection.close()
+    return False
+
+
+def test_publication_waits_on_concurrent_candidate_lock_then_refuses(
+    engine: Engine, monkeypatch: Any
+) -> None:
+    """A real synchronized interleaving at the candidate lock boundary.
+
+    A second session holds the candidate row lock, mutates the authoritative
+    FINAL_CLIP, and commits while the finalizer is *verifiably* blocked inside its
+    publication path (a not-granted PostgreSQL lock on the holder's transaction
+    id). The finalizer then revalidates under the lock and refuses to publish the
+    now-stale generation. Bounded ``lock_timeout``/``statement_timeout`` turn any
+    deadlock into a failure, and all threads must terminate.
+    """
+
+    import threading
+
+    from sqlalchemy import text
+
+    envelope_id = _prepare(engine, monkeypatch)
+    _attach_render(engine, envelope_id)
+
+    invalidator_locked = threading.Event()
+    release = threading.Event()
+    errors: list[Exception] = []
+    holder: dict[str, int] = {}
+
+    def invalidator() -> None:
+        session = _production_session(engine)
+        try:
+            session.execute(text("SET lock_timeout = '15000ms'"))
+            session.execute(text("SET statement_timeout = '20000ms'"))
+            envelope = session.get(ClipMaterialization, envelope_id)
+            assert envelope is not None
+            # Take the shared candidate lock first (same order the finalizer uses).
+            session.execute(
+                text("SELECT id FROM clip_candidates WHERE id = :cid FOR UPDATE"),
+                {"cid": str(envelope.clip_candidate_id)},
+            ).first()
+            holder["xid"] = int(session.execute(text("SELECT txid_current()")).scalar())
+            invalidator_locked.set()
+            release.wait(timeout=20)
+            refine = session.scalars(
+                select(CandidateRefinement).where(
+                    CandidateRefinement.clip_candidate_id == envelope.clip_candidate_id,
+                    CandidateRefinement.priority == RefinementPriority.FINAL_CLIP,
+                )
+            ).one()
+            refine.status = RefinementStatus.NEEDS_MANUAL_TRANSCRIPT_REVIEW
+            session.commit()
+        except Exception as error:  # noqa: BLE001 - surfaced by assertion
+            errors.append(error)
+            try:
+                session.rollback()
+            except Exception:
+                pass
+        finally:
+            session.close()
+
+    thread = threading.Thread(target=invalidator)
+    thread.start()
+    assert invalidator_locked.wait(timeout=15)
+    assert "xid" in holder
+
+    outcome_holder: dict[str, Any] = {}
+
+    def finalize() -> None:
+        try:
+            result, job_id = _finalize_in_production_session(engine, envelope_id)
+            outcome_holder["result"] = result
+            outcome_holder["job_id"] = job_id
+        except Exception as error:  # noqa: BLE001 - surfaced by assertion
+            errors.append(error)
+
+    finalizer_thread = threading.Thread(target=finalize)
+    finalizer_thread.start()
+
+    # Deterministic handshake: the finalizer must be genuinely blocked on the
+    # intended PostgreSQL lock before the holder is released.
+    assert _wait_for_lock_waiter(engine, holder["xid"], timeout=15)
+    assert "result" not in outcome_holder
+    assert finalizer_thread.is_alive()
+    release.set()
+
+    finalizer_thread.join(timeout=30)
+    thread.join(timeout=30)
+    assert not finalizer_thread.is_alive()
+    assert not thread.is_alive()
+    assert not errors, errors
+
+    result = outcome_holder["result"]
+    job_id = outcome_holder["job_id"]
+    assert result.outcome == FINALIZATION_SUPERSEDED
+    assert "UPSTREAM_REVALIDATION_REQUIRED" in result.reason_codes
+    envelope = _envelope(engine, envelope_id)
+    assert envelope.lifecycle.value == "BLOCKED"
+    assert envelope.semantic_outcome.value == "UPSTREAM_REVALIDATION_REQUIRED"
+    assert envelope.human_review_required is False
+    assert envelope.cache_eligible is False
+    assert envelope.publication_ready is False
+    assert not (envelope.metrics or {}).get("assessment_fingerprint")
+    assert _job_status(engine, job_id) is JobStatus.SUCCEEDED
+
+
+def test_publication_and_queue_share_lock_order_without_deadlock(
+    engine: Engine, monkeypatch: Any
+) -> None:
+    """Publication and a live queue POST acquire the candidate lock in the same
+    order and must serialize without deadlock.
+
+    A real ``queue_materialization`` POST holds the candidate row lock (in the
+    production order) while the finalizer enters its publication path; the
+    finalizer must wait on the same lock and then proceed -- never invert the lock
+    order. Both threads must terminate within bounded timeouts.
+    """
+
+    import threading
+
+    from sqlalchemy import text as _text
+
+    import app.materialization.queue as queue_module
+    from app.materialization.queue import queue_materialization
+
+    envelope_id = _prepare(engine, monkeypatch)
+    _attach_render(engine, envelope_id)
+
+    queue_locked = threading.Event()
+    queue_release = threading.Event()
+    errors: list[Exception] = []
+    holder: dict[str, int] = {}
+
+    original_lock_candidate = queue_module._lock_candidate
+
+    def hook_lock_candidate(session: Any, candidate_id: Any) -> Any:
+        candidate = original_lock_candidate(session, candidate_id)
+        holder["xid"] = int(session.execute(_text("SELECT txid_current()")).scalar())
+        queue_locked.set()
+        queue_release.wait(timeout=20)
+        return candidate
+
+    monkeypatch.setattr(queue_module, "_lock_candidate", hook_lock_candidate)
+    monkeypatch.setattr(queue_module, "_dispatch", lambda *args, **kwargs: None)
+
+    with Session(engine) as session:
+        candidate_id = session.get(ClipMaterialization, envelope_id).clip_candidate_id
+
+    queue_outcome: dict[str, Any] = {}
+
+    def queue_post() -> None:
+        session = _production_session(engine)
+        try:
+            session.execute(_text("SET lock_timeout = '15000ms'"))
+            session.execute(_text("SET statement_timeout = '20000ms'"))
+            queue_outcome["result"] = queue_materialization(
+                session, candidate_id, priority="CANDIDATE"
+            )
+            session.commit()
+        except Exception as error:  # noqa: BLE001 - surfaced by assertion
+            errors.append(error)
+            try:
+                session.rollback()
+            except Exception:
+                pass
+        finally:
+            session.close()
+
+    queue_thread = threading.Thread(target=queue_post)
+    queue_thread.start()
+    assert queue_locked.wait(timeout=15), errors
+
+    outcome_holder: dict[str, Any] = {}
+
+    def finalize() -> None:
+        try:
+            result, _job = _finalize_in_production_session(engine, envelope_id)
+            outcome_holder["result"] = result
+        except Exception as error:  # noqa: BLE001 - surfaced by assertion
+            errors.append(error)
+
+    finalizer_thread = threading.Thread(target=finalize)
+    finalizer_thread.start()
+
+    # The finalizer must be verifiably waiting on the candidate lock the queue POST
+    # holds before we release it, so the interleaving is deterministic.
+    assert _wait_for_lock_waiter(engine, holder["xid"], timeout=15)
+    assert "result" not in outcome_holder
+    assert finalizer_thread.is_alive()
+    queue_release.set()
+
+    finalizer_thread.join(timeout=40)
+    queue_thread.join(timeout=40)
+    assert not finalizer_thread.is_alive()
+    assert not queue_thread.is_alive()
+    assert not errors, errors
+
+    # Neither party deadlocked; publication produced a truthful outcome.
+    assert "result" in outcome_holder
+    assert outcome_holder["result"].outcome in {
+        FINALIZATION_SUPERSEDED,
+        "COMPLETE",
+        "DEFERRED",
+    }
+    assert "result" in queue_outcome
 

@@ -32,6 +32,15 @@ MAX_NARRATION_SECONDS = 60.0
 MAX_RAW_SYNTHESIS_CALLS = 6
 NARRATION_DURATION_TOLERANCE_SECONDS = 0.35
 
+# Bounded narration mix gain. A channel profile may request a nonzero narration
+# gain (via ``tts_settings['narration_gain_db']``); it is clamped to this
+# conservative range so narration can never be boosted toward clipping or muted
+# out. The applied gain participates in the audio recipe and output fingerprint.
+MIN_NARRATION_GAIN_DB = -12.0
+MAX_NARRATION_GAIN_DB = 6.0
+DEFAULT_NARRATION_GAIN_DB = 0.0
+NARRATION_GAIN_SETTING_KEY = "narration_gain_db"
+
 # Delivery bounds.
 MAX_CLIP_SECONDS = 180.0
 
@@ -114,6 +123,9 @@ class Stage6Config:
     max_narration_chunks: int = MAX_NARRATION_CHUNKS
     max_narration_seconds: float = MAX_NARRATION_SECONDS
     max_raw_synthesis_calls: int = MAX_RAW_SYNTHESIS_CALLS
+    min_narration_gain_db: float = MIN_NARRATION_GAIN_DB
+    max_narration_gain_db: float = MAX_NARRATION_GAIN_DB
+    default_narration_gain_db: float = DEFAULT_NARRATION_GAIN_DB
     max_clip_seconds: float = MAX_CLIP_SECONDS
     max_repair_count: int = MAX_REPAIR_COUNT
     max_boundary_trim_seconds: float = MAX_BOUNDARY_TRIM_SECONDS
@@ -133,6 +145,21 @@ class Stage6Config:
 
 
 DEFAULT_CONFIG = Stage6Config()
+
+
+def narration_gain_db(settings: object, config: Stage6Config) -> float:
+    """Resolve the bounded narration mix gain from a profile's TTS settings.
+
+    Non-numeric or missing values fall back to the neutral default; a numeric
+    value is clamped to the configured conservative range, so the applied gain is
+    always finite and bounded.
+    """
+
+    value = settings.get(NARRATION_GAIN_SETTING_KEY) if isinstance(settings, dict) else None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return config.default_narration_gain_db
+    gain = float(value)
+    return max(config.min_narration_gain_db, min(config.max_narration_gain_db, gain))
 
 
 @dataclass
@@ -233,4 +260,5 @@ __all__ = [
     "STAGE6_POLICY_VERSION",
     "STAGE6_SCHEMA_VERSION",
     "STAGE6_VALIDATION_VERSION",
+    "narration_gain_db",
 ]

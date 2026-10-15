@@ -33,6 +33,7 @@ from app.core.enums import (
 from app.core.settings import get_settings
 from app.db.base import Base
 from app.materialization.finalization import (
+    FINALIZATION_COMPLETE,
     FINALIZATION_DEFERRED,
     FINALIZATION_SUPERSEDED,
     finalize_materialization,
@@ -332,6 +333,131 @@ def test_favorable_snapshot_never_overrides_missing_content(
 
 
 # --- 5. authoritative SCRIPT dependency + UNKNOWN critical evidence ------------
+
+
+def _snapshot_context(envelope: ClipMaterialization) -> dict[str, Any]:
+    metrics = dict(envelope.metrics or {})
+    raw = dict(metrics[PRE_RENDER_CONTEXT_METRIC])
+    context = dict(raw.get("context") or {})
+    raw["context"] = context
+    metrics[PRE_RENDER_CONTEXT_METRIC] = raw
+    envelope.metrics = metrics
+    return context
+
+
+def _add_snapshot_finding(
+    envelope: ClipMaterialization,
+    *,
+    dimension: str,
+    level: str,
+    reason_codes: list[str],
+) -> None:
+    context = _snapshot_context(envelope)
+    extra = [dict(item) for item in (context.get("extra_findings") or [])]
+    extra.append(
+        {
+            "dimension": dimension,
+            "level": level,
+            "reason_codes": list(reason_codes),
+            "evidence": {},
+        }
+    )
+    context["extra_findings"] = extra
+
+
+def test_snapshot_adverse_finding_is_not_discarded(
+    session: Session, monkeypatch: Any
+) -> None:
+    """Adverse evidence in the dependency-bound snapshot is authoritative.
+
+    Reproduces SOL's confirmed bug: ``_derive_evidence`` replaced
+    ``base.extra_findings`` with the (favorable) top-level row findings, so an
+    UNMET ``SUBSTANTIVE_VALUE`` / ``PARAPHRASE_ONLY`` finding that lived only in
+    the validated snapshot silently disappeared and the materialization became
+    reviewable. The adverse finding must survive and reject the generation.
+    """
+
+    fixture, envelope = _persisted_materialization(session, monkeypatch)
+    _add_snapshot_finding(
+        envelope,
+        dimension="SUBSTANTIVE_VALUE",
+        level="UNMET",
+        reason_codes=["PARAPHRASE_ONLY"],
+    )
+    session.flush()
+    _attach_render(session, fixture, envelope)
+
+    result = _finalize(session, fixture, envelope)
+    session.refresh(envelope)
+    assert result.outcome == FINALIZATION_COMPLETE
+    assert envelope.semantic_outcome.value == "REJECTED_QUALITY"
+    assert envelope.semantic_outcome.value not in _REVIEWABLE
+    assert envelope.human_review_required is False
+    assert envelope.cache_eligible is False
+    assert envelope.publication_ready is False
+    persisted = {
+        (str(item.get("dimension")), str(item.get("level"))): set(item.get("reason_codes") or [])
+        for item in (envelope.quality_findings or [])
+    }
+    assert ("SUBSTANTIVE_VALUE", "UNMET") in persisted
+    assert "PARAPHRASE_ONLY" in persisted[("SUBSTANTIVE_VALUE", "UNMET")]
+    assert "PARAPHRASE_ONLY" in (envelope.reason_codes or [])
+
+
+def test_snapshot_critical_unknown_defers(session: Session, monkeypatch: Any) -> None:
+    """UNKNOWN critical evidence in the snapshot is missing evidence, not favorable.
+
+    A contradiction between a favorable row and an UNKNOWN critical semantic
+    dimension in the validated snapshot must defer truthfully rather than
+    promote to review readiness.
+    """
+
+    fixture, envelope = _persisted_materialization(session, monkeypatch)
+    _add_snapshot_finding(
+        envelope,
+        dimension="GROUNDING_VERIFICATION",
+        level="UNKNOWN",
+        reason_codes=[],
+    )
+    session.flush()
+    _attach_render(session, fixture, envelope)
+
+    result = _finalize(session, fixture, envelope)
+    session.refresh(envelope)
+    assert result.outcome == FINALIZATION_DEFERRED
+    assert envelope.semantic_outcome.value == "DEFERRED_EVIDENCE"
+    assert envelope.semantic_outcome.value not in _REVIEWABLE
+    assert envelope.human_review_required is False
+    assert envelope.cache_eligible is False
+    assert envelope.publication_ready is False
+
+
+def test_snapshot_adverse_finding_survives_idempotent_replay(
+    session: Session, monkeypatch: Any
+) -> None:
+    """An adverse snapshot finding is preserved across an identical replay."""
+
+    fixture, envelope = _persisted_materialization(session, monkeypatch)
+    _add_snapshot_finding(
+        envelope,
+        dimension="SUBSTANTIVE_VALUE",
+        level="UNMET",
+        reason_codes=["PARAPHRASE_ONLY"],
+    )
+    session.flush()
+    _attach_render(session, fixture, envelope)
+
+    first = _finalize(session, fixture, envelope)
+    assert first.outcome == FINALIZATION_COMPLETE
+    session.refresh(envelope)
+    assert envelope.semantic_outcome.value == "REJECTED_QUALITY"
+
+    replay = _finalize(session, fixture, envelope)
+    assert replay.reused is True
+    assert replay.assessment_fingerprint == first.assessment_fingerprint
+    session.refresh(envelope)
+    assert envelope.semantic_outcome.value == "REJECTED_QUALITY"
+    assert "PARAPHRASE_ONLY" in (envelope.reason_codes or [])
 
 
 def test_missing_script_dependency_binding_defers(session: Session, monkeypatch: Any) -> None:

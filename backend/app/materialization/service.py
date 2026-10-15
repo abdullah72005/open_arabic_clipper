@@ -266,11 +266,19 @@ def resolve_prerequisites(
 
 
 def _current_profile(session: Session, profile_key: str | None) -> ChannelProductionProfile | None:
-    if profile_key is None:
-        return None
+    """Resolve the requested profile, defaulting an omitted key to ``default``.
+
+    An omitted ``profile_key`` resolves to the current ``channel_key='default'``
+    profile when one exists, otherwise to the existing neutral no-voice profile
+    (``None``). A configured default voice is never silently ignored by treating
+    an omitted key as an unconditional empty profile. Explicit keys are honored
+    as-is, including a non-``default`` channel.
+    """
+
+    key = profile_key if profile_key is not None else "default"
     return session.scalars(
         select(ChannelProductionProfile).where(
-            ChannelProductionProfile.channel_key == profile_key,
+            ChannelProductionProfile.channel_key == key,
             ChannelProductionProfile.is_current.is_(True),
         )
     ).first()
@@ -616,7 +624,8 @@ def assemble_result(
         inputs,
         script.authored_blocks,
         narration_satisfied_blocks=narration_blocks,
-        narration_satisfied_slots=narration_slots,
+        narration_satisfied_slots=frozenset(narration_slots),
+        narration_slot_blocks=narration_slots,
     )
 
     build = build_timeline(
@@ -699,13 +708,15 @@ def _narration_required(inputs: MaterializationInputs) -> bool:
 
 def _narration_slot_ids(
     inputs: MaterializationInputs, narration_blocks: frozenset[int]
-) -> frozenset[str]:
+) -> dict[str, int]:
     """Contract narration slots fulfilled by validated generated audio.
 
     A required ``AUTHORED_NARRATION`` slot is bound to a generated chunk when the
     slot names a block that was narrated, or, for a slot without a block index,
     when the plan's narration placement block was narrated. One validated audio
     asset fulfils both a block and a contract slot without duplicate narration.
+    Returns ``slot_id -> narration block index`` so the exact fulfilled block is
+    recorded even when the contract slot omits it.
     """
 
     placement = None
@@ -714,7 +725,7 @@ def _narration_slot_ids(
         candidate = requirements.get("placement_block_index")
         if isinstance(candidate, int) and not isinstance(candidate, bool):
             placement = candidate
-    satisfied: set[str] = set()
+    satisfied: dict[str, int] = {}
     for slot in inputs.execution_slots:
         if str(slot.get("slot_kind", "")) != "AUTHORED_NARRATION":
             continue
@@ -724,10 +735,10 @@ def _narration_slot_ids(
         block_index = slot.get("block_index")
         if isinstance(block_index, int) and not isinstance(block_index, bool):
             if block_index in narration_blocks:
-                satisfied.add(slot_id)
+                satisfied[slot_id] = block_index
         elif placement is not None and placement in narration_blocks:
-            satisfied.add(slot_id)
-    return frozenset(satisfied)
+            satisfied[slot_id] = placement
+    return satisfied
 
 
 def _synthesize_narration(

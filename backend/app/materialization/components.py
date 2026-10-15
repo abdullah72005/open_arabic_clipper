@@ -32,6 +32,7 @@ from app.materialization.policy import (
     Stage6Config,
 )
 from app.materialization.providers import (
+    BlockCritique,
     CritiqueRequest,
     CritiqueResult,
     MaterializationCritiqueProvider,
@@ -67,6 +68,9 @@ class ComponentProviders:
     writing: MaterializationWritingProvider
     critique: MaterializationCritiqueProvider | None = None
     narration: NarrationSynthesizer | None = None
+    #: Optional local audio-backed fidelity validator for synthesized audio. It
+    #: returns a mapping with at least ``status`` (ACCEPTED/DEFERRED/REJECTED).
+    narration_fidelity: Callable[[NarrationAudio], Mapping[str, object]] | None = None
 
 
 @dataclass
@@ -319,6 +323,7 @@ def _critique_result_to_dict(result: CritiqueResult) -> dict[str, object]:
         "accepted": [
             {"index": int(index), "value": bool(value)} for index, value in result.accepted.items()
         ],
+        "blocks": [block.as_dict() for block in result.blocks.values()],
         "provider_identity": dict(result.provider_identity),
         "notes": result.notes,
         "deferred": bool(result.deferred),
@@ -335,6 +340,14 @@ def _critique_result_from_dict(data: Mapping[str, object]) -> CritiqueResult:
                 index = item.get("index")
                 if isinstance(index, int) and not isinstance(index, bool):
                     accepted[index] = bool(item.get("value", False))
+    blocks: dict[int, BlockCritique] = {}
+    raw_blocks = data.get("blocks")
+    if isinstance(raw_blocks, list):
+        for item in raw_blocks:
+            if isinstance(item, Mapping):
+                block = BlockCritique.from_dict(item)
+                if block.block_index >= 0:
+                    blocks[block.block_index] = block
     identity = data.get("provider_identity")
     reason_code = data.get("reason_code")
     return CritiqueResult(
@@ -343,6 +356,7 @@ def _critique_result_from_dict(data: Mapping[str, object]) -> CritiqueResult:
         notes=str(data.get("notes", "")),
         deferred=bool(data.get("deferred", False)),
         reason_code=reason_code if isinstance(reason_code, str) else None,
+        blocks=blocks,
     )
 
 
@@ -563,11 +577,13 @@ class CheckpointedNarrationSynthesizer:
         synthesizer: NarrationSynthesizer,
         gateway: DurableRequestGateway,
         inputs: MaterializationInputs,
+        validator: Callable[[NarrationAudio], Mapping[str, object]] | None = None,
     ) -> None:
         self._synthesizer = synthesizer
         self.provider_name = getattr(synthesizer, "provider_name", "narration")
         self._gateway = gateway
         self._inputs = inputs
+        self._validator = validator
         self.reused = False
 
     def available(self) -> bool:
@@ -581,6 +597,8 @@ class CheckpointedNarrationSynthesizer:
         stored = self._stored_chunk(request.chunk_id, dep)
         if stored is not None:
             self.reused = True
+            if not self._ensure_fidelity(stored, request, dep):
+                raise RuntimeError("NARRATION_FIDELITY_FAILED")
             return stored
 
         def on_response(result: Any) -> Mapping[str, object] | None:
@@ -613,7 +631,71 @@ class CheckpointedNarrationSynthesizer:
             raise RuntimeError("TTS_UNAVAILABLE")
         audio = response
         assert isinstance(audio, NarrationAudio)
+        if not self._ensure_fidelity(audio, request, dep):
+            raise RuntimeError("NARRATION_FIDELITY_FAILED")
         return audio
+
+    def _ensure_fidelity(
+        self, audio: NarrationAudio, request: NarrationSynthesisRequest, dep: str
+    ) -> bool:
+        """Run the separate, idempotently-checkpointed local fidelity validation.
+
+        The synthesis checkpoint is persisted before this call. An already
+        ACCEPTED validation is reused without re-running ASR; a missing or
+        non-accepted validation runs exactly once more and is persisted. Unknown
+        (deferred) or rejected fidelity does not accept the chunk.
+        """
+
+        if self._validator is None:
+            return True
+        if self._stored_validation_status(request.chunk_id, dep) == "ACCEPTED":
+            return True
+        validation = dict(self._validator(audio))
+        self._record_validation(request.chunk_id, dep, validation)
+        return str(validation.get("status") or "") == "ACCEPTED"
+
+    def _stored_validation_status(self, chunk_id: str, dep: str) -> str | None:
+        from app.models import ClipMaterialization
+
+        row = self._gateway.context.session.get(
+            ClipMaterialization,
+            self._gateway.context.owner.materialization_id,
+            populate_existing=True,
+        )
+        if row is None or not isinstance(row.component_checkpoints, Mapping):
+            return None
+        entry = row.component_checkpoints.get("NARRATION")
+        if not isinstance(entry, Mapping):
+            return None
+        chunks = entry.get("chunks")
+        if not isinstance(chunks, Mapping):
+            return None
+        chunk = chunks.get(chunk_id)
+        if not isinstance(chunk, Mapping) or chunk.get("dependency_fingerprint") != dep:
+            return None
+        validation = chunk.get("validation")
+        if not isinstance(validation, Mapping):
+            return None
+        return str(validation.get("status") or "") or None
+
+    def _record_validation(
+        self, chunk_id: str, dep: str, validation: Mapping[str, object]
+    ) -> None:
+        from app.models import ClipMaterialization
+
+        session = self._gateway.context.session
+        owner = self._gateway.context.owner
+        row = session.get(ClipMaterialization, owner.materialization_id, populate_existing=True)
+        checkpoints = dict(row.component_checkpoints or {}) if row is not None else {}
+        entry = checkpoints.get("NARRATION")
+        merged = dict(entry) if isinstance(entry, Mapping) else {}
+        chunks = dict(merged.get("chunks") or {})
+        chunk = dict(chunks.get(chunk_id) or {})
+        chunk["dependency_fingerprint"] = dep
+        chunk["validation"] = dict(validation)
+        chunks[chunk_id] = chunk
+        merged["chunks"] = chunks
+        merge_component_checkpoint(session, owner, "NARRATION", merged)
 
     def _stored_chunk(self, chunk_id: str, dep: str) -> NarrationAudio | None:
         from app.models import ClipMaterialization
@@ -691,7 +773,12 @@ def prepare_materialization(context: ComponentContext) -> PreparedMaterializatio
         else None
     )
     narration = (
-        CheckpointedNarrationSynthesizer(providers.narration, gateway, context.inputs)
+        CheckpointedNarrationSynthesizer(
+            providers.narration,
+            gateway,
+            context.inputs,
+            validator=providers.narration_fidelity,
+        )
         if providers.narration is not None
         else None
     )
@@ -703,7 +790,7 @@ def prepare_materialization(context: ComponentContext) -> PreparedMaterializatio
         narration_synthesizer=narration,
         supporting_assets=context.supporting_assets,  # type: ignore[arg-type]
         config=context.config,
-        allow_hosted=context.allow_hosted and providers.critique is not None,
+        allow_hosted=context.allow_hosted,
         ledger=CallLedger(),
     )
     _record_script_checkpoint(context, script_dep, script_dep_inputs, result.script)

@@ -406,6 +406,121 @@ def test_accepted_synthesis_is_reused_on_resume(component_fixture: Any) -> None:
     assert len(synthesizer.calls) == first_synthesis_calls
 
 
+def test_narration_fidelity_is_separately_checkpointed_and_reused(
+    component_fixture: Any,
+) -> None:
+    """Local fidelity validation is a separate, idempotently-reused checkpoint."""
+
+    engine, session, inputs, owner = component_fixture
+    profile = replace(inputs.profile, narration_allowed=True)
+    narration_inputs = replace(
+        inputs,
+        narration={"need": "RECOMMENDED", "requirements": {}},
+        profile=profile,
+    )
+    envelope = get_or_create_envelope(session, narration_inputs, {"priority": "CANDIDATE"})
+    job = ProcessingJob(
+        source_video_id=uuid.UUID(narration_inputs.source_id),
+        kind=JobKind.MATERIALIZATION,
+        materialization_id=envelope.id,
+        status=JobStatus.RUNNING,
+        claim_version=1,
+    )
+    session.add(job)
+    session.flush()
+    envelope.active_job_id = job.id
+    session.commit()
+    owner = claim_materialization(session, envelope.id, job.id, expected_job_claim_version=1)
+    assert owner is not None
+
+    writing = ScriptedWritingProvider()
+    critique = AcceptingCritiqueProvider()
+    synthesizer = CountingNarrationSynthesizer()
+    validated = {"n": 0}
+
+    def accept(_audio: Any) -> Mapping[str, object]:
+        validated["n"] += 1
+        return {"status": "ACCEPTED", "findings": [], "asr_identity": {"model": "fake"}}
+
+    context = _context(
+        session,
+        owner,
+        narration_inputs,
+        ComponentProviders(
+            writing=writing,
+            critique=critique,
+            narration=synthesizer,
+            narration_fidelity=accept,
+        ),
+    )
+    first = prepare_materialization(context)
+    assert first.narration_references
+    synthesis_calls = len(synthesizer.calls)
+    assert synthesis_calls >= 1
+    assert validated["n"] == 1
+
+    # Replaying reuses both the accepted synthesis and the accepted validation.
+    prepare_materialization(
+        _context(
+            session,
+            owner,
+            narration_inputs,
+            ComponentProviders(
+                writing=writing,
+                critique=critique,
+                narration=synthesizer,
+                narration_fidelity=accept,
+            ),
+        )
+    )
+    assert len(synthesizer.calls) == synthesis_calls
+    assert validated["n"] == 1
+
+
+def test_rejected_fidelity_does_not_accept_the_narration(
+    component_fixture: Any,
+) -> None:
+    engine, session, inputs, owner = component_fixture
+    profile = replace(inputs.profile, narration_allowed=True)
+    narration_inputs = replace(
+        inputs,
+        narration={"need": "RECOMMENDED", "requirements": {}},
+        profile=profile,
+    )
+    envelope = get_or_create_envelope(session, narration_inputs, {"priority": "CANDIDATE"})
+    job = ProcessingJob(
+        source_video_id=uuid.UUID(narration_inputs.source_id),
+        kind=JobKind.MATERIALIZATION,
+        materialization_id=envelope.id,
+        status=JobStatus.RUNNING,
+        claim_version=1,
+    )
+    session.add(job)
+    session.flush()
+    envelope.active_job_id = job.id
+    session.commit()
+    owner = claim_materialization(session, envelope.id, job.id, expected_job_claim_version=1)
+    assert owner is not None
+
+    def reject(_audio: Any) -> Mapping[str, object]:
+        return {"status": "REJECTED", "findings": ["MEANING_MISMATCH"]}
+
+    prepared = prepare_materialization(
+        _context(
+            session,
+            owner,
+            narration_inputs,
+            ComponentProviders(
+                writing=ScriptedWritingProvider(),
+                critique=AcceptingCritiqueProvider(),
+                narration=CountingNarrationSynthesizer(),
+                narration_fidelity=reject,
+            ),
+        )
+    )
+    assert not prepared.narration_references
+
+
 def test_component_dependency_fingerprint_is_stable(component_fixture: Any) -> None:
     _engine, session, inputs, owner = component_fixture
     context = _context(

@@ -1,0 +1,402 @@
+"""Stage 6 Gemini TTS narration adapter and local audio-backed fidelity check.
+
+The synthesizer executes exactly one Interactions API request per chunk (the
+durable gateway reserves the attempt first), requests verbatim audio, and
+persists the returned bytes as immutable lossless audio through StorageService.
+Returned MIME is honored: an ``audio/wav`` payload is saved as-is (never
+double-wrapped), a headerless ``audio/l16`` payload is wrapped exactly once using
+its declared sample rate/channels, and any other container is refused rather than
+misinterpreted. The API key is never logged or serialized; the SDK client is
+built lazily, its automatic retries are disabled, and the key is scrubbed on
+release.
+
+Local fidelity validation is a *separate* step: it transcribes the synthesized
+WAV with the existing leased faster-whisper engine and applies the strict
+order/occurrence-, negation-, number- and code-switch-aware comparison. A loose
+similarity score is never sufficient; unknown/empty transcript defers.
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import threading
+from collections.abc import Callable
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from google import genai
+from google.genai import types
+
+from app.candidates.providers import ProviderErrorCategory
+from app.materialization.narration import (
+    inspect_wav,
+    transcription_matches,
+    validate_narration_audio,
+    wrap_pcm_as_wav,
+)
+from app.materialization.providers import MaterializationProviderError
+from app.materialization.types import NarrationAudio, NarrationSynthesisRequest
+from app.services.storage import StorageService
+
+GEMINI_TTS_MODEL = "gemini-3.8-flash-tts"
+GEMINI_TTS_API_VERSION = "v1beta"
+GEMINI_TTS_SAMPLE_RATE = 24_000
+GEMINI_TTS_MIME_PCM = "audio/l16"
+GEMINI_TTS_MIME_WAV = "audio/wav"
+_SUPPORTED_MIME = frozenset({GEMINI_TTS_MIME_PCM, GEMINI_TTS_MIME_WAV})
+
+
+def _persist_to_storage(
+    storage: StorageService, source_id: str
+) -> Callable[[str, bytes], tuple[str, str]]:
+    from app.materialization.narration import write_narration_asset
+
+    def persist(chunk_id: str, data: bytes) -> tuple[str, str]:
+        filename = f"{chunk_id}.wav"
+        return write_narration_asset(storage, source_id, filename, data)
+
+    return persist
+
+
+class GeminiNarrationSynthesizer:
+    """Single-request hosted narration adapter implementing the synthesis protocol."""
+
+    provider_name = "gemini-tts"
+    hosted_provider = True
+
+    def __init__(
+        self,
+        *,
+        api_key: object | None,
+        model: str = GEMINI_TTS_MODEL,
+        api_version: str = GEMINI_TTS_API_VERSION,
+        voice: str = "Kore",
+        style: str = "",
+        mime_type: str = GEMINI_TTS_MIME_PCM,
+        sample_rate: int = GEMINI_TTS_SAMPLE_RATE,
+        timeout_seconds: float = 60.0,
+        storage: StorageService | None = None,
+        source_id: str = "",
+        persist: Callable[[str, bytes], tuple[str, str]] | None = None,
+        owns_client: bool = True,
+        client_factory: Callable[[], object] | None = None,
+    ) -> None:
+        self.model = model
+        self._api_version = api_version or GEMINI_TTS_API_VERSION
+        self._voice = voice or "Kore"
+        self._style = style or ""
+        self._mime_type = mime_type if mime_type in _SUPPORTED_MIME else GEMINI_TTS_MIME_PCM
+        self._sample_rate = max(1, int(sample_rate))
+        self._timeout = max(0.1, float(timeout_seconds))
+        self._owns_client = owns_client
+        self._client_factory = client_factory
+        self._client: object | None = None
+        self._key_present = bool(api_key)
+        self._api_key = api_key if self._key_present else None
+        self._raw_calls = 0
+        if persist is not None:
+            self._persist = persist
+        elif storage is not None and source_id:
+            self._persist = _persist_to_storage(storage, source_id)
+        else:
+            self._persist = None
+        self._digest = hashlib.sha256(f"gemini-tts:{model}:{self._voice}".encode()).hexdigest()
+
+    def available(self) -> bool:
+        return self._key_present
+
+    def runtime_identity(self) -> dict[str, object]:
+        return {
+            "provider": "gemini-tts",
+            "model": self.model,
+            "api_version": self._api_version,
+            "voice": self._voice,
+            "style": self._style,
+            "mime_type": self._mime_type,
+            "sample_rate": self._sample_rate,
+            "digest": self._digest,
+        }
+
+    def raw_call_count(self) -> int:
+        return self._raw_calls
+
+    def release(self) -> None:
+        client = self._client
+        self._client = None
+        self._api_key = None
+        if client is None or not self._owns_client:
+            return
+        close = getattr(client, "close", None)
+        if close is not None:
+            try:
+                close()
+            except Exception:
+                pass
+
+    def _build_client(self) -> object:
+        return genai.Client(
+            api_key=str(self._api_key or ""),
+            http_options=types.HttpOptions(
+                api_version=self._api_version,
+                timeout=int(self._timeout * 1000),
+                retry_options=types.HttpRetryOptions(attempts=1),
+            ),
+        )
+
+    def _client_instance(self) -> object | None:
+        if self._client is not None:
+            return self._client
+        if not self._key_present:
+            return None
+        try:
+            self._client = self._client_factory() if self._client_factory else self._build_client()
+        except Exception:
+            raise MaterializationProviderError(
+                ProviderErrorCategory.PROVIDER_ERROR.value, "gemini tts client construction failed"
+            ) from None
+        return self._client
+
+    def synthesize(self, request: NarrationSynthesisRequest) -> NarrationAudio:
+        if not self._key_present:
+            raise MaterializationProviderError(ProviderErrorCategory.MISSING_KEY.value)
+        if not request.text.strip():
+            raise MaterializationProviderError(ProviderErrorCategory.INVALID_REQUEST.value)
+        client = self._client_instance()
+        if client is None:
+            raise MaterializationProviderError(ProviderErrorCategory.MISSING_KEY.value)
+        self._raw_calls += 1
+        voice = request.voice or self._voice
+        style = request.style or self._style
+        annotation: dict[str, object] = {"type": "speech_metadata"}
+        if style:
+            annotation["style"] = style
+        try:
+            interaction = client.interactions.create(  # type: ignore[attr-defined]
+                model=self.model,
+                input=[
+                    {
+                        "type": "user_input",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": request.text,
+                                "annotations": [annotation],
+                            }
+                        ],
+                    }
+                ],
+                response_format={
+                    "type": "audio",
+                    "mime_type": self._mime_type,
+                    "sample_rate": self._sample_rate,
+                },
+                generation_config={"speech_config": [{"voice": voice}]},
+            )
+        except Exception as error:
+            raise MaterializationProviderError(_classify_exception(error)) from None
+        return self._narration_from_interaction(request, interaction, voice, style)
+
+    def _narration_from_interaction(
+        self,
+        request: NarrationSynthesisRequest,
+        interaction: Any,
+        voice: str,
+        style: str,
+    ) -> NarrationAudio:
+        audio = getattr(interaction, "output_audio", None)
+        if audio is None and isinstance(interaction, dict):
+            audio = interaction.get("output_audio")
+        if audio is None:
+            raise MaterializationProviderError(ProviderErrorCategory.MALFORMED_OUTPUT.value)
+        data_b64 = audio.get("data") if isinstance(audio, dict) else getattr(audio, "data", None)
+        mime = (
+            audio.get("mime_type")
+            if isinstance(audio, dict)
+            else getattr(audio, "mime_type", None)
+        )
+        channels = (
+            audio.get("channels")
+            if isinstance(audio, dict)
+            else getattr(audio, "channels", None)
+        )
+        sample_rate = (
+            audio.get("sample_rate")
+            if isinstance(audio, dict)
+            else getattr(audio, "sample_rate", None)
+        )
+        if not isinstance(data_b64, str) or not data_b64:
+            raise MaterializationProviderError(ProviderErrorCategory.MALFORMED_OUTPUT.value)
+        try:
+            raw = base64.b64decode(data_b64, validate=True)
+        except Exception:
+            raise MaterializationProviderError(
+                ProviderErrorCategory.MALFORMED_OUTPUT.value
+            ) from None
+        mime = str(mime or self._mime_type)
+        if mime == GEMINI_TTS_MIME_WAV:
+            wav_bytes = raw
+        elif mime == GEMINI_TTS_MIME_PCM:
+            rate = int(sample_rate) if isinstance(sample_rate, int) and sample_rate > 0 else (
+                self._sample_rate
+            )
+            ch = int(channels) if isinstance(channels, int) and channels > 0 else 1
+            wav_bytes = wrap_pcm_as_wav(raw, sample_rate=rate, channels=ch)
+        else:
+            raise MaterializationProviderError(ProviderErrorCategory.MALFORMED_OUTPUT.value)
+        try:
+            info = inspect_wav(wav_bytes)
+        except ValueError:
+            raise MaterializationProviderError(
+                ProviderErrorCategory.MALFORMED_OUTPUT.value
+            ) from None
+        if self._persist is None:
+            raise MaterializationProviderError(
+                ProviderErrorCategory.PROVIDER_ERROR.value, "narration storage is not bound"
+            )
+        relative_path, sha256 = self._persist(request.chunk_id, wav_bytes)
+        validation = validate_narration_audio(info, expected_text=request.text, config=_config())
+        return NarrationAudio(
+            chunk_id=request.chunk_id,
+            block_index=request.block_index,
+            text=request.text,
+            relative_path=relative_path,
+            sha256=sha256,
+            size_bytes=len(wav_bytes),
+            duration_seconds=info.duration_seconds,
+            sample_rate=info.sample_rate,
+            channels=info.channels,
+            container="wav",
+            provider_identity={
+                **request.identity(),
+                "voice": voice,
+                "style": style,
+                "model": self.model,
+                "api_version": self._api_version,
+            },
+            validation=validation,
+        )
+
+
+def _config() -> Any:
+    from app.materialization.policy import DEFAULT_CONFIG
+
+    return DEFAULT_CONFIG
+
+
+def _classify_exception(error: Exception) -> str:
+    if isinstance(error, MaterializationProviderError):
+        return error.category
+    if isinstance(error, TimeoutError):
+        return ProviderErrorCategory.TIMEOUT.value
+    if isinstance(error, (ConnectionError, OSError)):
+        return ProviderErrorCategory.CONNECTION.value
+    code = getattr(error, "code", None)
+    if not isinstance(code, int):
+        response = getattr(error, "response", None)
+        status = getattr(response, "status_code", None) if response is not None else None
+        code = status if isinstance(status, int) else None
+    if code in {401, 403}:
+        return ProviderErrorCategory.AUTHENTICATION.value
+    if code == 429:
+        return ProviderErrorCategory.RATE_LIMITED.value
+    if code in {408, 504} or "timeout" in str(error).casefold():
+        return ProviderErrorCategory.TIMEOUT.value
+    if code == 503:
+        return ProviderErrorCategory.SERVICE_UNAVAILABLE.value
+    if code is not None and code >= 500:
+        return ProviderErrorCategory.PROVIDER_ERROR.value
+    return ProviderErrorCategory.PROVIDER_ERROR.value
+
+
+# Local audio-backed fidelity validation
+
+
+FIDELITY_ACCEPTED = "ACCEPTED"
+FIDELITY_DEFERRED = "DEFERRED"
+FIDELITY_REJECTED = "REJECTED"
+
+
+@dataclass(frozen=True)
+class NarrationFidelityResult:
+    """Outcome of one local audio-backed narration fidelity check."""
+
+    status: str
+    transcript: str
+    findings: tuple[str, ...]
+    asr_identity: dict[str, object]
+
+    @property
+    def accepted(self) -> bool:
+        return self.status == FIDELITY_ACCEPTED
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "status": self.status,
+            "transcript": self.transcript,
+            "findings": list(self.findings),
+            "asr_identity": dict(self.asr_identity),
+        }
+
+
+def validate_narration_fidelity(
+    audio_path: Path,
+    *,
+    expected_text: str,
+    engine: Any,
+    options: Any,
+    lease_factory: Any | None = None,
+    cancel_event: threading.Event | None = None,
+) -> NarrationFidelityResult:
+    """Transcribe the synthesized audio under the heavy-model lease and compare.
+
+    Unknown fidelity (empty/unusable transcript, or a lost lease) defers; a clear
+    lexical/meaning mismatch rejects. The comparison is the strict order- and
+    occurrence-aware check in ``narration.transcription_matches``; a scalar
+    similarity ratio is never accepted as proof of meaning.
+    """
+
+    from app.runtime.heavy_model_lease import NoopHeavyModelLeaseFactory
+
+    factory = lease_factory if lease_factory is not None else NoopHeavyModelLeaseFactory()
+    ownership_lost = False
+    with factory.acquire(purpose="narration-fidelity") as lease:
+        result = engine.transcribe(audio_path, options, cancel_event=cancel_event)
+        ownership_lost = bool(getattr(lease, "ownership_lost", False))
+    asr_identity = {
+        "provider": "faster-whisper",
+        "model": getattr(options, "model", ""),
+        "device": getattr(options, "device", ""),
+        "compute_type": getattr(options, "compute_type", ""),
+        "beam_size": getattr(options, "beam_size", None),
+        "language": getattr(result, "language", None),
+    }
+    if ownership_lost:
+        return NarrationFidelityResult(
+            FIDELITY_DEFERRED, "", ("LEASE_LOST",), asr_identity
+        )
+    transcript = str(getattr(result, "raw_text", "") or "").strip()
+    if not transcript:
+        return NarrationFidelityResult(
+            FIDELITY_DEFERRED, "", ("EMPTY_TRANSCRIPT",), asr_identity
+        )
+    if transcription_matches(expected_text, transcript):
+        return NarrationFidelityResult(FIDELITY_ACCEPTED, transcript, (), asr_identity)
+    return NarrationFidelityResult(
+        FIDELITY_REJECTED, transcript, ("MEANING_MISMATCH",), asr_identity
+    )
+
+
+__all__ = [
+    "FIDELITY_ACCEPTED",
+    "FIDELITY_DEFERRED",
+    "FIDELITY_REJECTED",
+    "GEMINI_TTS_API_VERSION",
+    "GEMINI_TTS_MIME_PCM",
+    "GEMINI_TTS_MIME_WAV",
+    "GEMINI_TTS_MODEL",
+    "GeminiNarrationSynthesizer",
+    "NarrationFidelityResult",
+    "validate_narration_fidelity",
+]

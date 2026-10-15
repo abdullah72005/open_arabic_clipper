@@ -106,8 +106,74 @@ def _active_job(session: Session, materialization_id: uuid.UUID) -> ProcessingJo
     return jobs[0] if jobs else None
 
 
-def _is_cached(row: ClipMaterialization) -> bool:
-    return bool(row.cache_eligible) and row.lifecycle is MaterializationLifecycle.COMPLETE
+#: Completed-cache verification dispositions. A COMPLETE+cache_eligible envelope
+#: is only a cache *candidate*: it must still verify its exact bound render,
+#: binding, live scope, and artifact integrity before it may be claimed as cached.
+CACHE_VALID = "VALID"
+CACHE_RECOVERABLE = "RECOVERABLE"
+CACHE_TERMINAL = "TERMINAL"
+
+
+def _bound_completed_render(
+    session: Session, envelope: ClipMaterialization
+) -> RenderExecution | None:
+    """Return the exact effective bound transformed render, or ``None``.
+
+    The bound render must be the envelope's exact reverse-bound revision, a
+    ``TRANSFORMED_SHORT`` artifact, ``COMPLETE``, current, and its own
+    cache-eligible flag set. Any deviation returns ``None`` (never a substitute
+    row).
+    """
+
+    from app.render.execution.policy import TRANSFORMED_SHORT
+
+    if envelope.render_execution_id is None:
+        return None
+    render = session.get(RenderExecution, envelope.render_execution_id, populate_existing=True)
+    if render is None:
+        return None
+    if render.materialization_id != envelope.id:
+        return None
+    if render.artifact_purpose.value != TRANSFORMED_SHORT:
+        return None
+    if render.lifecycle.value != "COMPLETE":
+        return None
+    if not render.is_current or not render.cache_eligible:
+        return None
+    return render
+
+
+def _completed_cache_state(
+    session: Session, envelope: ClipMaterialization, *, settings: Settings
+) -> str:
+    """Classify a COMPLETE envelope as a verified cache, recoverable, or terminal.
+
+    ``CACHE_VALID`` requires the exact effective bound render, the complete
+    generation/output/repair binding identity, a currently-fresh render scope, and
+    an artifact that actually exists with the expected digest. ``CACHE_RECOVERABLE``
+    means the completed result is no longer a trustworthy cache claim and must be
+    revalidated/technically recovered. ``CACHE_TERMINAL`` means the envelope is not
+    a cache candidate at all and the normal COMPLETE skip applies.
+    """
+
+    if not (envelope.cache_eligible and envelope.lifecycle is MaterializationLifecycle.COMPLETE):
+        return CACHE_TERMINAL
+    render = _bound_completed_render(session, envelope)
+    if render is None:
+        return CACHE_RECOVERABLE
+    from app.materialization.finalization import _artifact_identity, _validate_render_binding
+
+    if _validate_render_binding(envelope, render) is not None:
+        return CACHE_RECOVERABLE
+    from app.render.execution.service import _live_request_freshness
+
+    if _live_request_freshness(session, render, settings) != "CURRENT":
+        return CACHE_RECOVERABLE
+    from app.services.storage import StorageService
+
+    if isinstance(_artifact_identity(StorageService(settings.storage_root), render), str):
+        return CACHE_RECOVERABLE
+    return CACHE_VALID
 
 
 def _outcome(
@@ -238,9 +304,42 @@ def queue_materialization(
             phase=resolve_job_phase(session, active, envelope),
         )
 
-    if not force and _is_cached(envelope):
-        session.commit()
-        return _outcome(None, envelope, queued=False, cached=True)
+    if not force:
+        cache_state = _completed_cache_state(session, envelope, settings=resolved_settings)
+        if cache_state == CACHE_VALID:
+            session.commit()
+            return _outcome(None, envelope, queued=False, cached=True)
+        if cache_state == CACHE_RECOVERABLE:
+            # A completed result whose bound render, binding, scope, or artifact no
+            # longer verifies is never returned as cached: the accepted semantic
+            # components, provider budgets, repair usage, and historical artifacts
+            # are preserved, and the exact transform is technically recovered
+            # through the render reactivation/re-handoff boundary (never a semantic
+            # regeneration). Clearing the forward binding forces the handoff
+            # boundary to reactivate an equivalent current revision or queue a
+            # bounded technical re-render, rather than finalizing an unverifiable
+            # render directly.
+            envelope.lifecycle = MaterializationLifecycle.AWAITING_RENDER
+            envelope.cache_eligible = False
+            envelope.render_execution_id = None
+            # Invalidating the current completed assessment atomically clears its
+            # final-review eligibility: an AWAITING_RENDER (pending-finalization)
+            # generation never carries a stale review requirement or a stale
+            # reviewable semantic outcome. Only a verified current final
+            # assessment may restore review readiness. Historical assessments,
+            # artifacts, accepted components, budgets, and repair usage remain
+            # preserved (the assessment fingerprint/metrics are untouched).
+            envelope.human_review_required = False
+            envelope.publication_ready = False
+            envelope.semantic_outcome = None
+            session.flush()
+            return _route_awaiting_render(
+                session,
+                candidate_id,
+                envelope,
+                settings=resolved_settings,
+                dispatcher=render_dispatcher,
+            )
 
     # One authoritative durable phase router: an AWAITING_RENDER envelope is
     # either recovering its exact render handoff, reporting its active render, or
@@ -382,10 +481,10 @@ def _route_awaiting_render(
     providers are never repeated). C: an active bound render -> return its active
     identity and recover a marked broker-delivery failure. D: an exact terminal
     bound render -> queue/recover one finalizer. G: a cancelled render -> preserve
-    the truthful outcome. A historical/superseded bound render never finalizes.
+    the truthful outcome. A historical/superseded but otherwise exact bound render
+    is recovered through the handoff boundary (reactivating an equivalent render or
+    queueing a technical re-render), never finalized directly.
     """
-
-    from app.services.storage import StorageService
 
     render_id = envelope.render_execution_id
     if render_id is not None:
@@ -402,33 +501,60 @@ def _route_awaiting_render(
                 session.commit()
                 return _outcome(None, envelope, queued=False, skipped_reason="RENDER_CANCELLED")
             if state in _RENDER_FINALIZABLE and render.is_current:
-                from app.materialization.finalization import request_finalization_job
+                return _request_bound_finalizer(
+                    session, envelope, render, settings=settings, dispatcher=dispatcher
+                )
+            # A terminal bound render that is no longer current/effective is
+            # recovered through the exact handoff below rather than being treated
+            # as finalizable: reactivating an equivalent historical render (same
+            # generation, verified artifact) or queueing a technical re-render.
 
-                job_id = request_finalization_job(
-                    session, render.id, settings=settings, dispatcher=dispatcher
-                )
-                session.commit()
-                job = session.get(ProcessingJob, job_id) if job_id is not None else None
-                if job is None:
-                    return _outcome(
-                        None, envelope, queued=False, skipped_reason="FINALIZATION_UNAVAILABLE"
-                    )
-                return _outcome(
-                    job, envelope, queued=False, active=True, phase=PHASE_FINALIZE
-                )
-            if not render.is_current:
-                # Historical/superseded render: require explicit revalidation.
-                session.commit()
-                return _outcome(
-                    None, envelope, queued=False, skipped_reason="RENDER_SUPERSEDED"
-                )
+    return _recover_render_handoff(
+        session, candidate_id, envelope, settings=settings, dispatcher=dispatcher
+    )
 
-    # B: the envelope committed a renderable result but never durably bound a
-    # render. Recover the exact handoff; accepted providers are checkpointed.
+
+def _request_bound_finalizer(
+    session: Session,
+    envelope: ClipMaterialization,
+    render: RenderExecution,
+    *,
+    settings: Settings,
+    dispatcher: object | None,
+) -> MaterializationQueueOutcome:
+    """Queue/recover one finalizer for an exact terminal current bound render."""
+
+    from app.materialization.finalization import request_finalization_job
+
+    job_id = request_finalization_job(session, render.id, settings=settings, dispatcher=dispatcher)
+    session.commit()
+    job = session.get(ProcessingJob, job_id) if job_id is not None else None
+    if job is None:
+        return _outcome(None, envelope, queued=False, skipped_reason="FINALIZATION_UNAVAILABLE")
+    return _outcome(job, envelope, queued=False, active=True, phase=PHASE_FINALIZE)
+
+
+def _recover_render_handoff(
+    session: Session,
+    candidate_id: uuid.UUID | str,
+    envelope: ClipMaterialization,
+    *,
+    settings: Settings,
+    dispatcher: object | None,
+) -> MaterializationQueueOutcome:
+    """Recover the exact transformed-render handoff through the render boundary.
+
+    The accepted components and output fingerprint are preserved; the existing
+    render queue reactivates an equivalent historical revision when its artifact
+    still verifies, or queues a bounded technical re-render otherwise. A recovered
+    terminal current render is then handed to the finalizer.
+    """
+
     from app.materialization.finalization import dispatch_transformed_render
+    from app.services.storage import StorageService
 
     try:
-        dispatch_transformed_render(
+        render_id = dispatch_transformed_render(
             session,
             envelope,
             candidate_id,
@@ -442,9 +568,43 @@ def _route_awaiting_render(
             None, envelope, queued=False, skipped_reason="RENDER_HANDOFF_RECOVERY_FAILED"
         )
     session.commit()
+    if render_id is None:
+        return _outcome(
+            None, envelope, queued=False, skipped_reason="RENDER_HANDOFF_RECOVERY_FAILED"
+        )
+    render = session.get(RenderExecution, render_id, populate_existing=True)
+    if render is None:
+        return _outcome(
+            None, envelope, queued=False, skipped_reason="RENDER_HANDOFF_RECOVERY_FAILED"
+        )
+    # A freshly queued technical re-render owns the work: never finalize a still
+    # active render. Only a recovered terminal current render is handed to the
+    # finalizer.
+    if _active_render_job(session, render.id) is not None:
+        return _outcome(
+            None, envelope, queued=False, active=True, skipped_reason="RENDER_HANDOFF_RECOVERED"
+        )
+    if render.is_current and render.lifecycle.value in _RENDER_FINALIZABLE:
+        return _request_bound_finalizer(
+            session, envelope, render, settings=settings, dispatcher=dispatcher
+        )
     return _outcome(
         None, envelope, queued=False, active=True, skipped_reason="RENDER_HANDOFF_RECOVERED"
     )
+
+
+def _active_render_job(session: Session, render_id: uuid.UUID) -> ProcessingJob | None:
+    """Return an active RENDER_EXECUTION job for this render, or ``None``."""
+
+    return session.scalars(
+        select(ProcessingJob)
+        .where(
+            ProcessingJob.render_execution_id == render_id,
+            ProcessingJob.kind == JobKind.RENDER_EXECUTION,
+            ProcessingJob.status.in_(_ACTIVE_STATUSES),
+        )
+        .order_by(ProcessingJob.created_at.desc())
+    ).first()
 
 
 def _recover_render_job(
@@ -523,6 +683,76 @@ def _clear_dispatch_marker(session: Session, job: ProcessingJob) -> None:
             session.rollback()
 
 
+def cancel_materialization(
+    session: Session,
+    candidate_id: uuid.UUID | str,
+    *,
+    profile_key: str | None = None,
+) -> uuid.UUID:
+    """Cooperatively cancel the current Stage 6 generation for a candidate.
+
+    Marks the active MATERIALIZATION job and the envelope ``CANCELLED`` in one
+    short transaction (the executor polls the exact job status), and cancels an
+    active transformed render through the existing render cancellation convention.
+    Never cancels unrelated core validation/history work, and a cancelled envelope
+    is never revived by the finalizer.
+    """
+
+    candidate = _lock_candidate(session, candidate_id)
+    if candidate is None:
+        raise MaterializationQueueError("candidate does not exist")
+    envelope = session.scalars(
+        select(ClipMaterialization)
+        .where(
+            ClipMaterialization.clip_candidate_id == candidate.id,
+            ClipMaterialization.is_current.is_(True),
+        )
+        .order_by(ClipMaterialization.created_at.desc())
+    ).first()
+    if envelope is None:
+        raise MaterializationQueueError("materialization does not exist")
+
+    for job in session.scalars(
+        select(ProcessingJob).where(
+            ProcessingJob.materialization_id == envelope.id,
+            ProcessingJob.kind == JobKind.MATERIALIZATION,
+            ProcessingJob.status.in_(_ACTIVE_STATUSES),
+        )
+    ).all():
+        job.status = JobStatus.CANCELLED
+
+    if envelope.render_execution_id is not None:
+        render = session.get(
+            RenderExecution, envelope.render_execution_id, populate_existing=True
+        )
+        if render is not None:
+            render_job = session.scalars(
+                select(ProcessingJob).where(
+                    ProcessingJob.render_execution_id == render.id,
+                    ProcessingJob.kind == JobKind.RENDER_EXECUTION,
+                    ProcessingJob.status.in_(_ACTIVE_STATUSES),
+                )
+            ).first()
+            if render_job is not None:
+                render_job.status = JobStatus.CANCELLED
+                session.flush()
+                from app.render.execution.service import cancel_execution
+
+                try:
+                    cancel_execution(session, render.id, job_id=render_job.id)
+                except Exception:
+                    session.rollback()
+                    raise
+
+    envelope.lifecycle = MaterializationLifecycle.CANCELLED
+    envelope.active_job_id = None
+    envelope.human_review_required = False
+    envelope.publication_ready = False
+    envelope.cache_eligible = False
+    session.commit()
+    return uuid.UUID(str(envelope.id))
+
+
 def get_job(session: Session, job_id: uuid.UUID | str) -> ProcessingJob | None:
     try:
         parsed = job_id if isinstance(job_id, uuid.UUID) else uuid.UUID(str(job_id))
@@ -559,6 +789,7 @@ __all__ = [
     "RENDER_DISPATCH_FAILED_MARKER",
     "MaterializationQueueError",
     "MaterializationQueueOutcome",
+    "cancel_materialization",
     "get_job",
     "queue_materialization",
     "resolve_job_options",

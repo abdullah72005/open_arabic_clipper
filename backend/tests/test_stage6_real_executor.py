@@ -141,23 +141,28 @@ def _export_synthetic_package(
     envelope: ClipMaterialization,
     render: RenderExecution,
     artifact: Path,
-) -> None:
+    *,
+    case_name: str = "happy-no-narration",
+) -> Path:
     """Persist a SYNTHETIC INTEGRATION evidence package (not product acceptance).
 
-    Keeps actual DB UUIDs, fingerprints, the final MP4, the authored ASS, the
-    audio recipe, mastering measurements, and QC so a reviewer can inspect the
-    real production-path result without re-running it.
+    Each case is written to its own identifiable subdirectory and keeps the actual
+    DB UUIDs, fingerprints, the final MP4, the authored ASS, the audio recipe
+    (including narration gain), mastering measurements, QC, repair history, job
+    dispositions, and a SHA256SUMS manifest, so a reviewer can inspect the real
+    production-path result without re-running it.
     """
 
     import hashlib
     import json
     import shutil
 
-    root = Path(
-        os.environ.get(
-            "CLIPFACTORY_BENCHMARK_ROOT", "/var/lib/clipfactory/benchmarks"
-        )
-    ) / "stage-6" / "synthetic-integration"
+    root = (
+        Path(os.environ.get("CLIPFACTORY_BENCHMARK_ROOT", "/var/lib/clipfactory/benchmarks"))
+        / "stage-6"
+        / "synthetic-integration"
+        / case_name
+    )
     root.mkdir(parents=True, exist_ok=True)
     shutil.copy2(artifact, root / "final.mp4")
     request = render.request_payload if isinstance(render.request_payload, dict) else {}
@@ -169,8 +174,33 @@ def _export_synthetic_package(
         ass_path = storage.storage_root / ass_rel
         if ass_path.is_file():
             shutil.copy2(ass_path, root / "authored.ass")
+    jobs = [
+        {
+            "job_id": str(job.id),
+            "kind": job.kind.value,
+            "status": job.status.value,
+            "error_code": job.error_code,
+        }
+        for job in session.scalars(
+            select(ProcessingJob).where(
+                ProcessingJob.materialization_id == envelope.id
+            )
+        ).all()
+    ]
+    jobs.extend(
+        {
+            "job_id": str(job.id),
+            "kind": job.kind.value,
+            "status": job.status.value,
+            "error_code": job.error_code,
+        }
+        for job in session.scalars(
+            select(ProcessingJob).where(ProcessingJob.render_execution_id == render.id)
+        ).all()
+    )
     index = {
         "kind": "SYNTHETIC_INTEGRATION",
+        "case": case_name,
         "note": "Generated test media. Test evidence, not product acceptance.",
         "materialization_id": str(envelope.id),
         "candidate_id": str(envelope.clip_candidate_id),
@@ -192,10 +222,26 @@ def _export_synthetic_package(
         "lifecycle": envelope.lifecycle.value,
         "publication_ready": bool(envelope.publication_ready),
         "human_review_required": bool(envelope.human_review_required),
+        "cache_eligible": bool(envelope.cache_eligible),
+        "assessment_policy_version": (envelope.metrics or {}).get("assessment_policy_version"),
+        "assessment_fingerprint": (envelope.metrics or {}).get("assessment_fingerprint"),
+        "measured_final_integrated_lufs": (envelope.metrics or {}).get("final_integrated_lufs"),
+        "measured_final_true_peak_dbtp": (envelope.metrics or {}).get("final_true_peak_dbtp"),
+        "semantic_findings": envelope.quality_findings,
+        "reason_codes": envelope.reason_codes,
+        "repair_count": int(envelope.repair_count or 0),
+        "repair_actions": envelope.repair_actions,
+        "narration_references": envelope.narration_references,
         "audio_recipe": envelope.audio_recipe,
         "timeline_payload": envelope.timeline_payload,
         "qc_result": render.qc_result,
         "artifact_reference": render.artifact_reference,
+        "artifact_sha256": (
+            render.artifact_reference.get("sha256")
+            if isinstance(render.artifact_reference, dict)
+            else None
+        ),
+        "jobs": jobs,
     }
     (root / "index.json").write_text(json.dumps(index, indent=2, default=str), encoding="utf-8")
     lines = []
@@ -205,6 +251,25 @@ def _export_synthetic_package(
             digest = hashlib.sha256(path.read_bytes()).hexdigest()
             lines.append(f"{digest}  {name}")
     (root / "SHA256SUMS").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    catalog: dict[str, object] = {}
+    for case_dir in sorted(root.parent.iterdir()):
+        case_index = case_dir / "index.json"
+        if not case_index.is_file():
+            continue
+        data = json.loads(case_index.read_text(encoding="utf-8"))
+        catalog[case_dir.name] = {
+            "materialization_id": data.get("materialization_id"),
+            "render_execution_id": data.get("render_execution_id"),
+            "output_fingerprint": data.get("output_fingerprint"),
+            "assessment_fingerprint": data.get("assessment_fingerprint"),
+            "semantic_outcome": data.get("semantic_outcome"),
+            "repair_count": data.get("repair_count"),
+            "narration_count": len(data.get("narration_references") or []),
+        }
+    (root.parent / "catalog.json").write_text(
+        json.dumps(catalog, indent=2, default=str), encoding="utf-8"
+    )
+    return root
 
 
 def test_real_persisted_executor_end_to_end(engine: Engine, monkeypatch: Any) -> None:

@@ -20,6 +20,7 @@ from app.materialization.policy import (
     MIN_RETAINED_BREATHING_ROOM_SECONDS,
     STAGE6_TIMELINE_SCHEMA_VERSION,
     Stage6Config,
+    narration_gain_db,
 )
 from app.materialization.types import (
     AudioEntry,
@@ -284,6 +285,10 @@ def build_audio_recipe(
     conflicts: list[dict[str, object]] = []
     narration_by_block = {chunk.block_index: chunk for chunk in narration}
     narration_intervals: list[tuple[float, float, int]] = []
+    # The bounded narration mix gain is a production profile setting; it is
+    # applied to every narration placement and participates in the recipe/output
+    # fingerprint.
+    narration_gain = narration_gain_db(inputs.profile.tts_settings, config)
 
     for index, segment in enumerate(timeline.segments):
         if segment.kind == "SOURCE" and segment.source_start is not None:
@@ -306,6 +311,7 @@ def build_audio_recipe(
                         kind="NARRATION",
                         output_start=segment.output_start,
                         output_end=segment.output_end,
+                        gain_db=narration_gain,
                         narration_chunk_id=chunk.chunk_id,
                     )
                 )

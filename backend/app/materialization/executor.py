@@ -16,8 +16,10 @@ from __future__ import annotations
 
 import threading
 import uuid
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from typing import cast
 
 from sqlalchemy import and_, or_, select, update
 from sqlalchemy.orm import Session, sessionmaker
@@ -71,6 +73,21 @@ class MaterializationProviders:
     writing: MaterializationWritingProvider
     critique: MaterializationCritiqueProvider | None = None
     narration: object | None = None
+    #: Whether hosted providers are permitted for this bundle. This is an
+    #: explicit configuration decision, never inferred from a critique object's
+    #: mere presence.
+    allow_hosted: bool = False
+    #: Shared admit/deny callable (HIGH gate) consulted before any hosted call.
+    admission: Callable[[], bool] | None = field(default=None)
+    #: Per-run narration synthesizer builder (needs the resolved source id). Used
+    #: only when no narration provider is injected directly.
+    narration_factory: Callable[[MaterializationInputs], object | None] | None = field(default=None)
+    #: Optional local audio-backed fidelity validator applied to synthesized audio.
+    narration_fidelity: Callable[[object], Mapping[str, object]] | None = field(default=None)
+
+
+def _is_hosted_provider(provider: object) -> bool:
+    return bool(getattr(provider, "provider_name", "deterministic") != "deterministic")
 
 
 def build_materialization_providers(
@@ -79,19 +96,146 @@ def build_materialization_providers(
     writing: MaterializationWritingProvider | None = None,
     critique: MaterializationCritiqueProvider | None = None,
     narration: object | None = None,
+    storage: StorageService | None = None,
 ) -> MaterializationProviders:
-    """Build the production provider bundle.
+    """Build the production provider bundle from the configured materialization mode.
 
-    The deterministic writing provider makes zero hosted calls and can only
-    reuse already-authored plan wording; no hosted writing/critique/TTS adapter
-    is wired yet, so the default bundle is deterministic and network-free.
+    Injected providers (tests/fixtures) are honored exactly and determine hosted
+    permission from the providers themselves. When nothing is injected, an
+    explicit ``adaptive`` mode with a configured key builds the hosted writing and
+    critique adapters routed through the shared HIGH admission gate; a
+    ``deterministic`` mode (or a missing key) builds the network-free deterministic
+    writing provider and makes zero hosted calls.
     """
 
+    from app.core.enums import SemanticProviderMode
+
+    if writing is not None or critique is not None:
+        # Hosted permission follows the *writing* provider that would make the
+        # hosted call; it is never inferred from the mere presence of a critique
+        # object. Injected providers are a test/fixture seam and are not routed
+        # through the production admission backend.
+        hosted = _is_hosted_provider(writing)
+        return MaterializationProviders(
+            writing=writing or DeterministicWritingProvider(),
+            critique=critique,
+            narration=narration,
+            allow_hosted=hosted,
+        )
+
+    mode = settings.materialization_semantic_mode()
+    if mode is SemanticProviderMode.ADAPTIVE:
+        writing = cast(
+            "MaterializationWritingProvider | None", settings.materialization_writing_provider()
+        )
+        critique = cast(
+            "MaterializationCritiqueProvider | None", settings.materialization_critique_provider()
+        )
+        hosted = writing is not None or critique is not None
+        return MaterializationProviders(
+            writing=writing or DeterministicWritingProvider(),
+            critique=critique,
+            narration=narration,
+            allow_hosted=hosted,
+            admission=_admission_callable(settings.gemini_admission_controller) if hosted else None,
+            narration_factory=(
+                _narration_factory(settings, storage) if storage is not None else None
+            ),
+            narration_fidelity=(
+                _narration_fidelity_validator(settings, storage) if storage is not None else None
+            ),
+        )
+    # Deterministic (or an unavailable local-only adapter): zero hosted calls.
     return MaterializationProviders(
         writing=writing or DeterministicWritingProvider(),
         critique=critique,
         narration=narration,
+        allow_hosted=False,
     )
+
+
+def _narration_factory(
+    settings: Settings, storage: StorageService
+) -> Callable[[MaterializationInputs], object | None]:
+    """Build a per-run Gemini narration synthesizer bound to the exact source."""
+
+    def build(inputs: MaterializationInputs) -> object | None:
+        profile = inputs.profile
+        if not profile.narration_allowed:
+            return None
+        provider = (profile.tts_provider or "").strip().lower()
+        if provider not in {"gemini-tts", "gemini"}:
+            # No configured (or a non-Gemini) narrator: TTS is simply unavailable.
+            return None
+        key = settings.gemini_api_key
+        if key is None or not key.get_secret_value():
+            return None
+        from app.materialization.tts_gemini import GeminiNarrationSynthesizer
+
+        return GeminiNarrationSynthesizer(
+            api_key=key.get_secret_value(),
+            model=profile.tts_model or settings.materialization_tts_model,
+            api_version=profile.tts_api_version or settings.materialization_tts_api_version,
+            voice=profile.tts_voice or settings.materialization_tts_default_voice,
+            style=profile.tts_style,
+            storage=storage,
+            source_id=inputs.source_id,
+        )
+
+    return build
+
+
+def _narration_fidelity_validator(
+    settings: Settings, storage: StorageService
+) -> Callable[[object], Mapping[str, object]]:
+    """Build the local audio-backed fidelity validator under the heavy-model lease."""
+
+    from app.materialization.tts_gemini import validate_narration_fidelity
+    from app.transcription.engine import WhisperEngine
+
+    def validate(audio: object) -> Mapping[str, object]:
+        relative = str(getattr(audio, "relative_path", "") or "")
+        expected = str(getattr(audio, "text", "") or "")
+        if not relative or not expected:
+            return {"status": "DEFERRED", "findings": ["MISSING_NARRATION_EVIDENCE"]}
+        try:
+            path = storage.resolve_relative(relative)
+            engine = WhisperEngine()
+            options = settings.targeted_transcription_options("FINAL_CLIP")
+            lease_factory = settings.heavy_model_lease_factory()
+        except Exception:
+            return {"status": "DEFERRED", "findings": ["FIDELITY_UNAVAILABLE"]}
+        try:
+            result = validate_narration_fidelity(
+                path,
+                expected_text=expected,
+                engine=engine,
+                options=options,
+                lease_factory=lease_factory,
+            )
+        except Exception:
+            return {"status": "DEFERRED", "findings": ["FIDELITY_UNAVAILABLE"]}
+        return result.as_dict()
+
+    return validate
+
+
+def _admission_callable(factory: Callable[[], object]) -> Callable[[], bool]:
+    """Wrap the shared admission controller as an admit/deny boolean (HIGH gate)."""
+
+    from app.core.enums import AdmissionPriority
+
+    controller = factory()
+    priority = AdmissionPriority.HIGH
+
+    def admit() -> bool:
+        try:
+            decision = controller.acquire(priority)  # type: ignore[attr-defined]
+        except Exception:
+            return False
+        return bool(getattr(decision, "admitted", False))
+
+    return admit
 
 
 class _LivenessHeartbeat:
@@ -472,6 +616,12 @@ class MaterializationExecutor:
     def _component_context(
         self, inputs: MaterializationInputs, owner: MaterializationOwner
     ) -> ComponentContext:
+        narration = self._providers.narration
+        if narration is None and self._providers.narration_factory is not None:
+            narration = self._providers.narration_factory(inputs)
+        from app.materialization.narration import NarrationSynthesizer
+
+        narration_provider = narration if isinstance(narration, NarrationSynthesizer) else None
         return ComponentContext(
             session=self._session,
             owner=owner,
@@ -481,9 +631,13 @@ class MaterializationExecutor:
             providers=ComponentProviders(
                 writing=self._providers.writing,
                 critique=self._providers.critique,
-                narration=self._providers.narration,  # type: ignore[arg-type]
+                narration=narration_provider,
+                narration_fidelity=(
+                    self._providers.narration_fidelity if narration_provider is not None else None
+                ),
             ),
-            allow_hosted=self._providers.critique is not None,
+            allow_hosted=self._providers.allow_hosted,
+            admission=self._providers.admission,
             cancelled=self._should_stop,
         )
 
@@ -742,7 +896,7 @@ def build_materialization_executor(
         config=settings.stage6_config(),
         storage=storage,
         providers=build_materialization_providers(
-            settings, writing=writing, critique=critique, narration=narration
+            settings, writing=writing, critique=critique, narration=narration, storage=storage
         ),
     )
 

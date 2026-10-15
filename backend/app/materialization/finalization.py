@@ -1611,6 +1611,32 @@ def _finding_levels(findings: list[QualityFinding]) -> dict[str, str]:
     return levels
 
 
+def _merge_context_findings(
+    prior: tuple[QualityFinding, ...],
+    row: list[QualityFinding],
+) -> list[QualityFinding]:
+    """Union the snapshot's and the row's findings without losing provenance.
+
+    Both the dependency-bound pre-render snapshot and the persisted row are
+    authoritative adverse evidence: neither may silently replace the other. A
+    finding is identified by ``(dimension, level, reason_codes)`` and the first
+    occurrence wins, so the snapshot's record (including its evidence) is
+    preserved while a contradictory row finding is still retained. Severity is
+    never weakened: the worst level per dimension still dominates in
+    :func:`_finding_levels` and every raw finding still reaches the assessment.
+    """
+
+    merged: list[QualityFinding] = []
+    seen: set[tuple[str, str, tuple[str, ...]]] = set()
+    for finding in (*prior, *row):
+        key = (finding.dimension, finding.level, tuple(finding.reason_codes))
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(finding)
+    return merged
+
+
 def _load_snapshot(envelope: ClipMaterialization) -> AssessmentContext | None:
     """Load the versioned, dependency-bound pre-render snapshot, or ``None``.
 
@@ -1708,7 +1734,13 @@ def _derive_evidence(
     is never trusted without the corresponding accepted content.
     """
 
-    findings = _stored_findings(envelope)
+    # Evidence from every authoritative source is merged: the dependency-bound
+    # pre-render snapshot and the persisted row. Neither may silently replace the
+    # other, so adverse evidence in either survives (provenance preserved, severity
+    # never weakened).
+    snapshot = _load_snapshot(envelope)
+    prior = snapshot.extra_findings if snapshot is not None else ()
+    findings = _merge_context_findings(prior, _stored_findings(envelope))
     levels = _finding_levels(findings)
     unmet = {
         code for finding in findings if finding.level == "UNMET" for code in finding.reason_codes
@@ -1739,7 +1771,6 @@ def _derive_evidence(
         or unknown_critical
     )
 
-    snapshot = _load_snapshot(envelope)
     if snapshot is not None:
         base = snapshot
     else:
