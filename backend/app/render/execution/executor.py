@@ -403,14 +403,7 @@ class RenderExecutionExecutor:
             self._block(row, "CANDIDATE_NOT_CURRENT")
             return row
         try:
-            spec = self._spec_builder(
-                self._session,
-                candidate,
-                artifact_purpose=row.artifact_purpose.value,
-                delivery_profile_key=row.delivery_profile_key,
-                settings=self._settings,
-                storage=self._storage,
-            )
+            spec = self._build_spec(row, candidate)
         except RenderExecutionError as error:
             if error.blocked:
                 self._block(row, error.reason_code)
@@ -457,6 +450,7 @@ class RenderExecutionExecutor:
             raise
 
         ass_data = self._verified_ass_bytes(spec)
+        authored_ass_data = self._verified_authored_ass_bytes(spec)
 
         if not self._begin_attempt(row):
             self.skipped_duplicate = True
@@ -470,6 +464,7 @@ class RenderExecutionExecutor:
             timeout_seconds=self._config.max_render_seconds,
             poll_seconds=self._config.cancel_poll_seconds,
             ass_bytes=ass_data,
+            authored_ass_bytes=authored_ass_data,
             deadline=attempt_deadline,
         )
         try:
@@ -576,6 +571,48 @@ class RenderExecutionExecutor:
         self._session.expire_all()
         return True
 
+    def _build_spec(self, row: RenderExecution, candidate: Any) -> Any:
+        """Build the exact request for this row, purpose-aware.
+
+        A transformed row bound to a materialization loads that exact
+        materialization (by id/output fingerprint); every other row keeps the
+        injected/core builder.
+        """
+
+        from app.render.execution.policy import TRANSFORMED_SHORT
+        from app.render.execution.service import build_spec_for_row
+
+        if row.artifact_purpose.value == TRANSFORMED_SHORT and row.materialization_id is not None:
+            return build_spec_for_row(self._session, candidate, row, self._settings, self._storage)
+        return self._spec_builder(
+            self._session,
+            candidate,
+            artifact_purpose=row.artifact_purpose.value,
+            delivery_profile_key=row.delivery_profile_key,
+            settings=self._settings,
+            storage=self._storage,
+        )
+
+    def _verified_authored_ass_bytes(self, spec: Any) -> bytes:
+        """Load and hash-verify the Stage 6 authored ASS for an authored payload."""
+
+        payload = getattr(spec, "authored", None)
+        if payload is None:
+            return b""
+        reference = payload.authored_ass
+        path = (self._storage.storage_root / reference.relative_path).resolve()
+        try:
+            path.relative_to(self._storage.storage_root)
+        except ValueError as error:
+            raise RenderExecutionError("ASS_MISSING") from error
+        data = path.read_bytes()
+        import hashlib
+
+        actual = hashlib.sha256(data).hexdigest()
+        if not reference.sha256 or actual != reference.sha256.lower():
+            raise RenderExecutionError("ASS_HASH_MISMATCH")
+        return bytes(data)
+
     def _verified_ass_bytes(self, spec: Any) -> bytes:
         relative = spec.ass.relative_path
         path = (self._storage.storage_root / relative).resolve()
@@ -663,14 +700,7 @@ class RenderExecutionExecutor:
                 ).first()
 
             try:
-                fresh = self._spec_builder(
-                    self._session,
-                    locked,
-                    artifact_purpose=row.artifact_purpose.value,
-                    delivery_profile_key=row.delivery_profile_key,
-                    settings=self._settings,
-                    storage=self._storage,
-                )
+                fresh = self._build_spec(row, locked)
             except RenderExecutionError as error:
                 self._safe_rollback()
                 if error.blocked:

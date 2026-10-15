@@ -136,6 +136,11 @@ def validate_spec(spec: RenderSpec) -> None:
     if not spec.occurrences:
         _fail(NO_RENDERABLE_OCCURRENCES)
 
+    # Authored output legitimately interleaves CARD units between SOURCE
+    # occurrences, so source-only occurrence contiguity is not required there;
+    # the authored payload's contiguous complete VISUAL units are validated
+    # instead. Core source validation still requires contiguous occurrences.
+    authored = spec.artifact_purpose == TRANSFORMED_SHORT
     cursor = 0.0
     for occurrence in spec.occurrences:
         if occurrence.source_end <= occurrence.source_start:
@@ -144,14 +149,25 @@ def validate_spec(spec: RenderSpec) -> None:
             _fail(OCCURRENCE_BOUNDS_INVALID)
         if occurrence.source_end > spec.source_duration + 0.05:
             _fail(OCCURRENCE_BEYOND_MEDIA)
-        if abs(occurrence.output_start - cursor) > 1e-4:
-            _fail(OCCURRENCE_BOUNDS_INVALID)
+        if not authored:
+            if abs(occurrence.output_start - cursor) > 1e-4:
+                _fail(OCCURRENCE_BOUNDS_INVALID)
+            cursor = occurrence.output_end
         if occurrence.output_end <= occurrence.output_start:
             _fail(OCCURRENCE_BOUNDS_INVALID)
-        cursor = occurrence.output_end
         _validate_occurrence_scenes(spec, occurrence)
 
     validate_captions(spec)
+    if authored and spec.authored is not None:
+        from app.render.execution.authored import (
+            AuthoredPayloadError,
+            validate_authored_payload,
+        )
+
+        try:
+            validate_authored_payload(spec.authored)
+        except AuthoredPayloadError as error:
+            _fail(error.reason_code)
 
 
 def _validate_occurrence_scenes(spec: RenderSpec, occurrence: object) -> None:
