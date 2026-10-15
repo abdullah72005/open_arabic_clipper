@@ -401,6 +401,24 @@ def test_authored_render_produces_one_real_mp4(workspace: Path) -> None:
     assert (workspace / "mix-unmastered.wav").is_file()
     assert (workspace / "mix-master.wav").is_file()
 
+    # Purpose-aware QC: authored cards decode and the decoded AAC carries real
+    # final loudness/true-peak evidence within the specified targets.
+    from app.render.execution.qc import check_render_artifact
+
+    qc = check_render_artifact(
+        artifacts,
+        artifacts.manifest,
+        get_settings().stage52_config(),
+        source_path=source,
+    )
+    assert qc.status in {"PASS", "WARN"}, qc.as_dict()
+    assert "final_integrated_lufs" in qc.measured
+    assert -17.0 <= float(qc.measured["final_integrated_lufs"]) <= -15.0
+    assert float(qc.measured["final_true_peak_dbtp"]) <= -1.5 + 0.05
+    assert all(
+        check.name != "authored_cards_decode" or check.status == "PASS" for check in qc.checks
+    )
+
     # Card frames actually appear: the card interval is a near-black authored
     # card with legible text, so its mean luma is far below the animated source.
     card_luma = _mean_luma(output, 3.5)

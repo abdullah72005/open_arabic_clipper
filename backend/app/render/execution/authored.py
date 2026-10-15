@@ -1110,7 +1110,15 @@ def compile_authored_render(spec: Any, runtime_identity: RuntimeIdentity) -> Com
             },
             "artifact_purpose": spec.artifact_purpose,
         },
-        diagnostics={"authored": True, "units": len(payload.units)},
+        diagnostics={
+            "authored": True,
+            "units": len(payload.units),
+            "card_intervals": [
+                [round(unit.start_frame / fps_value, 6), round(unit.end_frame / fps_value, 6)]
+                for unit in payload.units
+                if unit.kind == UNIT_CARD
+            ],
+        },
         authored_ass_localized_name=_AUTHORED_ASS_LOCAL_NAME,
         input_relative_paths=tuple(extra_inputs),
         audio_preparation=audio_plan,
