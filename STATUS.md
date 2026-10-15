@@ -1,5 +1,68 @@
 # Runtime status
 
+## Stage 6 SOL defect fixes A–E + worker-chain wiring (2026-10-15, commits 6041709, eb6a0b1)
+
+Status: **the five SOL-reproduced defects (A finalizer content/technical gates,
+B exact generation binding/currentness, C authored-asset localization, D audio
+recipe preservation, E idempotence finishing the current job) are fixed with
+regressions, and the prepare→render→finalize worker chain is wired. Task G (a
+single persisted end-to-end executor test through real FFmpeg with genuine
+media), Task 6 (hosted grounded writing/critique), Task 7 (TTS/voice), Task 8
+(candidate API/CLI/UI) and Task 9 (genuine manual-acceptance package) are NOT
+done. No production-path transformed MP4 and no manual-acceptance artifact
+exist. Stage 6 is NOT FROZEN.**
+
+- **A — finalizer gates (`6041709`).** `finalize_materialization` no longer
+  unconditionally writes `READY_FOR_HUMAN_REVIEW`. It rebuilds an
+  `AssessmentContext` from the durable pre-render snapshot (`metrics.
+  pre_render_assessment_context`, now persisted by `components`), stored
+  categorical findings, and the actual render/QC/loudness measurements, then runs
+  the existing categorical assessment. Missing critical evidence → `DEFERRED_
+  EVIDENCE`; unmet substantive value/fidelity/slots → `REJECTED_QUALITY`/
+  `NO_OUTPUT`; unsupported essential → `BLOCKED_VERIFICATION`; out-of-policy
+  loudness/true peak (`-16 LUFS ±1 LU`, `≤ -1.5 dBTP`) → `REJECTED_QUALITY`. A
+  stored `PASS` label cannot override contradictory/missing measurements; stored
+  findings/reasons are preserved; `publication_ready` stays false.
+- **B — exact binding (`6041709`).** Finalization validates the render's
+  `request_payload` expected output fingerprint, bound materialization id, and
+  authored repair revision against the current envelope; a stale/late callback
+  is `SUPERSEDED` and never finalizes a repaired revision.
+- **C — asset localization (`6041709`).** `RenderExecutionExecutor` verifies and
+  localizes every referenced authored (non-source) asset through
+  `StorageService` (hash/size/traversal checked, controlled attempt-local name)
+  before compilation; authored narration no longer fails `AUTHORED_ASSET_INVALID`.
+- **D — audio recipe (`6041709`).** `materialization/rendering._tracks` preserves
+  each entry's requested gain and translates authorized ducking into bounded,
+  monotonic gain points (80 ms attack/180 ms release); overlapping narration and
+  unsupported instructions are rejected, not dropped. An authorized peak-limit
+  repair reaches the renderer via `MasteringSpec.repair_peak_limit_db` and a bounded
+  `alimiter` pass in the runner; other mastering fields already flowed through.
+- **E — idempotence (`6041709`).** A replayed identical assessment still
+  completes/releases the *current* job under its exact owner fence and preserves
+  the assessment fingerprint.
+- **F — worker chain (`eb6a0b1`).** The materialization executor dispatches the
+  `TRANSFORMED_SHORT` render for the exact revision after in-line prepare
+  (non-renderable outcomes never dispatch); the render handoff persists the
+  reverse materialization binding and the forward render binding before broker
+  delivery; a render-completion callback requests one coalesced `MATERIALIZATION`
+  finalizer job; the executor branches to finalization without rerunning accepted
+  writing/synthesis.
+- **Regressions.** `test_stage6_finalization_gates.py` (UNMET value, unresolved
+  verification, missing slot, unknown critical fidelity, out-of-policy loudness
+  despite a PASS label, missing loudness, stale output/repair revision, replay
+  finishes the job, cancelled), `test_stage6_audio_recipe_mapping.py` (gain +
+  ducking translation, overlap rejection, peak-limit routing),
+  `test_stage6_asset_localization.py`, `test_stage6_worker_chain.py`, and the
+  updated `test_stage6_vertical_slice.py`. Docker Python 3.12.14 + PostgreSQL 16:
+  `pytest -k "stage6 or stage52"` → `307 passed, 0 skipped`. `ruff` clean on
+  `app`+`tests`; `mypy --no-incremental` clean on the changed modules (the
+  pre-existing `app/materialization/{components,service,executor}.py` no-any
+  findings are unchanged). Migrations unchanged.
+- **Remaining (internal work).** Task G's single persisted end-to-end executor
+  test needs real source media (the seed fixtures carry a stub `source.mp4` that
+  `build_render_spec` cannot probe); Task 6/7 hosted adapters; Task 8 API/CLI/UI;
+  Task 9 manual acceptance. No hosted provider call was made.
+
 ## Stage 6 authored renderer defects fixed + production-path integration (2026-10-15)
 
 Status: **the four renderer defects SOL reproduced are fixed with regressions,
