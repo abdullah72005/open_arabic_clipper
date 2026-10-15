@@ -32,6 +32,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any, cast
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.enums import (
@@ -125,18 +126,26 @@ def dispatch_transformed_render(
     redispatch; it never silently drops the request.
     """
 
-    from app.render.execution.queue import queue_render_execution
+    from app.render.execution.policy import DEFAULT_DELIVERY_PROFILE_KEY
+    from app.render.execution.queue import deliver_render_job, queue_render_execution
 
     if materialization.lifecycle is not MaterializationLifecycle.AWAITING_RENDER:
         return None
     if not materialization.output_fingerprint:
         return None
-    profile_key = delivery_profile_key or materialization.profile_key
-    if not profile_key:
-        profile_key = "default"
-    from app.render.execution.policy import DEFAULT_DELIVERY_PROFILE_KEY
-
     delivery = DEFAULT_DELIVERY_PROFILE_KEY
+
+    # Persist ALL bindings (the render envelope's reverse materialization binding
+    # and this envelope's forward render binding) *before* broker delivery. The
+    # queue commits the render row; capture its dispatch instead of delivering so
+    # the forward binding is durable first, then deliver.
+    captured: dict[str, uuid.UUID] = {}
+
+    class _Capture:
+        def dispatch(self, render_id: uuid.UUID, job_id: uuid.UUID, force: bool) -> None:
+            captured["render_id"] = render_id
+            captured["job_id"] = job_id
+
     outcome = queue_render_execution(
         session,
         candidate_id,
@@ -145,13 +154,132 @@ def dispatch_transformed_render(
         materialization_id=materialization.id,
         expected_output_fingerprint=materialization.output_fingerprint,
         settings=settings,
-        dispatcher=dispatcher,
+        dispatcher=_Capture(),
     )
     render_execution_id = uuid.UUID(str(outcome.render_execution_id))
-    if materialization.render_execution_id != render_execution_id:
-        materialization.render_execution_id = render_execution_id
-        session.flush()
+    materialization.render_execution_id = render_execution_id
+    session.commit()
+
+    if outcome.job_id is not None:
+        try:
+            deliver_render_job(
+                render_execution_id, uuid.UUID(str(outcome.job_id)), False, dispatcher
+            )
+        except Exception:
+            _mark_render_dispatch_failed(session, outcome.job_id)
     return render_execution_id
+
+
+def _mark_render_dispatch_failed(session: Session, job_id: object) -> None:
+    from app.models import ProcessingJob
+
+    job = session.get(ProcessingJob, job_id)
+    if job is None:
+        return
+    job.error_code = "RENDER_DISPATCH_FAILED"
+    try:
+        session.commit()
+    except Exception:
+        session.rollback()
+
+
+def request_finalization_job(
+    session: Session,
+    render_execution_id: uuid.UUID | str,
+    *,
+    settings: Settings,
+    dispatcher: object | None = None,
+) -> uuid.UUID | None:
+    """Request a MATERIALIZATION job to finalize an AWAITING_RENDER envelope.
+
+    Called after a transformed render reaches a terminal state. Coalesces with an
+    existing active MATERIALIZATION job for the same envelope (duplicate callbacks
+    are harmless). A durable ``MATERIALIZATION_DISPATCH_FAILED`` marker lets the
+    next POST/resume recover a lost dispatch; GET never calls this.
+    """
+
+    from app.core.enums import JobKind
+    from app.materialization.repository import bind_active_job
+    from app.models import ProcessingJob
+
+    parsed = (
+        render_execution_id
+        if isinstance(render_execution_id, uuid.UUID)
+        else _as_uuid(render_execution_id)
+    )
+    if parsed is None:
+        return None
+    render = session.get(RenderExecution, parsed, populate_existing=True)
+    if render is None or render.materialization_id is None:
+        return None
+    if render.artifact_purpose.value != TRANSFORMED_SHORT:
+        return None
+    envelope = session.get(ClipMaterialization, render.materialization_id, populate_existing=True)
+    if envelope is None or not envelope.is_current:
+        return None
+    if envelope.lifecycle is not MaterializationLifecycle.AWAITING_RENDER:
+        return None
+
+    existing = session.scalars(
+        select(ProcessingJob)
+        .where(
+            ProcessingJob.materialization_id == envelope.id,
+            ProcessingJob.kind == JobKind.MATERIALIZATION,
+            ProcessingJob.status.in_((JobStatus.QUEUED, JobStatus.RUNNING)),
+        )
+        .order_by(ProcessingJob.created_at.desc())
+    ).first()
+    if existing is not None:
+        return uuid.UUID(str(existing.id))
+
+    job = ProcessingJob(
+        source_video_id=envelope.source_video_id,
+        kind=JobKind.MATERIALIZATION,
+        candidate_refinement_id=envelope.refinement_id,
+        materialization_id=envelope.id,
+    )
+    session.add(job)
+    session.flush()
+    if not bind_active_job(session, envelope.id, job.id):
+        session.rollback()
+        return None
+    session.commit()
+    session.refresh(job)
+    _deliver_finalization_job(session, job, settings=settings, dispatcher=dispatcher)
+    return uuid.UUID(str(job.id))
+
+
+def _deliver_finalization_job(
+    session: Session,
+    job: Any,
+    *,
+    settings: Settings,
+    dispatcher: object | None,
+) -> None:
+    from app.materialization.queue import DISPATCH_FAILED_MARKER
+
+    envelope = session.get(ClipMaterialization, job.materialization_id)
+    candidate_id = str(envelope.clip_candidate_id) if envelope is not None else ""
+    try:
+        if dispatcher is not None:
+            call = getattr(dispatcher, "dispatch_finalization", None) or getattr(
+                dispatcher, "dispatch", None
+            )
+            if callable(call):
+                call(candidate_id, str(job.id))
+            else:
+                raise TypeError("dispatcher is not callable")
+        else:
+            from app.workers.tasks import run_materialization_finalization
+
+            run_materialization_finalization.delay(candidate_id, str(job.id))
+        job.error_code = None
+    except Exception:
+        job.error_code = DISPATCH_FAILED_MARKER
+    try:
+        session.commit()
+    except Exception:
+        session.rollback()
 
 
 def finalize_materialization(
@@ -247,7 +375,7 @@ def finalize_materialization(
         code
         for finding in findings
         if finding.get("level") == "UNMET"
-        for code in (finding.get("reason_codes") or [])
+        for code in _reason_tuple(finding)
     ]
     reasons = tuple(
         dict.fromkeys(
@@ -298,6 +426,17 @@ def finalize_materialization(
         semantic_outcome=assessment.outcome,
         findings=tuple(findings),
     )
+
+
+def _as_uuid(value: object) -> uuid.UUID | None:
+    if isinstance(value, uuid.UUID):
+        return value
+    if isinstance(value, str) and value:
+        try:
+            return uuid.UUID(value)
+        except ValueError:
+            return None
+    return None
 
 
 def _existing_semantic_outcome(envelope: ClipMaterialization, assessed: str) -> str:
@@ -464,7 +603,7 @@ def _apply_stored_evidence(
 
     if not updates:
         return context
-    return replace(context, **updates)  # type: ignore[arg-type]
+    return replace(context, **updates)
 
 
 def _reason_tuple(entry: Mapping[str, object]) -> tuple[str, ...]:
@@ -571,4 +710,5 @@ __all__ = [
     "FinalizationResult",
     "dispatch_transformed_render",
     "finalize_materialization",
+    "request_finalization_job",
 ]

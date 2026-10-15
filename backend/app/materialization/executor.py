@@ -144,6 +144,16 @@ class _LivenessHeartbeat:
             session.close()
 
 
+class _NoDispatch:
+    """A no-op broker seam for non-worker executor use (no delivery)."""
+
+    def dispatch(self, *_args: object, **_kwargs: object) -> None:
+        return None
+
+    def dispatch_finalization(self, *_args: object, **_kwargs: object) -> None:
+        return None
+
+
 def _sanitize_error_code(error: Exception | None) -> str:
     if error is None:
         return "MATERIALIZATION_FAILED"
@@ -186,6 +196,18 @@ class MaterializationExecutor:
         self._claim_version: int | None = None
         self.claim_lost = False
         self.skipped_duplicate = False
+        # Default: no broker delivery (safe for pure/unit reuse). Production
+        # workers inject the real broker seam via ``set_render_dispatcher``.
+        self._render_dispatcher: object | None = _NoDispatch()
+
+    def set_render_dispatcher(self, dispatcher: object | None) -> None:
+        """Set the broker seam for the render handoff.
+
+        ``None`` selects the real Celery broker; a ``_NoDispatch`` default keeps
+        direct/unit executor use from touching the broker.
+        """
+
+        self._render_dispatcher = dispatcher
 
     # -- job claim / ownership -------------------------------------------------
 
@@ -544,7 +566,86 @@ class MaterializationExecutor:
                 return StageExecutionResult("", None)
             self._session.commit()
             self._job_owner = False
+
+            # Render handoff: a renderable outcome dispatches the existing
+            # TRANSFORMED_SHORT renderer for this exact revision. A non-renderable
+            # outcome never dispatches. Broker failure is recoverable through
+            # POST/resume; the durable AWAITING_RENDER + binding is the marker.
+            if (
+                prepared.lifecycle is MaterializationLifecycle.AWAITING_RENDER
+                and envelope.output_fingerprint
+            ):
+                try:
+                    from app.materialization.finalization import dispatch_transformed_render
+
+                    dispatch_transformed_render(
+                        self._session,
+                        envelope,
+                        candidate_id,
+                        settings=self._settings,
+                        storage=self._storage,
+                        dispatcher=self._render_dispatcher,
+                    )
+                except Exception:
+                    self._session.rollback()
             return StageExecutionResult(prepared.output_fingerprint, envelope)
+        except StageCancelled:
+            self._finish_job(JobStatus.CANCELLED)
+            raise
+        finally:
+            if heartbeat is not None:
+                heartbeat.stop()
+            self._release_resources()
+
+    def finalize(self, candidate_id: str) -> StageExecutionResult:
+        """Claim an AWAITING_RENDER envelope and apply the final assessment.
+
+        Branches to finalization without rerunning any accepted writing or
+        synthesis: the same MATERIALIZATION job kind and paired job/envelope
+        fencing are reused.
+        """
+
+        from app.materialization.finalization import finalize_materialization
+        from app.materialization.repository import claim_materialization
+
+        self.skipped_duplicate = False
+        self.claim_lost = False
+        if self._job_cancelled():
+            self._finish_job(JobStatus.CANCELLED)
+            raise StageCancelled("Stage 6 finalization cancelled before start")
+        if not self._claim_job():
+            self.skipped_duplicate = True
+            return StageExecutionResult("", None)
+        heartbeat = self._start_heartbeat()
+        try:
+            job = self._session.get(ProcessingJob, self._active_job_id)
+            materialization_id = job.materialization_id if job is not None else None
+            if materialization_id is None:
+                self._finish_job(
+                    JobStatus.FAILED, MaterializationError("finalization envelope missing")
+                )
+                return StageExecutionResult("", None)
+            owner = claim_materialization(
+                self._session,
+                materialization_id,
+                self._active_job_id,
+                expected_job_claim_version=self._claim_version or 0,
+            )
+            if owner is None:
+                self.skipped_duplicate = True
+                return StageExecutionResult("", None)
+            if not self._claim_guard(require_running=True):
+                self._session.rollback()
+                return StageExecutionResult("", None)
+            result = finalize_materialization(
+                self._session, owner, settings=self._settings, storage=self._storage
+            )
+            self._job_owner = False
+            try:
+                envelope = self._session.get(ClipMaterialization, materialization_id)
+            except Exception:
+                envelope = None
+            return StageExecutionResult(result.assessment_fingerprint, envelope)
         except StageCancelled:
             self._finish_job(JobStatus.CANCELLED)
             raise

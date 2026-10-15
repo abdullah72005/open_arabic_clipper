@@ -399,9 +399,26 @@ def _dispatch(
     run_render_execution.delay(str(render_execution_id), str(job_id), force)
 
 
+def deliver_render_job(
+    render_execution_id: uuid.UUID,
+    job_id: uuid.UUID,
+    force: bool = False,
+    dispatcher: object | None = None,
+) -> None:
+    """Deliver an already-persisted render job to the broker (or injected seam).
+
+    Split out so a caller can persist *all* bindings (forward and reverse)
+    before delivery; a broker failure remains recoverable through the existing
+    ``RENDER_DISPATCH_FAILED`` marker.
+    """
+
+    _dispatch(render_execution_id, job_id, force, dispatcher)
+
+
 __all__ = [
     "RenderQueueError",
     "RenderQueueOutcome",
+    "deliver_render_job",
     "get_render_execution_row",
     "queue_render_execution",
     "with_execution_id",

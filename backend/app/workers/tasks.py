@@ -500,6 +500,10 @@ def run_render_execution(
         except Exception as error:
             if parsed_job is not None and not getattr(executor, "skipped_duplicate", False):
                 executor.record_failure(error)
+            # A terminal technical failure still requests the honest Stage 6
+            # finalizer so a justified bounded repair can be allocated.
+            if not getattr(error, "retryable", False):
+                _request_finalization_after_render(parsed_execution)
             if getattr(error, "retryable", False):
                 raise self.retry(
                     args=[render_execution_id, job_id, force],
@@ -507,11 +511,36 @@ def run_render_execution(
                     max_retries=MAX_RETRIES,
                 ) from error
             raise
+        _request_finalization_after_render(parsed_execution)
         return {
             "render_execution_id": str(parsed_execution),
             "job_id": str(parsed_job) if parsed_job else None,
             "skipped": bool(getattr(executor, "skipped_duplicate", False)),
         }
+    finally:
+        session.close()
+
+
+def _request_finalization_after_render(render_execution_id: UUID | str) -> None:
+    """Request a Stage 6 finalizer job for a terminal transformed render.
+
+    Runs in a fresh session after the render's terminal state is committed.
+    Duplicate callbacks coalesce through envelope ownership; a lost callback is
+    recoverable through POST/resume. Failures are swallowed (never mask the
+    render result).
+    """
+
+    from app.materialization.finalization import request_finalization_job
+
+    session = create_session_factory()()
+    try:
+        settings = get_settings()
+        request_finalization_job(session, render_execution_id, settings=settings)
+    except Exception:
+        try:
+            session.rollback()
+        except Exception:
+            pass
     finally:
         session.close()
 
@@ -550,6 +579,8 @@ def run_materialization_job(
                 return {"candidate_id": candidate_id, "cancelled": True}
         executor = build_materialization_executor(session, storage, settings)
         executor.set_active_job(parsed_job)
+        # Production: deliver the render handoff through the real broker.
+        executor.set_render_dispatcher(None)
         try:
             executor.execute(
                 candidate_id,
@@ -576,6 +607,52 @@ def run_materialization_job(
                     exc=error,
                     max_retries=MAX_RETRIES,
                 ) from error
+            raise
+        return {
+            "candidate_id": candidate_id,
+            "job_id": str(parsed_job) if parsed_job else None,
+            "skipped": bool(getattr(executor, "skipped_duplicate", False)),
+        }
+    finally:
+        session.close()
+
+
+@celery_app.task(  # type: ignore[untyped-decorator]
+    bind=True, autoretry_for=(), name="clipfactory.run_materialization_finalization"
+)
+def run_materialization_finalization(
+    self: Task,
+    candidate_id: str,
+    job_id: str | None = None,
+) -> dict[str, str | bool | None]:
+    """Finalize one AWAITING_RENDER Stage 6 materialization.
+
+    Extends the existing job system with the same MATERIALIZATION job kind; it
+    adds no ``PipelineStage``/``PipelineRun``/``_NEXT_STAGE`` entry.
+    """
+
+    from uuid import UUID as _UUID
+
+    from app.materialization.executor import build_materialization_executor
+
+    parsed_job = _UUID(job_id) if job_id else None
+    session = create_session_factory()()
+    try:
+        settings = get_settings()
+        storage = StorageService(settings.storage_root)
+        if parsed_job is not None:
+            job = session.get(ProcessingJob, parsed_job)
+            if job is not None and job.status is JobStatus.CANCELLED:
+                return {"candidate_id": candidate_id, "cancelled": True}
+        executor = build_materialization_executor(session, storage, settings)
+        executor.set_active_job(parsed_job)
+        try:
+            executor.finalize(candidate_id)
+        except StageCancelled:
+            return {"candidate_id": candidate_id, "cancelled": True}
+        except Exception as error:
+            if parsed_job is not None and not getattr(executor, "skipped_duplicate", False):
+                executor.record_failure(error)
             raise
         return {
             "candidate_id": candidate_id,
