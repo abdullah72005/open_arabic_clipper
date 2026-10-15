@@ -26,7 +26,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.enums import JobKind, JobStatus, MaterializationLifecycle
-from app.core.settings import Settings
+from app.core.settings import Settings, get_settings
 from app.materialization.repository import (
     bind_active_job,
     get_or_create_envelope,
@@ -37,9 +37,18 @@ from app.materialization.service import (
     resolve_prerequisites,
 )
 from app.models import ClipCandidate, ClipMaterialization, ProcessingJob
+from app.models.render_execution import RenderExecution
 
 _ACTIVE_STATUSES = {JobStatus.QUEUED, JobStatus.RUNNING}
 DISPATCH_FAILED_MARKER = "MATERIALIZATION_DISPATCH_FAILED"
+RENDER_DISPATCH_FAILED_MARKER = "RENDER_DISPATCH_FAILED"
+
+#: Durable job phases resolved from the job's bound envelope, never from the
+#: transient Celery task name or caller arguments.
+PHASE_PREPARE = "PREPARE"
+PHASE_FINALIZE = "FINALIZE"
+
+_RENDER_TERMINAL = {"COMPLETE", "FAILED", "BLOCKED", "CANCELLED"}
 
 
 class MaterializationQueueError(ValueError):
@@ -56,6 +65,7 @@ class MaterializationQueueOutcome:
     skipped_reason: str | None = None
     materialization_id: uuid.UUID | None = None
     render_execution_id: uuid.UUID | None = None
+    phase: str | None = None
 
 
 def validate_candidate_for_materialization(
@@ -104,6 +114,7 @@ def _outcome(
     cached: bool = False,
     active: bool = False,
     skipped_reason: str | None = None,
+    phase: str | None = None,
 ) -> MaterializationQueueOutcome:
     return MaterializationQueueOutcome(
         job_id=job.id if job is not None else None,
@@ -114,7 +125,56 @@ def _outcome(
         skipped_reason=skipped_reason,
         materialization_id=envelope.id,
         render_execution_id=envelope.render_execution_id,
+        phase=phase,
     )
+
+
+def resolve_job_phase(
+    session: Session, job: ProcessingJob, envelope: ClipMaterialization | None
+) -> str:
+    """Resolve the durable phase of one MATERIALIZATION job from its envelope.
+
+    A job is a FINALIZE job only when its envelope is AWAITING_RENDER with a
+    terminal bound render; otherwise it is PREPARE work. The Celery task name and
+    transient caller arguments are never the phase identity.
+    """
+
+    if envelope is None and job.materialization_id is not None:
+        envelope = session.get(
+            ClipMaterialization, job.materialization_id, populate_existing=True
+        )
+    if envelope is None:
+        return PHASE_PREPARE
+    if envelope.lifecycle is not MaterializationLifecycle.AWAITING_RENDER:
+        return PHASE_PREPARE
+    if envelope.render_execution_id is None:
+        return PHASE_PREPARE
+    render = session.get(RenderExecution, envelope.render_execution_id, populate_existing=True)
+    if render is None:
+        return PHASE_PREPARE
+    if render.lifecycle.value in _RENDER_TERMINAL:
+        return PHASE_FINALIZE
+    return PHASE_PREPARE
+
+
+def resolve_job_options(
+    session: Session, job: ProcessingJob, envelope: ClipMaterialization | None
+) -> dict[str, object]:
+    """Resolve candidate/source/request options from the job's bound envelope."""
+
+    if envelope is None and job.materialization_id is not None:
+        envelope = session.get(ClipMaterialization, job.materialization_id, populate_existing=True)
+    request = (
+        envelope.request_payload
+        if envelope is not None and isinstance(envelope.request_payload, dict)
+        else {}
+    )
+    return {
+        "candidate_id": str(envelope.clip_candidate_id) if envelope is not None else None,
+        "priority": str(request.get("priority") or "CANDIDATE"),
+        "profile_key": request.get("requested_profile_key", request.get("profile_key")),
+        "supporting_requested": str(request.get("supporting_requested") or "OFF"),
+    }
 
 
 def queue_materialization(
@@ -126,9 +186,11 @@ def queue_materialization(
     supporting_requested: str = "OFF",
     force: bool = False,
     settings: Settings | None = None,
+    render_dispatcher: object | None = None,
 ) -> MaterializationQueueOutcome:
     """Queue (or reuse) one bounded Stage 6 materialization run for a candidate."""
 
+    resolved_settings = settings or get_settings()
     candidate = _lock_candidate(session, candidate_id)
     if candidate is None:
         raise MaterializationQueueError("candidate does not exist")
@@ -144,34 +206,69 @@ def queue_materialization(
     request_identity = {
         "priority": priority,
         "profile_key": inputs.profile.profile_key,
+        "requested_profile_key": profile_key,
         "supporting_requested": supporting_requested,
     }
     envelope = get_or_create_envelope(session, inputs, request_identity)
 
     active = _active_job(session, envelope.id)
     if active is not None:
-        session.commit()
-        _recover_or_dispatch(
+        _recover_active_job(
             session,
             candidate_id,
             active,
+            envelope,
+            settings=resolved_settings,
+            dispatcher=render_dispatcher,
             priority=priority,
             profile_key=profile_key,
             supporting_requested=supporting_requested,
             force=force,
         )
-        return _outcome(active, envelope, queued=False, active=True)
+        session.commit()
+        return _outcome(
+            active,
+            envelope,
+            queued=False,
+            active=True,
+            phase=resolve_job_phase(session, active, envelope),
+        )
 
     if not force and _is_cached(envelope):
         session.commit()
         return _outcome(None, envelope, queued=False, cached=True)
 
-    # A completed-enough pre-render state is awaiting its render/finalization;
-    # the post-render callback owns the next job (finalization). Re-requesting a
-    # dispatch here is recovery, handled in Task 5; for now surface it truthfully.
+    # One authoritative durable phase router: an AWAITING_RENDER envelope is
+    # either recovering its exact render handoff, reporting its active render, or
+    # queuing/recovering its exact finalizer — never blindly returning a stale
+    # "AWAITING_FINALIZATION" and never re-running accepted providers.
     if envelope.lifecycle is MaterializationLifecycle.AWAITING_RENDER:
+        return _route_awaiting_render(
+            session,
+            candidate_id,
+            envelope,
+            settings=resolved_settings,
+            dispatcher=render_dispatcher,
+        )
+
+    # G: a cancelled/semantically-blocked/materialized-terminal generation is
+    # preserved truthfully; nothing silently regenerates to force output.
+    if envelope.lifecycle in {
+        MaterializationLifecycle.BLOCKED,
+        MaterializationLifecycle.CANCELLED,
+    }:
         session.commit()
-        return _outcome(None, envelope, queued=False, skipped_reason="AWAITING_FINALIZATION")
+        return _outcome(None, envelope, queued=False, skipped_reason=envelope.lifecycle.value)
+    if envelope.lifecycle is MaterializationLifecycle.COMPLETE and not force:
+        session.commit()
+        return _outcome(
+            None,
+            envelope,
+            queued=False,
+            skipped_reason=(
+                envelope.semantic_outcome.value if envelope.semantic_outcome else "COMPLETE"
+            ),
+        )
 
     # Clear a stale binding left by a terminal job before CAS-ing a new one.
     if envelope.active_job_id is not None:
@@ -202,6 +299,7 @@ def queue_materialization(
 
     payload = dict(active_envelope_payload(envelope))
     payload.update(request_identity)
+    payload.setdefault("requested_profile_key", profile_key)
     envelope.request_payload = payload
     session.commit()
     session.refresh(job)
@@ -224,34 +322,41 @@ def active_envelope_payload(envelope: ClipMaterialization) -> dict[str, object]:
     return dict(envelope.request_payload or {})
 
 
-def _recover_or_dispatch(
+def _recover_active_job(
     session: Session,
     candidate_id: uuid.UUID | str,
     job: ProcessingJob,
+    envelope: ClipMaterialization,
     *,
+    settings: Settings,
+    dispatcher: object | None,
     priority: str,
     profile_key: str | None,
     supporting_requested: str,
     force: bool,
 ) -> None:
-    """Redispatch a pending job whose broker dispatch previously failed.
+    """Redispatch a pending job whose broker delivery previously failed.
 
-    Only a QUEUED job carrying the dispatch-failed marker is redispatched with
-    its original request. A RUNNING job is left alone; a QUEUED job without the
-    marker was already delivered, so the request merely returns its identity.
-    Duplicate redispatches (crash after success but before clearing the marker)
-    are harmless because the worker claim is atomic.
+    The durable phase is resolved from the job's bound envelope, so a queued
+    FINALIZE job is redispatched to finalization and never to preparation. A
+    RUNNING job is left alone; a QUEUED job without the marker was already
+    delivered, so the request merely returns its identity.
     """
 
     if job.status is not JobStatus.QUEUED:
         return
     if job.error_code != DISPATCH_FAILED_MARKER:
         return
+    if resolve_job_phase(session, job, envelope) == PHASE_FINALIZE:
+        from app.materialization.finalization import _deliver_finalization_job
+
+        _deliver_finalization_job(session, job, settings=settings, dispatcher=dispatcher)
+        return
     _dispatch_or_mark(
         session,
         candidate_id,
         job,
-        session.get(ClipMaterialization, job.materialization_id) or _empty_envelope(job),
+        envelope,
         priority=priority,
         profile_key=profile_key,
         supporting_requested=supporting_requested,
@@ -259,8 +364,110 @@ def _recover_or_dispatch(
     )
 
 
-def _empty_envelope(job: ProcessingJob) -> ClipMaterialization:
-    raise MaterializationQueueError("materialization envelope is missing for an active job")
+def _route_awaiting_render(
+    session: Session,
+    candidate_id: uuid.UUID | str,
+    envelope: ClipMaterialization,
+    *,
+    settings: Settings,
+    dispatcher: object | None,
+) -> MaterializationQueueOutcome:
+    """Resolve the durable phase of an AWAITING_RENDER envelope.
+
+    B: no durable bound render -> recover the exact render handoff (accepted
+    providers are never repeated). C: an active bound render -> return its active
+    identity and recover a marked broker-delivery failure. D: an exact terminal
+    bound render -> queue/recover one finalizer. G: a cancelled render -> preserve
+    the truthful outcome. A historical/superseded bound render never finalizes.
+    """
+
+    from app.services.storage import StorageService
+
+    render_id = envelope.render_execution_id
+    if render_id is not None:
+        render = session.get(RenderExecution, render_id, populate_existing=True)
+        if render is not None and envelope.id == render.materialization_id:
+            state = render.lifecycle.value
+            if state not in _RENDER_TERMINAL and render.is_current:
+                _recover_render_job(session, render, dispatcher=dispatcher)
+                session.commit()
+                return _outcome(
+                    None, envelope, queued=False, active=True, skipped_reason="AWAITING_RENDER"
+                )
+            if state == "CANCELLED":
+                session.commit()
+                return _outcome(None, envelope, queued=False, skipped_reason="RENDER_CANCELLED")
+            if state in {"COMPLETE", "FAILED"} and render.is_current:
+                from app.materialization.finalization import request_finalization_job
+
+                job_id = request_finalization_job(
+                    session, render.id, settings=settings, dispatcher=dispatcher
+                )
+                session.commit()
+                job = session.get(ProcessingJob, job_id) if job_id is not None else None
+                if job is None:
+                    return _outcome(
+                        None, envelope, queued=False, skipped_reason="FINALIZATION_UNAVAILABLE"
+                    )
+                return _outcome(
+                    job, envelope, queued=False, active=True, phase=PHASE_FINALIZE
+                )
+            if not render.is_current:
+                # Historical/superseded render: require explicit revalidation.
+                session.commit()
+                return _outcome(
+                    None, envelope, queued=False, skipped_reason="RENDER_SUPERSEDED"
+                )
+
+    # B: the envelope committed a renderable result but never durably bound a
+    # render. Recover the exact handoff; accepted providers are checkpointed.
+    from app.materialization.finalization import dispatch_transformed_render
+
+    try:
+        dispatch_transformed_render(
+            session,
+            envelope,
+            candidate_id,
+            settings=settings,
+            storage=StorageService(settings.storage_root),
+            dispatcher=dispatcher,
+        )
+    except Exception:
+        session.rollback()
+        return _outcome(
+            None, envelope, queued=False, skipped_reason="RENDER_HANDOFF_RECOVERY_FAILED"
+        )
+    session.commit()
+    return _outcome(
+        None, envelope, queued=False, active=True, skipped_reason="RENDER_HANDOFF_RECOVERED"
+    )
+
+
+def _recover_render_job(
+    session: Session, render: RenderExecution, *, dispatcher: object | None
+) -> ProcessingJob | None:
+    """Redispatch a bound render job whose broker delivery previously failed."""
+
+    from app.render.execution.queue import deliver_render_job
+
+    job = session.scalars(
+        select(ProcessingJob)
+        .where(
+            ProcessingJob.render_execution_id == render.id,
+            ProcessingJob.status.in_(_ACTIVE_STATUSES),
+        )
+        .order_by(ProcessingJob.created_at.desc())
+    ).first()
+    if job is None:
+        return None
+    if job.error_code == RENDER_DISPATCH_FAILED_MARKER:
+        try:
+            deliver_render_job(render.id, job.id, False, dispatcher)
+            job.error_code = None
+        except Exception:
+            job.error_code = RENDER_DISPATCH_FAILED_MARKER
+        session.commit()
+    return job
 
 
 def _dispatch_or_mark(
@@ -343,9 +550,14 @@ def _dispatch(
 
 __all__ = [
     "DISPATCH_FAILED_MARKER",
+    "PHASE_FINALIZE",
+    "PHASE_PREPARE",
+    "RENDER_DISPATCH_FAILED_MARKER",
     "MaterializationQueueError",
     "MaterializationQueueOutcome",
     "get_job",
     "queue_materialization",
+    "resolve_job_options",
+    "resolve_job_phase",
     "validate_candidate_for_materialization",
 ]

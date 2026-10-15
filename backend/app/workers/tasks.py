@@ -13,7 +13,7 @@ from app.core.settings import get_settings
 from app.db.session import create_session_factory
 from app.media.audio import AudioExtractor
 from app.media.ffprobe import FFprobe
-from app.models import ProcessingJob
+from app.models import ClipMaterialization, ProcessingJob
 from app.pipeline.executor import StageCancelled, StageExecutor
 from app.pipeline.runner import PipelineRunner
 from app.pipeline.stages import (
@@ -561,7 +561,8 @@ def run_materialization_job(
 
     This extends the existing job system, not the pipeline: it creates no
     ``PipelineRun``, schedules no next stage, and never touches the whole-source
-    stage chain.
+    stage chain. The durable phase (prepare vs finalize) is resolved from the
+    job's bound envelope, never from this task name or its transient arguments.
     """
 
     from uuid import UUID as _UUID
@@ -582,7 +583,10 @@ def run_materialization_job(
         # Production: deliver the render handoff through the real broker.
         executor.set_render_dispatcher(None)
         try:
-            executor.execute(
+            _run_materialization_phase(
+                session,
+                executor,
+                parsed_job,
                 candidate_id,
                 priority=priority,
                 profile_key=profile_key,
@@ -617,6 +621,54 @@ def run_materialization_job(
         session.close()
 
 
+def _run_materialization_phase(
+    session: Session,
+    executor: object,
+    parsed_job: UUID | None,
+    candidate_id: str,
+    *,
+    priority: str,
+    profile_key: str | None,
+    supporting_requested: str,
+    force: bool,
+) -> None:
+    """Resolve and execute the job's durable phase from its bound envelope."""
+
+    from app.materialization.queue import (
+        PHASE_FINALIZE,
+        resolve_job_options,
+        resolve_job_phase,
+    )
+
+    if parsed_job is None:
+        executor.execute(  # type: ignore[attr-defined]
+            candidate_id,
+            priority=priority,
+            profile_key=profile_key,
+            supporting_requested=supporting_requested,
+            force=force,
+        )
+        return
+    job = session.get(ProcessingJob, parsed_job)
+    envelope = (
+        session.get(ClipMaterialization, job.materialization_id)
+        if job is not None and job.materialization_id is not None
+        else None
+    )
+    if resolve_job_phase(session, job, envelope) == PHASE_FINALIZE:
+        executor.finalize(candidate_id)  # type: ignore[attr-defined]
+        return
+    options = resolve_job_options(session, job, envelope)
+    resolved_candidate = options.get("candidate_id") or candidate_id
+    executor.execute(  # type: ignore[attr-defined]
+        str(resolved_candidate),
+        priority=str(options.get("priority") or priority),
+        profile_key=options.get("profile_key") or profile_key,
+        supporting_requested=str(options.get("supporting_requested") or supporting_requested),
+        force=force,
+    )
+
+
 @celery_app.task(  # type: ignore[untyped-decorator]
     bind=True, autoretry_for=(), name="clipfactory.run_materialization_finalization"
 )
@@ -628,7 +680,8 @@ def run_materialization_finalization(
     """Finalize one AWAITING_RENDER Stage 6 materialization.
 
     Extends the existing job system with the same MATERIALIZATION job kind; it
-    adds no ``PipelineStage``/``PipelineRun``/``_NEXT_STAGE`` entry.
+    adds no ``PipelineStage``/``PipelineRun``/``_NEXT_STAGE`` entry. Delegates to
+    the same verified durable phase resolution as the materialization task.
     """
 
     from uuid import UUID as _UUID
@@ -647,7 +700,16 @@ def run_materialization_finalization(
         executor = build_materialization_executor(session, storage, settings)
         executor.set_active_job(parsed_job)
         try:
-            executor.finalize(candidate_id)
+            _run_materialization_phase(
+                session,
+                executor,
+                parsed_job,
+                candidate_id,
+                priority="CANDIDATE",
+                profile_key=None,
+                supporting_requested="OFF",
+                force=False,
+            )
         except StageCancelled:
             return {"candidate_id": candidate_id, "cancelled": True}
         except Exception as error:
