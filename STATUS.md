@@ -1,5 +1,87 @@
 # Runtime status
 
+## Stage 6 SOL defect corrections 1–4 + real persisted executor (2026-10-15)
+
+Status: **the four reproduced SOL defects are corrected with regressions, a real
+production bug (the prepare→render handoff silently never ran because of a stale
+identity-map envelope under `expire_on_commit=False`) is fixed, the durable
+delivery/resume router exists, and a genuine persisted end-to-end executor
+integration test now runs real FFmpeg/compiler/runner/probe/QC through normal
+executor entry points producing a real transformed MP4. Tasks 6 (hosted
+grounded writing/critique), 7 (TTS/voice/audition), 8 (candidate API/CLI/UI
+completion) and 9 (genuine manual-acceptance package) remain NOT done. No
+genuine authorized-media acceptance artifact exists. Stage 6 is NOT FROZEN.**
+
+- **Defect 1 — live currentness at finalization.** `finalize_materialization`
+  now re-assembles the exact persisted request options through
+  `assemble_inputs` and compares the current input fingerprint to the envelope
+  before assessing. A stale FINAL_CLIP/selection/plan/contract/composition →
+  `SUPERSEDED` with `lifecycle=BLOCKED`, `semantic_outcome=
+  UPSTREAM_REVALIDATION_REQUIRED`, `human_review_required=false`,
+  `cache_eligible=false` (history preserved). `critical_evidence_current` is no
+  longer forced to a `true` constant. Two-session PostgreSQL regressions in
+  `test_stage6_finalizer_currentness_postgres.py` cover changes during rendering
+  and immediately before assessment, plus FINAL_CLIP/plan/output-revision
+  changes and concurrent POSTs sharing one finalizer.
+- **Defect 2 — versioned, dependency-bound evidence.** The pre-render snapshot
+  is now `{version, materialization_output_fingerprint, context}`
+  (`stage6-prerender-context-v2`); a missing/empty/partial/malformed/
+  dependency-mismatched snapshot is refused and rebuilt deterministically from
+  authoritative evidence. Required slots are derived from the authoritative
+  contract plus persisted resolutions (an empty list never means "no
+  requirements"; a required `DEFERRED` resolution is a distinct failure from
+  missing evidence). Accepted script/timeline/narration evidence and stored
+  findings are validated; an empty dict or malformed field can never imply a
+  satisfied gate. Regressions in `test_stage6_finalizer_evidence.py`.
+- **Defect 3 — one guarded disposition commit.** Every handled finalization exit
+  (complete/defer/superseded/cancelled, including missing render/artifact/
+  evidence) commits through `_disposition`, which closes the exact owned job and
+  releases its binding while ownership permits and never mutates another
+  worker's claim. Handled semantic defer/rejection is not an execution failure.
+- **Defect 4 — one durable delivery/resume router.** `queue_materialization`
+  and the render callback (`request_finalization_job`) share one authoritative
+  phase router (`queue.resolve_job_phase`) resolving PREPARE vs FINALIZE from
+  the job's bound envelope: AWAITING_RENDER with no bound render recovers the
+  handoff; an active render returns its identity and recovers a marked
+  broker-delivery failure; an exact terminal render queues/recovers one
+  finalizer; a dispatch-failed FINALIZE job is redispatched to finalization
+  (never preparation); terminal/cancelled/blocked generations are preserved
+  truthfully. `request_finalization_job` requires a terminal, current,
+  exactly-bound render and ignores historical/nonterminal callbacks. The
+  materialization and finalization Celery tasks both delegate to the shared
+  phase resolution. Regressions in `test_stage6_durable_router.py`.
+- **Defect 5 — real persisted executor integration.** `executor.py` re-reads the
+  envelope after `commit_prepared` before deciding the render handoff (the
+  previous stale-object check silently skipped every handoff). A narrow
+  test-fixture media factory (`seed_stage50/51 media_writer`) generates real
+  1080p30/AAC source media *before* contract/composition/materialization
+  fingerprints. `test_stage6_real_executor.py` drives POST/queue → prepare
+  executor → render handoff → `RenderExecutionExecutor` → real
+  FFmpeg/compiler/runner/probe/QC → completion callback → finalizer executor →
+  replay with zero extra calls, asserting all jobs terminal and the final
+  decoded `final_integrated_lufs`/`final_true_peak_dbtp` measured from the real
+  MP4. No COMPLETE/PASS/artifact evidence is inserted manually. A persistent
+  SYNTHETIC INTEGRATION package (index.json + final.mp4 + authored.ass +
+  SHA256SUMS, actual DB UUIDs/fingerprints/QC/audio recipe) is written to
+  `storage/benchmarks/stage-6/synthetic-integration/`. The bounded limiter
+  repair has a real-FFmpeg regression (`test_stage6_limiter_repair.py`):
+  high-crest source → `AUDIO_PEAK_REPAIR_NEEDED` with a partial measurement
+  manifest; the authorized repair starts from the lossless mix, changes the
+  limited intermediate, and satisfies final decoded QC.
+- **Verification.** Docker Python 3.12.14 + PostgreSQL 16 + real FFmpeg:
+  `pytest -k "stage6 or stage52"` → `331 passed, 0 failed, 0 skipped`. `ruff`
+  clean on `app`+`tests`. `mypy --no-incremental --follow-imports=skip` clean on
+  the changed/new modules (`finalization`, `queue`, `repository`, `workers/
+  tasks`); the pre-existing `components`/`executor` no-any findings are
+  unchanged. Frontend: `vitest run` 55 passed, `eslint` clean (one pre-existing
+  `tsc` test-file typing error in `job-poller.test.tsx`, untouched).
+- **Remaining BLOCKERS (not done).** Task 6 hosted grounded writing/critique
+  adapters; Task 7 TTS adapter + local fidelity + provisional-voice audition
+  (the "authored card plus synthetic narration asset, nonzero gain" integration
+  case is therefore not exercised); Task 8 candidate API/CLI/UI completion;
+  Task 9 genuine manual-acceptance package over authorized media (no
+  authorized source media configured in this environment).
+
 ## Stage 6 SOL defect fixes A–E + worker-chain wiring (2026-10-15, commits 6041709, eb6a0b1)
 
 Status: **the five SOL-reproduced defects (A finalizer content/technical gates,
