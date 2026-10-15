@@ -240,7 +240,7 @@ def request_finalization_job(
         return None
     if render.artifact_purpose.value != TRANSFORMED_SHORT:
         return None
-    if render.lifecycle.value != "COMPLETE":
+    if render.lifecycle.value not in {"COMPLETE", "FAILED", "BLOCKED"}:
         # Only a terminal render has authoritative final evidence.
         return None
     if not render.is_current:
