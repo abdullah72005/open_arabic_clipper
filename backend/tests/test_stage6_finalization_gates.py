@@ -149,9 +149,14 @@ def test_unmet_substantive_value_is_not_promoted(session: Session, monkeypatch: 
 
 def test_missing_required_slot_is_no_output(session: Session, monkeypatch: Any) -> None:
     fixture, envelope = _persisted_materialization(session, monkeypatch)
-    snapshot = dict(envelope.metrics.get("pre_render_assessment_context") or {})
-    snapshot["required_slots_fulfilled"] = False
-    envelope.metrics = {**envelope.metrics, "pre_render_assessment_context": snapshot}
+    # Persist an *actual* required AUTHORED_TEXT contract slot resolution as
+    # DEFERRED (a real authoritative failure, not a flipped snapshot boolean).
+    resolutions = [dict(item) for item in (envelope.slot_resolutions or [])]
+    for item in resolutions:
+        if item.get("slot_kind") == "AUTHORED_TEXT":
+            item["resolution"] = "DEFERRED"
+            item["reason_code"] = "MISSING_REQUIRED_VALUE"
+    envelope.slot_resolutions = resolutions
     session.flush()
     _attach_render(session, fixture, envelope)
 
@@ -164,9 +169,15 @@ def test_missing_required_slot_is_no_output(session: Session, monkeypatch: Any) 
 
 def test_unsupported_verification_blocks(session: Session, monkeypatch: Any) -> None:
     fixture, envelope = _persisted_materialization(session, monkeypatch)
-    snapshot = dict(envelope.metrics.get("pre_render_assessment_context") or {})
-    snapshot["unsupported_essential"] = True
-    envelope.metrics = {**envelope.metrics, "pre_render_assessment_context": snapshot}
+    # Persist a real unsupported-essential-claim UNMET finding.
+    envelope.quality_findings = [
+        {
+            "dimension": "GROUNDING_VERIFICATION",
+            "level": "UNMET",
+            "reason_codes": ["UNSUPPORTED_ESSENTIAL_CLAIM"],
+            "evidence": {"block_index": 1},
+        }
+    ]
     session.flush()
     _attach_render(session, fixture, envelope)
 
@@ -178,9 +189,9 @@ def test_unsupported_verification_blocks(session: Session, monkeypatch: Any) -> 
 
 def test_unknown_critical_fidelity_defers(session: Session, monkeypatch: Any) -> None:
     fixture, envelope = _persisted_materialization(session, monkeypatch)
-    snapshot = dict(envelope.metrics.get("pre_render_assessment_context") or {})
-    snapshot["critical_fidelity_unknown"] = True
-    envelope.metrics = {**envelope.metrics, "pre_render_assessment_context": snapshot}
+    # Remove the accepted SCRIPT checkpoint: required semantic evidence is now
+    # missing (never a favorable default), so finalization must defer truthfully.
+    envelope.component_checkpoints = {}
     session.flush()
     _attach_render(session, fixture, envelope)
 

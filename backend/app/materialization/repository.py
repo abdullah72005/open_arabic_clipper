@@ -42,6 +42,12 @@ ATTEMPT_LEDGER_VERSION = "stage6-attempts-v2"
 #: so the finalizer can reconstruct the semantic gates from stored evidence.
 PRE_RENDER_CONTEXT_METRIC = "pre_render_assessment_context"
 
+#: Version of the durable pre-render snapshot. The snapshot is a versioned,
+#: dependency-bound checkpoint: it records the exact materialization output
+#: fingerprint it was computed for, so a stale/mismatched snapshot is never
+#: deserialized into favorable default gates.
+PRE_RENDER_CONTEXT_VERSION = "stage6-prerender-context-v2"
+
 CHECKPOINT_PENDING = "PENDING"
 CHECKPOINT_ACCEPTED = "ACCEPTED"
 CHECKPOINT_DEFERRED = "DEFERRED"
@@ -745,6 +751,8 @@ __all__ = [
     "CHECKPOINT_DEFERRED",
     "CHECKPOINT_PENDING",
     "CHECKPOINT_REJECTED",
+    "PRE_RENDER_CONTEXT_METRIC",
+    "PRE_RENDER_CONTEXT_VERSION",
     "MaterializationOwner",
     "MaterializationOwnershipError",
     "PreparedMaterialization",

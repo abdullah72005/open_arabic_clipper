@@ -44,6 +44,7 @@ from app.materialization.repository import (
     ATTEMPT_RESPONDED,
     ATTEMPT_UNCERTAIN,
     PRE_RENDER_CONTEXT_METRIC,
+    PRE_RENDER_CONTEXT_VERSION,
     MaterializationOwner,
     MaterializationOwnershipError,
     PreparedMaterialization,
@@ -742,6 +743,7 @@ def _prepared_from_result(
         }
         else MaterializationLifecycle.COMPLETE
     )
+    output_fp = _output_fingerprint(inputs, checkpoints)
     return PreparedMaterialization(
         lifecycle=lifecycle,
         semantic_outcome=outcome,
@@ -771,9 +773,13 @@ def _prepared_from_result(
             "segments": len(result.timeline.segments),
             "output_duration": round(result.timeline.output_duration, 6),
             "removals": [dict(item) for item in result.removals],
-            PRE_RENDER_CONTEXT_METRIC: dict(result.assessment_context),
+            PRE_RENDER_CONTEXT_METRIC: {
+                "version": PRE_RENDER_CONTEXT_VERSION,
+                "materialization_output_fingerprint": output_fp,
+                "context": dict(result.assessment_context),
+            },
         },
-        output_fingerprint=_output_fingerprint(inputs, checkpoints),
+        output_fingerprint=output_fp,
     )
 
 

@@ -8,16 +8,19 @@ finalizes the materialization by *re-assessing* the persisted semantic evidence
 together with the actual render/QC evidence.
 
 The finalizer never promotes a materialization to review readiness on the mere
-completion of a technical render. It rebuilds an explicit
-:class:`~app.materialization.acceptance.AssessmentContext` from stored accepted
-component results, stored categorical findings, required-slot/narration
-evidence, timeline/source protection, rights/readability, upstream currentness,
-and the actual render/QC/loudness measurements, then runs the existing
-categorical assessment engine. A stored ``PASS`` label can never override a
-missing or contradictory measurement, and a completed render never erases a
-persisted semantic failure.
+completion of a technical render. It re-derives live upstream effectiveness,
+rebuilds an explicit :class:`~app.materialization.acceptance.AssessmentContext`
+from the versioned, dependency-bound pre-render snapshot plus the stored accepted
+component/slot/claim/narration/timeline evidence and the actual render/QC
+measurements, then runs the existing categorical assessment engine. A stored
+``PASS`` label can never override a missing or contradictory measurement, a
+completed render never erases a persisted semantic failure, and a stale/missing
+snapshot is never deserialized into favorable default gates.
 
-Finalization is idempotent: an identical evidence replay makes zero
+Every handled disposition (complete/deferred/superseded/cancelled) is committed
+through one guarded transaction that finishes the exact owned job and releases
+its binding where ownership permits; a lost owner never mutates another worker's
+claim. Finalization is idempotent: an identical evidence replay makes zero
 provider/render calls, preserves the assessment identity, and still completes
 the *current* job under its exact owner fence.
 """
@@ -39,30 +42,32 @@ from app.core.enums import (
     JobStatus,
     MaterializationLifecycle,
     MaterializationOutcome,
+    MaterializationPriority,
 )
 from app.core.settings import Settings
 from app.materialization.acceptance import AssessmentContext, assess_materialization
+from app.materialization.fingerprints import input_fingerprint
+from app.materialization.inputs import MaterializationInputs
 from app.materialization.policy import (
     REASON_HERO_DAMAGED,
     REASON_INVALID_GROUNDING_REFERENCE,
     REASON_MANUAL_TRANSCRIPT_REVIEW,
-    REASON_MISSING_REQUIRED_NARRATION,
-    REASON_PROFILE_CONTEXT_MISMATCH,
     REASON_SCRIPT_AUDIO_MISMATCH,
-    REASON_STALE_CRITICAL_EVIDENCE,
     REASON_UNREADABLE_REQUIRED_COPY,
     REASON_UNSUITABLE_ASSET_RIGHTS,
     REASON_UNSUPPORTED_ESSENTIAL_CLAIM,
 )
+from app.materialization.profiles import semantic_context_matches
 from app.materialization.repository import (
     PRE_RENDER_CONTEXT_METRIC,
+    PRE_RENDER_CONTEXT_VERSION,
     MaterializationOwner,
     finish_owner_job,
     guarded_update,
     owner_is_current,
 )
 from app.materialization.types import QualityFinding
-from app.models import ClipMaterialization
+from app.models import ClipMaterialization, RenderContract
 from app.models.render_execution import RenderExecution
 from app.render.execution.policy import (
     TRANSFORMED_SHORT,
@@ -81,6 +86,7 @@ REASON_RENDER_BINDING_STALE = "RENDER_BINDING_STALE"
 REASON_MISSING_LOUDNESS_EVIDENCE = "MISSING_LOUDNESS_EVIDENCE"
 REASON_ARTIFACT_MISSING = "ARTIFACT_MISSING"
 REASON_ARTIFACT_HASH_MISMATCH = "ARTIFACT_HASH_MISMATCH"
+REASON_UPSTREAM_REVALIDATION_REQUIRED = "UPSTREAM_REVALIDATION_REQUIRED"
 ASSESSMENT_POLICY_VERSION = "stage6-assessment-v2"
 
 # Reviewable outcomes: actual media exists and all critical gates are known and
@@ -94,6 +100,26 @@ _DEFERRED_OUTCOMES = {
     MaterializationOutcome.UPSTREAM_REVALIDATION_REQUIRED.value,
     MaterializationOutcome.DEFERRED_PROVIDER.value,
 }
+
+_REQUIRED_CONTEXT_KEYS = frozenset(AssessmentContext().as_dict().keys())
+_BOOL_CONTEXT_KEYS = frozenset(
+    {
+        "required_slots_fulfilled",
+        "required_narration_required",
+        "narration_accepted",
+        "tts_available",
+        "provider_deferred",
+        "unsupported_essential",
+        "hero_protected",
+        "asset_rights_ok",
+        "script_audio_match",
+        "readable_copy",
+        "final_clip_usable",
+        "critical_evidence_current",
+        "critical_fidelity_unknown",
+        "render_complete",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -214,10 +240,21 @@ def request_finalization_job(
         return None
     if render.artifact_purpose.value != TRANSFORMED_SHORT:
         return None
+    if render.lifecycle.value != "COMPLETE":
+        # Only a terminal render has authoritative final evidence.
+        return None
+    if not render.is_current:
+        # Ignore historical/superseded callbacks.
+        return None
     envelope = session.get(ClipMaterialization, render.materialization_id, populate_existing=True)
     if envelope is None or not envelope.is_current:
         return None
     if envelope.lifecycle is not MaterializationLifecycle.AWAITING_RENDER:
+        return None
+    # The callback render must be the envelope's exact bound revision.
+    if envelope.render_execution_id is None or envelope.render_execution_id != render.id:
+        return None
+    if not _render_binding_matches(session, envelope, render):
         return None
 
     existing = session.scalars(
@@ -247,6 +284,12 @@ def request_finalization_job(
     session.refresh(job)
     _deliver_finalization_job(session, job, settings=settings, dispatcher=dispatcher)
     return uuid.UUID(str(job.id))
+
+
+def _render_binding_matches(
+    session: Session, envelope: ClipMaterialization, render: RenderExecution
+) -> bool:
+    return _validate_render_binding(envelope, render) is None
 
 
 def _deliver_finalization_job(
@@ -282,6 +325,60 @@ def _deliver_finalization_job(
         session.rollback()
 
 
+# ---------------------------------------------------------------------------
+# Guarded finalization disposition
+# ---------------------------------------------------------------------------
+
+
+def _disposition(
+    session: Session,
+    owner: MaterializationOwner,
+    *,
+    outcome: str,
+    reason_codes: tuple[str, ...] = (),
+    job_status: JobStatus = JobStatus.SUCCEEDED,
+    envelope_values: Mapping[str, object] | None = None,
+    mutate_envelope: bool = True,
+    assessment_fingerprint: str = "",
+    render_execution_id: str | None = None,
+    semantic_outcome: str | None = None,
+    findings: tuple[dict[str, object], ...] = (),
+    reused: bool = False,
+) -> FinalizationResult:
+    """Commit one handled finalization disposition and close the owned job.
+
+    A handled semantic defer/rejection is not an unhandled execution failure: the
+    owned job always becomes terminal. Envelope state is only mutated while this
+    worker still holds the exact ownership token; a lost owner never mutates
+    another worker's claim, but it also never leaves its own job RUNNING.
+    """
+
+    session.expire_all()
+    if mutate_envelope and owner_is_current(session, owner):
+        values: dict[str, object] = dict(envelope_values or {})
+        values.setdefault("active_job_id", None)
+        row = session.get(ClipMaterialization, owner.materialization_id, populate_existing=True)
+        existing = list(row.reason_codes or []) if row is not None else []
+        merged = list(dict.fromkeys((*existing, *(str(code) for code in reason_codes))))
+        values["reason_codes"] = merged
+        if not guarded_update(session, owner, values):
+            session.rollback()
+            return FinalizationResult(FINALIZATION_SUPERSEDED, ("OWNERSHIP_LOST",))
+    if not finish_owner_job(session, owner, job_status):
+        session.rollback()
+        return FinalizationResult(FINALIZATION_SUPERSEDED, ("OWNERSHIP_LOST",))
+    session.commit()
+    return FinalizationResult(
+        outcome,
+        reason_codes=tuple(str(code) for code in reason_codes),
+        assessment_fingerprint=assessment_fingerprint,
+        render_execution_id=render_execution_id,
+        reused=reused,
+        semantic_outcome=semantic_outcome,
+        findings=findings,
+    )
+
+
 def finalize_materialization(
     session: Session,
     owner: MaterializationOwner,
@@ -291,57 +388,159 @@ def finalize_materialization(
 ) -> FinalizationResult:
     """Finalize one materialization from its exact stored render evidence."""
 
+    session.expire_all()
     envelope = session.get(ClipMaterialization, owner.materialization_id, populate_existing=True)
     if envelope is None:
-        return FinalizationResult(FINALIZATION_SUPERSEDED, ("MATERIALIZATION_MISSING",))
+        return _disposition(
+            session,
+            owner,
+            outcome=FINALIZATION_SUPERSEDED,
+            reason_codes=("MATERIALIZATION_MISSING",),
+        )
     if envelope.lifecycle is MaterializationLifecycle.CANCELLED:
-        return FinalizationResult(FINALIZATION_CANCELLED, ("MATERIALIZATION_CANCELLED",))
+        return _disposition(
+            session,
+            owner,
+            outcome=FINALIZATION_CANCELLED,
+            reason_codes=("MATERIALIZATION_CANCELLED",),
+            job_status=JobStatus.CANCELLED,
+        )
     if not owner_is_current(session, owner):
         return FinalizationResult(FINALIZATION_SUPERSEDED, ("OWNERSHIP_LOST",))
 
     render_id = envelope.render_execution_id
     if render_id is None:
-        return FinalizationResult(FINALIZATION_DEFERRED, (REASON_RENDER_NOT_COMPLETE,))
+        return _disposition(
+            session,
+            owner,
+            outcome=FINALIZATION_DEFERRED,
+            reason_codes=(REASON_RENDER_NOT_COMPLETE,),
+        )
     render = session.get(RenderExecution, render_id, populate_existing=True)
     if render is None:
-        return FinalizationResult(FINALIZATION_DEFERRED, (REASON_RENDER_NOT_COMPLETE,))
+        return _disposition(
+            session,
+            owner,
+            outcome=FINALIZATION_DEFERRED,
+            reason_codes=(REASON_RENDER_NOT_COMPLETE,),
+        )
     if render.lifecycle.value == "CANCELLED":
-        return FinalizationResult(FINALIZATION_CANCELLED, ("RENDER_CANCELLED",))
+        return _disposition(
+            session,
+            owner,
+            outcome=FINALIZATION_CANCELLED,
+            reason_codes=("RENDER_CANCELLED",),
+            job_status=JobStatus.CANCELLED,
+        )
     if render.lifecycle.value != "COMPLETE":
-        return FinalizationResult(FINALIZATION_DEFERRED, (REASON_RENDER_NOT_COMPLETE,))
+        return _disposition(
+            session,
+            owner,
+            outcome=FINALIZATION_DEFERRED,
+            reason_codes=(REASON_RENDER_NOT_COMPLETE,),
+        )
     if not render.is_current:
-        return FinalizationResult(FINALIZATION_SUPERSEDED, ("RENDER_NOT_CURRENT",))
+        return _disposition(
+            session,
+            owner,
+            outcome=FINALIZATION_SUPERSEDED,
+            reason_codes=("RENDER_NOT_CURRENT",),
+        )
 
     binding = _validate_render_binding(envelope, render)
     if binding is not None:
-        return binding
+        return _disposition(
+            session,
+            owner,
+            outcome=binding.outcome,
+            reason_codes=binding.reason_codes,
+            job_status=(
+                JobStatus.CANCELLED
+                if binding.outcome == FINALIZATION_CANCELLED
+                else JobStatus.SUCCEEDED
+            ),
+        )
+
+    # Live currentness: the exact persisted request options must still assemble to
+    # the same immutable input generation. Upstream can change during rendering;
+    # a stale input may never authorize review readiness or cache reuse.
+    inputs = _revalidate_live_inputs(session, envelope)
+    if inputs is None:
+        return _disposition(
+            session,
+            owner,
+            outcome=FINALIZATION_SUPERSEDED,
+            reason_codes=(REASON_UPSTREAM_REVALIDATION_REQUIRED,),
+            envelope_values={
+                "lifecycle": MaterializationLifecycle.BLOCKED,
+                "semantic_outcome": MaterializationOutcome.UPSTREAM_REVALIDATION_REQUIRED,
+                "cache_eligible": False,
+                "human_review_required": False,
+                "publication_ready": False,
+            },
+        )
 
     measured = render.qc_result.get("measured") if isinstance(render.qc_result, dict) else {}
     measured = measured if isinstance(measured, dict) else {}
     integrated = measured.get("final_integrated_lufs")
     true_peak = measured.get("final_true_peak_dbtp")
     if render.qc_status is None:
-        return FinalizationResult(FINALIZATION_DEFERRED, (REASON_MISSING_LOUDNESS_EVIDENCE,))
+        return _disposition(
+            session,
+            owner,
+            outcome=FINALIZATION_DEFERRED,
+            reason_codes=(REASON_MISSING_LOUDNESS_EVIDENCE,),
+        )
     if not _finite(integrated) or not _finite(true_peak):
-        return FinalizationResult(FINALIZATION_DEFERRED, (REASON_MISSING_LOUDNESS_EVIDENCE,))
+        return _disposition(
+            session,
+            owner,
+            outcome=FINALIZATION_DEFERRED,
+            reason_codes=(REASON_MISSING_LOUDNESS_EVIDENCE,),
+        )
 
     reference = render.artifact_reference if isinstance(render.artifact_reference, dict) else {}
     relative = reference.get("relative_path")
     expected_hash = str(reference.get("sha256") or "")
     if not isinstance(relative, str) or not relative or not expected_hash:
-        return FinalizationResult(FINALIZATION_DEFERRED, (REASON_ARTIFACT_MISSING,))
+        return _disposition(
+            session,
+            owner,
+            outcome=FINALIZATION_DEFERRED,
+            reason_codes=(REASON_ARTIFACT_MISSING,),
+        )
     path = (storage.storage_root / relative).resolve()
     try:
         path.relative_to(storage.storage_root)
     except ValueError:
-        return FinalizationResult(FINALIZATION_DEFERRED, (REASON_ARTIFACT_MISSING,))
+        return _disposition(
+            session,
+            owner,
+            outcome=FINALIZATION_DEFERRED,
+            reason_codes=(REASON_ARTIFACT_MISSING,),
+        )
     if not path.is_file():
-        return FinalizationResult(FINALIZATION_DEFERRED, (REASON_ARTIFACT_MISSING,))
+        return _disposition(
+            session,
+            owner,
+            outcome=FINALIZATION_DEFERRED,
+            reason_codes=(REASON_ARTIFACT_MISSING,),
+        )
     if _sha256(path) != expected_hash.lower():
-        return FinalizationResult(FINALIZATION_DEFERRED, (REASON_ARTIFACT_HASH_MISMATCH,))
+        return _disposition(
+            session,
+            owner,
+            outcome=FINALIZATION_DEFERRED,
+            reason_codes=(REASON_ARTIFACT_HASH_MISMATCH,),
+        )
 
     context = _build_assessment_context(
-        envelope, render, float(cast(float, integrated)), float(cast(float, true_peak))
+        session,
+        envelope,
+        render,
+        inputs=inputs,
+        integrated=float(cast(float, integrated)),
+        true_peak=float(cast(float, true_peak)),
     )
     config = settings.stage6_config()
     assessment = assess_materialization(
@@ -355,15 +554,14 @@ def finalize_materialization(
         else None
     )
     if envelope.lifecycle is MaterializationLifecycle.COMPLETE and existing == fingerprint:
-        # Replay: identical evidence, zero writes, zero provider/render calls.
-        # Still complete the *current* job under its exact owner fence.
-        if not finish_owner_job(session, owner, JobStatus.SUCCEEDED):
-            session.rollback()
-            return FinalizationResult(FINALIZATION_SUPERSEDED, ("OWNERSHIP_LOST",))
-        session.commit()
-        return FinalizationResult(
-            FINALIZATION_COMPLETE,
+        # Replay: identical evidence, zero provider/render calls, no envelope
+        # mutation. Still complete the *current* job under its exact owner fence.
+        return _disposition(
+            session,
+            owner,
+            outcome=FINALIZATION_COMPLETE,
             reason_codes=assessment.reason_codes,
+            mutate_envelope=False,
             assessment_fingerprint=fingerprint,
             render_execution_id=str(render.id),
             reused=True,
@@ -394,10 +592,13 @@ def finalize_materialization(
     metrics["assessment_policy_version"] = ASSESSMENT_POLICY_VERSION
 
     reviewable = assessment.outcome in _REVIEWABLE_OUTCOMES
-    ok = guarded_update(
+    return _disposition(
         session,
         owner,
-        {
+        outcome=_disposition_outcome(assessment.outcome),
+        reason_codes=reasons,
+        job_status=JobStatus.SUCCEEDED,
+        envelope_values={
             "lifecycle": MaterializationLifecycle.COMPLETE,
             "semantic_outcome": MaterializationOutcome(assessment.outcome),
             "human_review_required": bool(assessment.human_review_required)
@@ -405,27 +606,346 @@ def finalize_materialization(
             else False,
             "publication_ready": False,
             "cache_eligible": reviewable,
-            "reason_codes": list(reasons),
             "quality_findings": findings,
             "metrics": metrics,
         },
-    )
-    if not ok:
-        session.rollback()
-        return FinalizationResult(FINALIZATION_SUPERSEDED, ("OWNERSHIP_LOST",))
-    if not finish_owner_job(session, owner, JobStatus.SUCCEEDED):
-        session.rollback()
-        return FinalizationResult(FINALIZATION_SUPERSEDED, ("OWNERSHIP_LOST",))
-    session.commit()
-    disposition = _disposition(assessment.outcome)
-    return FinalizationResult(
-        disposition,
-        reason_codes=assessment.reason_codes,
         assessment_fingerprint=fingerprint,
         render_execution_id=str(render.id),
         semantic_outcome=assessment.outcome,
         findings=tuple(findings),
     )
+
+
+def _disposition_outcome(assessment_outcome: str) -> str:
+    if assessment_outcome in _REVIEWABLE_OUTCOMES:
+        return FINALIZATION_COMPLETE
+    if assessment_outcome in _DEFERRED_OUTCOMES:
+        return FINALIZATION_DEFERRED
+    return FINALIZATION_COMPLETE
+
+
+# ---------------------------------------------------------------------------
+# Live currentness
+# ---------------------------------------------------------------------------
+
+
+def _revalidate_live_inputs(
+    session: Session, envelope: ClipMaterialization
+) -> MaterializationInputs | None:
+    """Re-assemble live inputs from the persisted request options.
+
+    Returns the freshly assembled inputs when the current generation still
+    matches the envelope's immutable input fingerprint; otherwise ``None``.
+    Never raises for a stale prerequisite; it reports staleness truthfully.
+    """
+
+    from app.materialization.service import MaterializationError, assemble_inputs
+
+    request = envelope.request_payload if isinstance(envelope.request_payload, Mapping) else {}
+    priority = str(request.get("priority") or MaterializationPriority.CANDIDATE.value)
+    if priority not in {
+        MaterializationPriority.CANDIDATE.value,
+        MaterializationPriority.FINAL_CLIP.value,
+    }:
+        priority = MaterializationPriority.CANDIDATE.value
+    raw_profile = request.get("requested_profile_key", request.get("profile_key"))
+    profile_key = str(raw_profile) if raw_profile else None
+    supporting = str(request.get("supporting_requested") or "OFF")
+    try:
+        session.expire_all()
+        current = assemble_inputs(
+            session,
+            envelope.clip_candidate_id,
+            priority=priority,
+            profile_key=profile_key,
+            supporting_requested=supporting,
+        )
+    except MaterializationError:
+        return None
+    except Exception:
+        return None
+    if input_fingerprint(current) != str(envelope.input_fingerprint or ""):
+        return None
+    return current
+
+
+# ---------------------------------------------------------------------------
+# Assessment context reconstruction
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _SlotEvidence:
+    required_slots_fulfilled: bool
+    explicit_failure: bool
+    missing_resolution: bool
+
+
+def _required_contract_slots(contract: RenderContract | None) -> list[Mapping[str, object]]:
+    if contract is None:
+        return []
+    payload = dict(contract.contract_payload or {})
+    materialization = payload.get("materialization")
+    if not isinstance(materialization, Mapping):
+        return []
+    slots = materialization.get("slots")
+    if not isinstance(slots, list):
+        return []
+    return [
+        slot
+        for slot in slots
+        if isinstance(slot, Mapping) and bool(slot.get("required", False))
+    ]
+
+
+def _slot_evidence(session: Session, envelope: ClipMaterialization) -> _SlotEvidence:
+    """Derive required-slot fulfilment from the contract + persisted resolutions.
+
+    An empty resolution list never means "no requirements": a required contract
+    slot without a persisted FULFILLED resolution is missing evidence, while an
+    explicit DEFERRED/BLOCKED required resolution is a failure.
+    """
+
+    contract = (
+        session.get(RenderContract, envelope.render_contract_id)
+        if envelope.render_contract_id
+        else None
+    )
+    rows = [
+        dict(row)
+        for row in (envelope.slot_resolutions or [])
+        if isinstance(row, Mapping)
+    ]
+    fulfilled_pairs = {
+        (str(row.get("slot_id")), str(row.get("slot_kind", "")))
+        for row in rows
+        if str(row.get("resolution")) == "FULFILLED"
+    }
+    failed_pairs = {
+        (str(row.get("slot_id")), str(row.get("slot_kind", "")))
+        for row in rows
+        if str(row.get("resolution")) in {"DEFERRED", "BLOCKED"}
+    }
+    explicit_failure = False
+    missing = contract is None
+    for slot in _required_contract_slots(contract):
+        slot_id = str(slot.get("slot_id"))
+        slot_kind = str(slot.get("slot_kind", ""))
+        if (slot_id, slot_kind) in failed_pairs:
+            explicit_failure = True
+        elif (slot_id, slot_kind) not in fulfilled_pairs:
+            missing = True
+    for row in rows:
+        if bool(row.get("required", False)) and str(row.get("resolution")) in {
+            "DEFERRED",
+            "BLOCKED",
+        }:
+            explicit_failure = True
+    return _SlotEvidence(
+        required_slots_fulfilled=not explicit_failure,
+        explicit_failure=explicit_failure,
+        missing_resolution=missing,
+    )
+
+
+def _load_snapshot(envelope: ClipMaterialization) -> AssessmentContext | None:
+    """Load the versioned, dependency-bound pre-render snapshot, or ``None``.
+
+    A snapshot whose version is unknown, whose output-fingerprint binding does
+    not match this exact output revision, or whose fields are incomplete/malformed
+    is refused: the finalizer never deserializes favorable defaults from a
+    partial or stale checkpoint.
+    """
+
+    metrics = envelope.metrics if isinstance(envelope.metrics, Mapping) else {}
+    raw = metrics.get(PRE_RENDER_CONTEXT_METRIC)
+    if not isinstance(raw, Mapping):
+        return None
+    if raw.get("version") != PRE_RENDER_CONTEXT_VERSION:
+        return None
+    if str(raw.get("materialization_output_fingerprint") or "") != str(
+        envelope.output_fingerprint or ""
+    ):
+        return None
+    context = raw.get("context")
+    if not isinstance(context, Mapping) or not _valid_snapshot_context(context):
+        return None
+    return AssessmentContext.from_dict(context)
+
+
+def _valid_snapshot_context(context: Mapping[str, object]) -> bool:
+    if not _REQUIRED_CONTEXT_KEYS.issubset(set(context.keys())):
+        return False
+    for key in _BOOL_CONTEXT_KEYS:
+        if not isinstance(context.get(key), bool):
+            return False
+    for key in ("measured_loudness_lufs", "measured_true_peak_dbtp"):
+        value = context.get(key)
+        if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float))):
+            return False
+    repair = context.get("repair_count")
+    if isinstance(repair, bool) or not isinstance(repair, int):
+        return False
+    for key in (
+        "extra_findings",
+        "profile_mismatch_fields",
+        "timeline_conflicts",
+        "audio_conflicts",
+    ):
+        if not isinstance(context.get(key), list):
+            return False
+    qc_status = context.get("render_qc_status")
+    if qc_status is not None and not isinstance(qc_status, str):
+        return False
+    return True
+
+
+def _stored_findings(envelope: ClipMaterialization) -> list[QualityFinding]:
+    findings: list[QualityFinding] = []
+    for item in envelope.quality_findings or []:
+        if not isinstance(item, Mapping):
+            continue
+        dimension = str(item.get("dimension") or "")
+        level = str(item.get("level") or "")
+        if not dimension or not level:
+            continue
+        findings.append(
+            QualityFinding(
+                dimension=dimension,
+                level=level,
+                reason_codes=_reason_tuple(item),
+                evidence=dict(item.get("evidence") or {}),
+            )
+        )
+    return findings
+
+
+def _narration_blocks(envelope: ClipMaterialization) -> set[int]:
+    blocks: set[int] = set()
+    for item in envelope.narration_references or []:
+        if not isinstance(item, Mapping):
+            continue
+        index = item.get("block_index")
+        if isinstance(index, int) and not isinstance(index, bool):
+            blocks.add(index)
+    return blocks
+
+
+def _script_checkpoint(envelope: ClipMaterialization) -> Mapping[str, object]:
+    checkpoints = envelope.component_checkpoints
+    if not isinstance(checkpoints, Mapping):
+        return {}
+    entry = checkpoints.get("SCRIPT")
+    return entry if isinstance(entry, Mapping) else {}
+
+
+def _derive_evidence(
+    session: Session, envelope: ClipMaterialization, inputs: MaterializationInputs
+) -> tuple[dict[str, object], bool]:
+    """Derive semantic gates from the persisted authoritative evidence.
+
+    Returns ``(updates, missing)``. ``missing`` is true when required evidence is
+    absent (which must defer), while explicit failures are encoded in the updated
+    flags (which reject). Findings are preserved as explicit evidence.
+    """
+
+    updates: dict[str, object] = {}
+    missing = False
+    findings = _stored_findings(envelope)
+    unmet = {
+        code for finding in findings if finding.level == "UNMET" for code in finding.reason_codes
+    }
+
+    slots = _slot_evidence(session, envelope)
+    updates["required_slots_fulfilled"] = slots.required_slots_fulfilled
+    if slots.missing_resolution:
+        missing = True
+
+    script = _script_checkpoint(envelope)
+    if not script or script.get("status") != "ACCEPTED":
+        missing = True
+    timeline = envelope.timeline_payload if isinstance(envelope.timeline_payload, Mapping) else {}
+    segments = timeline.get("segments")
+    if not isinstance(segments, list) or not segments:
+        missing = True
+
+    narration_required = _narration_required(inputs)
+    narration_gate = narration_required and inputs.profile.narration_allowed
+    updates["required_narration_required"] = narration_gate
+    updates["narration_accepted"] = bool(_narration_blocks(envelope)) or not narration_gate
+    if narration_gate and not _narration_blocks(envelope):
+        missing = True
+
+    updates["profile_mismatch_fields"] = _profile_mismatch_fields(inputs)
+    updates["unsupported_essential"] = REASON_UNSUPPORTED_ESSENTIAL_CLAIM in unmet
+    updates["hero_protected"] = _hero_protected(timeline) and REASON_HERO_DAMAGED not in unmet
+    updates["readable_copy"] = REASON_UNREADABLE_REQUIRED_COPY not in unmet
+    updates["asset_rights_ok"] = REASON_UNSUITABLE_ASSET_RIGHTS not in unmet
+    updates["script_audio_match"] = REASON_SCRIPT_AUDIO_MISMATCH not in unmet
+    updates["final_clip_usable"] = REASON_MANUAL_TRANSCRIPT_REVIEW not in unmet
+    if REASON_INVALID_GROUNDING_REFERENCE in unmet:
+        updates["unsupported_essential"] = True
+    updates["timeline_conflicts"] = tuple(
+        dict(item)
+        for item in (timeline.get("conflicts") or [])
+        if isinstance(item, Mapping)
+    )
+    updates["extra_findings"] = tuple(
+        finding for finding in findings if finding.dimension != "SLOT_FULFILLMENT"
+    )
+    return updates, missing
+
+
+def _build_assessment_context(
+    session: Session,
+    envelope: ClipMaterialization,
+    render: RenderExecution,
+    *,
+    inputs: MaterializationInputs,
+    integrated: float,
+    true_peak: float,
+) -> AssessmentContext:
+    """Rebuild the assessment context from a validated snapshot + real evidence."""
+
+    snapshot = _load_snapshot(envelope)
+    derived, missing = _derive_evidence(session, envelope, inputs)
+    base = snapshot if snapshot is not None else AssessmentContext()
+    # Authoritative persisted evidence always overrides the snapshot: a stored
+    # snapshot may never stand in for a missing/failed required slot or finding.
+    context = replace(base, **derived)
+    if missing:
+        context = replace(context, critical_fidelity_unknown=True)
+
+    qc_status = render.qc_status.value if render.qc_status is not None else None
+    return replace(
+        context,
+        render_complete=True,
+        render_qc_status=qc_status,
+        measured_loudness_lufs=integrated,
+        measured_true_peak_dbtp=true_peak,
+        # Live inputs were just re-derived and matched; this is a real value, not
+        # a constant standing in for unknown evidence.
+        critical_evidence_current=True,
+    )
+
+
+def _hero_protected(timeline: Mapping[str, object]) -> bool:
+    segments = timeline.get("segments")
+    if not isinstance(segments, list):
+        return False
+    return any(
+        isinstance(segment, Mapping) and bool(segment.get("is_hero")) for segment in segments
+    )
+
+
+def _narration_required(inputs: MaterializationInputs) -> bool:
+    need = str(inputs.narration.get("need", "NONE"))
+    return need in {"RECOMMENDED", "REQUIRED"}
+
+
+def _profile_mismatch_fields(inputs: MaterializationInputs) -> tuple[str, ...]:
+    ok, mismatches = semantic_context_matches(inputs.profile, inputs.plan_target_context)
+    return () if ok else mismatches
 
 
 def _as_uuid(value: object) -> uuid.UUID | None:
@@ -442,14 +962,6 @@ def _as_uuid(value: object) -> uuid.UUID | None:
 def _existing_semantic_outcome(envelope: ClipMaterialization, assessed: str) -> str:
     current = envelope.semantic_outcome.value if envelope.semantic_outcome else None
     return current or assessed
-
-
-def _disposition(outcome: str) -> str:
-    if outcome in _REVIEWABLE_OUTCOMES:
-        return FINALIZATION_COMPLETE
-    if outcome in _DEFERRED_OUTCOMES:
-        return FINALIZATION_DEFERRED
-    return FINALIZATION_COMPLETE
 
 
 def _validate_render_binding(
@@ -488,122 +1000,6 @@ def _validate_render_binding(
     if not render.qc_fingerprint:
         return FinalizationResult(FINALIZATION_DEFERRED, (REASON_MISSING_LOUDNESS_EVIDENCE,))
     return None
-
-
-def _build_assessment_context(
-    envelope: ClipMaterialization,
-    render: RenderExecution,
-    integrated: float,
-    true_peak: float,
-) -> AssessmentContext:
-    """Reconstruct the assessment context entirely from stored actual evidence."""
-
-    metrics = envelope.metrics if isinstance(envelope.metrics, dict) else {}
-    snapshot = metrics.get(PRE_RENDER_CONTEXT_METRIC)
-    has_snapshot = isinstance(snapshot, dict)
-    if has_snapshot:
-        context = AssessmentContext.from_dict(snapshot)
-    else:
-        context = AssessmentContext()
-
-    # Never trust default-True fields to stand in for missing evidence: re-derive
-    # the semantic gates from the persisted categorical findings. When a durable
-    # snapshot exists it is authoritative for the semantic flags; the stored
-    # findings are still preserved as explicit evidence either way.
-    context = _apply_stored_evidence(context, envelope, has_snapshot=has_snapshot)
-
-    qc_status = render.qc_status.value if render.qc_status is not None else None
-    return replace(
-        context,
-        render_complete=True,
-        render_qc_status=qc_status,
-        measured_loudness_lufs=integrated,
-        measured_true_peak_dbtp=true_peak,
-        critical_evidence_current=True,
-    )
-
-
-def _apply_stored_evidence(
-    context: AssessmentContext,
-    envelope: ClipMaterialization,
-    *,
-    has_snapshot: bool,
-) -> AssessmentContext:
-    """Re-derive semantic gates from stored findings without erasing evidence.
-
-    A completed technical render must never erase a persisted semantic failure.
-    Stored categorical findings are folded into the context as explicit evidence;
-    the well-known hard-failure findings also pin their corresponding gate so a
-    default-``True`` field can never stand in for missing evidence. Required-slot
-    fulfilment is only derived from stored findings when no authoritative
-    pre-render snapshot exists (otherwise the snapshot wins).
-    """
-
-    updates: dict[str, object] = {}
-    extras = list(context.extra_findings)
-    seen = {(finding.dimension, finding.level, tuple(finding.reason_codes)) for finding in extras}
-    unmet_reasons: set[str] = set()
-
-    for item in envelope.quality_findings or []:
-        if not isinstance(item, Mapping):
-            continue
-        dimension = str(item.get("dimension") or "")
-        level = str(item.get("level") or "")
-        if not dimension or not level:
-            continue
-        reason_tuple = _reason_tuple(item)
-        if level == "UNMET":
-            unmet_reasons.update(reason_tuple)
-
-        if dimension == "SLOT_FULFILLMENT":
-            # Required-slot truth is authoritative from the snapshot/slot
-            # resolution; an optional/declined empty block must not be promoted
-            # to a missing required value here.
-            if not has_snapshot and level == "UNMET":
-                updates["required_slots_fulfilled"] = False
-            continue
-
-        key = (dimension, level, reason_tuple)
-        if key in seen:
-            continue
-        seen.add(key)
-        extras.append(
-            QualityFinding(
-                dimension=dimension,
-                level=level,
-                reason_codes=reason_tuple,
-                evidence=dict(item.get("evidence") or {}),
-            )
-        )
-
-    if REASON_UNSUPPORTED_ESSENTIAL_CLAIM in unmet_reasons or (
-        REASON_INVALID_GROUNDING_REFERENCE in unmet_reasons
-    ):
-        updates["unsupported_essential"] = True
-    if REASON_HERO_DAMAGED in unmet_reasons:
-        updates["hero_protected"] = False
-    if REASON_UNREADABLE_REQUIRED_COPY in unmet_reasons:
-        updates["readable_copy"] = False
-    if REASON_UNSUITABLE_ASSET_RIGHTS in unmet_reasons:
-        updates["asset_rights_ok"] = False
-    if REASON_SCRIPT_AUDIO_MISMATCH in unmet_reasons:
-        updates["script_audio_match"] = False
-    if REASON_MANUAL_TRANSCRIPT_REVIEW in unmet_reasons:
-        updates["final_clip_usable"] = False
-    if REASON_MISSING_REQUIRED_NARRATION in unmet_reasons:
-        updates["required_slots_fulfilled"] = False
-        updates["narration_accepted"] = False
-    if REASON_PROFILE_CONTEXT_MISMATCH in unmet_reasons and not context.profile_mismatch_fields:
-        updates["profile_mismatch_fields"] = ("stored",)
-    if REASON_STALE_CRITICAL_EVIDENCE in unmet_reasons and has_snapshot:
-        updates["critical_evidence_current"] = False
-
-    if extras:
-        updates["extra_findings"] = tuple(extras)
-
-    if not updates:
-        return context
-    return replace(context, **updates)
 
 
 def _reason_tuple(entry: Mapping[str, object]) -> tuple[str, ...]:

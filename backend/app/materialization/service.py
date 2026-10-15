@@ -64,6 +64,10 @@ from app.materialization.providers import (
     MaterializationWritingProvider,
     materialize_script,
 )
+from app.materialization.repository import (
+    PRE_RENDER_CONTEXT_METRIC,
+    PRE_RENDER_CONTEXT_VERSION,
+)
 from app.materialization.scripting import (
     all_required_slots_fulfilled,
     resolve_slots,
@@ -965,13 +969,14 @@ def persist_materialization(
         "supporting_requested": inputs.supporting_requested,
     }
     row.input_fingerprint = input_fp
-    row.output_fingerprint = output_fingerprint(
+    output_fp = output_fingerprint(
         inputs,
         script_fp=_checkpoint_fingerprint(result.component_checkpoints, "SCRIPT"),
         narration_fp=_checkpoint_fingerprint(result.component_checkpoints, "NARRATION"),
         supporting_fp=_checkpoint_fingerprint(result.component_checkpoints, "SUPPORTING"),
         timeline_fp=_checkpoint_fingerprint(result.component_checkpoints, "TIMELINE"),
     )
+    row.output_fingerprint = output_fp
     row.component_checkpoints = dict(result.component_checkpoints)
     row.call_ledger = _merge_call_ledger(preserved_ledger, result.ledger)
     row.authored_blocks = [block.as_dict() for block in result.script.authored_blocks]
@@ -991,6 +996,11 @@ def persist_materialization(
         "segments": len(result.timeline.segments),
         "output_duration": round(result.timeline.output_duration, 6),
         "removals": [dict(item) for item in result.removals],
+        PRE_RENDER_CONTEXT_METRIC: {
+            "version": PRE_RENDER_CONTEXT_VERSION,
+            "materialization_output_fingerprint": output_fp,
+            "context": dict(result.assessment_context),
+        },
     }
     row.policy_version = STAGE6_POLICY_VERSION
     row.schema_version = STAGE6_SCHEMA_VERSION
