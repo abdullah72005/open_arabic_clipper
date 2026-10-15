@@ -80,12 +80,20 @@ class Stage50Fixture:
     settings: Any
 
 
-def managed_source(source: Any, *, size: int = 2048) -> tuple[StorageService, Path]:
+def managed_source(
+    source: Any, *, size: int = 2048, media_writer: Any | None = None
+) -> tuple[StorageService, Path]:
     settings = get_settings()
     storage = StorageService(settings.storage_root)
     directory = storage.source_directory(source.id)
     path = directory / "source.mp4"
-    path.write_bytes(b"\x00" * size)
+    if media_writer is not None:
+        # A narrow test-fixture media factory: create real media *before* the
+        # contract/composition/fingerprints are established, so the source is
+        # never replaced after media identity was fingerprinted.
+        media_writer(path)
+    else:
+        path.write_bytes(b"\x00" * size)
     source.source_uri = str(path)
     return storage, path
 
@@ -104,6 +112,7 @@ def seed_stage50(
     settings: Any = None,
     source_only: bool = False,
     first_provider_plan_factory: Any | None = None,
+    media_writer: Any | None = None,
 ) -> Stage50Fixture:
     specs = result_specs or [make_result_spec()]
     fixture = seed_selection_fixture(
@@ -124,7 +133,7 @@ def seed_stage50(
     storage = StorageService(get_settings().storage_root)
     source_path = Path()
     if create_media:
-        storage, source_path = managed_source(fixture.source)
+        storage, source_path = managed_source(fixture.source, media_writer=media_writer)
         session.flush()
     view = select_transformation_plan(session, fixture.candidate.id)
     assert view is not None

@@ -385,6 +385,7 @@ class MaterializationExecutor:
         request_identity = {
             "priority": priority,
             "profile_key": inputs.profile.profile_key,
+            "requested_profile_key": profile_key,
             "supporting_requested": supporting_requested,
         }
         envelope = get_or_create_envelope(self._session, inputs, request_identity)
@@ -567,12 +568,21 @@ class MaterializationExecutor:
             self._session.commit()
             self._job_owner = False
 
+            # The commit used synchronize_session=False and the production session
+            # has expire_on_commit=False, so re-read the envelope freshly before
+            # deciding whether to dispatch the render handoff.
+            envelope = self._session.get(
+                ClipMaterialization, owner.materialization_id, populate_existing=True
+            )
+            if envelope is None:
+                return StageExecutionResult(prepared.output_fingerprint, None)
+
             # Render handoff: a renderable outcome dispatches the existing
             # TRANSFORMED_SHORT renderer for this exact revision. A non-renderable
             # outcome never dispatches. Broker failure is recoverable through
             # POST/resume; the durable AWAITING_RENDER + binding is the marker.
             if (
-                prepared.lifecycle is MaterializationLifecycle.AWAITING_RENDER
+                envelope.lifecycle is MaterializationLifecycle.AWAITING_RENDER
                 and envelope.output_fingerprint
             ):
                 try:
@@ -586,6 +596,7 @@ class MaterializationExecutor:
                         storage=self._storage,
                         dispatcher=self._render_dispatcher,
                     )
+                    self._session.commit()
                 except Exception:
                     self._session.rollback()
             return StageExecutionResult(prepared.output_fingerprint, envelope)
