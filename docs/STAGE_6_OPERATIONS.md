@@ -1,13 +1,36 @@
 # Stage 6 transformed-short materialization operations
 
 Status: **IN PROGRESS.** The durable persistence, the deterministic
-materialization core, and the candidate-scoped queue/executor/worker/API/CLI are
-implemented and tested (the executor assembles inputs through genuine persisted
-ORM relationships and persists a fenced current row). The Stage 5.2
-`TRANSFORMED_SHORT` authored renderer, the idempotent finalizer, the semantic/TTS
-provider adapters, the review UI integration, and real manual acceptance are not
-yet implemented. Stage 6 remains awaiting human media review and SOL review; it
-is not frozen.
+materialization core, the candidate-scoped queue/executor/worker, the Stage 5.2
+`TRANSFORMED_SHORT` authored renderer, the idempotent finalizer, the hosted
+Gemini writing/critique adapter, the Gemini TTS adapter with separately
+checkpointed local ASR fidelity validation, the bounded voice audition, and the
+read-only acceptance exporter are implemented and tested. The remaining work is
+the candidate API/CLI review surface completion (Produce/Results UI parity),
+real manual acceptance over authorized source media, and the human media review.
+Stage 6 remains awaiting human media review and SOL review; it is not frozen.
+
+## Stage 6 CLI commands
+
+```bash
+# Queue / resume / cancel one candidate-scoped generation.
+python -m app.cli materialize <candidate-id> [--priority CANDIDATE] [--profile-key K] [--supporting OFF]
+python -m app.cli materialization-resume <candidate-id> [--profile-key K]
+python -m app.cli materialization-cancel <candidate-id>
+python -m app.cli materialization-status <candidate-id>
+
+# Import a strict JSON production profile (new current revision per channel_key).
+python -m app.cli production-profile-import path/to/profile.json
+
+# Read-only exports (never fabricate eligibility).
+python -m app.cli stage6-acceptance-export [--discover] [--limit 4] [--materialization-id ID ...]
+python -m app.cli stage6-tts-audition                      # 3 voices x 3 scripts, <=9 calls
+```
+
+An omitted `--profile-key` (and an omitted API `profile_key`) resolves to the
+current `channel_key='default'` profile when one exists, otherwise to the neutral
+no-voice profile. `stage6-tts-audition` makes zero live calls without a configured
+`GEMINI_API_KEY` and reports that honestly.
 
 ## Objective and ownership
 
@@ -85,6 +108,12 @@ social-account management). It carries a stable `channel_key` and `revision`
 settings and are never stored on the profile. Neutral defaults are
 `UNSPECIFIED` / `SOURCE_LANGUAGE` / `SOURCE_COMPATIBLE`.
 
+The optional `tts_settings["narration_gain_db"]` requests a bounded constant gain
+for every narration placement in the final mix (clamped to `-12..+6 dB` by
+`policy.narration_gain_db`; neutral default `0.0`). It participates in the audio
+recipe and output fingerprint, and is applied by the frozen renderer as an
+explicit `volume=<gain>dB` gain point on the narration track.
+
 ## Prerequisite follow-ups (completed)
 
 - Production transcription configuration defaulted to `v1` and overrode the
@@ -103,25 +132,55 @@ settings and are never stored on the profile. Neutral defaults are
   restores a previously cleared revision. Policy/validation advanced to
   `stage4.2-v8`.
 
+## Hosted adapters
+
+- `gemini.py`: `GeminiWritingProvider` and `GeminiCritiqueProvider` execute exactly
+  one `generateContent` request per invocation (the durable gateway reserves the
+  attempt first), v1, temperature 0, routine `gemini-3.5-flash-lite` / strong
+  `gemini-3.8-flash` (low thinking), strict structured-output schemas with closed
+  enums, and disabled SDK retries. A 429/quota/refusal/malformed/timeout outcome
+  is returned as a truthful *deferred* result, never raised into the pipeline.
+- The script critique is categorical per block (grounding/entailment, substantive
+  added value, semantic fidelity, unsupported facts, code-switch preservation,
+  redundancy, dialect/register fit, naturalness, length/necessity). Acceptance
+  requires a *known positive* grounding and added-value verdict plus no critical
+  concern/failure; a favorable critique never clears a deterministic UNMET finding.
+- `tts_gemini.py`: `GeminiNarrationSynthesizer` uses the Interactions API
+  (`v1beta`, model `gemini-3.8-flash-tts`) with verbatim input, a `speech_metadata`
+  style annotation, and a `speech_config` voice; it honors the returned MIME (a
+  WAV is saved as-is; headerless `audio/l16` is wrapped exactly once). Accepted
+  audio is written as immutable lossless bytes through StorageService.
+- Local fidelity validation (`validate_narration_fidelity`) is a *separate*
+  checkpoint: it transcribes the synthesized WAV with the leased faster-whisper
+  engine and applies the strict order/occurrence-, negation-, number-, and
+  code-switch-aware comparison. Unknown/empty fidelity defers; a clear meaning
+  mismatch rejects.
+- `tts_audition.py` / `stage6-tts-audition`: exactly three prebuilt voices
+  (Charon, Kore, Achird) × three fixed scripts (Egyptian conversational,
+  Arabic-English code switching, English), at most nine raw synthesis calls, no
+  automatic retries, cached by request identity. The result proposes one
+  technically viable PROVISIONAL voice; human quality approval is still required.
+- `acceptance_export.py` / `stage6-acceptance-export`: read-only assembly of the
+  exact persisted lineage (MP4, index, ASS, timeline, audio recipe, QC/assessment,
+  provider attempts and repair usage, SHA-256 manifest). It never fabricates
+  rights, governance, speech, or eligibility.
+
 ## Remaining work (explicit)
 
-- Semantic writing/critique provider adapter and the Gemini TTS adapter, with
-  shared admission, bounded raw-call accounting, and fake-transport tests.
-- The DB-assembly service, `MATERIALIZATION` queue/executor, `RENDER_EXECUTION`
-  `TRANSFORMED_SHORT` handoff, idempotent Stage 6 finalizer, fencing,
-  cancellation, and resume.
-- Reusable-renderer extension for authored cards/output overlays, mixed segment
-  assembly, explicit audio tracks/gain envelopes, final mix
-  measurement/mastering, and final-purpose QC (authored sections, source
-  synchronization, caption/audio coverage).
-- Candidate-scoped API (`POST/GET /api/candidates/{id}/materializations`,
-  `GET /api/materializations/{id}`, cancel, artifact), CLI, and the Produce /
-  Results UI changes.
-- Real manual acceptance (approximately three clips, maximum four) with the
-  fail-closed provenance and exact-currentness principles reused from Stage 5.2.
+- Candidate-scoped API completeness: a GET profile-key query parameter matching
+  POST resolution, and richer response types (separate lifecycle/semantic/live
+  freshness, component progress, exact render binding, findings). The singular
+  candidate route, `materialize`/`materialization-status`, resume, cancel, and the
+  artifact identity contract already exist.
+- Produce/Results UI parity: polling materialize → render → finalize for one
+  selected candidate, cancel-before-stop, and clearly distinguishing core
+  validation from transformed media. No automatic publication approval.
+- Real manual acceptance (approximately three clips, maximum four) over authorized
+  source media, and the human media review. No authorized source media is
+  configured in this environment and no hosted provider key is present, so no
+  genuine `MANUAL CHECK REQUIRED NOW` artifact exists.
 
-Until those exist, no transformed-short MP4 can be produced and no acceptance
-claim is made.
+Until a genuine manual-acceptance run exists, no acceptance claim is made.
 
 ## Verification
 
