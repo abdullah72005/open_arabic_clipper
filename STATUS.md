@@ -1,5 +1,64 @@
 # Runtime status
 
+## Stage 6 authored renderer defects fixed + production-path integration (2026-10-15)
+
+Status: **the four renderer defects SOL reproduced are fixed with regressions,
+and the persisted materialization now maps to a typed TRANSFORMED_SHORT render
+request that compiles and runs through the frozen renderer with a two-phase
+lossless mastering path and purpose-aware QC. A transformed render dispatch
+helper and an idempotent finalizer exist and are tested. The automatic
+dispatch/callback chain inside the worker, hosted scripting/critique (Task 6),
+TTS/narration (Task 7), the candidate API/CLI/UI completion (Task 8), and the
+genuine manual-acceptance package (Task 9) are NOT done. No production-path
+transformed MP4 and no manual-acceptance artifact exist. Stage 6 is NOT FROZEN.**
+
+- **Renderer defects (`a181277`).** (1) `TRANSFORMED_SHORT` fails closed without
+  an authored payload in validation, `compile_render`, and the render
+  queue/service; a core purpose with an authored payload is rejected. (2)
+  `compile_authored_render` executes *every* accepted SOURCE scene in source
+  order (framed/captioned in source time like the frozen core compiler),
+  validates unit/occurrence/frame mappings, and requires full hero coverage. (3)
+  The complete audio recipe is executed: all gain points (explicit ramps),
+  per-interval conform to authoritative samples, sample-based `adelay`
+  placement, `asplit` for repeated inputs. (4) Two-phase lossless mastering
+  (`render/execution/audio.py`): mix -> `loudnorm` measurement -> feasible
+  linear mastering -> lossless PCM master -> one H.264/AAC encode, all under one
+  shared deadline; partial measurements attach to pre-encode failures. Purpose
+  is threaded through render queue cache/envelope lookups so a transformed row
+  never demotes a coexisting core row. The synthetic audio recipe is corrected
+  (source 0-3, narration 3-4, source 4-7).
+- **Persisted integration (`48e7915`).** `materialization/rendering.py`
+  (`build_transformed_render_spec`) maps the accepted persisted timeline/audio
+  recipe to a `TRANSFORMED_SHORT` request bound to the exact materialization
+  id/output fingerprint, builds and stores the authored ASS in output time, and
+  emits SOURCE/CARD units plus source/narration tracks and mastering. The render
+  queue/service/executor load the exact bound materialization (never the newest
+  row), persist `materialization_id`/`expected_output_fingerprint`, set
+  `stage6_implemented` only on the transformed path, and verify/localize the
+  authored ASS bytes.
+- **Purpose-aware QC (`b02d9f3`).** Authored output samples intentional card
+  intervals and requires real decoded integrated loudness and true-peak evidence
+  from the final AAC; a missing measurement is a hard failure. Core QC is
+  unchanged.
+- **Dispatch/finalizer (`c6f63af`).** `dispatch_transformed_render` binds a
+  `TRANSFORMED_SHORT` render to the exact materialization through the existing
+  render queue; `finalize_materialization` rebuilds assessment from stored render
+  evidence and is an idempotent no-op on replay (`publication_ready=false`).
+- **Verification evidence.** Docker Python 3.12.14 + PostgreSQL 16: `pytest -k
+  "stage6 or stage52"` -> `255 passed, 27 skipped`; `pytest -k stage6` -> `139
+  passed, 11 skipped`; `pytest -k stage52` -> `117 passed, 16 skipped`;
+  `pytest tests/test_stage6_authored_render.py` and
+  `tests/test_stage6_vertical_slice.py` pass with real FFmpeg. `ruff` clean on
+  the changed modules; `mypy` clean on `app/materialization/rendering.py`,
+  `finalization.py`, and the changed `app/render/execution` modules (the wider
+  `app` tree has pre-existing mypy findings unrelated to this work). No hosted
+  provider call or manual-acceptance artifact was produced.
+- **Remaining blockers.** Automatic dispatch from the materialization executor
+  and the render-completion callback that requests the finalization job; hosted
+  grounded scripting/critique; optional TTS + local fidelity validation + a
+  provisional channel voice; candidate API/CLI/UI completion; genuine manual
+  acceptance over authorized source media.
+
 ## Stage 6 session/ownership corrections + authored renderer (2026-10-15)
 
 Status: **the four SOL PostgreSQL-probe corrections are fixed with regressions,

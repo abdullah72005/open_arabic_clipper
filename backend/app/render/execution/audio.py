@@ -19,7 +19,7 @@ import math
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from app.render.execution.policy import (
     AUDIO_MASTERING_INFEASIBLE,
@@ -27,9 +27,6 @@ from app.render.execution.policy import (
     AUDIO_PEAK_REPAIR_NEEDED,
     AUTHORED_AUDIO_RECIPE_UNSUPPORTED,
 )
-
-if TYPE_CHECKING:
-    from app.render.execution.authored import MasteringSpec
 
 UNMASTERED_RELATIVE_NAME = "mix-unmastered.wav"
 MASTER_RELATIVE_NAME = "mix-master.wav"
