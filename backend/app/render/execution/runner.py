@@ -206,7 +206,9 @@ def _prepare_authored_audio(
     """
 
     from app.render.execution.audio import (
+        LIMITED_RELATIVE_NAME,
         AudioPreparationError,
+        build_limit_argv,
         build_master_argv,
         build_measure_argv,
         measurement_or_fail,
@@ -244,6 +246,43 @@ def _prepare_authored_audio(
     try:
         measurement = measurement_or_fail(stderr)
         partial["mix_measurement"] = measurement.as_dict()
+    except AudioPreparationError as error:
+        raise RenderProcessError(error.reason_code, error.detail, manifest=partial) from error
+
+    # One authorized bounded peak-limiter repair may be applied before the final
+    # linear mastering; it starts from the lossless unmastered mix and is
+    # re-measured so the mastering decision uses the actual limited signal.
+    if float(getattr(plan.mastering, "repair_peak_limit_db", 0.0) or 0.0) > 0.0:
+        _checkpoint(deadline, context)
+        limited = str(attempt_directory / LIMITED_RELATIVE_NAME)
+        code, stderr = _run_process_group(
+            build_limit_argv(binary, unmastered, limited, measurement, plan.mastering),
+            attempt_directory,
+            context,
+            deadline,
+            poll,
+        )
+        if code != 0:
+            raise RenderProcessError(
+                "RENDER_PROCESS_FAILED", stderr[-2048:], manifest={"phase": "LIMIT", **partial}
+            )
+        unmastered = limited
+        partial["peak_limit_applied"] = True
+        _checkpoint(deadline, context)
+        code, stderr = _run_process_group(
+            build_measure_argv(binary, unmastered, plan.mastering),
+            attempt_directory,
+            context,
+            deadline,
+            poll,
+        )
+        try:
+            measurement = measurement_or_fail(stderr)
+            partial["limited_measurement"] = measurement.as_dict()
+        except AudioPreparationError as error:
+            raise RenderProcessError(error.reason_code, error.detail, manifest=partial) from error
+
+    try:
         decision = select_mastering(measurement, plan.mastering)
         partial["mastering_decision"] = decision.as_dict()
         reject_decision(decision)

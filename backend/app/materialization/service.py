@@ -141,6 +141,7 @@ class MaterializationResult:
     upstream_snapshot: dict[str, object] = field(default_factory=dict)
     timeline_conflicts: tuple[Mapping[str, object], ...] = ()
     removals: tuple[Mapping[str, object], ...] = ()
+    assessment_context: Mapping[str, object] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -655,6 +656,12 @@ def assemble_result(
         audio_conflicts=audio_conflicts,
         critical_evidence_current=True,
         render_complete=False,
+        # Required-slot fulfilment is authoritative from ``slot_resolutions``;
+        # the per-block SLOT_FULFILLMENT finding must not double-count an
+        # optional/declined block as a missing required value.
+        extra_findings=tuple(
+            finding for finding in script.findings if finding.dimension != "SLOT_FULFILLMENT"
+        ),
     )
     assessment = assess_materialization(
         context, output_duration=build.timeline.output_duration, config=config
@@ -677,6 +684,7 @@ def assemble_result(
         reason_codes=reasons,
         timeline_conflicts=build.conflicts,
         removals=build.removals,
+        assessment_context=context.as_dict(),
     )
 
 

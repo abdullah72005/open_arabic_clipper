@@ -67,6 +67,108 @@ class AssessmentContext:
     repair_count: int = 0
     extra_findings: tuple[QualityFinding, ...] = field(default_factory=tuple)
 
+    def as_dict(self) -> dict[str, object]:
+        """Serializable snapshot for durable persistence and later re-assessment."""
+
+        return {
+            "profile_mismatch_fields": list(self.profile_mismatch_fields),
+            "required_slots_fulfilled": self.required_slots_fulfilled,
+            "required_narration_required": self.required_narration_required,
+            "narration_accepted": self.narration_accepted,
+            "tts_available": self.tts_available,
+            "provider_deferred": self.provider_deferred,
+            "unsupported_essential": self.unsupported_essential,
+            "hero_protected": self.hero_protected,
+            "timeline_conflicts": [dict(item) for item in self.timeline_conflicts],
+            "audio_conflicts": [dict(item) for item in self.audio_conflicts],
+            "asset_rights_ok": self.asset_rights_ok,
+            "script_audio_match": self.script_audio_match,
+            "readable_copy": self.readable_copy,
+            "final_clip_usable": self.final_clip_usable,
+            "render_qc_status": self.render_qc_status,
+            "render_qc_findings": [dict(item) for item in self.render_qc_findings],
+            "measured_loudness_lufs": self.measured_loudness_lufs,
+            "measured_true_peak_dbtp": self.measured_true_peak_dbtp,
+            "critical_evidence_current": self.critical_evidence_current,
+            "critical_fidelity_unknown": self.critical_fidelity_unknown,
+            "render_complete": self.render_complete,
+            "repair_count": self.repair_count,
+            "extra_findings": [finding.as_dict() for finding in self.extra_findings],
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, object] | None) -> "AssessmentContext":
+        """Rebuild a context from a persisted snapshot (tolerant of older rows)."""
+
+        if not isinstance(data, Mapping):
+            return cls()
+
+        def _bool(key: str, default: bool) -> bool:
+            value = data.get(key, default)
+            return value if isinstance(value, bool) else default
+
+        def _mapping_tuple(key: str) -> tuple[Mapping[str, object], ...]:
+            raw = data.get(key)
+            if not isinstance(raw, list):
+                return ()
+            return tuple(dict(item) for item in raw if isinstance(item, Mapping))
+
+        def _optional_float(value: object) -> float | None:
+            if isinstance(value, bool):
+                return None
+            if isinstance(value, (int, float)):
+                return float(value)
+            return None
+
+        raw_fields = data.get("profile_mismatch_fields")
+        profile_fields = (
+            tuple(str(item) for item in raw_fields if isinstance(item, str))
+            if isinstance(raw_fields, list)
+            else ()
+        )
+        qc_status = data.get("render_qc_status")
+        raw_findings = data.get("extra_findings")
+        extra: tuple[QualityFinding, ...] = ()
+        if isinstance(raw_findings, list):
+            extra = tuple(
+                QualityFinding(
+                    dimension=str(item.get("dimension", "")),
+                    level=str(item.get("level", "")),
+                    reason_codes=tuple(str(code) for code in (item.get("reason_codes") or [])),
+                    evidence=dict(item.get("evidence") or {}),
+                )
+                for item in raw_findings
+                if isinstance(item, Mapping)
+            )
+        repair = data.get("repair_count", 0)
+        return cls(
+            profile_mismatch_fields=profile_fields,
+            required_slots_fulfilled=_bool("required_slots_fulfilled", True),
+            required_narration_required=_bool("required_narration_required", False),
+            narration_accepted=_bool("narration_accepted", True),
+            tts_available=_bool("tts_available", True),
+            provider_deferred=_bool("provider_deferred", False),
+            unsupported_essential=_bool("unsupported_essential", False),
+            hero_protected=_bool("hero_protected", True),
+            timeline_conflicts=_mapping_tuple("timeline_conflicts"),
+            audio_conflicts=_mapping_tuple("audio_conflicts"),
+            asset_rights_ok=_bool("asset_rights_ok", True),
+            script_audio_match=_bool("script_audio_match", True),
+            readable_copy=_bool("readable_copy", True),
+            final_clip_usable=_bool("final_clip_usable", True),
+            render_qc_status=qc_status if isinstance(qc_status, str) else None,
+            render_qc_findings=_mapping_tuple("render_qc_findings"),
+            measured_loudness_lufs=_optional_float(data.get("measured_loudness_lufs")),
+            measured_true_peak_dbtp=_optional_float(data.get("measured_true_peak_dbtp")),
+            critical_evidence_current=_bool("critical_evidence_current", True),
+            critical_fidelity_unknown=_bool("critical_fidelity_unknown", False),
+            render_complete=_bool("render_complete", True),
+            repair_count=(
+                int(repair) if isinstance(repair, int) and not isinstance(repair, bool) else 0
+            ),
+            extra_findings=extra,
+        )
+
 
 def _finite(value: float | None) -> bool:
     if value is None:

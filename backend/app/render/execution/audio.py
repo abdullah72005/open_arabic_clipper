@@ -29,9 +29,16 @@ from app.render.execution.policy import (
 )
 
 UNMASTERED_RELATIVE_NAME = "mix-unmastered.wav"
+LIMITED_RELATIVE_NAME = "mix-limited.wav"
 MASTER_RELATIVE_NAME = "mix-master.wav"
 MASTER_MIX_FILTERGRAPH_NAME = "authored-mix-filtergraph.txt"
 AUDIO_SAMPLE_FORMAT = "pcm_f32le"
+
+#: Bounded peak-limiter repair policy (milliseconds / dB), versioned.
+LIMITER_ATTACK_MS = 5.0
+LIMITER_RELEASE_MS = 50.0
+LIMITER_MAX_REDUCTION_DB = 3.0
+LIMITER_OVERSAMPLE_RATE = 192_000
 
 #: The measured input LRA is preserved with this bounded, versioned LRA target.
 _LOUDNORM_LRA_MIN = 1.0
@@ -286,6 +293,57 @@ def build_master_argv(
     ]
 
 
+def limiter_threshold_dbtp(measurement: LoudnessMeasurement, reduction_db: float) -> float:
+    """Compute the bounded limiter threshold from measured peak + reduction."""
+
+    bounded = min(LIMITER_MAX_REDUCTION_DB, max(0.0, float(reduction_db)))
+    return measurement.input_tp - bounded
+
+
+def build_limit_argv(
+    binary: str,
+    unmastered_path: str,
+    limited_path: str,
+    measurement: LoudnessMeasurement,
+    mastering: Any,
+) -> list[str]:
+    """Bounded peak-limiter pass (one authorized repair), oversampled and lossless.
+
+    Uses ``alimiter`` with automatic make-up *disabled* (``level=false``) and
+    latency compensation enabled, at an oversampled rate, returning to 48 kHz.
+    No dynamic loudnorm fallback is ever introduced here.
+    """
+
+    reduction = float(getattr(mastering, "repair_peak_limit_db", 0.0) or 0.0)
+    threshold = limiter_threshold_dbtp(measurement, reduction)
+    limit_linear = 10 ** (threshold / 20.0)
+    filter_expr = (
+        f"aresample={LIMITER_OVERSAMPLE_RATE},"
+        f"alimiter=level=false:limit={_num(limit_linear)}:"
+        f"attack={_num(LIMITER_ATTACK_MS)}:release={_num(LIMITER_RELEASE_MS)}:latency=true,"
+        f"aresample=48000"
+    )
+    return [
+        binary,
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "info",
+        "-i",
+        unmastered_path,
+        "-af",
+        filter_expr,
+        "-ar",
+        "48000",
+        "-ac",
+        "2",
+        "-c:a",
+        AUDIO_SAMPLE_FORMAT,
+        "-y",
+        limited_path,
+    ]
+
+
 def verify_linear_mastering(master_stderr: str) -> None:
     """Fail closed unless the mastering pass reported a genuinely linear mode."""
 
@@ -320,13 +378,20 @@ __all__ = [
     "AUDIO_SAMPLE_FORMAT",
     "AudioPreparationError",
     "AudioPreparationPlan",
+    "LIMITED_RELATIVE_NAME",
+    "LIMITER_ATTACK_MS",
+    "LIMITER_MAX_REDUCTION_DB",
+    "LIMITER_OVERSAMPLE_RATE",
+    "LIMITER_RELEASE_MS",
     "LoudnessMeasurement",
     "MASTER_MIX_FILTERGRAPH_NAME",
     "MASTER_RELATIVE_NAME",
     "MasteringDecision",
     "UNMASTERED_RELATIVE_NAME",
+    "build_limit_argv",
     "build_master_argv",
     "build_measure_argv",
+    "limiter_threshold_dbtp",
     "measurement_or_fail",
     "parse_loudnorm_output",
     "reject_decision",

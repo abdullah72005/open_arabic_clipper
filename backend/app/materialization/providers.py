@@ -29,7 +29,7 @@ from app.materialization.policy import (
     Stage6Config,
 )
 from app.materialization.scripting import resolve_grounding, validate_authored_block
-from app.materialization.types import AuthoredBlock, GroundingRef
+from app.materialization.types import AuthoredBlock, GroundingRef, QualityFinding
 
 _SUBSTANTIVE_BLOCK_TYPES = frozenset({"ORIGINAL_VALUE", "TEXTUAL_ANNOTATION"})
 
@@ -332,6 +332,7 @@ class MaterializationScript:
     provider_identity: Mapping[str, object]
     deferred: bool
     reason_codes: tuple[str, ...]
+    findings: tuple[QualityFinding, ...] = ()
 
 
 def materialize_script(
@@ -388,6 +389,7 @@ def materialize_script(
     authored: list[AuthoredBlock] = []
     review_targets: list[CritiqueTarget] = []
     reasons: list[str] = []
+    findings_by_block: dict[int, list[QualityFinding]] = {}
     accepted_indexes: dict[int, bool] = {}
     for target in request.targets:
         copy = result.copies.get(target.block_index, "")
@@ -400,6 +402,7 @@ def materialize_script(
             "verification_dependency_id": target.verification_dependency_id,
         }
         validation = validate_authored_block(block_payload, inputs, config)
+        findings_by_block[target.block_index] = list(validation.findings)
         for finding in validation.findings:
             reasons.extend(finding.reason_codes)
         if validation.accepted:
@@ -432,6 +435,7 @@ def materialize_script(
                 identity,
                 True,
                 ("GROUNDED_INFERENCE_REQUIRES_REVIEW",),
+                _unresolved_findings(findings_by_block, {}),
             )
         accepted_indexes.update(reviewed)
 
@@ -458,7 +462,27 @@ def materialize_script(
         provider_identity=result.provider_identity,
         deferred=False,
         reason_codes=tuple(dict.fromkeys(reasons)),
+        findings=_unresolved_findings(findings_by_block, accepted_indexes),
     )
+
+
+def _unresolved_findings(
+    findings_by_block: Mapping[int, list[QualityFinding]],
+    accepted_indexes: Mapping[int, bool],
+) -> tuple[QualityFinding, ...]:
+    """Findings that remain for blocks that were not ultimately accepted.
+
+    A deterministic/grounded-inference concern that a bounded semantic critique
+    later cleared must not linger as an unresolved concern in the accepted
+    materialization; the block's acceptance is the resolution.
+    """
+
+    unresolved: list[QualityFinding] = []
+    for index, findings in findings_by_block.items():
+        if accepted_indexes.get(index, False):
+            continue
+        unresolved.extend(findings)
+    return tuple(unresolved)
 
 
 def _run_critique(

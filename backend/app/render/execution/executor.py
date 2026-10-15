@@ -13,10 +13,12 @@ child is reaped on every exit path.
 
 from __future__ import annotations
 
+import hashlib
 import threading
 import time
 import uuid
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
 
@@ -443,6 +445,18 @@ class RenderExecutionExecutor:
             source_absolute_path=source_absolute,
             attempt_directory=str(attempt_directory),
         )
+        # Localize every referenced authored asset through StorageService: verify
+        # its immutable identity/hash and copy it to a controlled attempt-local
+        # name. The compiler only ever sees allow-listed localized filenames, so a
+        # provider path, URL, traversal, or mutable same-path replacement can
+        # never reach FFmpeg.
+        if getattr(spec, "authored", None) is not None:
+            runtime = replace(
+                runtime,
+                asset_localized_paths=localize_authored_assets(
+                    self._storage, spec.authored, attempt_directory
+                ),
+            )
         try:
             compiled = self._compiler(spec, runtime)
         except Exception as error:  # noqa: BLE001
@@ -859,6 +873,48 @@ class RenderExecutionExecutor:
         self._fail(row, getattr(error, "reason_code", "RENDER_PROCESS_FAILED"))
 
 
+def localize_authored_assets(
+    storage: StorageService, payload: Any, attempt_directory: Path
+) -> dict[str, str]:
+    """Verify and localize every referenced authored (non-source) asset.
+
+    Returns an ``asset_id -> filename`` map of controlled, attempt-local copies
+    inside ``attempt_directory``. Each asset's byte hash and declared size are
+    verified against its immutable managed storage identity; no provider path,
+    URL, traversal, or symlink escape is accepted. Used by
+    :class:`RenderExecutionExecutor` on the production runtime factory.
+    """
+
+    mapping: dict[str, str] = {}
+    attempt_directory.mkdir(parents=True, exist_ok=True)
+    for asset in payload.assets:
+        if asset.role == "SOURCE_VIDEO":
+            continue
+        source = (storage.storage_root / asset.storage_relative_path).resolve()
+        try:
+            source.relative_to(storage.storage_root)
+        except ValueError as error:
+            raise RenderExecutionError("ASSET_PATH_INVALID") from error
+        if not source.is_file():
+            raise RenderExecutionError("ASSET_MISSING")
+        data = source.read_bytes()
+        if not asset.sha256 or hashlib.sha256(data).hexdigest() != asset.sha256.lower():
+            raise RenderExecutionError("ASSET_HASH_MISMATCH")
+        if asset.size_bytes and len(data) != asset.size_bytes:
+            raise RenderExecutionError("ASSET_SIZE_MISMATCH")
+        safe_id = "".join(
+            character if character.isalnum() or character in "-_" else "_"
+            for character in asset.asset_id
+        )
+        suffix = source.suffix.lower()
+        if not suffix or len(suffix) > 8 or not suffix[1:].isalnum():
+            suffix = ".bin"
+        name = f"asset-{safe_id}{suffix}"
+        (attempt_directory / name).write_bytes(data)
+        mapping[asset.asset_id] = name
+    return mapping
+
+
 def _as_uuid(value: uuid.UUID | str) -> uuid.UUID:
     if isinstance(value, uuid.UUID):
         return value
@@ -896,4 +952,5 @@ __all__ = [
     "RenderAdmissionUnavailable",
     "RenderExecutionExecutor",
     "build_render_execution_executor",
+    "localize_authored_assets",
 ]

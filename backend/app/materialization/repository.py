@@ -38,6 +38,10 @@ from app.models import ClipMaterialization, ProcessingJob
 
 ATTEMPT_LEDGER_VERSION = "stage6-attempts-v2"
 
+#: Durable metric key holding the serialized pre-render :class:`AssessmentContext`
+#: so the finalizer can reconstruct the semantic gates from stored evidence.
+PRE_RENDER_CONTEXT_METRIC = "pre_render_assessment_context"
+
 CHECKPOINT_PENDING = "PENDING"
 CHECKPOINT_ACCEPTED = "ACCEPTED"
 CHECKPOINT_DEFERRED = "DEFERRED"

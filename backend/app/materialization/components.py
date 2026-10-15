@@ -43,6 +43,7 @@ from app.materialization.providers import (
 from app.materialization.repository import (
     ATTEMPT_RESPONDED,
     ATTEMPT_UNCERTAIN,
+    PRE_RENDER_CONTEXT_METRIC,
     MaterializationOwner,
     MaterializationOwnershipError,
     PreparedMaterialization,
@@ -744,7 +745,13 @@ def _prepared_from_result(
     return PreparedMaterialization(
         lifecycle=lifecycle,
         semantic_outcome=outcome,
-        human_review_required=bool(result.assessment.human_review_required),
+        # Review readiness requires actual media: the pre-render prepare step
+        # never requests human review, even for a cautionary semantic outcome.
+        human_review_required=(
+            False
+            if lifecycle is MaterializationLifecycle.AWAITING_RENDER
+            else bool(result.assessment.human_review_required)
+        ),
         repair_count=int(row.repair_count or 0) if row is not None else 0,
         reason_codes=tuple(result.reason_codes),
         component_checkpoints=checkpoints,
@@ -764,6 +771,7 @@ def _prepared_from_result(
             "segments": len(result.timeline.segments),
             "output_duration": round(result.timeline.output_duration, 6),
             "removals": [dict(item) for item in result.removals],
+            PRE_RENDER_CONTEXT_METRIC: dict(result.assessment_context),
         },
         output_fingerprint=_output_fingerprint(inputs, checkpoints),
     )

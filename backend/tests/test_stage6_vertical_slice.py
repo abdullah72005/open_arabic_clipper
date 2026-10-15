@@ -30,7 +30,10 @@ from app.core.enums import JobKind
 from app.core.settings import get_settings
 from app.db.base import Base
 from app.materialization.executor import build_materialization_executor
-from app.materialization.providers import DeterministicWritingProvider
+from app.materialization.providers import (
+    FakeCritiqueProvider,
+    FakeWritingProvider,
+)
 from app.materialization.rendering import build_transformed_render_spec
 from app.models import ClipMaterialization, ProcessingJob
 from app.render.execution.compiler import compile_render
@@ -38,6 +41,13 @@ from app.render.execution.policy import TRANSFORMED_SHORT
 from app.render.execution.service import SourceStreamFacts
 
 _PROFILE = "MP4_H264_AAC_1080X1920_V1"
+
+# A genuinely additive (source-grounded inference) authored line, accepted by the
+# fake critique below. Test fixture copy only; product acceptance uses real
+# authorized source speech and the actual persisted production route.
+_ANNOTATION_COPY = (
+    "That drop looks milder once you control for which teams already promoted heavily."
+)
 
 
 def _stream_probe(_path: Any, _settings: Any) -> SourceStreamFacts:
@@ -92,7 +102,8 @@ def _persisted_materialization(session: Session, monkeypatch: Any) -> tuple[Any,
         session,
         fixture.stage50.storage,
         get_settings(),
-        writing=DeterministicWritingProvider(),
+        writing=FakeWritingProvider({1: _ANNOTATION_COPY}),
+        critique=FakeCritiqueProvider(accepted={1: True}),
     )
     executor.set_active_job(job.id)
     executor.execute(str(candidate.id))
@@ -201,7 +212,15 @@ def test_finalizer_completes_and_is_idempotent(session: Session, monkeypatch: An
         qc_status=RenderQCStatus.PASS,
         is_current=True,
         output_fingerprint="f" * 64,
+        runtime_fingerprint="r" * 64,
         qc_fingerprint="q" * 64,
+        request_payload={
+            "materialization_id": str(envelope.id),
+            "expected_output_fingerprint": envelope.output_fingerprint,
+            "spec": {
+                "authored": {"repair_revision": int(envelope.repair_count or 0)},
+            },
+        },
         artifact_reference={"relative_path": relative, "sha256": digest, "size_bytes": 4096},
         qc_result={
             "status": "PASS",
@@ -216,11 +235,16 @@ def test_finalizer_completes_and_is_idempotent(session: Session, monkeypatch: An
 
     _job, owner = _bound_owner(session, envelope, candidate)
     result = finalize_materialization(session, owner, settings=get_settings(), storage=storage)
-    assert result.outcome == FINALIZATION_COMPLETE
+    assert result.outcome == FINALIZATION_COMPLETE, result.reason_codes
     assert result.assessment_fingerprint
     session.refresh(envelope)
     assert envelope.lifecycle.value == "COMPLETE"
-    assert envelope.semantic_outcome.value == "READY_FOR_HUMAN_REVIEW"
+    # A grounded-inference authored block that the bounded critique accepted is a
+    # reviewable noncritical caution; the materialization is never auto-approved.
+    assert envelope.semantic_outcome.value in {
+        "READY_FOR_HUMAN_REVIEW",
+        "MATERIALIZED_WITH_CAUTION",
+    }
     assert envelope.publication_ready is False
     assert envelope.human_review_required is True
     assert envelope.cache_eligible is True

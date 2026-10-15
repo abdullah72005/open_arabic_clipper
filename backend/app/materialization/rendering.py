@@ -41,6 +41,7 @@ from app.render.execution.authored import (
     RenderUnit,
 )
 from app.render.execution.policy import (
+    AUTHORED_AUDIO_RECIPE_UNSUPPORTED,
     AUTHORED_MATERIALIZATION_BINDING_INVALID,
     AUTHORED_SOURCE_MAPPING_INVALID,
     CORE_SOURCE_VALIDATION,
@@ -53,6 +54,9 @@ from app.services.storage import StorageService
 _SOURCE_ASSET_ID = "source"
 _SOURCE_SPAN_TOLERANCE = 0.06
 _RENDER_GUARD_DBTP = -1.8
+#: Versioned ducking ramp policy (milliseconds).
+DUCK_ATTACK_MS = 80.0
+DUCK_RELEASE_MS = 180.0
 
 
 def _as_uuid(value: object) -> uuid.UUID | None:
@@ -226,7 +230,7 @@ def build_transformed_render_spec(
         sample_rate=sample_rate,
         channels=2,
         mode=MASTERING_MODE_LINEAR,
-        repair_peak_limit_db=0.0,
+        repair_peak_limit_db=_authorized_peak_limit_db(row, audio_recipe),
     )
     payload = AuthoredRenderPayload(
         schema_version=AUTHORED_SCHEMA_VERSION,
@@ -250,6 +254,25 @@ def build_transformed_render_spec(
         occurrences=tuple(authored_occurrences),
     )
     return spec
+
+
+def _authorized_peak_limit_db(row: Any, audio_recipe: Mapping[str, object]) -> float:
+    """Return the authorized bounded peak-limiter reduction for this revision.
+
+    A repair allocation records the reduction in the recipe; without an
+    authorization the value is zero (no limiter). A positive value is clamped to
+    the versioned maximum so an out-of-range instruction is rejected, not obeyed.
+    """
+
+    value = _optional_float(audio_recipe.get("repair_peak_limit_db"))
+    if value is None:
+        metrics = row.metrics if isinstance(row.metrics, Mapping) else {}
+        value = _optional_float(metrics.get("repair_peak_limit_db"))
+    if value is None or value <= 0.0:
+        return 0.0
+    if value > 3.0:
+        raise RenderExecutionError(AUTHORED_AUDIO_RECIPE_UNSUPPORTED)
+    return value
 
 
 def _assets(
@@ -311,28 +334,109 @@ def _assets(
     return assets, narration_assets
 
 
+def _ducking_by_source(
+    audio_recipe: Mapping[str, object], sample_rate: int
+) -> dict[str, list[tuple[int, int, float]]]:
+    """Translate authorized ducking regions into bounded source-entry intervals.
+
+    Rejects unsupported/conflicting instructions instead of silently dropping
+    them. Each region becomes an explicit, forward-ordered sample interval on its
+    referenced source entry.
+    """
+
+    regions = audio_recipe.get("ducking_regions") or []
+    if not isinstance(regions, list):
+        raise RenderExecutionError(AUTHORED_AUDIO_RECIPE_UNSUPPORTED)
+    by_source: dict[str, list[tuple[int, int, float]]] = {}
+    for region in regions:
+        if not isinstance(region, Mapping):
+            raise RenderExecutionError(AUTHORED_AUDIO_RECIPE_UNSUPPORTED)
+        entry_id = str(region.get("source_entry_id") or "")
+        start = _optional_float(region.get("start"))
+        end = _optional_float(region.get("end"))
+        duck = _optional_float(region.get("ducking_db"))
+        if not entry_id or start is None or end is None or duck is None or end <= start:
+            raise RenderExecutionError(AUTHORED_AUDIO_RECIPE_UNSUPPORTED)
+        if duck > 0.0 or duck < -30.0:
+            # Ducking only ever attenuates, and within a bounded amount.
+            raise RenderExecutionError(AUTHORED_AUDIO_RECIPE_UNSUPPORTED)
+        start_sample = int(round(start * sample_rate))
+        end_sample = int(round(end * sample_rate))
+        by_source.setdefault(entry_id, []).append((start_sample, end_sample, duck))
+    for intervals in by_source.values():
+        intervals.sort()
+        for previous, current in zip(intervals, intervals[1:]):
+            if current[0] < previous[1]:
+                raise RenderExecutionError(AUTHORED_AUDIO_RECIPE_UNSUPPORTED)
+    return by_source
+
+
+def _source_gain_points(
+    base_db: float,
+    output_start_sample: int,
+    output_end_sample: int,
+    regions: list[tuple[int, int, float]],
+    sample_rate: int,
+) -> tuple[GainPoint, ...]:
+    """Preserve the requested gain and translate ducking into ramp gain points."""
+
+    if not regions:
+        return (GainPoint(sample_index=output_start_sample, gain_db=base_db),)
+
+    attack = int(round(DUCK_ATTACK_MS / 1000.0 * sample_rate))
+    release = int(round(DUCK_RELEASE_MS / 1000.0 * sample_rate))
+    points: list[tuple[int, float]] = [(output_start_sample, base_db)]
+    for start_sample, end_sample, duck_db in regions:
+        ramp_down = max(output_start_sample, start_sample - attack)
+        ramp_up = min(output_end_sample, end_sample + release)
+        points.append((ramp_down, base_db))
+        points.append((start_sample, duck_db))
+        points.append((end_sample, duck_db))
+        points.append((ramp_up, base_db))
+    points.append((output_end_sample, base_db))
+    points.sort(key=lambda item: item[0])
+    deduped: list[GainPoint] = []
+    for sample_index, gain_db in points:
+        if deduped and deduped[-1].sample_index == sample_index:
+            deduped[-1] = GainPoint(sample_index=sample_index, gain_db=gain_db)
+        else:
+            deduped.append(GainPoint(sample_index=sample_index, gain_db=gain_db))
+    return tuple(deduped)
+
+
 def _tracks(
     audio_recipe: Mapping[str, object],
     narration_assets: Mapping[str, MediaAssetRef],
     sample_rate: int,
 ) -> list[AudioTrackSpec]:
     tracks: list[AudioTrackSpec] = []
+    ducking = _ducking_by_source(audio_recipe, sample_rate)
+    narration_intervals: list[tuple[int, int]] = []
     for entry in _entries(audio_recipe):
         kind = str(entry.get("kind") or "")
+        entry_id = str(entry.get("entry_id") or len(tracks))
         output_start_sample = int(round(_float(entry.get("output_start")) * sample_rate))
         output_end_sample = int(round(_float(entry.get("output_end")) * sample_rate))
         if output_end_sample <= output_start_sample:
             raise RenderExecutionError(AUTHORED_MATERIALIZATION_BINDING_INVALID)
+        gain_db = _optional_float(entry.get("gain_db"))
+        gain_db = 0.0 if gain_db is None else gain_db
         if kind == "SOURCE":
+            regions = ducking.get(entry_id, [])
+            for region_start, region_end, _duck in regions:
+                if region_start < output_start_sample or region_end > output_end_sample:
+                    raise RenderExecutionError(AUTHORED_AUDIO_RECIPE_UNSUPPORTED)
             tracks.append(
                 AudioTrackSpec(
-                    track_id=f"src-{str(entry.get('entry_id') or len(tracks))}",
+                    track_id=f"src-{entry_id}",
                     asset_id=_SOURCE_ASSET_ID,
                     source_start_seconds=_float(entry.get("source_start")),
                     source_end_seconds=_float(entry.get("source_end")),
                     output_start_sample=output_start_sample,
                     output_end_sample=output_end_sample,
-                    gain_points=(GainPoint(sample_index=output_start_sample, gain_db=0.0),),
+                    gain_points=_source_gain_points(
+                        gain_db, output_start_sample, output_end_sample, regions, sample_rate
+                    ),
                 )
             )
         elif kind == "NARRATION":
@@ -340,6 +444,7 @@ def _tracks(
             asset = narration_assets.get(chunk_id)
             if asset is None:
                 raise RenderExecutionError(AUTHORED_MATERIALIZATION_BINDING_INVALID)
+            narration_intervals.append((output_start_sample, output_end_sample))
             tracks.append(
                 AudioTrackSpec(
                     track_id=f"narr-{chunk_id}",
@@ -348,9 +453,19 @@ def _tracks(
                     source_end_seconds=max(0.0, asset.duration_seconds),
                     output_start_sample=output_start_sample,
                     output_end_sample=output_end_sample,
-                    gain_points=(GainPoint(sample_index=output_start_sample, gain_db=0.0),),
+                    gain_points=(GainPoint(sample_index=output_start_sample, gain_db=gain_db),),
                 )
             )
+        else:
+            raise RenderExecutionError(AUTHORED_MATERIALIZATION_BINDING_INVALID)
+
+    # Keep no-overlap narration as the default: a competing narration overlap is a
+    # timeline conflict, never resolved by implicit ducking.
+    narration_intervals.sort()
+    for previous, current in zip(narration_intervals, narration_intervals[1:]):
+        if current[0] < previous[1]:
+            raise RenderExecutionError(AUTHORED_AUDIO_RECIPE_UNSUPPORTED)
+
     if not tracks:
         raise RenderExecutionError(AUTHORED_MATERIALIZATION_BINDING_INVALID)
     return tracks
