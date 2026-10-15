@@ -719,10 +719,10 @@ class MaterializationExecutor:
                     except Exception:
                         pass
                     break
-        try:
-            self._storage.cleanup_temporary_files(older_than_seconds=0, limit=200)
-        except Exception:
-            pass
+        # This worker owns no temporary files: intermediate artifacts are written
+        # atomically through StorageService, which manages its own temporary
+        # siblings. A global sweep here would delete *another* worker's fresh
+        # in-progress ``.tmp`` files, so the executor never runs one.
 
 
 def build_materialization_executor(

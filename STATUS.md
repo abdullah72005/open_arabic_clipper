@@ -1,5 +1,190 @@
 # Runtime status
 
+## Stage 6 SOL review reopened the finalizer blockers; six root-cause corrections (2026-10-15)
+
+Status: **SOL reviewed the previous continuation and reopened the "five blockers
+closed" claim, demonstrating six defects (A–F) through the actual finalizer with
+isolated persisted SQLite fixtures and seeded render evidence. This session
+corrects the four root causes that produced A–F and adds persisted regressions.
+The real-FFmpeg milestone, the two-session PostgreSQL interleavings, tasks 6–9,
+and genuine authorized-media acceptance remain NOT done. Stage 6 is NOT FROZEN.**
+
+This session ran outside Docker: host Python 3.10.12, **no FFmpeg/ffprobe on
+PATH**, no PostgreSQL, no Redis consumer, SQLite only. Results below are
+supplementary, not equivalent to the required Docker Python 3.12 / disposable
+PostgreSQL / real-FFmpeg evidence.
+
+- **Root cause 1 — complete authoritative semantic evidence (SOL A, B).**
+  `components.py` now persists the recomputable SCRIPT `dependency_inputs` (the
+  exact generation dependency set: plan/source/verification/narration/profile
+  context plus writer/critic identities). `finalization._accepted_script_blocks`
+  validates the checkpoint's `dependency_fingerprint` against the *live* inputs
+  (`_script_dependency_matches`), so a self-consistent result hash with no
+  dependency binding (or copied from another generation) is refused.
+  `_derive_evidence`/`_rebuild_context` now treat an `UNKNOWN` required dimension
+  and `UNKNOWN` critical semantic evidence (GROUNDING_VERIFICATION,
+  FIDELITY_ATTRIBUTION, SUBSTANTIVE_VALUE) as *missing* evidence
+  (`critical_fidelity_unknown` → `DEFERRED_EVIDENCE`), never a favorable default;
+  the presence of a dimension label no longer establishes a satisfied gate.
+  Regressions in `test_stage6_finalizer_evidence.py`:
+  `test_missing_script_dependency_binding_defers`,
+  `test_script_dependency_inputs_must_match_live_generation`,
+  `test_unknown_grounding_dimension_defers` (blocker A/B reproductions).
+- **Root cause 2 — callback identity vs successful-assessment evidence (SOL C).**
+  `_complete_render_identity_error` requires, on the COMPLETE branch only, exact
+  `output_fingerprint` + `runtime_fingerprint` + `qc_fingerprint`, a complete
+  artifact binding, and finite measured loudness/true-peak. A terminal
+  FAILED/BLOCKED render remains finalizable without successful QC (the pre-QC
+  repair/defer paths are unchanged). Regression:
+  `test_complete_render_requires_exact_identity`.
+- **Root cause 3 — short fenced publication transaction + lock order (SOL D, F).**
+  `_publish_assessment` now ends the prior snapshot, acquires the architecture's
+  lock order **candidate → upstream deps (selection/contract/plan/FINAL_CLIP/
+  visual/profile) → materialization → render → jobs** (candidate locked *before*
+  the envelope, matching queueing; the previous order was inverted), revalidates
+  exact current render scope (`envelope.render_execution_id == render.id and
+  render.is_current`), the exact binding and artifact identity, then **recomputes
+  the assessment under the locks** and refuses to publish when the fingerprint/
+  outcome changed (`EVIDENCE_CHANGED_DURING_PUBLICATION`). Regression:
+  `test_render_demoted_before_publication_is_not_published`.
+- **Root cause 4 — every handled owned-job disposition closes the job (SOL E).**
+  `_disposition` always attempts `finish_owner_job` under the exact job fence even
+  when envelope ownership was lost; the bare `FinalizationResult(SUPERSEDED,
+  OWNERSHIP_LOST)` early-returns were replaced with `_ownership_lost`, which
+  terminalizes this execution's own job (never a newer owner's). Regression:
+  `test_materialization_demoted_before_publication_closes_owned_job`.
+- **Verification (this session, NOT the Docker runtime).** Host Python 3.10.12 +
+  SQLite: `test_stage6_finalizer_evidence.py` (21 passed),
+  `test_stage6_finalization_gates.py`, `test_stage6_vertical_slice.py`,
+  `test_stage6_component_recovery.py`, `test_stage6_materialization_core.py`,
+  `test_stage6_runtime_ownership.py`, `test_stage6_worker_chain.py`,
+  `test_stage6_durable_router.py`, `test_stage6_service.py`,
+  `test_stage6_runtime_corrections.py`, `test_stage6_sol3_regressions.py`,
+  `test_stage6_blocker_regressions.py`, `test_stage6_repair.py`,
+  `test_stage6_temp_cleanup.py`, `test_stage6_authored_spec.py`,
+  `test_stage6_asset_localization.py`, `test_stage6_audio_recipe_mapping.py`,
+  `test_stage6_overlays.py`, `test_stage6_providers.py`,
+  `test_stage6_supporting_narration.py`, `test_stage6_sol2_regressions.py`,
+  `test_stage6_migration.py` → all green. `ruff` clean on changed modules.
+  `mypy --no-incremental --follow-imports=skip` clean on `finalization.py`
+  (pre-existing `components.py` any-returns unchanged).
+- **Remaining BLOCKERS.** (a) Real-FFmpeg failed-render → persisted measurements →
+  finalizer repair CAS → revised render → callback → final assessment with no
+  second repair, and the authored-card + synthetic-narration sub-case
+  (`test_stage6_limiter_repair.py::test_bounded_limiter_repair_survives_to_final_qc`
+  and `test_stage6_worker_pipeline.py` both error here: `FileNotFoundError:
+  ffmpeg`). (b) Synchronized PostgreSQL publication/queue interleavings with
+  bounded statement/lock timeouts (written, skipped — no PostgreSQL). (c) Tasks 6
+  (hosted grounded writing/critique), 7 (TTS/voice/audition), 8 (candidate
+  API/CLI/UI), 9 (genuine manual-acceptance package). (d) Genuine authorized-media
+  acceptance (no authorized source configured and no hosted provider key).
+- **NON-BLOCKING LIMITATIONS.** The `google-genai` installed version is 2.22.0
+  (spec pins >=2.25,<3); no hosted call is made by any code path in this session.
+
+## (Superseded) Stage 6 SOL continuation: production blockers 1–5 "closed" + worker-task pipeline (2026-10-15)
+
+> SOL review reopened this claim; see the section above. The worker-pipeline test
+> below requires real FFmpeg, which is not present in the current environment, and
+> the two-session PostgreSQL regressions are skipped here.
+
+Status: **the five SOL-identified production blockers were believed corrected with
+regressions, and the persisted execution milestone runs through the actual
+Celery worker-task callables (prepare → render → callback → finalizer) with real
+FFmpeg and a real broker on the no-narration path.** Tasks 6 (hosted grounded
+writing/critique), 7 (TTS/voice/audition), 8 (candidate API/CLI/UI) and 9
+(genuine manual-acceptance package) remain NOT done. The authored-card +
+synthetic-narration sub-case and the worker-pipeline staleness/recovery
+two-session cases are NOT done. No genuine authorized-media acceptance artifact
+exists. Stage 6 is NOT FROZEN. That session ran outside Docker: host Python
+3.10.12, static FFmpeg 7.0.2, a bundled Redis, SQLite; the two-session PostgreSQL
+regressions were written but skipped (no PostgreSQL available).**
+
+
+- **Blocker 1 — content, not status labels (`finalization.py`).** `_derive_evidence`
+  now validates the dependency-bound accepted *content*: an accepted SCRIPT
+  checkpoint must carry a well-formed `result` with validated authored blocks, a
+  matching `result_fingerprint`, and top-level `authored_blocks` equal to it; the
+  timeline must have real segments, schema, frame/sample totals, and an intact
+  SOURCE hero; every FULFILLED slot resolution must correspond to actually
+  accepted material (authored block or narration chunk). Gates are only ever
+  tightened (never loosened by absence of findings). A missing/invalid snapshot is
+  rebuilt only from complete evidence (content + the deterministic critical
+  findings); any gap yields `DEFERRED_EVIDENCE`. Regressions:
+  `test_stage6_finalizer_evidence.py` (accepted-status-without-content,
+  fulfilled-slot-without-material, contradictory top-level blocks, favorable
+  snapshot cannot override missing content).
+- **Blocker 2 — failed-render finalization + bounded repair (blocker 2).**
+  `_validate_render_binding` separates exact callback identity from
+  successful-QC evidence (a pre-QC failed render has no `qc_fingerprint` and is
+  now finalizable). `mark_failed`/`_mark_terminal` persist a `RenderProcessError`'s
+  partial measurement manifest under the render fence
+  (`render/execution/executor.py`, `service.py`). `finalize_materialization` now
+  handles terminal FAILED/BLOCKED renders: a persisted `AUDIO_PEAK_REPAIR_NEEDED`
+  measurement justifies the one bounded peak repair, allocated by the new
+  `repository.allocate_repair` CAS `repair_count` 0 → 1, which revises the recipe
+  and output fingerprint, records the repair action/evidence, returns the envelope
+  to `AWAITING_RENDER`, and dispatches exactly one repaired render. Unrepairable
+  peak → `REJECTED_QUALITY`; other terminal failures → `DEFERRED_EVIDENCE`.
+  Regressions: `test_stage6_repair.py` (single repair, no second repair, historical
+  callback cannot revive, non-peak failure defers). Real-FFmpeg end-to-end repair
+  (high-crest → measurements → finalizer → repaired render → callback → final
+  assessment) is NOT yet wired as a single persisted test.
+- **Blocker 3 — shared router + complete binding (`queue.py`, `workers/tasks.py`).**
+  A terminal **BLOCKED** render now routes to finalization (was falling through to
+  render-handoff recovery); `resolve_job_phase` and `_route_awaiting_render` share
+  one finalizable-state set. `_validate_render_binding` requires the complete exact
+  binding (bound materialization id, `spec`, `authored`, and `repair_revision`);
+  missing/malformed identity is invalid, never accepted on a fingerprint match.
+  `_validate_task_binding` rejects a Celery task whose transient candidate/source/
+  kind/refinement disagrees with its durable envelope. Regressions added to
+  `test_stage6_durable_router.py`.
+- **Blocker 4 — publication race (`finalization.py`).** The COMPLETE path is split
+  into a lock-free preparation (hash the artifact, compute the assessment) and a
+  short fenced publication transaction (`_publish_assessment`) that ends any prior
+  snapshot, acquires the frozen lock order (candidate → contract → plan →
+  FINAL_CLIP → visual composition), re-runs the live revalidation and the exact
+  artifact-identity check (size+mtime, not a re-hash) under the locks, and finishes
+  the envelope/job/release together. A prerequisite mutation, cancellation, or
+  output/repair change committed after the initial revalidation cannot authorize a
+  stale review readiness. Synchronized two-session `autoflush=False,
+  expire_on_commit=False` PostgreSQL regressions (change after revalidation before
+  publication: final clip / plan / output revision / cancel + unchanged case) added
+  to `test_stage6_finalizer_currentness_postgres.py` — **skipped here, no
+  PostgreSQL.**
+- **Blocker 5 — no other-worker temp sweep.** The global
+  `cleanup_temporary_files(older_than_seconds=0, limit=200)` sweep was removed from
+  `MaterializationExecutor._release_resources` and the Stage 5.1
+  `VisualCompositionExecutor._release_resources` (both own no temp files; the sweep
+  deleted another worker's fresh in-progress `.tmp`). New
+  `test_stage6_temp_cleanup.py` runs the actual release method against the real
+  StorageService and asserts an unrelated in-progress `.tmp` survives; the Stage 5.1
+  suite (`260 passed, 35 skipped`) confirms the composition change.
+- **Persisted milestone — worker-task entry points.** New
+  `test_stage6_worker_pipeline.py` drives the actual Celery task callables
+  (`run_materialization_job` → render dispatch → `run_render_execution` → callback →
+  `run_materialization_finalization`) with real generated media, real
+  FFmpeg/compiler/runner/probe/QC, and a real broker. It asserts exact persisted
+  lineage, final decoded loudness/true-peak, all handled jobs terminal, replay with
+  no duplicated work, and current **core/transformed coexistence** (a preexisting
+  current CORE render is not demoted), plus an operator-cancel-is-truthful case.
+  The authored-card + synthetic-narration (nonzero gain, production asset
+  localization) sub-case is not yet covered.
+- **Verification (this session, NOT the Docker runtime).** Host Python 3.10.12 +
+  SQLite + static FFmpeg 7.0.2 + bundled Redis: `pytest -k "stage6 or stage52"`
+  (excluding the PostgreSQL-gated tests) → **299 passed, 48 skipped** with only
+  `test_stage52_remediation.py::test_runtime_identity_is_truthful` failing because
+  the *static* FFmpeg links libass statically (no shared-object hash); it passes
+  with a dynamic libass build. `ruff` clean on all changed modules/tests; `mypy
+  --no-incremental --follow-imports=skip` clean on `materialization/{finalization,
+  queue,repository}` and `workers/tasks`. The pre-existing `render/execution/
+  service.py` no-any findings are unchanged.
+- **Remaining BLOCKERS.** (a) The real-FFmpeg failed-render→repair→final-assessment
+  persisted test. (b) The authored-card + synthetic-narration milestone sub-case.
+  (c) Worker-pipeline staleness/recovery two-session cases. (d) Tasks 6–9. (e)
+  Verification of the two-session PostgreSQL regressions and the Docker Python 3.12
+  runtime. (f) Genuine authorized-media acceptance (no authorized source configured
+  and no hosted provider key).
+
 ## Stage 6 SOL defect corrections 1–4 + real persisted executor (2026-10-15)
 
 Status: **the four reproduced SOL defects are corrected with regressions, a real

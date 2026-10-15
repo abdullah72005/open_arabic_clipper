@@ -558,10 +558,8 @@ class VisualCompositionExecutor:
                     except Exception:
                         pass
                     break
-        try:
-            self._storage.cleanup_temporary_files(older_than_seconds=0, limit=200)
-        except Exception:
-            pass
+        # This worker owns no temporary files; a global age-zero sweep here would
+        # delete another worker's fresh in-progress ``.tmp`` files.
 
 
 def build_visual_composition_executor(

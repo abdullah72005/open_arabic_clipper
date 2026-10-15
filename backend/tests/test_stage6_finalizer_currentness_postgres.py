@@ -401,3 +401,108 @@ def test_concurrent_posts_share_one_finalizer(engine: Engine, monkeypatch: Any) 
         )
     assert count == 1
 
+
+# --- 4. publication-race two-session synchronization --------------------------
+
+
+def _production_session(engine: Engine) -> Session:
+    """A session with the production application semantics (no autoflush/expire)."""
+
+    from sqlalchemy.orm import sessionmaker
+
+    factory = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+    return factory()
+
+
+def _finalize_in_production_session(
+    engine: Engine, envelope_id: uuid.UUID
+) -> tuple[Any, uuid.UUID]:
+    job_id, owner = _bound_owner(engine, envelope_id)
+    session = _production_session(engine)
+    try:
+        result = finalize_materialization(
+            session,
+            owner,
+            settings=get_settings(),
+            storage=StorageService(get_settings().storage_root),
+        )
+        session.commit()
+    finally:
+        session.close()
+    return result, job_id
+
+
+@pytest.mark.parametrize("mutation", ["final_clip", "plan", "output_revision", "cancel"])
+def test_change_after_revalidation_before_publication_refuses(
+    engine: Engine, monkeypatch: Any, mutation: str
+) -> None:
+    """A change committed after initial revalidation but before publication must
+    never authorize review readiness: the locked publication revalidation refuses
+    it (or serializes), and the owned job stays terminal.
+    """
+
+    import app.materialization.finalization as fin
+
+    envelope_id = _prepare(engine, monkeypatch)
+    _attach_render(engine, envelope_id)
+    original = fin._build_assessment_context
+    fired = {"done": False}
+
+    def hook(*args: Any, **kwargs: Any) -> Any:
+        # Runs after the lock-free upstream revalidation and before the locked
+        # publication transaction, from an independent committed session.
+        if not fired["done"]:
+            fired["done"] = True
+            mut = _production_session(engine)
+            try:
+                envelope = mut.get(ClipMaterialization, envelope_id)
+                assert envelope is not None
+                if mutation == "final_clip":
+                    from app.core.enums import RefinementStatus as _RS
+
+                    refine = mut.scalars(
+                        select(CandidateRefinement).where(
+                            CandidateRefinement.clip_candidate_id == envelope.clip_candidate_id,
+                            CandidateRefinement.priority == RefinementPriority.FINAL_CLIP,
+                        )
+                    ).one()
+                    refine.status = _RS.NEEDS_MANUAL_TRANSCRIPT_REVIEW
+                elif mutation == "plan":
+                    from app.models import TransformationPlan
+
+                    selection = mut.get(TransformationPlanSelection, envelope.selection_id)
+                    plan = mut.get(TransformationPlan, selection.selected_plan_id)
+                    plan.plan_output_fingerprint = "m" * 64
+                elif mutation == "output_revision":
+                    envelope.output_fingerprint = "9" * 64
+                else:
+                    from app.core.enums import MaterializationLifecycle
+
+                    envelope.lifecycle = MaterializationLifecycle.CANCELLED
+                mut.commit()
+            finally:
+                mut.close()
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(fin, "_build_assessment_context", hook)
+    result, job_id = _finalize_in_production_session(engine, envelope_id)
+    envelope = _envelope(engine, envelope_id)
+    assert envelope.human_review_required is False
+    assert envelope.cache_eligible is False
+    assert envelope.semantic_outcome.value not in _REVIEWABLE
+    assert envelope.publication_ready is False
+    assert _job_status(engine, job_id) is not JobStatus.RUNNING
+
+
+def test_unchanged_publication_with_production_session_reaches_review_ready(
+    engine: Engine, monkeypatch: Any
+) -> None:
+    envelope_id = _prepare(engine, monkeypatch)
+    _attach_render(engine, envelope_id)
+    result, _job_id = _finalize_in_production_session(engine, envelope_id)
+    envelope = _envelope(engine, envelope_id)
+    assert result.outcome == "COMPLETE"
+    assert envelope.semantic_outcome.value in _REVIEWABLE
+    assert envelope.publication_ready is False
+
+

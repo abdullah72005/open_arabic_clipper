@@ -178,3 +178,66 @@ def test_active_render_returns_identity_not_finalizer(
     assert outcome.job_id is None
     assert _finalizer_count(session, envelope.id) == 0
     assert session.get(RenderExecution, render.id).lifecycle is RenderExecutionLifecycle.RENDERING
+
+
+def test_blocked_render_routes_to_finalizer_not_handoff(
+    session: Session, monkeypatch: Any
+) -> None:
+    """A terminal BLOCKED render must finalize, not recover a fresh handoff."""
+
+    fixture, envelope = _persisted_materialization(session, monkeypatch)
+    render = _attach_render(session, fixture, envelope)
+    render.lifecycle = RenderExecutionLifecycle.BLOCKED
+    render.qc_status = None
+    render.cache_eligible = False
+    render.output_fingerprint = ""
+    render.reason_codes = ["SOURCE_STREAMS_UNSUPPORTED"]
+    render.error_code = "SOURCE_STREAMS_UNSUPPORTED"
+    session.flush()
+    session.commit()
+    candidate = fixture.stage50.selection.candidate
+    captured = _CaptureDispatcher()
+    monkeypatch.setattr(queue_module, "_dispatch", lambda *a, **k: None)
+
+    outcome = queue_materialization(
+        session, candidate.id, priority="CANDIDATE", render_dispatcher=captured
+    )
+    assert outcome.phase == PHASE_FINALIZE
+    assert outcome.job_id is not None
+    assert captured.finalized
+    assert not captured.rendered
+    assert _finalizer_count(session, envelope.id) == 1
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["missing_materialization_id", "missing_spec", "missing_authored", "missing_revision"],
+)
+def test_incomplete_render_binding_is_refused(
+    session: Session, monkeypatch: Any, mutation: str
+) -> None:
+    """Complete exact callback identity is required; a partial payload is invalid."""
+
+    fixture, envelope = _persisted_materialization(session, monkeypatch)
+    render = _attach_render(session, fixture, envelope)
+    payload = dict(render.request_payload)
+    if mutation == "missing_materialization_id":
+        payload.pop("materialization_id", None)
+    elif mutation == "missing_spec":
+        payload.pop("spec", None)
+    elif mutation == "missing_authored":
+        spec = dict(payload.get("spec") or {})
+        spec.pop("authored", None)
+        payload["spec"] = spec
+    else:
+        spec = dict(payload.get("spec") or {})
+        authored = dict(spec.get("authored") or {})
+        authored.pop("repair_revision", None)
+        spec["authored"] = authored
+        payload["spec"] = spec
+    render.request_payload = payload
+    session.flush()
+    session.commit()
+
+    assert request_finalization_job(session, render.id, settings=get_settings()) is None
+    assert _finalizer_count(session, envelope.id) == 0

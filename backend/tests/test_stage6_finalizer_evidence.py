@@ -237,3 +237,292 @@ def _finalize(session: Session, fixture: Any, envelope: ClipMaterialization) -> 
     return finalize_materialization(
         session, owner, settings=get_settings(), storage=fixture.stage50.storage
     )
+
+
+# --- 4. accepted CONTENT, not status labels -----------------------------------
+
+
+def _drop_snapshot(envelope: ClipMaterialization) -> None:
+    metrics = dict(envelope.metrics or {})
+    metrics.pop(PRE_RENDER_CONTEXT_METRIC, None)
+    envelope.metrics = metrics
+
+
+def test_accepted_status_label_without_content_defers(
+    session: Session, monkeypatch: Any
+) -> None:
+    """A bare SCRIPT ``{status: ACCEPTED}`` is not accepted content."""
+
+    fixture, envelope = _persisted_materialization(session, monkeypatch)
+    _drop_snapshot(envelope)
+    envelope.component_checkpoints = {"SCRIPT": {"status": "ACCEPTED"}}
+    session.flush()
+    _attach_render(session, fixture, envelope)
+
+    result = _finalize(session, fixture, envelope)
+    session.refresh(envelope)
+    assert result.outcome == FINALIZATION_DEFERRED
+    assert envelope.semantic_outcome.value == "DEFERRED_EVIDENCE"
+    assert envelope.human_review_required is False
+    assert envelope.cache_eligible is False
+    assert envelope.publication_ready is False
+
+
+def test_fulfilled_slot_without_actual_material_defers(
+    session: Session, monkeypatch: Any
+) -> None:
+    """A FULFILLED slot resolution must correspond to accepted authored material."""
+
+    from app.materialization.fingerprints import stable_digest
+
+    fixture, envelope = _persisted_materialization(session, monkeypatch)
+    _drop_snapshot(envelope)
+    # Self-consistent but empty accepted content: the fingerprint matches the
+    # empty block list, so only the slot/material correspondence can catch it.
+    envelope.authored_blocks = []
+    checkpoints = dict(envelope.component_checkpoints or {})
+    script = dict(checkpoints.get("SCRIPT") or {})
+    script["result"] = {"authored_blocks": []}
+    script["result_fingerprint"] = stable_digest([])
+    checkpoints["SCRIPT"] = script
+    envelope.component_checkpoints = checkpoints
+    session.flush()
+    _attach_render(session, fixture, envelope)
+
+    result = _finalize(session, fixture, envelope)
+    session.refresh(envelope)
+    assert result.outcome == FINALIZATION_DEFERRED
+    assert envelope.semantic_outcome.value == "DEFERRED_EVIDENCE"
+
+
+def test_contradictory_script_content_defers(session: Session, monkeypatch: Any) -> None:
+    """Top-level authored blocks that disagree with the checkpoint are refused."""
+
+    fixture, envelope = _persisted_materialization(session, monkeypatch)
+    _drop_snapshot(envelope)
+    envelope.authored_blocks = []
+    session.flush()
+    _attach_render(session, fixture, envelope)
+
+    result = _finalize(session, fixture, envelope)
+    session.refresh(envelope)
+    assert result.outcome == FINALIZATION_DEFERRED
+    assert envelope.semantic_outcome.value == "DEFERRED_EVIDENCE"
+
+
+def test_favorable_snapshot_never_overrides_missing_content(
+    session: Session, monkeypatch: Any
+) -> None:
+    """A favorable persisted snapshot cannot stand in for absent accepted content."""
+
+    fixture, envelope = _persisted_materialization(session, monkeypatch)
+    # Keep the (favorable) snapshot, but strip the accepted content it describes.
+    envelope.component_checkpoints = {}
+    envelope.timeline_payload = {}
+    envelope.slot_resolutions = []
+    session.flush()
+    _attach_render(session, fixture, envelope)
+
+    result = _finalize(session, fixture, envelope)
+    session.refresh(envelope)
+    assert result.outcome == FINALIZATION_DEFERRED
+    assert envelope.semantic_outcome.value == "DEFERRED_EVIDENCE"
+    assert envelope.human_review_required is False
+    assert envelope.publication_ready is False
+
+
+# --- 5. authoritative SCRIPT dependency + UNKNOWN critical evidence ------------
+
+
+def test_missing_script_dependency_binding_defers(session: Session, monkeypatch: Any) -> None:
+    """A self-consistent SCRIPT result hash with no dependency binding defers.
+
+    Reproduces SOL blocker A: removing ``SCRIPT.dependency_fingerprint`` (while
+    preserving the result/content hash) must never become reviewable.
+    """
+
+    fixture, envelope = _persisted_materialization(session, monkeypatch)
+    checkpoints = dict(envelope.component_checkpoints or {})
+    script = dict(checkpoints.get("SCRIPT") or {})
+    script.pop("dependency_fingerprint", None)
+    checkpoints["SCRIPT"] = script
+    envelope.component_checkpoints = checkpoints
+    session.flush()
+    _attach_render(session, fixture, envelope)
+
+    result = _finalize(session, fixture, envelope)
+    session.refresh(envelope)
+    assert result.outcome == FINALIZATION_DEFERRED
+    assert envelope.semantic_outcome.value == "DEFERRED_EVIDENCE"
+    assert envelope.human_review_required is False
+    assert envelope.cache_eligible is False
+    assert envelope.publication_ready is False
+
+
+def test_script_dependency_inputs_must_match_live_generation(
+    session: Session, monkeypatch: Any
+) -> None:
+    """A dependency binding from another generation is refused, not trusted."""
+
+    fixture, envelope = _persisted_materialization(session, monkeypatch)
+    checkpoints = dict(envelope.component_checkpoints or {})
+    script = dict(checkpoints.get("SCRIPT") or {})
+    raw = dict(script.get("dependency_inputs") or {})
+    raw["validation_version"] = "other-generation"
+    script["dependency_inputs"] = raw
+    checkpoints["SCRIPT"] = script
+    envelope.component_checkpoints = checkpoints
+    session.flush()
+    _attach_render(session, fixture, envelope)
+
+    result = _finalize(session, fixture, envelope)
+    session.refresh(envelope)
+    assert result.outcome == FINALIZATION_DEFERRED
+    assert envelope.semantic_outcome.value == "DEFERRED_EVIDENCE"
+
+
+def test_unknown_grounding_dimension_defers(session: Session, monkeypatch: Any) -> None:
+    """An UNKNOWN critical grounding dimension is missing evidence, not a gate.
+
+    Reproduces SOL blocker B: with the pre-render snapshot removed, an empty claim
+    ledger, the five required deterministic dimensions retained, and
+    ``GROUNDING_VERIFICATION`` set to UNKNOWN, finalization must defer rather than
+    return MATERIALIZED_WITH_CAUTION with human review.
+    """
+
+    fixture, envelope = _persisted_materialization(session, monkeypatch)
+    _drop_snapshot(envelope)
+    envelope.claim_ledger = []
+    findings = [dict(item) for item in (envelope.quality_findings or [])]
+    present = {str(item.get("dimension")) for item in findings}
+    for dimension in (
+        "SLOT_FULFILLMENT",
+        "GROUNDING_VERIFICATION",
+        "HERO_PRESERVATION",
+        "VISUAL_CAPTION_READABILITY",
+        "PLATFORM_SUITABILITY",
+    ):
+        assert dimension in present, dimension
+    for item in findings:
+        if item.get("dimension") == "GROUNDING_VERIFICATION":
+            item["level"] = "UNKNOWN"
+            item["reason_codes"] = []
+    envelope.quality_findings = findings
+    session.flush()
+    _attach_render(session, fixture, envelope)
+
+    result = _finalize(session, fixture, envelope)
+    session.refresh(envelope)
+    assert result.outcome == FINALIZATION_DEFERRED
+    assert envelope.semantic_outcome.value == "DEFERRED_EVIDENCE"
+    assert envelope.human_review_required is False
+    assert envelope.cache_eligible is False
+    assert envelope.publication_ready is False
+
+
+# --- 6. successful-render identity requirements (separate from callback) -------
+
+
+def test_complete_render_requires_exact_identity(session: Session, monkeypatch: Any) -> None:
+    """A COMPLETE render missing output/runtime/QC fingerprints must defer.
+
+    Reproduces SOL blocker C: the callback/QC separation must not let a successful
+    assessment pass without its independent complete-evidence identity.
+    """
+
+    fixture, envelope = _persisted_materialization(session, monkeypatch)
+    render = _attach_render(session, fixture, envelope)
+    render.output_fingerprint = ""
+    render.runtime_fingerprint = ""
+    render.qc_fingerprint = ""
+    session.flush()
+    session.commit()
+
+    result = _finalize(session, fixture, envelope)
+    session.refresh(envelope)
+    assert result.outcome == FINALIZATION_DEFERRED
+    assert envelope.semantic_outcome.value == "DEFERRED_EVIDENCE"
+    assert envelope.cache_eligible is False
+    assert envelope.publication_ready is False
+
+
+# --- 7. late demotion before publication ---------------------------------------
+
+
+def _other_session(session: Session) -> Session:
+    return Session(session.get_bind())
+
+
+def test_render_demoted_before_publication_is_not_published(
+    session: Session, monkeypatch: Any
+) -> None:
+    """Reproduces SOL blocker D: a bound render demoted immediately before
+    ``_publish_assessment`` is never published as current review readiness."""
+
+    import app.materialization.finalization as fin
+    from app.models.render_execution import RenderExecution
+
+    fixture, envelope = _persisted_materialization(session, monkeypatch)
+    render = _attach_render(session, fixture, envelope)
+    original = fin._publish_assessment
+    fired = {"done": False}
+
+    def hook(*args: Any, **kwargs: Any) -> Any:
+        if not fired["done"]:
+            fired["done"] = True
+            other = _other_session(session)
+            try:
+                row = other.get(RenderExecution, render.id)
+                row.is_current = False
+                other.commit()
+            finally:
+                other.close()
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(fin, "_publish_assessment", hook)
+    result = _finalize(session, fixture, envelope)
+    session.refresh(envelope)
+    assert result.outcome == FINALIZATION_SUPERSEDED
+    assert envelope.human_review_required is False
+    assert envelope.cache_eligible is False
+    assert envelope.publication_ready is False
+
+
+def test_materialization_demoted_before_publication_closes_owned_job(
+    session: Session, monkeypatch: Any
+) -> None:
+    """Reproduces SOL blocker E: demoting the materialization immediately before
+    ``_publish_assessment`` supersedes it and never strands the owned job RUNNING.
+    """
+
+    import app.materialization.finalization as fin
+
+    fixture, envelope = _persisted_materialization(session, monkeypatch)
+    _attach_render(session, fixture, envelope)
+    original = fin._publish_assessment
+    fired = {"done": False}
+
+    def hook(*args: Any, **kwargs: Any) -> Any:
+        if not fired["done"]:
+            fired["done"] = True
+            other = _other_session(session)
+            try:
+                row = other.get(ClipMaterialization, envelope.id)
+                row.is_current = False
+                other.commit()
+            finally:
+                other.close()
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(fin, "_publish_assessment", hook)
+    job, owner = _bound_owner(
+        session, envelope, fixture.stage50.selection.candidate
+    )
+    result = finalize_materialization(
+        session, owner, settings=get_settings(), storage=fixture.stage50.storage
+    )
+    assert result.outcome == FINALIZATION_SUPERSEDED
+    refreshed = session.get(ProcessingJob, job.id)
+    assert refreshed is not None
+    assert refreshed.status is not JobStatus.RUNNING
+    assert refreshed.status is JobStatus.SUCCEEDED

@@ -86,6 +86,42 @@ class ComponentContext:
     admission: Callable[[], bool] | None = None
 
 
+def script_dependency_inputs(
+    inputs: MaterializationInputs,
+    writing_identity: Mapping[str, object],
+    critique_identity: Mapping[str, object] | None,
+    config: Stage6Config,
+) -> dict[str, object]:
+    """The exact SCRIPT generation dependency set, including resolved evidence.
+
+    This is the canonical value the finalizer recomputes from *live* inputs (and
+    the persisted writer/critic identities) to prove a stored accepted SCRIPT
+    checkpoint belongs to this generation. It is a first-class, recomputable
+    identity boundary: a self-consistent content digest alone can never authorize
+    review readiness, because it does not tie the accepted copy to the actual
+    plan/source/verification/narration dependencies it was written from.
+    """
+
+    return {
+        "component": "SCRIPT",
+        "validation_version": config.validation_version,
+        "plan_output_fingerprint": inputs.plan_output_fingerprint,
+        "final_clip_output_fingerprint": inputs.final_clip.output_fingerprint,
+        "blocks": [dict(block) for block in inputs.blocks],
+        "plan_target_context": dict(inputs.plan_target_context),
+        "profile_semantic_context": {
+            "target_market": inputs.profile.target_market,
+            "output_language_policy": inputs.profile.output_language_policy,
+            "register_intent": inputs.profile.register_intent,
+        },
+        "narration": dict(inputs.narration),
+        "operator_authored_copy": [dict(item) for item in inputs.operator_authored_copy],
+        "verification_dependencies": [dict(item) for item in inputs.verification_dependencies],
+        "writing_identity": dict(writing_identity),
+        "critique_identity": dict(critique_identity or {}),
+    }
+
+
 def _script_dependency_fingerprint(
     inputs: MaterializationInputs,
     writing_identity: Mapping[str, object],
@@ -93,24 +129,7 @@ def _script_dependency_fingerprint(
     config: Stage6Config,
 ) -> str:
     return stable_digest(
-        {
-            "component": "SCRIPT",
-            "validation_version": config.validation_version,
-            "plan_output_fingerprint": inputs.plan_output_fingerprint,
-            "final_clip_output_fingerprint": inputs.final_clip.output_fingerprint,
-            "blocks": [dict(block) for block in inputs.blocks],
-            "plan_target_context": dict(inputs.plan_target_context),
-            "profile_semantic_context": {
-                "target_market": inputs.profile.target_market,
-                "output_language_policy": inputs.profile.output_language_policy,
-                "register_intent": inputs.profile.register_intent,
-            },
-            "narration": dict(inputs.narration),
-            "operator_authored_copy": [dict(item) for item in inputs.operator_authored_copy],
-            "verification_dependencies": [dict(item) for item in inputs.verification_dependencies],
-            "writing_identity": dict(writing_identity),
-            "critique_identity": dict(critique_identity or {}),
-        }
+        script_dependency_inputs(inputs, writing_identity, critique_identity, config)
     )
 
 
@@ -657,7 +676,13 @@ def prepare_materialization(context: ComponentContext) -> PreparedMaterializatio
 
     gateway = DurableRequestGateway(context)
     providers = context.providers
-    script_dep = script_dependency_fingerprint(context, critique_provider=providers.critique)
+    script_dep_inputs = script_dependency_inputs(
+        context.inputs,
+        providers.writing.runtime_identity(),
+        providers.critique.runtime_identity() if providers.critique else None,
+        context.config,
+    )
+    script_dep = stable_digest(script_dep_inputs)
 
     writing = CheckpointedWritingProvider(providers.writing, gateway, script_dep)
     critique = (
@@ -681,12 +706,15 @@ def prepare_materialization(context: ComponentContext) -> PreparedMaterializatio
         allow_hosted=context.allow_hosted and providers.critique is not None,
         ledger=CallLedger(),
     )
-    _record_script_checkpoint(context, script_dep, result.script)
+    _record_script_checkpoint(context, script_dep, script_dep_inputs, result.script)
     return _prepared_from_result(context, result, script_dep)
 
 
 def _record_script_checkpoint(
-    context: ComponentContext, script_dep: str, script: MaterializationScript
+    context: ComponentContext,
+    script_dep: str,
+    script_dep_inputs: Mapping[str, object],
+    script: MaterializationScript,
 ) -> None:
     if not owner_is_current(context.session, context.owner):
         return
@@ -703,6 +731,7 @@ def _record_script_checkpoint(
         result_fingerprint = None
     patch: dict[str, object] = {
         "dependency_fingerprint": script_dep,
+        "dependency_inputs": dict(script_dep_inputs),
         "status": status,
         "provider_identity": dict(script.provider_identity),
         "result": {
@@ -810,4 +839,5 @@ __all__ = [
     "DurableRequestGateway",
     "prepare_materialization",
     "script_dependency_fingerprint",
+    "script_dependency_inputs",
 ]

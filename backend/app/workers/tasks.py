@@ -655,6 +655,7 @@ def _run_materialization_phase(
         if job is not None and job.materialization_id is not None
         else None
     )
+    _validate_task_binding(job, envelope, candidate_id)
     if resolve_job_phase(session, job, envelope) == PHASE_FINALIZE:
         executor.finalize(candidate_id)  # type: ignore[attr-defined]
         return
@@ -667,6 +668,36 @@ def _run_materialization_phase(
         supporting_requested=str(options.get("supporting_requested") or supporting_requested),
         force=force,
     )
+
+
+def _validate_task_binding(
+    job: ProcessingJob | None,
+    envelope: ClipMaterialization | None,
+    candidate_id: str,
+) -> None:
+    """Reject a task whose transient arguments disagree with the durable envelope.
+
+    The durable envelope is authoritative: a mismatched/missing candidate, source,
+    kind, or refinement is refused rather than executed with caller-supplied
+    options.
+    """
+
+    from app.materialization.queue import MaterializationQueueError
+
+    if job is None or job.kind is not JobKind.MATERIALIZATION:
+        raise MaterializationQueueError("materialization job is missing or the wrong kind")
+    if envelope is None or job.materialization_id != envelope.id:
+        raise MaterializationQueueError("job is not bound to its durable envelope")
+    if str(envelope.clip_candidate_id) != str(candidate_id):
+        raise MaterializationQueueError("task candidate does not match the durable envelope")
+    if job.source_video_id != envelope.source_video_id:
+        raise MaterializationQueueError("job source does not match the durable envelope")
+    if (
+        job.candidate_refinement_id is not None
+        and envelope.refinement_id is not None
+        and job.candidate_refinement_id != envelope.refinement_id
+    ):
+        raise MaterializationQueueError("job refinement does not match the durable envelope")
 
 
 @celery_app.task(  # type: ignore[untyped-decorator]

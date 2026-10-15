@@ -17,7 +17,7 @@ import hashlib
 import threading
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
@@ -489,12 +489,16 @@ class RenderExecutionExecutor:
             # A cancellation/ownership stop observed at the runner error boundary
             # (e.g. a cancel committed between the runner's last poll and its
             # exception exit) enters the cancellation path; otherwise the
-            # truthful timeout/probe-error classification is preserved.
+            # truthful timeout/probe-error classification is preserved. A
+            # RenderProcessError's partial measurement manifest (e.g. a completed
+            # unmastered analysis) is persisted under this render fence so the
+            # Stage 6 finalizer can justify a bounded repair.
             if self._should_stop():
                 raise RenderCancelled("render stopped during output probing") from error
             self._fail(
                 row,
                 "RENDER_TIMEOUT" if isinstance(error, RenderTimeout) else error.reason_code,
+                partial_manifest=getattr(error, "manifest", None),
             )
             raise
 
@@ -798,9 +802,12 @@ class RenderExecutionExecutor:
         reason_code: str,
         *,
         qc: TechnicalQCResult | None = None,
+        partial_manifest: Mapping[str, object] | None = None,
     ) -> None:
         if self._job_id is None:
-            mark_failed(self._session, row, reason_code, qc=qc)
+            mark_failed(
+                self._session, row, reason_code, qc=qc, partial_manifest=partial_manifest
+            )
             self._commit_or_rollback()
             return
         if not self._claimed:
@@ -810,6 +817,7 @@ class RenderExecutionExecutor:
             row,
             reason_code,
             qc=qc,
+            partial_manifest=partial_manifest,
             job_id=self._job_id,
             claim_version=self._claim_version,
         )

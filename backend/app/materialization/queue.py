@@ -50,6 +50,10 @@ PHASE_FINALIZE = "FINALIZE"
 
 _RENDER_TERMINAL = {"COMPLETE", "FAILED", "BLOCKED", "CANCELLED"}
 
+#: Terminal render states that have authoritative final evidence to assess (or a
+#: justified repair to allocate). A CANCELLED render is never finalized.
+_RENDER_FINALIZABLE = {"COMPLETE", "FAILED", "BLOCKED"}
+
 
 class MaterializationQueueError(ValueError):
     """A Stage 6 queue request was stale, rejected, or missing a prerequisite."""
@@ -152,7 +156,7 @@ def resolve_job_phase(
     render = session.get(RenderExecution, envelope.render_execution_id, populate_existing=True)
     if render is None:
         return PHASE_PREPARE
-    if render.lifecycle.value in _RENDER_TERMINAL:
+    if render.lifecycle.value in _RENDER_FINALIZABLE:
         return PHASE_FINALIZE
     return PHASE_PREPARE
 
@@ -397,7 +401,7 @@ def _route_awaiting_render(
             if state == "CANCELLED":
                 session.commit()
                 return _outcome(None, envelope, queued=False, skipped_reason="RENDER_CANCELLED")
-            if state in {"COMPLETE", "FAILED"} and render.is_current:
+            if state in _RENDER_FINALIZABLE and render.is_current:
                 from app.materialization.finalization import request_finalization_job
 
                 job_id = request_finalization_job(

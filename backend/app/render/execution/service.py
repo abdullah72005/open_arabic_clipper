@@ -1392,6 +1392,7 @@ def mark_failed(
     reason_code: str,
     *,
     qc: TechnicalQCResult | None = None,
+    partial_manifest: Mapping[str, object] | None = None,
     job_id: uuid.UUID | None = None,
     claim_version: int = -1,
 ) -> bool:
@@ -1401,6 +1402,7 @@ def mark_failed(
         RenderExecutionLifecycle.FAILED,
         reason_code,
         qc=qc,
+        partial_manifest=partial_manifest,
         job_id=job_id,
         claim_version=claim_version,
     )
@@ -1430,15 +1432,22 @@ def _mark_terminal(
     reason_code: str,
     *,
     qc: TechnicalQCResult | None = None,
+    partial_manifest: Mapping[str, object] | None = None,
     job_id: uuid.UUID | None = None,
     claim_version: int = -1,
 ) -> bool:
+    if partial_manifest:
+        manifest = dict(partial_manifest)
+    elif qc is not None:
+        manifest = dict(qc.measured)
+    else:
+        manifest = {}
     values: dict[str, Any] = dict(
         lifecycle=lifecycle,
         cache_eligible=False,
         qc_status=(RenderQCStatus(qc.status) if qc is not None and qc.status == "FAIL" else None),
         artifact_reference={},
-        execution_manifest=dict(qc.measured) if qc is not None else {},
+        execution_manifest=manifest,
         qc_result=qc.as_dict() if qc is not None else {},
         output_fingerprint="",
         reason_codes=[reason_code],

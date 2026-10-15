@@ -339,6 +339,28 @@ def set_lifecycle(
     return guarded_update(session, owner, {"lifecycle": lifecycle})
 
 
+def allocate_repair(
+    session: Session, owner: MaterializationOwner, values: Mapping[str, Any]
+) -> bool:
+    """Allocate the single repair as an atomic CAS (``repair_count`` 0 -> 1).
+
+    Applies the authoritative revision values (revised output/render identity,
+    the repair action/history, and any revised recipe) under the full ownership
+    predicate *and* a ``repair_count = 0`` guard, so two workers can never spend
+    the one repair, and a historical worker can never mutate a newer revision.
+    Always sets ``repair_count`` to 1; the caller must not include it in
+    ``values``.
+    """
+
+    result = session.execute(
+        update(ClipMaterialization)
+        .where(*_owner_where(owner), ClipMaterialization.repair_count == 0)
+        .values(repair_count=1, **dict(values))
+        .execution_options(synchronize_session=False)
+    )
+    return int(result.rowcount) == 1
+
+
 def bind_active_job(
     session: Session, materialization_id: uuid.UUID | str, job_id: uuid.UUID | None
 ) -> bool:
@@ -756,6 +778,7 @@ __all__ = [
     "MaterializationOwner",
     "MaterializationOwnershipError",
     "PreparedMaterialization",
+    "allocate_repair",
     "bind_active_job",
     "claim_materialization",
     "commit_prepared",
