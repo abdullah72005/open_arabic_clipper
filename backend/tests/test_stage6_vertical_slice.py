@@ -144,6 +144,95 @@ def test_persisted_materialization_builds_executable_transformed_spec(
     assert compiled.authored_ass_localized_name == "authored.ass"
 
 
+def _bound_owner(session: Session, envelope: ClipMaterialization, candidate: Any) -> Any:
+    from datetime import datetime, timezone
+
+    from app.core.enums import JobStatus
+    from app.materialization.repository import bind_active_job, claim_materialization
+
+    job = ProcessingJob(
+        source_video_id=candidate.source_video_id,
+        kind=JobKind.MATERIALIZATION,
+        materialization_id=envelope.id,
+        status=JobStatus.RUNNING,
+        claim_version=1,
+        started_at=datetime.now(timezone.utc),
+        heartbeat_at=datetime.now(timezone.utc),
+    )
+    session.add(job)
+    envelope.active_job_id = None
+    session.commit()
+    bind_active_job(session, envelope.id, job.id)
+    session.commit()
+    owner = claim_materialization(session, envelope.id, job.id, expected_job_claim_version=1)
+    assert owner is not None
+    return job, owner
+
+
+def test_finalizer_completes_and_is_idempotent(session: Session, monkeypatch: Any) -> None:
+    import hashlib
+
+    from app.core.enums import RenderArtifactPurpose, RenderExecutionLifecycle, RenderQCStatus
+    from app.materialization.finalization import (
+        FINALIZATION_COMPLETE,
+        finalize_materialization,
+    )
+    from app.models.render_execution import RenderExecution
+
+    fixture, envelope = _persisted_materialization(session, monkeypatch)
+    candidate = fixture.stage50.selection.candidate
+    storage = fixture.stage50.storage
+
+    artifact_dir = storage.source_directory(candidate.source_video_id) / "render-executions" / "x"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    artifact = artifact_dir / "output.mp4"
+    artifact.write_bytes(b"\x00" * 4096)
+    relative = storage.storage_relative(artifact)
+    digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+
+    render_id = uuid.uuid4()
+    render = RenderExecution(
+        id=render_id,
+        source_video_id=candidate.source_video_id,
+        clip_candidate_id=candidate.id,
+        materialization_id=envelope.id,
+        artifact_purpose=RenderArtifactPurpose.TRANSFORMED_SHORT,
+        lifecycle=RenderExecutionLifecycle.COMPLETE,
+        qc_status=RenderQCStatus.PASS,
+        is_current=True,
+        output_fingerprint="f" * 64,
+        qc_fingerprint="q" * 64,
+        artifact_reference={"relative_path": relative, "sha256": digest, "size_bytes": 4096},
+        qc_result={
+            "status": "PASS",
+            "measured": {"final_integrated_lufs": -16.1, "final_true_peak_dbtp": -1.8},
+        },
+        reason_codes=[],
+    )
+    session.add(render)
+    envelope.render_execution_id = render_id
+    session.flush()
+    session.commit()
+
+    _job, owner = _bound_owner(session, envelope, candidate)
+    result = finalize_materialization(session, owner, settings=get_settings(), storage=storage)
+    assert result.outcome == FINALIZATION_COMPLETE
+    assert result.assessment_fingerprint
+    session.refresh(envelope)
+    assert envelope.lifecycle.value == "COMPLETE"
+    assert envelope.semantic_outcome.value == "READY_FOR_HUMAN_REVIEW"
+    assert envelope.publication_ready is False
+    assert envelope.human_review_required is True
+    assert envelope.cache_eligible is True
+
+    # Replay is a no-op with zero writes.
+    _job2, owner2 = _bound_owner(session, envelope, candidate)
+    replay = finalize_materialization(session, owner2, settings=get_settings(), storage=storage)
+    assert replay.outcome == FINALIZATION_COMPLETE
+    assert replay.reused is True
+    assert replay.assessment_fingerprint == result.assessment_fingerprint
+
+
 def test_transformed_spec_fails_closed_on_wrong_output_fingerprint(
     session: Session, monkeypatch: Any
 ) -> None:
