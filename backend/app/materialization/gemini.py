@@ -42,35 +42,42 @@ from app.materialization.providers import (
 GEMINI_API_VERSION = "v1"
 GEMINI_ROUTINE_MODEL = "gemini-3.5-flash-lite"
 GEMINI_STRONG_MODEL = "gemini-3.8-flash"
+#: Bumped whenever the prompt text or structured-output schema changes, so a
+#: stale accepted checkpoint is never reused against a different instruction.
+GEMINI_SCHEMA_VERSION = "stage6-gemini-schema-v1"
 
 WRITING_SYSTEM_INSTRUCTION = (
-    "You are a precise bilingual (Egyptian Arabic / English) short-form video "
-    "writer. For each target you receive bounded ACTUAL resolved source evidence "
-    "and a semantic intent. Write only the final on-screen/narration prose that "
-    "delivers the intent. Rules: (1) ground every statement in the provided "
-    "evidence; never invent numbers, names, facts, quotes, or source timestamps. "
-    "(2) produce genuinely substantive value, not a paraphrase, restatement, "
-    "filler, or presentation-only rewording of the source. (3) preserve the "
-    "source's meaning, negation scope, quantities and their associations, and any "
-    "Latin/code-switch token or proper name verbatim. (4) write natural, "
-    "conversational Arabic compatible with the requested register and target "
-    "context; do not force Modern Standard Arabic or an invented dialect. "
-    "(5) be concise: one short sentence per target. Output only the requested "
-    "structured JSON; you never choose source spans, strategy, rights, renderer "
-    "settings, or whether a deterministic failure may be ignored."
+    "You are a precise bilingual short-form video writer. For each target you "
+    "receive bounded ACTUAL resolved source evidence, an optional source "
+    "language/dialect (descriptive evidence about the material, not a target "
+    "audience), and a semantic intent. Write only the final on-screen/narration "
+    "prose that delivers the intent. Rules: (1) ground every statement in the "
+    "provided evidence; never invent numbers, names, facts, quotes, or source "
+    "timestamps. (2) produce genuinely substantive value, not a paraphrase, "
+    "restatement, filler, or presentation-only rewording of the source. (3) "
+    "preserve the source's meaning, negation scope, quantities and their "
+    "associations, and any Latin/code-switch token or proper name verbatim. (4) "
+    "write natural, conversational language compatible with the requested "
+    "register and target context; do not force Modern Standard Arabic, a "
+    "particular dialect, or an invented dialect. (5) be concise: one short "
+    "sentence per target. Output only the requested structured JSON; you never "
+    "choose source spans, strategy, rights, renderer settings, or whether a "
+    "deterministic failure may be ignored."
 )
 
 CRITIQUE_SYSTEM_INSTRUCTION = (
-    "You are a strict bilingual (Egyptian Arabic / English) semantic reviewer. "
-    "For each block you receive the authored copy, its intended value, and the "
-    "bounded ACTUAL source evidence it claims to be grounded in. Return one "
-    "categorical finding per dimension you can judge: GROUNDING_ENTAILMENT, "
+    "You are a strict bilingual semantic reviewer. For each block you receive the "
+    "authored copy, its intended value, an optional source language/dialect, and "
+    "the bounded ACTUAL source evidence it claims to be grounded in. Return "
+    "exactly one categorical finding for each dimension: GROUNDING_ENTAILMENT, "
     "SUBSTANTIVE_ADDED_VALUE, SEMANTIC_FIDELITY, UNSUPPORTED_FACTS, "
     "CODE_SWITCH_PRESERVATION, REDUNDANCY, DIALECT_REGISTER_FIT, NATURALNESS, "
     "LENGTH_NECESSITY. Each level is PASS, CONCERN, FAIL, or UNKNOWN with short "
-    "evidence. Grounding and added value must be a known PASS to be approved. Do "
-    "not infer knowledge from outside the provided evidence: if the evidence is "
-    "insufficient to judge a dimension, answer UNKNOWN rather than PASS."
+    "evidence. Grounding, substantive added value, semantic fidelity, unsupported "
+    "facts, and code-switch preservation must each be a known PASS to be approved; "
+    "a missing or UNKNOWN critical dimension cannot be approved. Do not infer "
+    "knowledge from outside the provided evidence: if the evidence is insufficient "
+    "to judge a dimension, answer UNKNOWN rather than PASS."
 )
 
 
@@ -170,6 +177,9 @@ class _GeminiChatAdapter:
         self._digest = hashlib.sha256(
             f"gemini-{self._kind}:{routine_model}:{strong_model}".encode()
         ).hexdigest()
+        self._prompt_sha256 = hashlib.sha256(
+            self._system_instruction.encode("utf-8")
+        ).hexdigest()
         self.rate_limited = False
         self._usage: dict[str, int] = {
             "prompt_token_count": 0,
@@ -192,6 +202,8 @@ class _GeminiChatAdapter:
             "temperature": self._temperature,
             "max_output_tokens": self._output_tokens,
             "thinking_level": self._thinking_level,
+            "prompt_sha256": self._prompt_sha256,
+            "schema_version": GEMINI_SCHEMA_VERSION,
         }
 
     def usage_summary(self) -> dict[str, int]:
@@ -468,6 +480,11 @@ def _response_content(response: Any) -> object:
 def _classify_exception(error: Exception) -> str:
     if isinstance(error, MaterializationProviderError):
         return error.category
+    kind = type(error).__name__.casefold()
+    if "timeout" in kind:
+        return ProviderErrorCategory.TIMEOUT.value
+    if "connect" in kind:
+        return ProviderErrorCategory.CONNECTION.value
     if isinstance(error, TimeoutError):
         return ProviderErrorCategory.TIMEOUT.value
     if isinstance(error, (ConnectionError, OSError)):

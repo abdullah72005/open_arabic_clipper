@@ -146,10 +146,39 @@ class CountingNarrationSynthesizer:
         return {"provider": "counting-tts", "model": "m", "api_version": "v1"}
 
     def synthesize(self, request: Any):
-        from app.materialization.narration import FakeNarrationSynthesizer
+        import struct
+
+        from app.materialization.narration import (
+            inspect_wav,
+            wrap_pcm_as_wav,
+            write_narration_asset,
+        )
+        from app.materialization.types import NarrationAudio
+        from app.services.storage import StorageService
 
         self.calls.append(request)
-        return FakeNarrationSynthesizer().synthesize(request)
+        frames = max(1, int(0.5 * 24_000))
+        pcm = struct.pack(f"<{frames}h", *([600] * frames))
+        wav = wrap_pcm_as_wav(pcm, sample_rate=24_000, channels=1)
+        storage = StorageService(get_settings().storage_root)
+        relative, sha = write_narration_asset(
+            storage, "test-source", f"{request.chunk_id}.wav", wav
+        )
+        info = inspect_wav(wav)
+        return NarrationAudio(
+            chunk_id=request.chunk_id,
+            block_index=request.block_index,
+            text=request.text,
+            relative_path=relative,
+            sha256=sha,
+            size_bytes=len(wav),
+            duration_seconds=info.duration_seconds,
+            sample_rate=info.sample_rate,
+            channels=info.channels,
+            container="wav",
+            provider_identity=request.identity(),
+            validation={"ok": True},
+        )
 
     def release(self) -> None:
         return None

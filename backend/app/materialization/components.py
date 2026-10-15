@@ -15,6 +15,7 @@ free and makes zero provider calls.
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -42,6 +43,7 @@ from app.materialization.providers import (
     WritingResult,
 )
 from app.materialization.repository import (
+    ATTEMPT_FAILED_KNOWN,
     ATTEMPT_RESPONDED,
     ATTEMPT_UNCERTAIN,
     PRE_RENDER_CONTEXT_METRIC,
@@ -50,6 +52,7 @@ from app.materialization.repository import (
     MaterializationOwnershipError,
     PreparedMaterialization,
     ledger_counts,
+    ledger_entries,
     merge_component_checkpoint,
     owner_is_current,
     record_attempt_response,
@@ -88,6 +91,40 @@ class ComponentContext:
     settings: Settings | None = None
     cancelled: Callable[[], bool] = field(default=lambda: False)
     admission: Callable[[], bool] | None = None
+    #: Notify the shared admission controller of a rate/quota failure so its
+    #: cooldown is applied (setting a provider's flag alone is not enough).
+    on_rate_limited: Callable[[], None] | None = None
+
+
+#: Provider failure categories that mean the HTTP response was received (even if
+#: its semantic content was unusable). A malformed/safety-refused response is a
+#: truthful RESPONDED attempt; only its *content* was not accepted.
+_RESPONDED_DELIVERY_REASONS = frozenset({"MALFORMED_OUTPUT", "SAFETY_REFUSAL"})
+#: Provider failure categories that mean the request may have reached the
+#: provider but no response was received (ambiguous transport loss).
+_UNCERTAIN_DELIVERY_REASONS = frozenset({"TIMEOUT", "CONNECTION"})
+_RATE_LIMITED_REASON = "RATE_LIMITED"
+
+
+def _delivery_status(response: object) -> str:
+    """Classify a returned provider response into a truthful attempt outcome.
+
+    A non-deferred response (or a received response whose content is unusable) is
+    RESPONDED; an ambiguous transport loss after possible submission is UNCERTAIN;
+    a known provider rejection is FAILED_KNOWN. Only a RESPONDED *and validated*
+    response may become an accepted checkpoint.
+    """
+
+    deferred = bool(getattr(response, "deferred", False))
+    reason = getattr(response, "reason_code", None)
+    reason_code = str(reason) if reason else ""
+    if not deferred:
+        return ATTEMPT_RESPONDED
+    if reason_code in _UNCERTAIN_DELIVERY_REASONS:
+        return ATTEMPT_UNCERTAIN
+    if reason_code in _RESPONDED_DELIVERY_REASONS:
+        return ATTEMPT_RESPONDED
+    return ATTEMPT_FAILED_KNOWN
 
 
 def script_dependency_inputs(
@@ -260,17 +297,47 @@ class DurableRequestGateway:
                 )
                 return None, "DEFERRED", attempt_id
             patch = on_response(response) if on_response is not None else None
+            delivery = _delivery_status(response)
+            if str(getattr(response, "reason_code", "") or "") == _RATE_LIMITED_REASON:
+                self._notify_rate_limited()
             record_attempt_response(
                 self._context.session,
                 self._context.owner,
                 attempt_id,
-                status=ATTEMPT_RESPONDED,
+                status=delivery,
                 component=checkpoint_component or component,
                 response_fingerprint=stable_digest(_response_identity(response)),
                 checkpoint_patch=patch,
             )
+            if delivery != ATTEMPT_RESPONDED:
+                return response, "DEFERRED", attempt_id
             return response, "RESPONDED", attempt_id
         return operation(), "RESPONDED", None
+
+    def _notify_rate_limited(self) -> None:
+        notify = self._context.on_rate_limited
+        if notify is None:
+            return
+        try:
+            notify()
+        except Exception:
+            return
+
+    def has_uncertain_attempt(self, component: str, dependency_fingerprint: str) -> bool:
+        """True when an ambiguous (UNCERTAIN) attempt already consumed the budget.
+
+        An uncertain attempt may have reached the provider, so a later run must
+        never silently retry it; the generation defers honestly instead.
+        """
+
+        for entry in ledger_entries(self._ledger()):
+            if (
+                entry.get("component") == component
+                and entry.get("dependency_fingerprint") == dependency_fingerprint
+                and entry.get("status") == ATTEMPT_UNCERTAIN
+            ):
+                return True
+        return False
 
 
 def _response_identity(response: object) -> object:
@@ -462,6 +529,10 @@ class CheckpointedWritingProvider:
             on_response=on_response,
             checkpoint_component="SCRIPT",
         )
+        if isinstance(response, WritingResult) and response.deferred:
+            # Preserve the provider's truthful delivery reason (e.g. UNCERTAIN),
+            # never collapsing it into a generic deferral.
+            return response
         if status != "RESPONDED" or response is None:
             self.deferred_reason = "DEFERRED_PROVIDER"
             return WritingResult(
@@ -543,6 +614,8 @@ class CheckpointedCritiqueProvider:
             on_response=on_response,
             checkpoint_component="SCRIPT",
         )
+        if isinstance(response, CritiqueResult) and response.deferred:
+            return response
         if status != "RESPONDED" or response is None:
             return CritiqueResult(
                 accepted={},
@@ -722,7 +795,21 @@ class CheckpointedNarrationSynthesizer:
         asset = synthesis.get("asset")
         if not isinstance(asset, Mapping):
             return None
-        return _narration_audio_from_dict(asset)
+        audio = _narration_audio_from_dict(asset)
+        if not self._verify_stored_asset(audio):
+            return None
+        return audio
+
+    def _verify_stored_asset(self, audio: NarrationAudio) -> bool:
+        """Confirm stored bytes match the recorded hash before any checkpoint reuse."""
+
+        storage = self._gateway.context.storage
+        try:
+            path = storage.resolve_relative(audio.relative_path)
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        except Exception:
+            return False
+        return bool(audio.sha256) and digest == audio.sha256
 
     def release(self) -> None:
         return None

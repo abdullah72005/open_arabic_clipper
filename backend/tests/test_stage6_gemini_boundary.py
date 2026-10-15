@@ -240,31 +240,34 @@ def test_writing_adapter_missing_key_is_unavailable_and_defers() -> None:
     assert result.reason_code == "MISSING_KEY"
 
 
+def _complete_findings(**overrides: str) -> list[dict[str, str]]:
+    return [
+        {"dimension": dimension, "level": overrides.get(dimension, "PASS"), "evidence": "e"}
+        for dimension in CRITIQUE_DIMENSIONS
+    ]
+
+
+def _complete_block(index: int, **overrides: str) -> BlockCritique:
+    return BlockCritique(
+        block_index=index,
+        findings=tuple(
+            CritiqueDimensionFinding(dimension, overrides.get(dimension, "PASS"))
+            for dimension in CRITIQUE_DIMENSIONS
+        ),
+    )
+
+
 def test_critique_adapter_parses_categorical_findings() -> None:
     transport = _Transport()
-    payload = {
-        "blocks": [
-            {
-                "block_index": 1,
-                "findings": [
-                    {"dimension": "GROUNDING_ENTAILMENT", "level": "PASS", "evidence": "e"},
-                    {"dimension": "SUBSTANTIVE_ADDED_VALUE", "level": "PASS", "evidence": "e"},
-                    {"dimension": "UNSUPPORTED_FACTS", "level": "PASS", "evidence": "e"},
-                ],
-            }
-        ]
-    }
+    payload = {"blocks": [{"block_index": 1, "findings": _complete_findings()}]}
     transport.set_handler(lambda request: _Ok(payload).as_response())
     result = _critique_provider(transport).critique(_critique_request())
 
     assert result.deferred is False
     assert result.decision(1) is True
     block = result.blocks[1]
-    assert {finding.dimension for finding in block.findings} == {
-        "GROUNDING_ENTAILMENT",
-        "SUBSTANTIVE_ADDED_VALUE",
-        "UNSUPPORTED_FACTS",
-    }
+    assert {finding.dimension for finding in block.findings} == set(CRITIQUE_DIMENSIONS)
+    assert block.verdict() == "ACCEPTED"
     assert len(transport.requests) == 1
 
 
@@ -386,17 +389,7 @@ def test_materialize_script_requires_known_positive_critique() -> None:
     assert script.authored_blocks == ()
     assert failing.calls == 1
 
-    passing = _CategoricalCritiqueProvider(
-        {
-            1: BlockCritique(
-                block_index=1,
-                findings=(
-                    CritiqueDimensionFinding("GROUNDING_ENTAILMENT", "PASS"),
-                    CritiqueDimensionFinding("SUBSTANTIVE_ADDED_VALUE", "PASS"),
-                ),
-            )
-        }
-    )
+    passing = _CategoricalCritiqueProvider({1: _complete_block(1, NATURALNESS="CONCERN")})
     accepted = materialize_script(
         DeterministicWritingProvider(),
         inputs,
@@ -408,6 +401,10 @@ def test_materialize_script_requires_known_positive_critique() -> None:
     assert accepted.accepted is True
     assert accepted.authored_blocks[0].copy == NOVEL_COPY
     assert passing.calls == 1
+    assert any(
+        finding.dimension == "LANGUAGE_REGISTER_NATURALNESS" and finding.level == "CONCERN"
+        for finding in accepted.findings
+    )
 
 
 def test_hosted_disabled_makes_zero_provider_calls() -> None:

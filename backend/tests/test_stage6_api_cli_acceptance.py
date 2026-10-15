@@ -84,10 +84,14 @@ def test_profile_import_rejects_unknown_and_invalid(engine: Engine) -> None:
 
 
 def _seed_completed_materialization(engine: Engine, storage_relative: str) -> uuid.UUID:
+    import hashlib
+
     settings = get_settings()
     artifact = settings.storage_root / storage_relative
     artifact.parent.mkdir(parents=True, exist_ok=True)
     artifact.write_bytes(b"\x00\x00\x00\x18ftypmp42synthetic")
+    artifact_sha = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    output_fingerprint = "a" * 64
 
     materialization_id = uuid.uuid4()
     render_id = uuid.uuid4()
@@ -104,7 +108,7 @@ def _seed_completed_materialization(engine: Engine, storage_relative: str) -> uu
             human_review_required=True,
             publication_ready=False,
             is_current=True,
-            output_fingerprint="a" * 64,
+            output_fingerprint=output_fingerprint,
             render_execution_id=render_id,
             metrics={"assessment_fingerprint": "f" * 64, "final_integrated_lufs": -16.0},
             authored_blocks=[{"block_index": 0, "copy": "hi"}],
@@ -124,7 +128,11 @@ def _seed_completed_materialization(engine: Engine, storage_relative: str) -> uu
             lifecycle=RenderExecutionLifecycle.COMPLETE,
             is_current=True,
             output_fingerprint="b" * 64,
-            artifact_reference={"relative_path": storage_relative, "sha256": "c" * 64},
+            request_payload={
+                "materialization_id": str(materialization_id),
+                "expected_output_fingerprint": output_fingerprint,
+            },
+            artifact_reference={"relative_path": storage_relative, "sha256": artifact_sha},
             qc_result={"measured": {"final_integrated_lufs": -16.0, "final_true_peak_dbtp": -2.0}},
         )
         session.add(envelope)

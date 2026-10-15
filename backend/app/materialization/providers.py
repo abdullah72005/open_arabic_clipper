@@ -73,6 +73,37 @@ CRITICAL_CRITIQUE_DIMENSIONS = frozenset(
 )
 _POSITIVE_REQUIRED_DIMENSIONS = ("GROUNDING_ENTAILMENT", "SUBSTANTIVE_ADDED_VALUE")
 
+#: A block verdict is a closed tri-state. ``ACCEPTED`` requires exactly one valid
+#: finding for every requested dimension and a known PASS for every critical
+#: dimension. ``DEFERRED`` means the critique evidence is missing, malformed,
+#: duplicated, contradictory, or critical-UNKNOWN and therefore can never imply
+#: approval. ``REJECTED`` means a critical dimension is CONCERN/FAIL.
+CRITIQUE_ACCEPTED = "ACCEPTED"
+CRITIQUE_DEFERRED = "DEFERRED"
+CRITIQUE_REJECTED = "REJECTED"
+
+#: Map a categorical critique dimension to the persisted Stage 6 quality
+#: dimension so noncritical concerns survive into assessment/final findings.
+CRITIQUE_TO_QUALITY_DIMENSION: dict[str, str] = {
+    "GROUNDING_ENTAILMENT": "GROUNDING_VERIFICATION",
+    "SUBSTANTIVE_ADDED_VALUE": "SUBSTANTIVE_VALUE",
+    "SEMANTIC_FIDELITY": "FIDELITY_ATTRIBUTION",
+    "UNSUPPORTED_FACTS": "GROUNDING_VERIFICATION",
+    "CODE_SWITCH_PRESERVATION": "LANGUAGE_REGISTER_NATURALNESS",
+    "REDUNDANCY": "SUBSTANTIVE_VALUE",
+    "DIALECT_REGISTER_FIT": "LANGUAGE_REGISTER_NATURALNESS",
+    "NATURALNESS": "LANGUAGE_REGISTER_NATURALNESS",
+    "LENGTH_NECESSITY": "PACING_CONTEXT_DENSITY",
+}
+
+#: Categorical critique level -> persisted quality level.
+CRITIQUE_TO_QUALITY_LEVEL: dict[str, str] = {
+    "PASS": "SATISFIED",
+    "CONCERN": "CONCERN",
+    "FAIL": "UNMET",
+    "UNKNOWN": "UNKNOWN",
+}
+
 
 @dataclass(frozen=True)
 class CritiqueDimensionFinding:
@@ -94,27 +125,84 @@ class BlockCritique:
     findings: tuple[CritiqueDimensionFinding, ...] = ()
 
     def _level(self, dimension: str) -> str | None:
+        levels = self.levels()
+        return levels.get(dimension)
+
+    def levels(
+        self, requested: Sequence[str] = CRITIQUE_DIMENSIONS
+    ) -> dict[str, str]:
+        """Return the known level per dimension, dropping duplicates/non-requested.
+
+        A duplicate or out-of-vocabulary finding for a requested dimension is
+        recorded via :meth:`structural_issues` and never silently resolved to a
+        favorable value.
+        """
+
+        allowed = set(requested)
+        levels: dict[str, str] = {}
         for finding in self.findings:
-            if finding.dimension == dimension:
-                return finding.level
-        return None
+            if finding.dimension not in allowed:
+                continue
+            if finding.dimension in levels:
+                continue
+            if finding.level not in CRITIQUE_LEVELS:
+                continue
+            levels[finding.dimension] = finding.level
+        return levels
+
+    def structural_issues(
+        self, requested: Sequence[str] = CRITIQUE_DIMENSIONS
+    ) -> list[str]:
+        """Malformed/duplicate/missing findings that cannot imply approval."""
+
+        allowed = set(requested)
+        issues: list[str] = []
+        seen: set[str] = set()
+        for finding in self.findings:
+            if finding.dimension not in allowed:
+                issues.append(f"UNEXPECTED_DIMENSION:{finding.dimension}")
+                continue
+            if finding.level not in CRITIQUE_LEVELS:
+                issues.append(f"INVALID_LEVEL:{finding.dimension}:{finding.level}")
+                continue
+            if finding.dimension in seen:
+                issues.append(f"DUPLICATE_DIMENSION:{finding.dimension}")
+                continue
+            seen.add(finding.dimension)
+        for dimension in requested:
+            if dimension not in seen:
+                issues.append(f"MISSING_DIMENSION:{dimension}")
+        return issues
+
+    def verdict(self, requested: Sequence[str] = CRITIQUE_DIMENSIONS) -> str:
+        """Tri-state block verdict derived from complete categorical evidence.
+
+        Exactly one valid finding is required for every requested dimension. A
+        missing/malformed/duplicate finding defers; any critical CONCERN/FAIL
+        rejects; a critical UNKNOWN defers; only an all-critical-PASS block is
+        accepted. Noncritical CONCERN/FAIL/UNKNOWN never block acceptance.
+        """
+
+        if self.structural_issues(requested):
+            return CRITIQUE_DEFERRED
+        levels = self.levels(requested)
+        for dimension in CRITICAL_CRITIQUE_DIMENSIONS:
+            level = levels.get(dimension)
+            if level in {"CONCERN", "FAIL"}:
+                return CRITIQUE_REJECTED
+            if level != "PASS":
+                return CRITIQUE_DEFERRED
+        return CRITIQUE_ACCEPTED
 
     @property
     def accepted(self) -> bool:
-        """Known-positive grounding + added value and no critical concern/failure."""
-
-        for dimension in _POSITIVE_REQUIRED_DIMENSIONS:
-            if self._level(dimension) != "PASS":
-                return False
-        for dimension in CRITICAL_CRITIQUE_DIMENSIONS:
-            if self._level(dimension) in {"CONCERN", "FAIL"}:
-                return False
-        return True
+        return self.verdict() == CRITIQUE_ACCEPTED
 
     def as_dict(self) -> dict[str, object]:
         return {
             "block_index": self.block_index,
             "accepted": self.accepted,
+            "verdict": self.verdict(),
             "findings": [finding.as_dict() for finding in self.findings],
         }
 
@@ -191,10 +279,12 @@ class CritiqueRequest:
 
     targets: tuple[CritiqueTarget, ...]
     tier: str = SEMANTIC_ROUTINE_TIER
+    source_context: Mapping[str, object] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, object]:
         return {
             "tier": self.tier,
+            "source_context": dict(self.source_context),
             "targets": [target.as_dict() for target in self.targets],
         }
 
@@ -224,6 +314,25 @@ class CritiqueResult:
             return bool(self.accepted[index])
         return None
 
+    def verdict(self, index: int, requested: Sequence[str] = CRITIQUE_DIMENSIONS) -> str | None:
+        """Tri-state verdict for one block, preferring full categorical evidence.
+
+        A boolean-only result (a legacy/fake provider) is honored for test
+        compatibility, but the production acceptance path always supplies
+        categorical ``blocks`` and therefore never relies on a bare boolean.
+        """
+
+        block = self.blocks.get(index)
+        if block is not None:
+            return block.verdict(requested)
+        if index in self.accepted:
+            return CRITIQUE_ACCEPTED if self.accepted[index] else CRITIQUE_REJECTED
+        return None
+
+    def findings_for(self, index: int) -> tuple[CritiqueDimensionFinding, ...]:
+        block = self.blocks.get(index)
+        return block.findings if block is not None else ()
+
 
 @dataclass(frozen=True)
 class WritingRequest:
@@ -233,12 +342,14 @@ class WritingRequest:
     priority: str
     profile_semantic_context: Mapping[str, object]
     tier: str = SEMANTIC_ROUTINE_TIER
+    source_context: Mapping[str, object] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, object]:
         return {
             "priority": self.priority,
             "tier": self.tier,
             "profile_semantic_context": dict(self.profile_semantic_context),
+            "source_context": dict(self.source_context),
             "targets": [target.as_dict() for target in self.targets],
         }
 
@@ -438,7 +549,22 @@ def build_writing_request(inputs: MaterializationInputs, *, config: Stage6Config
             "register_intent": inputs.profile.register_intent,
         },
         tier=tier,
+        source_context=_source_context(inputs),
     )
+
+
+def _source_context(inputs: MaterializationInputs) -> dict[str, object]:
+    """Source language/dialect identity, supplied separately from target context.
+
+    The source language/dialect is descriptive evidence about the material, never
+    a deployment-wide default or a target audience; it is passed to providers
+    separately so the shared instruction stays dialect-neutral.
+    """
+
+    return {
+        "source_language": inputs.source_language,
+        "source_dialect": dict(inputs.source_dialect),
+    }
 
 
 @dataclass(frozen=True)
@@ -509,6 +635,7 @@ def materialize_script(
     reasons: list[str] = []
     findings_by_block: dict[int, list[QualityFinding]] = {}
     accepted_indexes: dict[int, bool] = {}
+    critique_by_block: dict[int, BlockCritique] = {}
     for target in request.targets:
         copy = result.copies.get(target.block_index, "")
         block_payload = {
@@ -537,30 +664,62 @@ def materialize_script(
                 )
             )
 
+    unresolved = False
     if review_targets:
-        reviewed = _run_critique(
+        evaluation = _run_critique(
             critique_provider,
             review_targets,
             ledger=ledger,
             config=config,
             allow_hosted=allow_hosted,
             attempt_scope=attempt_scope,
+            source_context=_source_context(inputs),
         )
-        if reviewed is None:
+        if evaluation is None:
+            # No usable critique evidence: the review-required block defers
+            # honestly rather than being accepted on novelty alone.
             return MaterializationScript(
                 (),
                 False,
                 identity,
                 True,
                 ("GROUNDED_INFERENCE_REQUIRES_REVIEW",),
-                _unresolved_findings(findings_by_block, {}),
+                _combined_findings(findings_by_block, accepted_indexes, {}),
             )
-        accepted_indexes.update(reviewed)
+        for target in review_targets:
+            index = target.block_index
+            block = evaluation.blocks.get(index)
+            if block is not None:
+                critique_by_block[index] = block
+            verdict = evaluation.verdict(index)
+            if verdict == CRITIQUE_ACCEPTED:
+                accepted_indexes[index] = True
+            elif verdict == CRITIQUE_REJECTED:
+                accepted_indexes[index] = False
+                reasons.extend(_critique_reasons(block))
+            else:
+                # Missing/malformed/duplicate/contradictory/critical-UNKNOWN
+                # evidence can never imply approval: the generation defers.
+                unresolved = True
+
+    if unresolved:
+        return MaterializationScript(
+            (),
+            False,
+            identity,
+            True,
+            tuple(dict.fromkeys((*reasons, "GROUNDED_INFERENCE_REQUIRES_REVIEW"))),
+            _combined_findings(findings_by_block, accepted_indexes, critique_by_block),
+        )
 
     for target in request.targets:
         if not accepted_indexes.get(target.block_index, False):
             continue
         copy = result.copies.get(target.block_index, "")
+        evidence: dict[str, object] = {"accepted": True}
+        block_critique = critique_by_block.get(target.block_index)
+        if block_critique is not None:
+            evidence["critique"] = block_critique.as_dict()
         authored.append(
             AuthoredBlock(
                 block_index=target.block_index,
@@ -571,7 +730,7 @@ def materialize_script(
                 adds_beyond_source=target.semantic_intent,
                 claim_class=ClaimClass.SOURCE_GROUNDED_INFERENCE.value,
                 grounding_refs=target.grounding_refs,
-                validation_evidence={"accepted": True},
+                validation_evidence=evidence,
             )
         )
     return MaterializationScript(
@@ -580,27 +739,71 @@ def materialize_script(
         provider_identity=result.provider_identity,
         deferred=False,
         reason_codes=tuple(dict.fromkeys(reasons)),
-        findings=_unresolved_findings(findings_by_block, accepted_indexes),
+        findings=_combined_findings(findings_by_block, accepted_indexes, critique_by_block),
     )
 
 
-def _unresolved_findings(
+def _combined_findings(
     findings_by_block: Mapping[int, list[QualityFinding]],
     accepted_indexes: Mapping[int, bool],
+    critique_by_block: Mapping[int, BlockCritique],
 ) -> tuple[QualityFinding, ...]:
-    """Findings that remain for blocks that were not ultimately accepted.
+    """All persisted script findings, including noncritical categorical concerns.
 
-    A deterministic/grounded-inference concern that a bounded semantic critique
-    later cleared must not linger as an unresolved concern in the accepted
-    materialization; the block's acceptance is the resolution.
+    Deterministic findings for blocks that were not ultimately accepted are kept
+    (a favorable critique that resolved a soft inference concern drops only that
+    block's own deterministic concern). Categorical critique findings are carried
+    as quality findings for *every* reviewed block, so a noncritical concern
+    (e.g. NATURALNESS) survives into persisted script evidence and the final
+    assessment even when the block was accepted.
     """
 
-    unresolved: list[QualityFinding] = []
+    combined: list[QualityFinding] = []
     for index, findings in findings_by_block.items():
         if accepted_indexes.get(index, False):
             continue
-        unresolved.extend(findings)
-    return tuple(unresolved)
+        combined.extend(findings)
+    for block in critique_by_block.values():
+        for finding in block.findings:
+            dimension = CRITIQUE_TO_QUALITY_DIMENSION.get(finding.dimension)
+            level = CRITIQUE_TO_QUALITY_LEVEL.get(finding.level)
+            if dimension is None or level is None or level == "SATISFIED":
+                continue
+            combined.append(
+                QualityFinding(
+                    dimension=dimension,
+                    level=level,
+                    reason_codes=(f"CRITIQUE_{finding.dimension}_{finding.level}",),
+                    evidence={
+                        "critique_dimension": finding.dimension,
+                        "critique_level": finding.level,
+                        "evidence": finding.evidence,
+                    },
+                )
+            )
+    return tuple(combined)
+
+
+def _critique_reasons(block: BlockCritique | None) -> list[str]:
+    if block is None:
+        return []
+    reasons: list[str] = []
+    for dimension in CRITICAL_CRITIQUE_DIMENSIONS:
+        level = block._level(dimension)
+        if level in {"CONCERN", "FAIL"}:
+            reasons.append(f"CRITIQUE_{dimension}_{level}")
+    return reasons
+
+
+@dataclass(frozen=True)
+class CritiqueEvaluation:
+    """Validated categorical critique for the requested review targets."""
+
+    blocks: Mapping[int, BlockCritique]
+
+    def verdict(self, index: int) -> str | None:
+        block = self.blocks.get(index)
+        return block.verdict() if block is not None else None
 
 
 def _run_critique(
@@ -611,7 +814,8 @@ def _run_critique(
     config: Stage6Config,
     allow_hosted: bool,
     attempt_scope: str,
-) -> dict[int, bool] | None:
+    source_context: Mapping[str, object] | None = None,
+) -> CritiqueEvaluation | None:
     if critique_provider is None or not allow_hosted:
         return None
     if ledger.semantic >= config.max_raw_semantic_calls:
@@ -620,15 +824,31 @@ def _run_critique(
         return None
     if not ledger.reserve(f"{attempt_scope}:critique", kind="critique"):
         return None
-    result = critique_provider.critique(CritiqueRequest(targets=tuple(targets)))
+    result = critique_provider.critique(
+        CritiqueRequest(targets=tuple(targets), source_context=dict(source_context or {}))
+    )
     if result.deferred:
         return None
-    decisions: dict[int, bool] = {}
+    blocks: dict[int, BlockCritique] = {}
     for target in targets:
-        verdict = result.decision(target.block_index)
-        if verdict is not None:
-            decisions[target.block_index] = verdict
-    return decisions
+        block = result.blocks.get(target.block_index)
+        if block is not None:
+            blocks[target.block_index] = block
+        elif target.block_index in result.accepted:
+            # Boolean-only legacy/fake result: synthesize a block that carries
+            # the boolean as complete evidence only when it is a rejection.
+            accepted = bool(result.accepted[target.block_index])
+            level = "PASS" if accepted else "FAIL"
+            blocks[target.block_index] = BlockCritique(
+                block_index=target.block_index,
+                findings=tuple(
+                    CritiqueDimensionFinding(dimension=dimension, level=level)
+                    for dimension in CRITIQUE_DIMENSIONS
+                ),
+            )
+    if not blocks:
+        return None
+    return CritiqueEvaluation(blocks=blocks)
 
 
 def _refs(value: object) -> tuple[GroundingRef, ...]:
@@ -685,10 +905,14 @@ def _optional_str(value: object) -> str | None:
 
 __all__ = [
     "CRITICAL_CRITIQUE_DIMENSIONS",
+    "CRITIQUE_ACCEPTED",
+    "CRITIQUE_DEFERRED",
     "CRITIQUE_DIMENSIONS",
     "CRITIQUE_LEVELS",
+    "CRITIQUE_REJECTED",
     "BlockCritique",
     "CritiqueDimensionFinding",
+    "CritiqueEvaluation",
     "CritiqueRequest",
     "CritiqueResult",
     "CritiqueTarget",

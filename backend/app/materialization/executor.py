@@ -79,6 +79,8 @@ class MaterializationProviders:
     allow_hosted: bool = False
     #: Shared admit/deny callable (HIGH gate) consulted before any hosted call.
     admission: Callable[[], bool] | None = field(default=None)
+    #: Notify the shared admission controller of a rate/quota failure.
+    on_rate_limited: Callable[[], None] | None = field(default=None)
     #: Per-run narration synthesizer builder (needs the resolved source id). Used
     #: only when no narration provider is injected directly.
     narration_factory: Callable[[MaterializationInputs], object | None] | None = field(default=None)
@@ -132,12 +134,19 @@ def build_materialization_providers(
             "MaterializationCritiqueProvider | None", settings.materialization_critique_provider()
         )
         hosted = writing is not None or critique is not None
+        admission = None
+        on_rate_limited = None
+        if hosted:
+            controller = settings.gemini_admission_controller()
+            admission = _admission_callable(controller)
+            on_rate_limited = _rate_limit_notifier(controller)
         return MaterializationProviders(
             writing=writing or DeterministicWritingProvider(),
             critique=critique,
             narration=narration,
             allow_hosted=hosted,
-            admission=_admission_callable(settings.gemini_admission_controller) if hosted else None,
+            admission=admission,
+            on_rate_limited=on_rate_limited,
             narration_factory=(
                 _narration_factory(settings, storage) if storage is not None else None
             ),
@@ -186,7 +195,11 @@ def _narration_factory(
 
 
 def _narration_fidelity_validator(
-    settings: Settings, storage: StorageService
+    settings: Settings,
+    storage: StorageService,
+    *,
+    cancel_event: object | None = None,
+    is_cancelled: Callable[[], bool] | None = None,
 ) -> Callable[[object], Mapping[str, object]]:
     """Build the local audio-backed fidelity validator under the heavy-model lease."""
 
@@ -212,20 +225,24 @@ def _narration_fidelity_validator(
                 engine=engine,
                 options=options,
                 lease_factory=lease_factory,
+                cancel_event=cancel_event,  # type: ignore[arg-type]
+                is_cancelled=is_cancelled,
             )
         except Exception:
             return {"status": "DEFERRED", "findings": ["FIDELITY_UNAVAILABLE"]}
         return result.as_dict()
 
+    #: Marks this as the settings-built validator so the executor may rebind it to
+    #: the per-run cancellation event; injected test validators are left untouched.
+    validate._stage6_rebindable = True  # type: ignore[attr-defined]
     return validate
 
 
-def _admission_callable(factory: Callable[[], object]) -> Callable[[], bool]:
+def _admission_callable(controller: object) -> Callable[[], bool]:
     """Wrap the shared admission controller as an admit/deny boolean (HIGH gate)."""
 
     from app.core.enums import AdmissionPriority
 
-    controller = factory()
     priority = AdmissionPriority.HIGH
 
     def admit() -> bool:
@@ -236,6 +253,20 @@ def _admission_callable(factory: Callable[[], object]) -> Callable[[], bool]:
         return bool(getattr(decision, "admitted", False))
 
     return admit
+
+
+def _rate_limit_notifier(controller: object) -> Callable[[], None]:
+    """Wrap the shared controller so a rate/quota failure applies its cooldown."""
+
+    def notify() -> None:
+        recorder = getattr(controller, "record_rate_limit", None)
+        if callable(recorder):
+            try:
+                recorder()
+            except Exception:
+                return
+
+    return notify
 
 
 class _LivenessHeartbeat:
@@ -340,6 +371,12 @@ class MaterializationExecutor:
         self._claim_version: int | None = None
         self.claim_lost = False
         self.skipped_duplicate = False
+        #: Shared cancellation event for this run: set when the job is cancelled or
+        #: the claim is lost, and observed by the local ASR child.
+        self._cancel_event = threading.Event()
+        #: A narration synthesizer created by the per-run factory, so it is released
+        #: with the other owned provider resources on every exit.
+        self._owned_narration: object | None = None
         # Default: no broker delivery (safe for pure/unit reuse). Production
         # workers inject the real broker seam via ``set_render_dispatcher``.
         self._render_dispatcher: object | None = _NoDispatch()
@@ -510,7 +547,10 @@ class MaterializationExecutor:
         return heartbeat
 
     def _should_stop(self) -> bool:
-        return self._job_cancelled() or not self._claim_is_current()
+        stopping = self._job_cancelled() or not self._claim_is_current()
+        if stopping:
+            self._cancel_event.set()
+        return stopping
 
     # -- execution -------------------------------------------------------------
 
@@ -619,9 +659,25 @@ class MaterializationExecutor:
         narration = self._providers.narration
         if narration is None and self._providers.narration_factory is not None:
             narration = self._providers.narration_factory(inputs)
+            if narration is not None:
+                self._owned_narration = narration
         from app.materialization.narration import NarrationSynthesizer
 
         narration_provider = narration if isinstance(narration, NarrationSynthesizer) else None
+        narration_fidelity = self._providers.narration_fidelity
+        if (
+            narration_provider is not None
+            and narration_fidelity is not None
+            and getattr(narration_fidelity, "_stage6_rebindable", False)
+        ):
+            # Rebind the settings-built validator so a lost lease or a cancelled
+            # job sets the same cancellation event the Whisper child observes.
+            narration_fidelity = _narration_fidelity_validator(
+                self._settings,
+                self._storage,
+                cancel_event=self._cancel_event,
+                is_cancelled=self._should_stop,
+            )
         return ComponentContext(
             session=self._session,
             owner=owner,
@@ -633,11 +689,12 @@ class MaterializationExecutor:
                 critique=self._providers.critique,
                 narration=narration_provider,
                 narration_fidelity=(
-                    self._providers.narration_fidelity if narration_provider is not None else None
+                    narration_fidelity if narration_provider is not None else None
                 ),
             ),
             allow_hosted=self._providers.allow_hosted,
             admission=self._providers.admission,
+            on_rate_limited=self._providers.on_rate_limited,
             cancelled=self._should_stop,
         )
 
@@ -652,6 +709,7 @@ class MaterializationExecutor:
     ) -> StageExecutionResult:
         self.skipped_duplicate = False
         self.claim_lost = False
+        self._cancel_event.clear()
         if self._job_cancelled():
             self._finish_job(JobStatus.CANCELLED)
             raise StageCancelled("Stage 6 materialization cancelled before start")
@@ -862,6 +920,7 @@ class MaterializationExecutor:
             self._providers.writing,
             self._providers.critique,
             self._providers.narration,
+            self._owned_narration,
         ):
             if target is None:
                 continue

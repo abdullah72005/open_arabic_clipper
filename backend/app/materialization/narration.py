@@ -226,19 +226,18 @@ def _lcs_length(left: Sequence[str], right: Sequence[str]) -> int:
     return previous[-1]
 
 
-def transcription_matches(expected: str, actual: str, *, threshold: float = 0.6) -> bool:
+def transcription_matches(expected: str, actual: str) -> bool:
     """Deterministic ASR-vs-script comparison (never rewrites source evidence).
 
     A bounded local ASR transcript is compared with the accepted copy. Arabic
     orthographic variants are folded, contractions expanded, and clear
-    non-lexical fillers dropped. Meaning-critical content is then checked with
-    order- and occurrence-aware alignment: negation and numbers must match in
-    set *and* order (so a swapped negation scope or number attribution fails),
-    code-switch/Latin tokens must keep their order, the first-occurrence order of
-    distinct content tokens must be identical (so a reversed participant
-    attribution fails even when the token multiset is unchanged), every expected
-    token must be present, and the ordered LCS must cover the expected sequence.
-    Uncertain alignment never passes.
+    non-lexical fillers dropped (the only documented exceptions). The normalized
+    *content token sequence* of the actual transcript must then equal the expected
+    sequence exactly: every token, its multiplicity, and its order must match. A
+    permissive similarity ratio is never acceptance authority, so every
+    participant role, negation scope, number association, and code-switch token is
+    preserved. Any difference in sequence, occurrence, or order is a clear
+    meaning mismatch.
     """
 
     expected_tokens = _tokenize(expected)
@@ -247,39 +246,8 @@ def transcription_matches(expected: str, actual: str, *, threshold: float = 0.6)
     actual_tokens = _tokenize(actual)
     expected_content = _content_tokens(expected_tokens)
     actual_content = _content_tokens(actual_tokens)
-
-    expected_negation = [token for token in expected_content if token in _NEGATION_TOKENS]
-    actual_negation = [token for token in actual_content if token in _NEGATION_TOKENS]
-    if expected_negation != actual_negation:
+    if expected_content != actual_content:
         return False
-
-    expected_numbers = [token for token in expected_content if _is_number(token)]
-    actual_numbers = [token for token in actual_content if _is_number(token)]
-    if expected_numbers != actual_numbers:
-        return False
-
-    # Code-switch / Latin tokens must be present and in the same order.
-    expected_latin = [token for token in expected_content if _is_latin(token)]
-    actual_latin = [token for token in actual_content if _is_latin(token)]
-    if expected_latin and not _is_subsequence(expected_latin, actual_latin):
-        return False
-
-    # Participant attribution: the first-occurrence order of distinct content
-    # tokens must be identical. A reversed attribution has a different distinct
-    # order even though its token multiset is unchanged.
-    if _distinct_order(expected_content) != _distinct_order(actual_content):
-        return False
-
-    # Every expected token must be present; a dropped word is never accepted.
-    actual_set = set(actual_tokens)
-    if not all(token in actual_set for token in expected_tokens):
-        return False
-
-    # Order-sensitive coverage of the expected sequence.
-    if expected_content:
-        coverage = _lcs_length(expected_content, actual_content) / len(expected_content)
-        if coverage < threshold:
-            return False
     return True
 
 

@@ -1,5 +1,133 @@
 # Runtime status
 
+## Stage 6: SOL review root causes 1–6 corrected with regressions (2026-10-16, continuation)
+
+Status: **the six reproduced root causes (categorical critique evidence,
+strict audio fidelity, immutable narration + owned resources, truthful
+provider-attempt outcomes + shared cooldown, audition identity/budget/export,
+genuine acceptance export/inventory) are corrected with persisted regressions
+that assert the corrected behavior. The prior SOL diagnostic
+(`/tmp/test_sol_stage6_adapter_review.py`) was replaced by
+`backend/tests/test_stage6_adapter_regressions.py` (8 tests). Task 8's
+`cancel_materialization` profile-key authority is fixed; the remaining Task 8
+rich API/UI Produce→Results surface and Task 9's genuine authorized-media
+acceptance are still NOT done. No genuine `MANUAL CHECK REQUIRED NOW` media
+exists. Stage 6 is NOT FROZEN.**
+
+### 1. Complete categorical evidence (root cause 1)
+
+`providers.BlockCritique` is now a tri-state decision: `verdict()` requires
+exactly one valid finding for every requested categorical dimension and a known
+`PASS` for every critical dimension. Missing/malformed/duplicate findings or a
+critical `UNKNOWN` yield `DEFERRED` (never approval); a critical `CONCERN/FAIL`
+yields `REJECTED`. Noncritical categorical concerns are carried as persisted
+`QualityFinding`s into `MaterializationScript.findings` even when the block was
+accepted (no longer dropped by an accepted block), and full categorical evidence
+is stored in the accepted block's `validation_evidence`. `materialize_script`
+now defers the whole generation on any unresolved review target instead of
+treating an undecided block as a rejection. Boolean-only fake-provider
+compatibility is confined to test providers (production always supplies
+categorical blocks). The Gemini writing/critique instructions are dialect-neutral
+and receive source language/dialect as a separate `source_context` field, and the
+prompt SHA-256 + schema version participate in `runtime_identity` (and therefore
+the SCRIPT dependency fingerprint).
+
+### 2. Strict audio fidelity + cancellation wiring (root cause 2)
+
+`narration.transcription_matches` no longer uses an LCS ratio as acceptance
+authority: the normalized content-token sequence must match exactly (orthographic
+folding, contraction expansion, and documented non-lexical fillers are the only
+exceptions), so a repeated-name role reversal is rejected. A real-SDK
+`httpx.ReadTimeout` after submission is now classified as TIMEOUT (detected by
+exception class name, not message text). `validate_narration_fidelity` creates a
+child cancellation event, wires `factory.acquire(on_ownership_lost=...)` to set
+it, optionally watches an executor `is_cancelled` predicate, and passes the event
+to `engine.transcribe`; the executor owns a per-run event set by `_should_stop`
+and rebinds the settings-built validator to it.
+
+### 3. Immutable narration + owned resources (root cause 3)
+
+`tts_gemini._persist_to_storage` is content-addressed
+(`{chunk_id}-{sha256[:16]}.wav`), so changed content gets a distinct path and the
+first generation is never overwritten; identical bytes deterministically reuse the
+same verified path. `CheckpointedNarrationSynthesizer` verifies stored bytes
+against the recorded hash before any checkpoint reuse. The synthesizer refuses an
+unsupported/`missing` MIME and ambiguous PCM metadata instead of guessing from the
+request. The executor tracks the factory-created narration synthesizer as an owned
+resource and releases/scrubs it (and the audition releases each factory-created
+provider).
+
+### 4. Truthful provider-attempt outcomes + cooldown (root cause 4)
+
+`components._delivery_status` classifies a returned provider response: a
+non-deferred response (or a received response with unusable content — malformed/
+safety-refused) is `RESPONDED`; a TIMEOUT/CONNECTION transport loss is
+`UNCERTAIN`; a known rejection (429/auth/invalid/5xx) is `FAILED_KNOWN`. The
+gateway records that status durably (no longer unconditional `RESPONDED`); only a
+`RESPONDED` response can become an accepted checkpoint, and the provider's
+truthful deferred reason is preserved. A rate/quota failure now notifies the
+shared admission controller (`record_rate_limit`) via
+`MaterializationProviders.on_rate_limited`, applying the existing cooldown.
+
+### 5. Audition identity, bounded attempts, usable export (root cause 5)
+
+`run_audition` derives the cache/ledger identity from the full request identity
+(provider, model, voice, script, text hash); a changed model is a genuinely new
+audition, never a cache hit. Attempt budget (≤9) is reserved and persisted in
+`benchmarks/stage-6/tts-audition/ledger.json`; failures/uncertainty consume the
+ceiling and are never auto-repeated. A fidelity rejection/deferral or invalid
+audio makes a voice nonviable, so a rejected sample can never propose a
+provisional voice (the prior `Charon` fallback is gone). `export_tts_audition`
+never copies a file onto itself (`source == target`).
+
+### 6. Genuine acceptance export + truthful inventory (root cause 6)
+
+`acceptance_export.genuine_acceptance_reasons` verifies live prerequisites, the
+completed materialization, the exact reverse-bound `TRANSFORMED_SHORT`
+render/output/repair identity, the final assessment, finite QC measurements, and
+the actual on-disk artifact hash; a demoted/wrong-purpose render is no longer
+discovered. The exporter copies the real authored `authored.ass` from its
+deterministic managed path (never the `artifact_reference` JSON), copies
+referenced narration/supporting assets verifying each hash, and labels each case
+`genuine_acceptance` with concrete reasons. A new bounded read-only
+`inventory_source_readiness` reports concrete source/candidate prerequisites so an
+empty completed inventory is never misread as "no source media".
+
+### Task 8 (partial)
+
+`cancel_materialization` now resolves the requested/default profile exactly as
+POST does (via `_current_profile`/`profile_from_row`) instead of picking the
+newest current envelope across profiles; the `materialization-cancel` CLI accepts
+`--profile-key`. The acceptance-export CLI reports the bounded source inventory
+when no eligible media is found.
+
+### Verification (this session)
+
+- Docker `oac-stage6-test` (Python 3.12.14, real FFmpeg 7.1.5, google-genai
+  2.31.0): `pytest -k stage6` → **260 passed, 23 skipped** (0 failed); the 23
+  skips are PostgreSQL-gated (`CLIPFACTORY_TEST_POSTGRES_URL` unset).
+- `backend/tests/test_stage6_adapter_regressions.py` (new, 8 corrected
+  regressions) passed; `test_stage6_{providers,gemini_boundary,tts_boundary,
+  api_cli_acceptance,component_recovery}.py` passed (53 total in the focused
+  batch).
+- `ruff check app tests` clean.
+
+### BLOCKERS (not done)
+
+- Task 8 rich response types (separate lifecycle/semantic/live-freshness,
+  component progress, exact render binding, findings), the Produce→Results
+  transformed polling/cancel-before-stop UI, and the review surface.
+- Task 9 genuine authorized-media acceptance: no authorized source media and no
+  hosted provider key are configured here, so no genuine assessment artifact
+  exists.
+
+### NON-BLOCKING LIMITATIONS
+
+- The corrected regressions exercise the real installed SDK via a fake httpx
+  transport and seeded media, not a live hosted call.
+- `ruff format --check` reports pre-existing formatting drift in 25 untouched
+  files (not enforced by the project's `ruff check`).
+
 ## Stage 6: recovery review-state defect fixed; grounded writing/critique, TTS + local fidelity, audition and acceptance export implemented (2026-10-16, continuation)
 
 Status: **the recovery review-state defect is fixed with extended normal-POST

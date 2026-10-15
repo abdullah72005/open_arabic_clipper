@@ -1467,14 +1467,19 @@ def materialization_resume(
 
 
 @app.command("materialization-cancel")
-def materialization_cancel(candidate_id: UUID) -> None:
+def materialization_cancel(
+    candidate_id: UUID,
+    profile_key: str | None = typer.Option(None, "--profile-key"),
+) -> None:
     """Cooperatively cancel the current Stage 6 generation for one candidate."""
 
     from app.materialization.queue import cancel_materialization
 
     with create_session_factory()() as session:
         try:
-            materialization_id = cancel_materialization(session, candidate_id)
+            materialization_id = cancel_materialization(
+                session, candidate_id, profile_key=profile_key
+            )
         except (MaterializationError, MaterializationQueueError) as error:
             raise typer.BadParameter(str(error)) from error
     typer.echo(
@@ -1528,6 +1533,7 @@ def stage6_acceptance_export(
     from app.materialization.acceptance_export import (
         discover_eligible_materializations,
         export_materializations,
+        inventory_source_readiness,
     )
 
     settings = get_settings()
@@ -1536,7 +1542,21 @@ def stage6_acceptance_export(
         if discover or not ids:
             ids = discover_eligible_materializations(session, limit=limit)
         if not ids:
-            typer.echo(json.dumps({"root": None, "cases": [], "reason": "NO_ELIGIBLE_MEDIA"}))
+            # An empty completed inventory is *not* proof that source media is
+            # unavailable: report the bounded concrete prerequisite evidence.
+            inventory = inventory_source_readiness(session, limit=limit)
+            typer.echo(
+                json.dumps(
+                    {
+                        "root": None,
+                        "cases": [],
+                        "reason": "NO_ELIGIBLE_MEDIA",
+                        "source_inventory": inventory,
+                    },
+                    ensure_ascii=False,
+                    default=str,
+                )
+            )
             return
         result = export_materializations(session, settings, ids, output_root=output_root)
     typer.echo(json.dumps(result, ensure_ascii=False, default=str))

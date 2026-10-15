@@ -701,10 +701,18 @@ def cancel_materialization(
     candidate = _lock_candidate(session, candidate_id)
     if candidate is None:
         raise MaterializationQueueError("candidate does not exist")
+    # Resolve the requested/default profile exactly as POST does: an omitted or
+    # unknown explicit key resolves to the neutral ``default`` generation, so a
+    # cancel never targets another profile's newest current envelope.
+    from app.materialization.profiles import profile_from_row
+    from app.materialization.service import _current_profile
+
+    resolved_profile_key = profile_from_row(_current_profile(session, profile_key)).profile_key
     envelope = session.scalars(
         select(ClipMaterialization)
         .where(
             ClipMaterialization.clip_candidate_id == candidate.id,
+            ClipMaterialization.profile_key == resolved_profile_key,
             ClipMaterialization.is_current.is_(True),
         )
         .order_by(ClipMaterialization.created_at.desc())

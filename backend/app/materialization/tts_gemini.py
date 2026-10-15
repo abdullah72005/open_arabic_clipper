@@ -54,7 +54,12 @@ def _persist_to_storage(
     from app.materialization.narration import write_narration_asset
 
     def persist(chunk_id: str, data: bytes) -> tuple[str, str]:
-        filename = f"{chunk_id}.wav"
+        # Content-addressed: the chunk id is a logical identifier, not a globally
+        # reusable filename. Changed content gets a distinct path; identical bytes
+        # deterministically reuse the same verified path and never overwrite a
+        # historical or another candidate's accepted audio.
+        digest = hashlib.sha256(data).hexdigest()
+        filename = f"{chunk_id}-{digest[:16]}.wav"
         return write_narration_asset(storage, source_id, filename, data)
 
     return persist
@@ -87,7 +92,14 @@ class GeminiNarrationSynthesizer:
         self._api_version = api_version or GEMINI_TTS_API_VERSION
         self._voice = voice or "Kore"
         self._style = style or ""
-        self._mime_type = mime_type if mime_type in _SUPPORTED_MIME else GEMINI_TTS_MIME_PCM
+        if mime_type not in _SUPPORTED_MIME:
+            # An unsupported requested container is refused rather than silently
+            # reinterpreted; the caller must request WAV or documented PCM.
+            raise MaterializationProviderError(
+                ProviderErrorCategory.INVALID_REQUEST.value,
+                f"unsupported tts mime type: {mime_type}",
+            )
+        self._mime_type = mime_type
         self._sample_rate = max(1, int(sample_rate))
         self._timeout = max(0.1, float(timeout_seconds))
         self._owns_client = owns_client
@@ -234,15 +246,19 @@ class GeminiNarrationSynthesizer:
             raise MaterializationProviderError(
                 ProviderErrorCategory.MALFORMED_OUTPUT.value
             ) from None
-        mime = str(mime or self._mime_type)
+        if not isinstance(mime, str) or not mime:
+            # A response without a declared container is refused: the format is
+            # never guessed from the request.
+            raise MaterializationProviderError(ProviderErrorCategory.MALFORMED_OUTPUT.value)
         if mime == GEMINI_TTS_MIME_WAV:
             wav_bytes = raw
         elif mime == GEMINI_TTS_MIME_PCM:
-            rate = int(sample_rate) if isinstance(sample_rate, int) and sample_rate > 0 else (
-                self._sample_rate
-            )
-            ch = int(channels) if isinstance(channels, int) and channels > 0 else 1
-            wav_bytes = wrap_pcm_as_wav(raw, sample_rate=rate, channels=ch)
+            # Raw PCM cannot be wrapped without explicit, unambiguous metadata.
+            if not (isinstance(sample_rate, int) and sample_rate > 0) or not (
+                isinstance(channels, int) and channels > 0
+            ):
+                raise MaterializationProviderError(ProviderErrorCategory.MALFORMED_OUTPUT.value)
+            wav_bytes = wrap_pcm_as_wav(raw, sample_rate=sample_rate, channels=channels)
         else:
             raise MaterializationProviderError(ProviderErrorCategory.MALFORMED_OUTPUT.value)
         try:
@@ -288,6 +304,11 @@ def _config() -> Any:
 def _classify_exception(error: Exception) -> str:
     if isinstance(error, MaterializationProviderError):
         return error.category
+    kind = type(error).__name__.casefold()
+    if "timeout" in kind:
+        return ProviderErrorCategory.TIMEOUT.value
+    if "connect" in kind:
+        return ProviderErrorCategory.CONNECTION.value
     if isinstance(error, TimeoutError):
         return ProviderErrorCategory.TIMEOUT.value
     if isinstance(error, (ConnectionError, OSError)):
@@ -348,22 +369,51 @@ def validate_narration_fidelity(
     options: Any,
     lease_factory: Any | None = None,
     cancel_event: threading.Event | None = None,
+    is_cancelled: Callable[[], bool] | None = None,
 ) -> NarrationFidelityResult:
     """Transcribe the synthesized audio under the heavy-model lease and compare.
 
+    Lease loss and (optional) executor cancellation are connected to the Whisper
+    child's cancellation event: a lost lease or a cancelled/foreign job sets the
+    event, which terminates and reaps the child before the lease is released.
     Unknown fidelity (empty/unusable transcript, or a lost lease) defers; a clear
-    lexical/meaning mismatch rejects. The comparison is the strict order- and
-    occurrence-aware check in ``narration.transcription_matches``; a scalar
-    similarity ratio is never accepted as proof of meaning.
+    sequence mismatch rejects. The comparison is the strict exact-sequence check
+    in ``narration.transcription_matches``; a scalar similarity ratio is never
+    accepted as proof of meaning.
     """
 
     from app.runtime.heavy_model_lease import NoopHeavyModelLeaseFactory
 
     factory = lease_factory if lease_factory is not None else NoopHeavyModelLeaseFactory()
+    event = cancel_event if cancel_event is not None else threading.Event()
+
+    def _on_ownership_lost() -> None:
+        event.set()
+
+    watcher_stop = threading.Event()
+    watcher: threading.Thread | None = None
+    if is_cancelled is not None:
+
+        def _watch() -> None:
+            while not watcher_stop.wait(0.1):
+                if is_cancelled():
+                    event.set()
+                    return
+
+        watcher = threading.Thread(target=_watch, name="narration-fidelity-cancel", daemon=True)
+        watcher.start()
+
     ownership_lost = False
-    with factory.acquire(purpose="narration-fidelity") as lease:
-        result = engine.transcribe(audio_path, options, cancel_event=cancel_event)
-        ownership_lost = bool(getattr(lease, "ownership_lost", False))
+    try:
+        with factory.acquire(
+            purpose="narration-fidelity", on_ownership_lost=_on_ownership_lost
+        ) as lease:
+            result = engine.transcribe(audio_path, options, cancel_event=event)
+            ownership_lost = bool(getattr(lease, "ownership_lost", False))
+    finally:
+        watcher_stop.set()
+        if watcher is not None:
+            watcher.join(timeout=1.0)
     asr_identity = {
         "provider": "faster-whisper",
         "model": getattr(options, "model", ""),
@@ -372,7 +422,7 @@ def validate_narration_fidelity(
         "beam_size": getattr(options, "beam_size", None),
         "language": getattr(result, "language", None),
     }
-    if ownership_lost:
+    if ownership_lost or event.is_set():
         return NarrationFidelityResult(
             FIDELITY_DEFERRED, "", ("LEASE_LOST",), asr_identity
         )
