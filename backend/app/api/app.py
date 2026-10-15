@@ -1758,9 +1758,14 @@ def create_app(
         response_model=MaterializationResponse,
     )
     def get_candidate_materialization(
-        candidate_id: UUID, database: Session = Depends(session)
+        candidate_id: UUID,
+        profile_key: str | None = None,
+        database: Session = Depends(session),
     ) -> MaterializationResponse:
-        row = _current_materialization(database, candidate_id)
+        # GET resolves an omitted profile_key exactly as POST does (to the current
+        # ``default`` channel), so a read never reports a different scope than the
+        # request that created it.
+        row = _current_materialization(database, candidate_id, profile_key=profile_key)
         if row is None:
             raise HTTPException(status_code=404, detail="materialization not found")
         return _materialization_response(row)
@@ -2424,11 +2429,15 @@ def _composition_http(error: CompositionQueueError) -> HTTPException:
     return HTTPException(status_code=code, detail=detail)
 
 
-def _current_materialization(database: Session, candidate_id: UUID) -> ClipMaterialization | None:
+def _current_materialization(
+    database: Session, candidate_id: UUID, *, profile_key: str | None = None
+) -> ClipMaterialization | None:
+    resolved = profile_key if profile_key is not None else "default"
     return database.scalars(
         select(ClipMaterialization)
         .where(
             ClipMaterialization.clip_candidate_id == candidate_id,
+            ClipMaterialization.profile_key == resolved,
             ClipMaterialization.is_current.is_(True),
         )
         .order_by(ClipMaterialization.created_at.desc())
