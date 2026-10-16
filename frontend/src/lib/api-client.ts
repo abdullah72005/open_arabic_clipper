@@ -356,6 +356,34 @@ export interface RenderArtifact {
   cache_eligible: boolean;
   is_current: boolean;
   created_at: string;
+  kind: "CORE_SOURCE_VALIDATION" | "TRANSFORMED_SHORT";
+  materialization_id: string | null;
+  materialization_lifecycle: string | null;
+  semantic_outcome: string | null;
+  human_review_required: boolean;
+  publication_ready: boolean;
+  review_ready: boolean;
+  materialization_effective: boolean;
+  live_freshness: string;
+  materialization_state:
+    | "CORE"
+    | "REVIEW_READY"
+    | "PENDING"
+    | "DEFERRED"
+    | "REJECTED"
+    | "NO_OUTPUT"
+    | "BLOCKED"
+    | "FAILED"
+    | "CANCELLED"
+    | "HISTORICAL"
+    | "DIAGNOSTIC";
+  readiness_reasons: string[];
+  findings: Array<Record<string, unknown>>;
+  selection_id: string | null;
+  render_contract_id: string | null;
+  artifact_endpoint: "render_execution" | "materialization";
+  artifact_available: boolean;
+  historical: boolean;
 }
 
 export interface MaterializationReadiness {
