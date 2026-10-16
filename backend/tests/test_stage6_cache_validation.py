@@ -526,3 +526,255 @@ def _materialization_job_ids(materialization_id: uuid.UUID) -> set[str]:
         }
     finally:
         session.close()
+
+
+def _remove_committed_assessment(materialization_id: uuid.UUID) -> None:
+    session = _session()
+    try:
+        row = session.get(ClipMaterialization, materialization_id)
+        assert row is not None
+        metrics = dict(row.metrics or {})
+        assert metrics.pop("assessment_fingerprint", None)
+        row.metrics = metrics
+        session.commit()
+    finally:
+        session.close()
+
+
+def test_missing_committed_assessment_is_recovered_not_cached(
+    engine: Engine, monkeypatch: Any
+) -> None:
+    """A COMPLETE envelope whose committed assessment is gone is not a cache hit.
+
+    The exact completed render remains valid, so recovery runs ONE finalizer over
+    that same render -- no provider repeat and no re-render.
+    """
+
+    from test_stage6_real_executor import _write_source
+
+    candidate_id, materialization_id, render_id, _storage = _complete_materialization(
+        engine, monkeypatch, media_writer=_write_source
+    )
+    before = _fresh_state(materialization_id)
+    assert before["assessment_fingerprint"]
+    before_jobs = _materialization_job_ids(materialization_id)
+    _remove_committed_assessment(materialization_id)
+
+    capture = _Capture()
+    outcome = _post(candidate_id, capture)
+
+    assert outcome.cached is False
+    # One finalizer over the exact render; no new technical render.
+    assert capture.finalized and not capture.rendered
+    pending = _fresh_state(materialization_id)
+    assert pending["lifecycle"] == "AWAITING_RENDER"
+    assert pending["human_review_required"] is False
+    assert pending["publication_ready"] is False
+    assert pending["render_execution_id"] == render_id
+    assert len(_materialization_job_ids(materialization_id)) == len(before_jobs) + 1
+
+    # Running the recovered finalizer restores the committed assessment with no
+    # duplicated provider work (untouched ledger/checkpoints/repair usage).
+    from app.workers.tasks import run_materialization_finalization
+
+    assert outcome.job_id is not None
+    run_materialization_finalization(str(candidate_id), str(outcome.job_id))
+    after = _fresh_state(materialization_id)
+    assert after["lifecycle"] == "COMPLETE"
+    assert after["human_review_required"] is True
+    assert after["cache_eligible"] is True
+    assert after["assessment_fingerprint"]
+    assert after["component_checkpoints"] == before["component_checkpoints"]
+    assert after["call_ledger"] == before["call_ledger"]
+    assert after["repair_count"] == before["repair_count"]
+
+
+def test_resume_valid_completed_is_verified_cache_without_work(
+    engine: Engine, monkeypatch: Any
+) -> None:
+    """Resume of a genuinely complete generation converges on verified cache."""
+
+    from test_stage6_real_executor import _write_source
+
+    from app.materialization.queue import resume_materialization_by_id
+
+    candidate_id, materialization_id, _render_id, _storage = _complete_materialization(
+        engine, monkeypatch, media_writer=_write_source
+    )
+    before_jobs = _materialization_job_ids(materialization_id)
+    capture = _Capture()
+    session = _session()
+    try:
+        outcome = resume_materialization_by_id(
+            session, materialization_id, settings=get_settings(), dispatcher=capture
+        )
+        session.commit()
+    finally:
+        session.close()
+    assert outcome.cached is True
+    assert outcome.job_id is None
+    assert capture.rendered == [] and capture.finalized == []
+    assert _materialization_job_ids(materialization_id) == before_jobs
+
+
+def test_resume_missing_assessment_recovers_one_finalizer_without_render(
+    engine: Engine, monkeypatch: Any
+) -> None:
+    """Resume of a valid render with a missing assessment runs one finalizer."""
+
+    from test_stage6_real_executor import _write_source
+
+    from app.materialization.queue import resume_materialization_by_id
+
+    candidate_id, materialization_id, render_id, _storage = _complete_materialization(
+        engine, monkeypatch, media_writer=_write_source
+    )
+    before = _fresh_state(materialization_id)
+    _remove_committed_assessment(materialization_id)
+    capture = _Capture()
+    session = _session()
+    try:
+        outcome = resume_materialization_by_id(
+            session, materialization_id, settings=get_settings(), dispatcher=capture
+        )
+        session.commit()
+    finally:
+        session.close()
+    assert outcome.cached is False
+    assert capture.finalized and not capture.rendered
+    pending = _fresh_state(materialization_id)
+    assert pending["lifecycle"] == "AWAITING_RENDER"
+    assert pending["render_execution_id"] == render_id
+
+    from app.workers.tasks import run_materialization_finalization
+
+    assert outcome.job_id is not None
+    run_materialization_finalization(str(candidate_id), str(outcome.job_id))
+    after = _fresh_state(materialization_id)
+    assert after["lifecycle"] == "COMPLETE"
+    assert after["assessment_fingerprint"] == before["assessment_fingerprint"]
+    assert after["call_ledger"] == before["call_ledger"]
+
+
+def _tampering_copyfile(monkeypatch: Any) -> None:
+    """Corrupt the destination authored.ass AFTER an otherwise-correct copy."""
+
+    import shutil as _shutil
+
+    real = _shutil.copyfile
+
+    def tamper(src: Any, dst: Any, *args: Any, **kwargs: Any) -> Any:
+        result = real(src, dst, *args, **kwargs)
+        if str(dst).endswith("authored.ass"):
+            with open(dst, "ab") as handle:
+                handle.write(b"; corrupted-after-copy")
+        return result
+
+    monkeypatch.setattr(_shutil, "copyfile", tamper)
+
+
+def test_export_verifies_copied_destination_bytes(
+    engine: Engine, monkeypatch: Any
+) -> None:
+    """A genuine export verifies the COPIED destination bytes, not the source."""
+
+    import json
+    from pathlib import Path
+
+    from test_stage6_real_executor import _write_source
+
+    from app.materialization.acceptance_export import export_materializations
+
+    _candidate_id, materialization_id, _render_id, _storage = _complete_materialization(
+        engine, monkeypatch, media_writer=_write_source
+    )
+    settings = get_settings()
+    session = _session()
+    try:
+        genuine = export_materializations(session, settings, [materialization_id])
+    finally:
+        session.close()
+    genuine_case = genuine["cases"][0]
+    assert genuine_case["genuine_acceptance"] is True, genuine_case
+    genuine_index = json.loads(
+        (Path(genuine_case["directory"]) / "index.json").read_text(encoding="utf-8")
+    )
+    assert genuine_index["genuine_acceptance"] is True
+    assert not [
+        reason
+        for reason in genuine_index["genuine_acceptance_reasons"]
+        if reason.startswith("EXPORT_ASSET")
+    ]
+
+    # Corrupt only the destination copy of the bound ASS: the copied bytes no longer
+    # match the authoritative expected hash, so acceptance must be invalidated.
+    _tampering_copyfile(monkeypatch)
+    session = _session()
+    try:
+        tampered = export_materializations(session, settings, [materialization_id])
+    finally:
+        session.close()
+    tampered_case = tampered["cases"][0]
+    assert tampered_case["genuine_acceptance"] is False
+    tampered_index = json.loads(
+        (Path(tampered_case["directory"]) / "index.json").read_text(encoding="utf-8")
+    )
+    assert any(
+        reason.startswith("EXPORT_ASSET_MISMATCH")
+        for reason in tampered_index["genuine_acceptance_reasons"]
+    )
+    assert tampered_index["authored_ass_sha256"] != tampered_index["authored_ass_expected_sha256"]
+
+
+def test_diagnostic_export_preserves_last_valid_package(
+    engine: Engine, monkeypatch: Any
+) -> None:
+    """A diagnostic export never replaces a valid acceptance package."""
+
+    import json
+    from pathlib import Path
+
+    from test_stage6_real_executor import _write_source
+
+    from app.materialization.acceptance_export import export_materializations
+
+    _candidate_id, materialization_id, _render_id, _storage = _complete_materialization(
+        engine, monkeypatch, media_writer=_write_source
+    )
+    settings = get_settings()
+    session = _session()
+    try:
+        genuine = export_materializations(session, settings, [materialization_id])
+    finally:
+        session.close()
+    valid_directory = Path(genuine["cases"][0]["directory"])
+    assert genuine["cases"][0]["genuine_acceptance"] is True
+    valid_index_before = (valid_directory / "index.json").read_text(encoding="utf-8")
+
+    _tampering_copyfile(monkeypatch)
+    session = _session()
+    try:
+        diagnostic = export_materializations(session, settings, [materialization_id])
+    finally:
+        session.close()
+    diagnostic_case = diagnostic["cases"][0]
+    assert diagnostic_case["genuine_acceptance"] is False
+    assert diagnostic_case["published"] is False
+    diagnostic_directory = Path(str(diagnostic_case["diagnostic_directory"]))
+    assert diagnostic_directory.is_dir()
+    diagnostic_index = json.loads(
+        (diagnostic_directory / "index.json").read_text(encoding="utf-8")
+    )
+    assert diagnostic_index["diagnostic"] is True
+    # The last valid package is preserved untouched.
+    assert (valid_directory / "index.json").read_text(encoding="utf-8") == valid_index_before
+    preserved = json.loads(
+        (valid_directory / "index.json").read_text(encoding="utf-8")
+    )
+    assert preserved["genuine_acceptance"] is True
+    # The catalog is updated atomically and references the diagnostic package.
+    catalog = json.loads(
+        (valid_directory.parent / "catalog.json").read_text(encoding="utf-8")
+    )
+    assert catalog["cases"][0]["diagnostic_directory"] == str(diagnostic_directory)
+    assert catalog["cases"][0]["published"] is False

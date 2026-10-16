@@ -108,10 +108,29 @@ def _active_job(session: Session, materialization_id: uuid.UUID) -> ProcessingJo
 
 #: Completed-cache verification dispositions. A COMPLETE+cache_eligible envelope
 #: is only a cache *candidate*: it must still verify its exact bound render,
-#: binding, live scope, and artifact integrity before it may be claimed as cached.
+#: binding, live scope, artifact integrity, and committed final assessment before
+#: it may be claimed as cached.
 CACHE_VALID = "VALID"
 CACHE_RECOVERABLE = "RECOVERABLE"
+#: The exact completed render remains valid but the finalizer's committed
+#: assessment is missing/invalid: recoverable by one finalizer over that render.
+CACHE_ASSESSMENT_RECOVERABLE = "ASSESSMENT_RECOVERABLE"
 CACHE_TERMINAL = "TERMINAL"
+
+#: Shared-readiness reasons that mean the completed render itself is valid and only
+#: the finalizer's committed assessment is missing/invalid. A completed cache hit
+#: carrying only these reasons is recoverable by one finalizer over the exact
+#: render (reusing accepted components: no provider repeat, no unnecessary render).
+_ASSESSMENT_RECOVERY_REASONS = frozenset(
+    {
+        "MISSING_FINAL_ASSESSMENT",
+        "ASSESSMENT_POLICY_MISMATCH",
+        "ASSESSMENT_RENDER_BINDING_MISMATCH",
+        "ASSESSMENT_FINGERPRINT_MISMATCH",
+        "HUMAN_REVIEW_NOT_REQUIRED",
+        "HUMAN_REVIEW_FLAG_CLEARED",
+    }
+)
 
 
 def _bound_completed_render(
@@ -149,11 +168,15 @@ def _completed_cache_state(
     """Classify a COMPLETE envelope as a verified cache, recoverable, or terminal.
 
     ``CACHE_VALID`` requires the exact effective bound render, the complete
-    generation/output/repair binding identity, a currently-fresh render scope, and
-    an artifact that actually exists with the expected digest. ``CACHE_RECOVERABLE``
-    means the completed result is no longer a trustworthy cache claim and must be
-    revalidated/technically recovered. ``CACHE_TERMINAL`` means the envelope is not
-    a cache candidate at all and the normal COMPLETE skip applies.
+    generation/output/repair binding identity, a currently-fresh render scope, an
+    artifact that actually exists with the expected digest, AND the same
+    committed-assessment/live-input requirements the shared readiness view
+    enforces. ``CACHE_ASSESSMENT_RECOVERABLE`` means the completed render is itself
+    valid but the committed final assessment is missing/invalid: one finalizer over
+    that exact render can restore it. ``CACHE_RECOVERABLE`` means the completed
+    result is no longer a trustworthy cache claim and must be revalidated/
+    technically recovered. ``CACHE_TERMINAL`` means the envelope is not a cache
+    candidate at all and the normal COMPLETE skip applies.
     """
 
     if not (envelope.cache_eligible and envelope.lifecycle is MaterializationLifecycle.COMPLETE):
@@ -171,9 +194,61 @@ def _completed_cache_state(
         return CACHE_RECOVERABLE
     from app.services.storage import StorageService
 
-    if isinstance(_artifact_identity(StorageService(settings.storage_root), render), str):
+    storage = StorageService(settings.storage_root)
+    if isinstance(_artifact_identity(storage, render), str):
         return CACHE_RECOVERABLE
-    return CACHE_VALID
+
+    # A completed cache hit must satisfy the SAME committed assessment, live-input,
+    # render-binding, QC, and artifact requirements as the shared readiness view.
+    # Missing or mismatched assessment evidence is never a verified cache hit. The
+    # authoritative read view is reused rather than a second permissive
+    # approximation, so ordinary POST and resume converge on one verdict.
+    from app.materialization.readiness import evaluate_readiness
+
+    view = evaluate_readiness(session, storage, envelope)
+    if view.review_ready:
+        return CACHE_VALID
+    if view.reasons and all(reason in _ASSESSMENT_RECOVERY_REASONS for reason in view.reasons):
+        # The exact completed render is valid; only the committed final assessment
+        # is missing/invalid. Recover one finalizer using that render.
+        return CACHE_ASSESSMENT_RECOVERABLE
+    return CACHE_RECOVERABLE
+
+
+def _recover_completed_generation(
+    session: Session,
+    candidate_id: uuid.UUID | str,
+    envelope: ClipMaterialization,
+    *,
+    settings: Settings,
+    dispatcher: object | None,
+    keep_render: bool,
+) -> MaterializationQueueOutcome:
+    """Recover a completed generation through the authoritative durable router.
+
+    One transition is shared by normal POST and id-based resume: an AWAITING_RENDER
+    (pending-finalization) generation never carries a stale review requirement or a
+    stale reviewable semantic outcome; only a verified current final assessment may
+    restore review readiness. Historical assessments, artifacts, accepted
+    components, budgets, and repair usage remain preserved.
+
+    ``keep_render`` preserves the exact bound render (a valid completed render whose
+    assessment is missing is finalized directly); otherwise the forward binding is
+    cleared so the handoff boundary reactivates an equivalent current revision or
+    queues a bounded technical re-render (never a semantic regeneration).
+    """
+
+    envelope.lifecycle = MaterializationLifecycle.AWAITING_RENDER
+    if not keep_render:
+        envelope.render_execution_id = None
+    envelope.cache_eligible = False
+    envelope.human_review_required = False
+    envelope.publication_ready = False
+    envelope.semantic_outcome = None
+    session.flush()
+    return _route_awaiting_render(
+        session, candidate_id, envelope, settings=settings, dispatcher=dispatcher
+    )
 
 
 def _outcome(
@@ -319,26 +394,26 @@ def queue_materialization(
             # boundary to reactivate an equivalent current revision or queue a
             # bounded technical re-render, rather than finalizing an unverifiable
             # render directly.
-            envelope.lifecycle = MaterializationLifecycle.AWAITING_RENDER
-            envelope.cache_eligible = False
-            envelope.render_execution_id = None
-            # Invalidating the current completed assessment atomically clears its
-            # final-review eligibility: an AWAITING_RENDER (pending-finalization)
-            # generation never carries a stale review requirement or a stale
-            # reviewable semantic outcome. Only a verified current final
-            # assessment may restore review readiness. Historical assessments,
-            # artifacts, accepted components, budgets, and repair usage remain
-            # preserved (the assessment fingerprint/metrics are untouched).
-            envelope.human_review_required = False
-            envelope.publication_ready = False
-            envelope.semantic_outcome = None
-            session.flush()
-            return _route_awaiting_render(
+            return _recover_completed_generation(
                 session,
                 candidate_id,
                 envelope,
                 settings=resolved_settings,
                 dispatcher=render_dispatcher,
+                keep_render=False,
+            )
+        if cache_state == CACHE_ASSESSMENT_RECOVERABLE:
+            # The exact completed render remains valid; only the finalizer's
+            # committed assessment is missing/invalid. Recover one finalizer over
+            # that render, reusing accepted components (no provider repeat and no
+            # unnecessary re-render).
+            return _recover_completed_generation(
+                session,
+                candidate_id,
+                envelope,
+                settings=resolved_settings,
+                dispatcher=render_dispatcher,
+                keep_render=True,
             )
 
     # One authoritative durable phase router: an AWAITING_RENDER envelope is
@@ -841,6 +916,19 @@ def resume_materialization_by_id(
     if not envelope.is_current:
         raise MaterializationQueueError("MATERIALIZATION_NOT_CURRENT")
 
+    # Reconstruct the exact persisted request options and revalidate the live
+    # prerequisites plus the recomputed input fingerprint BEFORE any active
+    # recovery, cache acceptance, job creation, binding change, or dispatch.
+    # ``is_current`` alone is insufficient: upstream mutation (a superseded
+    # FINAL_CLIP, selected plan, render contract, or composition) can leave this
+    # row current while its persisted generation no longer matches live inputs,
+    # and a cancelled generation must never be resumed into stale work. A genuine
+    # match preserves current-generation checkpoint reuse.
+    from app.materialization.finalization import _revalidate_live_inputs
+
+    if _revalidate_live_inputs(session, envelope) is None:
+        raise MaterializationQueueError("UPSTREAM_REVALIDATION_REQUIRED")
+
     request = envelope.request_payload if isinstance(envelope.request_payload, dict) else {}
     priority = str(request.get("priority") or envelope.priority.value)
     profile_key = request.get("requested_profile_key", request.get("profile_key"))
@@ -875,15 +963,22 @@ def resume_materialization_by_id(
             session.commit()
             return _outcome(None, envelope, queued=False, cached=True)
         if cache_state == CACHE_RECOVERABLE:
-            envelope.lifecycle = MaterializationLifecycle.AWAITING_RENDER
-            envelope.cache_eligible = False
-            envelope.render_execution_id = None
-            envelope.human_review_required = False
-            envelope.publication_ready = False
-            envelope.semantic_outcome = None
-            session.flush()
-            return _route_awaiting_render(
-                session, candidate.id, envelope, settings=resolved_settings, dispatcher=dispatcher
+            return _recover_completed_generation(
+                session,
+                candidate.id,
+                envelope,
+                settings=resolved_settings,
+                dispatcher=dispatcher,
+                keep_render=False,
+            )
+        if cache_state == CACHE_ASSESSMENT_RECOVERABLE:
+            return _recover_completed_generation(
+                session,
+                candidate.id,
+                envelope,
+                settings=resolved_settings,
+                dispatcher=dispatcher,
+                keep_render=True,
             )
         session.commit()
         return _outcome(

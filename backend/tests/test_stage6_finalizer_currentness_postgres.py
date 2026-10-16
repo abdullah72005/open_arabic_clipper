@@ -776,3 +776,63 @@ def test_publication_and_queue_share_lock_order_without_deadlock(
     }
     assert "result" in queue_outcome
 
+
+
+def _materialization_job_count(engine: Engine, envelope_id: uuid.UUID) -> int:
+    from sqlalchemy import func
+
+    with Session(engine) as session:
+        return int(
+            session.scalar(
+                select(func.count())
+                .select_from(ProcessingJob)
+                .where(ProcessingJob.materialization_id == envelope_id)
+            )
+            or 0
+        )
+
+
+def test_resume_refuses_superseded_final_clip_without_new_work(
+    engine: Engine, monkeypatch: Any
+) -> None:
+    """A cancelled current generation whose FINAL_CLIP was superseded is refused.
+
+    ``is_current`` alone is insufficient: resume revalidates the live prerequisites
+    and the recomputed input fingerprint under the candidate lock before any active
+    recovery, cache acceptance, job creation, binding change, or dispatch. No new
+    work (no delivery, no job allocation) escapes the guard.
+    """
+
+    from app.materialization import queue as queue_module
+    from app.materialization.queue import (
+        MaterializationQueueError,
+        cancel_materialization_by_id,
+        resume_materialization_by_id,
+    )
+
+    monkeypatch.setattr(queue_module, "_dispatch", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "app.workers.tasks.run_materialization_job.delay", lambda *a, **k: None
+    )
+    envelope_id = _prepare(engine, monkeypatch)
+    with Session(engine) as session:
+        cancel_materialization_by_id(session, envelope_id)
+        session.commit()
+    before = _materialization_job_count(engine, envelope_id)
+
+    # A different session supersedes the FINAL_CLIP the generation depends on.
+    refine = _final_clip(engine, envelope_id)
+    with Session(engine) as session:
+        row = session.get(CandidateRefinement, refine.id)
+        assert row is not None
+        row.status = RefinementStatus.NEEDS_MANUAL_TRANSCRIPT_REVIEW
+        session.commit()
+
+    with Session(engine) as session:
+        with pytest.raises(MaterializationQueueError):
+            resume_materialization_by_id(session, envelope_id, settings=get_settings())
+        session.rollback()
+
+    assert _materialization_job_count(engine, envelope_id) == before
+    envelope = _envelope(engine, envelope_id)
+    assert envelope.lifecycle.value == "CANCELLED"

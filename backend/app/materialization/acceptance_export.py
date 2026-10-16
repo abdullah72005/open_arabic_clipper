@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import uuid
 from collections.abc import Mapping, Sequence
@@ -24,6 +25,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.settings import Settings
+from app.materialization.readiness import ReferencedAsset
 from app.models import ClipMaterialization, ProcessingJob, SourceVideo
 from app.models.render_execution import RenderExecution
 from app.services.storage import StorageService
@@ -85,9 +87,16 @@ def genuine_acceptance_reasons(
 
 
 def _identity_snapshot(
-    envelope: ClipMaterialization, render: RenderExecution | None
+    envelope: ClipMaterialization,
+    render: RenderExecution | None,
+    assets: Sequence[ReferencedAsset] = (),
 ) -> dict[str, object]:
-    """The exact accepted materialization/input/output/repair/render/assessment identity."""
+    """The exact accepted materialization/input/output/repair/render/QC/asset identity.
+
+    The referenced-asset identities (authored ASS, narration, supporting) are part
+    of the snapshot so a recheck can never publish a package whose copied assets no
+    longer match the accepted set.
+    """
 
     metrics = envelope.metrics if isinstance(envelope.metrics, Mapping) else {}
     reference = (
@@ -104,8 +113,18 @@ def _identity_snapshot(
             str(envelope.render_execution_id) if envelope.render_execution_id else None
         ),
         "render_output_fingerprint": render.output_fingerprint if render is not None else None,
+        "render_qc_fingerprint": render.qc_fingerprint if render is not None else None,
+        "render_qc_status": (
+            getattr(render.qc_status, "value", render.qc_status)
+            if render is not None and render.qc_status is not None
+            else None
+        ),
         "artifact_sha256": str(reference.get("sha256") or ""),
         "assessment_fingerprint": metrics.get("assessment_fingerprint"),
+        "assessment_policy_version": metrics.get("assessment_policy_version"),
+        "assets": sorted(
+            (asset.kind, asset.relative_path, asset.expected_sha256) for asset in assets
+        ),
     }
 
 
@@ -146,12 +165,13 @@ def export_materialization(
         if render_id is not None
         else None
     )
-    initial_identity = _identity_snapshot(envelope, render)
-    expected_artifact_sha = str(initial_identity.get("artifact_sha256") or "")
-
     from app.materialization.readiness import evaluate_readiness
 
     readiness = evaluate_readiness(session, storage, envelope)
+    initial_identity = _identity_snapshot(envelope, render, readiness.assets)
+    expected_artifact_sha = str(initial_identity.get("artifact_sha256") or "")
+
+    destination_reasons: list[str] = []
 
     artifact_name: str | None = None
     artifact_sha: str | None = None
@@ -164,11 +184,16 @@ def export_materialization(
             artifact_sha = _sha256_file(staging_dir / "final.mp4")
             if expected_artifact_sha and artifact_sha != expected_artifact_sha.lower():
                 artifact_verified = False
+        elif expected_artifact_sha:
+            artifact_verified = False
+    elif expected_artifact_sha:
+        artifact_verified = False
 
     # Copy the exact bound authored ASS and every referenced narration/supporting
-    # asset from the persisted render request, verifying each against its accepted
-    # hash. A newer file at the deterministic authored.ass path is never
-    # substituted for the bound accepted asset.
+    # asset from the persisted render request, then verify the COPIED destination
+    # bytes against each authoritative expected hash. A missing or mismatched copy
+    # invalidates acceptance: rechecking an unchanged source file never verifies the
+    # destination bytes actually published.
     authored_ass_sha: str | None = None
     ass_expected_sha = ""
     copied_assets: list[dict[str, object]] = []
@@ -176,13 +201,26 @@ def export_materialization(
     for asset in readiness.assets:
         record = asset.as_dict()
         record["copied"] = False
+        record["destination_sha256"] = None
+        record["destination_verified"] = False
+        expected = asset.expected_sha256
         if asset.kind == "authored_ass":
-            ass_expected_sha = asset.expected_sha256
+            ass_expected_sha = expected
             if asset.present and asset.verified:
                 source_path = storage.resolve_relative(asset.relative_path)
-                shutil.copyfile(source_path, staging_dir / "authored.ass")
-                authored_ass_sha = _sha256_file(staging_dir / "authored.ass")
+                destination = staging_dir / "authored.ass"
+                shutil.copyfile(source_path, destination)
+                authored_ass_sha = _sha256_file(destination)
                 record["copied"] = True
+                record["destination_sha256"] = authored_ass_sha
+                record["destination_verified"] = bool(expected) and (
+                    authored_ass_sha == expected.lower()
+                )
+                if not record["destination_verified"]:
+                    destination_reasons.append(f"EXPORT_ASSET_MISMATCH:{asset.kind}")
+            elif not asset.present:
+                destination_reasons.append(f"EXPORT_ASSET_MISSING:{asset.kind}")
+            # present-but-unverified-at-source is already a shared-readiness reason
             copied_assets.append(record)
             continue
         if asset.present:
@@ -191,7 +229,16 @@ def export_materialization(
             target = asset_dir / f"{asset.kind}-{source_path.name}"
             if source_path.resolve() != target.resolve():
                 shutil.copyfile(source_path, target)
+            destination_sha = _sha256_file(target)
             record["copied"] = True
+            record["destination_sha256"] = destination_sha
+            record["destination_verified"] = bool(expected) and (
+                destination_sha == expected.lower()
+            )
+            if not record["destination_verified"]:
+                destination_reasons.append(f"EXPORT_ASSET_MISMATCH:{asset.kind}")
+        elif not asset.present:
+            destination_reasons.append(f"EXPORT_ASSET_MISSING:{asset.kind}")
         copied_assets.append(record)
 
     # Refresh the authoritative rows and re-verify the SAME identity before
@@ -205,12 +252,17 @@ def export_materialization(
         else None
     )
     recheck = evaluate_readiness(session, storage, fresh) if fresh is not None else None
-    fresh_identity = _identity_snapshot(fresh, fresh_render) if fresh is not None else {}
+    fresh_identity = (
+        _identity_snapshot(fresh, fresh_render, recheck.assets)
+        if fresh is not None and recheck is not None
+        else ({} if fresh is None else _identity_snapshot(fresh, fresh_render))
+    )
     reasons = list(recheck.reasons) if recheck is not None else ["MATERIALIZATION_MISSING"]
     if fresh_identity != initial_identity:
         reasons.append("EXPORT_IDENTITY_CHANGED")
     if not artifact_verified:
         reasons.append("EXPORT_ARTIFACT_MISMATCH")
+    reasons.extend(destination_reasons)
     if readiness.review_ready and recheck is not None and not recheck.review_ready:
         reasons.append("EVIDENCE_CHANGED_DURING_EXPORT")
     genuine = not reasons
@@ -277,12 +329,35 @@ def export_materialization(
         "\n".join(manifest_lines) + "\n", encoding="utf-8"
     )
 
-    # Publish only the fully built, verified staging package. A previously valid
-    # package is removed only after the replacement is complete.
-    if case_dir.exists():
-        shutil.rmtree(case_dir)
-    shutil.move(str(staging_dir), str(case_dir))
-    return {"case": case, "directory": str(case_dir), "index": index, "genuine": genuine}
+    # Publish only a fully built, verified staging package. A previously valid
+    # package is never deleted before the replacement is verified, and a
+    # diagnostic export never replaces a valid acceptance package: the last valid
+    # package is preserved and the diagnostic package is published separately.
+    published = genuine or not case_dir.exists()
+    diagnostic_directory: str | None = None
+    if published:
+        backup: Path | None = None
+        if case_dir.exists():
+            backup = output_root / f".replaced-{case}-{uuid.uuid4().hex}"
+            os.replace(case_dir, backup)
+        os.replace(staging_dir, case_dir)
+        if backup is not None:
+            shutil.rmtree(backup)
+        published_directory = case_dir
+    else:
+        published_directory = output_root / f"diagnostic-{case}-{uuid.uuid4().hex[:10]}"
+        os.replace(staging_dir, published_directory)
+        diagnostic_directory = str(published_directory)
+    package_identity = _sha256_file(published_directory / "SHA256SUMS")
+    return {
+        "case": case,
+        "directory": str(published_directory),
+        "diagnostic_directory": diagnostic_directory,
+        "published": published,
+        "package_identity": package_identity,
+        "index": index,
+        "genuine": genuine,
+    }
 
 
 def export_materializations(
@@ -293,7 +368,13 @@ def export_materializations(
     output_root: Path | None = None,
     case_labels: Sequence[str | None] | None = None,
 ) -> dict[str, object]:
-    """Export a bounded set of materializations and a top-level catalog."""
+    """Export a bounded set of materializations and a top-level catalog.
+
+    Only a verified genuine package replaces a case's published package; a
+    diagnostic export is published separately (``diagnostic_directory``) and never
+    overwrites the last valid acceptance package. The catalog is updated atomically
+    and references the published package identity.
+    """
 
     storage = StorageService(settings.storage_root)
     root = output_root or (settings.storage_root / "benchmarks" / "stage-6" / "manual-acceptance")
@@ -310,11 +391,17 @@ def export_materializations(
                 "case": result["case"],
                 "directory": result["directory"],
                 "genuine_acceptance": result["genuine"],
+                "published": result["published"],
+                "diagnostic_directory": result.get("diagnostic_directory"),
+                "package_identity": result.get("package_identity"),
             }
         )
-    (root / "catalog.json").write_text(
+    catalog_path = root / "catalog.json"
+    temporary = root / f".catalog-{uuid.uuid4().hex}.json"
+    temporary.write_text(
         json.dumps({"cases": catalog}, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+    os.replace(temporary, catalog_path)
     return {"root": str(root), "cases": catalog}
 
 

@@ -30,7 +30,6 @@ from app.api.app import create_app
 from app.core.enums import (
     CandidateDisposition,
     ContentType,
-    JobKind,
     MaterializationLifecycle,
     MaterializationOutcome,
     OriginalityRisk,
@@ -382,24 +381,35 @@ def test_resume_historical_id_is_refused(harness) -> None:
         assert current.lifecycle is MaterializationLifecycle.CANCELLED
 
 
-def test_resume_cancelled_current_creates_new_fenced_job(harness) -> None:
+def test_resume_cancelled_current_without_live_prerequisites_is_refused(harness) -> None:
     client, _factory, engine = harness
     _historical_id, current_id = _seed_generations(
         engine, current_lifecycle=MaterializationLifecycle.CANCELLED
     )
+    before_jobs = _materialization_job_ids(engine, current_id)
+    # ``is_current`` alone is insufficient: the seeded generation has no live
+    # FINAL_CLIP/plan/contract/composition, so resume must refuse it rather than
+    # allocate new work for a stale generation.
     response = client.post(f"/api/materializations/{current_id}/resume")
-    assert response.status_code == 202
-    payload = response.json()
-    assert payload["materialization_id"] == str(current_id)
-    assert payload["queued"] is True
-    assert payload["job_id"] is not None
+    assert response.status_code == 409
+    assert response.json()["detail"] == "UPSTREAM_REVALIDATION_REQUIRED"
     with Session(engine) as session:
-        jobs = session.scalars(
-            select(ProcessingJob).where(ProcessingJob.materialization_id == current_id)
-        ).all()
-        assert any(job.kind is JobKind.MATERIALIZATION for job in jobs)
-        row = session.get(ClipMaterialization, current_id)
-        assert row is not None and row.lifecycle is not MaterializationLifecycle.CANCELLED
+        current = session.get(ClipMaterialization, current_id)
+        assert current is not None and current.lifecycle is MaterializationLifecycle.CANCELLED
+    # No new work escapes the guard.
+    assert _materialization_job_ids(engine, current_id) == before_jobs
+
+
+def _materialization_job_ids(engine: object, materialization_id: uuid.UUID) -> set[str]:
+    with Session(engine) as session:  # type: ignore[arg-type]
+        return {
+            str(job.id)
+            for job in session.scalars(
+                select(ProcessingJob).where(
+                    ProcessingJob.materialization_id == materialization_id
+                )
+            ).all()
+        }
 
 
 def test_narration_effective_synthesizer_identity_invalidates_reuse(component_fixture) -> None:
