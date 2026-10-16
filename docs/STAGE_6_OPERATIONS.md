@@ -5,10 +5,15 @@ materialization core, the candidate-scoped queue/executor/worker, the Stage 5.2
 `TRANSFORMED_SHORT` authored renderer, the idempotent finalizer, the hosted
 Gemini writing/critique adapter, the Gemini TTS adapter with separately
 checkpointed local ASR fidelity validation, the bounded voice audition, and the
-read-only acceptance exporter are implemented and tested. The remaining work is
-the candidate API/CLI review surface completion (Produce/Results UI parity),
-real manual acceptance over authorized source media, and the human media review.
-Stage 6 remains awaiting human media review and SOL review; it is not frozen.
+read-only acceptance exporter are implemented and tested. The candidate-scoped
+API/CLI review surface and the Produce→Results UI parity are implemented: Produce
+tracks the durable materialization id across preparation/rendering/finalization
+and exposes a transformed short only after the committed assessment permits
+review; Results consults the shared Stage 6 readiness evaluator; cancellation is
+server-authoritative including an in-flight submission, and id-based resume
+revalidates live prerequisites. The remaining work is real manual acceptance over
+authorized source media and the human media review. Stage 6 remains awaiting human
+media review and SOL review; it is not frozen.
 
 ## Stage 6 CLI commands
 
@@ -162,19 +167,32 @@ explicit `volume=<gain>dB` gain point on the narration track.
   technically viable PROVISIONAL voice; human quality approval is still required.
 - `acceptance_export.py` / `stage6-acceptance-export`: read-only assembly of the
   exact persisted lineage (MP4, index, ASS, timeline, audio recipe, QC/assessment,
-  provider attempts and repair usage, SHA-256 manifest). It never fabricates
-  rights, governance, speech, or eligibility.
+  provider attempts and repair usage, SHA-256 manifest). Every COPIED destination
+  byte set (MP4, bound authored ASS, narration, supporting assets) is verified
+  against its authoritative expected hash before publishing; a missing or
+  mismatched copy invalidates acceptance. The snapshot/recheck binds the complete
+  render/QC/assessment and referenced-asset identities. It never fabricates
+  rights, governance, speech, or eligibility. A diagnostic export never replaces a
+  valid package: the last valid package is preserved and the diagnostic package is
+  published separately, and the catalog is updated atomically with the published
+  package identity.
 
 ## Remaining work (explicit)
 
-- Candidate-scoped API completeness: a GET profile-key query parameter matching
-  POST resolution, and richer response types (separate lifecycle/semantic/live
-  freshness, component progress, exact render binding, findings). The singular
-  candidate route, `materialize`/`materialization-status`, resume, cancel, and the
-  artifact identity contract already exist.
-- Produce/Results UI parity: polling materialize → render → finalize for one
-  selected candidate, cancel-before-stop, and clearly distinguishing core
-  validation from transformed media. No automatic publication approval.
+- Candidate-scoped API/CLI completeness and response types (separate
+  lifecycle/semantic/live freshness, component progress, exact render binding,
+  findings) are implemented; the singular candidate route,
+  `materialize`/`materialization-status`, resume, cancel, and the artifact
+  identity contract exist.
+- Produce/Results UI parity is implemented: Produce tracks the durable
+  materialization id across preparation → render → finalization, polls the
+  read-only materialization endpoint across changing render/finalizer job
+  identities, and offers a transformed short only after the committed readiness
+  response permits review (never from `artifact_available` alone); cancellation is
+  server-authoritative (including an in-flight submission) with an explicit
+  unconfirmed/retry state; Results consults the shared readiness evaluator and
+  distinguishes current review-ready output from pending/deferred/rejected/
+  historical/diagnostic media. No automatic publication approval.
 - Real manual acceptance (approximately three clips, maximum four) over authorized
   source media, and the human media review. No authorized source media is
   configured in this environment and no hosted provider key is present, so no
@@ -197,3 +215,15 @@ docker compose run --rm --no-deps -v "$(pwd)/backend:/app" backend \
 The host Python 3.10.12 run is a convenience only and is not Python 3.12
 verification. PostgreSQL migration validation requires
 `CLIPFACTORY_TEST_POSTGRES_URL`; without it the PostgreSQL test is skipped.
+
+The SOL-reopened corrections are covered by
+`tests/test_stage6_rc_v4_corrections.py` (id-scoped cancel/resume authority and
+resume revalidation), `tests/test_stage6_cache_validation.py` (completed-cache vs
+committed-assessment unification, missing-assessment finalizer recovery, and
+destination-byte export verification/preservation), and
+`tests/test_stage6_results_boundary.py` (the Produce→Results HTTP boundary and the
+transformed Results review classification). Live-input mutation around resume is
+covered by `tests/test_stage6_finalizer_currentness_postgres.py` under
+`CLIPFACTORY_TEST_POSTGRES_URL`. Frontend Produce/Results behavior is covered by
+`frontend/src/lib/produce-runner.test.ts` and
+`frontend/src/components/produce-runner.test.tsx`.

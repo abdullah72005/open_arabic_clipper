@@ -1,5 +1,124 @@
 # Runtime status
 
+## Stage 6: SOL six-defect corrections — Produce state machine, truthful cancel, Results assessment, resume revalidation, cache/assessment unification, export integrity (2026-10-17, continuation)
+
+Status: **the six SOL-reopened defects are corrected with behavioral regressions
+across backend (persisted, real-FFmpeg, and PostgreSQL) and frontend
+(orchestrator + component). The Produce state machine tracks the durable
+materialization id across preparation/rendering/finalization and exposes a
+transformed short only after the committed readiness response permits review;
+cancellation is truthful including an in-flight submission; Results consults the
+shared Stage 6 readiness evaluator; id-based resume revalidates live inputs before
+any work; completed-cache verification requires the committed assessment; and
+export verifies every copied destination byte and preserves the last valid
+package. No live hosted/provider call is made. Task 9 still has no genuine
+authorized-media acceptance. Stage 6 is NOT FROZEN.**
+
+### Corrections (SOL reproduction → corrected + regression)
+
+1. **Produce state machine (`frontend/src/lib/produce-runner.ts`,
+   `components/produce-runner.tsx`).** The preparation `ProcessingJob` is only
+   intermediate progress: after `queueMaterialization` the run polls the read-only
+   `GET /api/materializations/{id}` across changing render/finalizer job
+   identities, tracking the durable materialization id throughout. A transformed
+   short is exposed only when `readiness.review_ready`, `lifecycle=COMPLETE`,
+   `is_current`, and a verified artifact agree — `artifact_available` alone is
+   insufficient, and media that exists but is not review-ready is not offered.
+   Blocked/deferred/rejected/cancelled/stale/no-output/unavailable outcomes are
+   explicit (zero output is valid). At most one bounded durable-resume recovery is
+   attempted for a stalled pending-finalization generation; polling never triggers
+   provider retries or synchronous worker waits, and GET stays read-only.
+   Regressions: `produce-runner.test.ts` (prep-success-is-not-completion,
+   artifact-availability-is-insufficient, changing render identities, bounded
+   resume, `produce-runner.test.tsx` smoke).
+2. **Truthful cancellation (`produce-runner.ts`).** A stop-requested flag is
+   independent of browser polling. Cancellation reconciles an in-flight
+   `queueMaterialization` submission, then cancels the exact returned
+   materialization (Stage 6) or the exact active job (pre-Stage 6). A failure is
+   surfaced as an explicit unconfirmed state with a retry path (each retry a fresh
+   attempt); a confirmed cancellation is never displayed for a swallowed failure.
+   Regressions: in-flight-submission reconciliation and unconfirmed-then-retry.
+3. **Results consults Stage 6 assessment (`app/api/app.py`,
+   `app/results/page.tsx`).** `RenderArtifactResponse` for `TRANSFORMED_SHORT`
+   entries now carries materialization identity, lifecycle, semantic outcome,
+   currentness/readiness (from the shared `evaluate_readiness`), findings, exact
+   lineage, and the verified materialization artifact endpoint; a
+   `materialization_state` distinguishes `REVIEW_READY` from pending/deferred/
+   rejected/no-output/blocked/failed/cancelled and historical/diagnostic media.
+   Historical inspectability never implies current review readiness. CORE behavior
+   is preserved. Regressions: `test_stage6_results_boundary.py` (4 tests incl. the
+   real Produce→Results HTTP flow).
+4. **Resume revalidation (`app/materialization/queue.py`).**
+   `resume_materialization_by_id` reconstructs the exact persisted request options
+   and revalidates live prerequisites plus the recomputed input fingerprint under
+   the candidate lock *before* any active recovery, cache acceptance, job
+   creation, binding change, or dispatch; a stale/superseded generation is refused
+   `UPSTREAM_REVALIDATION_REQUIRED` with no new work, while a genuine match
+   preserves checkpoint reuse. Regressions: `test_stage6_rc_v4_corrections.py`
+   (refused-without-live-prerequisites, no job allocation) and
+   `test_stage6_finalizer_currentness_postgres.py::test_resume_refuses_superseded_final_clip_without_new_work`.
+5. **Completed-cache vs committed assessment (`queue.py`).** A COMPLETE
+   `cache_eligible` envelope is a cache hit only when it satisfies the same
+   committed-assessment/live-input/render-binding/QC/artifact requirements as the
+   shared readiness view. A missing/mismatched assessment is
+   `CACHE_ASSESSMENT_RECOVERABLE`: the exact completed render is preserved and one
+   finalizer is recovered over it (no provider repeat, no re-render). Ordinary
+   POST and resume converge on the same authoritative durable router. Regressions:
+   `test_stage6_cache_validation.py` (missing-assessment recovery, resume cache
+   convergence, resume missing-assessment recovery).
+6. **Export integrity and publication (`acceptance_export.py`).** Every copied
+   destination byte set (MP4, bound ASS, narration, supporting) is verified against
+   its authoritative expected hash before publishing; the snapshot/recheck binds
+   the complete render/QC/assessment and referenced-asset identities. A diagnostic
+   export never replaces a valid package: the last valid package is preserved and
+   the diagnostic package is published separately; the catalog is updated
+   atomically with a package identity. Regressions:
+   `test_export_verifies_copied_destination_bytes`
+   (destination-only ASS corruption invalidates acceptance) and
+   `test_diagnostic_export_preserves_last_valid_package`.
+
+### Verification (this session)
+
+- Docker `oac-stage6-test` (Python 3.12.14, real FFmpeg 7.1.5, google-genai
+  2.31.0); PostgreSQL 16 `oac-stage6-pg-v4`:
+  - `test_stage6_rc_v4_corrections.py` + `test_stage6_finalizer_currentness_postgres.py`
+    (with `CLIPFACTORY_TEST_POSTGRES_URL`): 33 passed.
+  - `test_stage6_cache_validation.py`: 11 passed (real FFmpeg; 3 new cache/resume
+    + 2 new export-integrity tests).
+  - `test_stage6_results_boundary.py` (new, 4 tests): 4 passed.
+  - `test_stage6_durable_router + api_cli_acceptance + materialization_core +
+    finalizer_evidence + finalization_gates + rc_corrections`: 89 passed.
+  - `test_stage6_component_recovery + sol2_regressions + sol3_regressions +
+    runtime_ownership + runtime_corrections + worker_chain + test_api_sources`:
+    63 passed, 7 skipped.
+  - `test_stage6_sol3_postgres + finalizer_currentness_postgres`: 16 passed.
+  - `ruff check app tests` clean.
+- Frontend: `vitest run` 64 passed (6 new orchestrator tests + component smoke);
+  `eslint src --max-warnings=0` clean; `next build` succeeded (types + lint +
+  10/10 static pages); `tsc --noEmit` retains only the pre-existing
+  `job-poller.test.tsx` test-only typing error (untouched).
+- Zero live hosted/provider calls in this session; no hosted quota was spent.
+
+### BLOCKERS (not done)
+
+- Task 9 genuine authorized-media acceptance: no authorized source media and no
+  hosted provider key are configured here, so no genuine
+  `MANUAL CHECK REQUIRED NOW` artifact exists. This is a real external
+  prerequisite, not a code gap.
+- Actual hosted writing/TTS quality and the provisional voice audition against a
+  real provider remain outstanding (no hosted key present).
+
+### NON-BLOCKING LIMITATIONS
+
+- The frontend has no DOM test environment (jsdom/@testing-library are not
+  installed), so the Produce component is covered by a static render smoke test
+  plus behavioral orchestrator tests; in-flight cancellation and cancellation
+  failure are asserted at the orchestrator boundary rather than through a mounted
+  component.
+- The full `pytest -k stage6` suite is long-running and was validated in focused
+  batches rather than one run.
+- `tsc --noEmit` retains the pre-existing `job-poller.test.tsx` typing error.
+
 ## Stage 6: SOL-reopened defects corrected — committed readiness, id-scoped cancel/resume, artifact verification, narration identity, export snapshot (2026-10-16, continuation)
 
 Status: **this session corrects the remaining gaps in the six SOL-reopened root
