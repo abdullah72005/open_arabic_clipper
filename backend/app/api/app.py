@@ -40,6 +40,7 @@ from app.core.enums import (
     PipelineStage,
     ReconstructionStatus,
     RefinementPriority,
+    RenderArtifactPurpose,
     RenderExecutionLifecycle,
     RightsRisk,
     RightsStatus,
@@ -798,7 +799,16 @@ class RenderExecutionQueueResponse(BaseModel):
 
 
 class RenderArtifactResponse(BaseModel):
-    """One completed, downloadable Stage 5.2 render artifact for a results list."""
+    """One completed, downloadable Stage 5.2 render artifact for a results list.
+
+    For a ``TRANSFORMED_SHORT`` row the response additionally carries the bound
+    Stage 6 materialization review surface (identity, lifecycle, semantic outcome,
+    currentness/readiness from the shared evaluator, findings, exact lineage, and
+    the verified materialization artifact endpoint). ``materialization_state``
+    distinguishes current review-ready output from pending, deferred/rejected,
+    no-output, cancelled, and historical/diagnostic media; historical
+    inspectability never implies current review readiness.
+    """
 
     id: UUID
     source_video_id: UUID
@@ -809,6 +819,23 @@ class RenderArtifactResponse(BaseModel):
     cache_eligible: bool
     is_current: bool
     created_at: datetime
+    kind: str = "CORE_SOURCE_VALIDATION"
+    materialization_id: UUID | None = None
+    materialization_lifecycle: str | None = None
+    semantic_outcome: str | None = None
+    human_review_required: bool = False
+    publication_ready: bool = False
+    review_ready: bool = False
+    materialization_effective: bool = False
+    live_freshness: str = "UNKNOWN"
+    materialization_state: str = "CORE"
+    readiness_reasons: list[str] = []
+    findings: list[dict[str, object]] = []
+    selection_id: UUID | None = None
+    render_contract_id: UUID | None = None
+    artifact_endpoint: str = "render_execution"
+    artifact_available: bool = True
+    historical: bool = False
     model_config = {"extra": "allow"}
 
 
@@ -1987,24 +2014,7 @@ def create_app(
         statement = statement.order_by(RenderExecution.created_at.desc()).limit(
             min(max(limit, 1), 200)
         )
-        return [
-            RenderArtifactResponse(
-                id=row.id,
-                source_video_id=row.source_video_id,
-                clip_candidate_id=row.clip_candidate_id,
-                artifact_purpose=getattr(row.artifact_purpose, "value", row.artifact_purpose),
-                lifecycle=getattr(row.lifecycle, "value", row.lifecycle),
-                qc_status=(
-                    None
-                    if row.qc_status is None
-                    else getattr(row.qc_status, "value", row.qc_status)
-                ),
-                cache_eligible=row.cache_eligible,
-                is_current=row.is_current,
-                created_at=row.created_at,
-            )
-            for row in database.scalars(statement)
-        ]
+        return [_render_artifact_response(database, row) for row in database.scalars(statement)]
 
     @app.patch("/api/sources/{source_id}/provenance", response_model=SourceResponse)
     def update_source_provenance(
@@ -2686,6 +2696,125 @@ def _materialization_response(
         provider_attempts=_materialization_provider_attempts(row),
         artifact_available=_materialization_artifact_available(database, row),
     )
+
+
+def _materialization_state(row: ClipMaterialization, review_ready: bool, freshness: str) -> str:
+    """Classify a transformed materialization for the Results review surface.
+
+    Review readiness is authoritative: only a current, committed, review-ready
+    generation is ``REVIEW_READY``. Everything else is labeled truthfully so
+    historical or pending media never reads as current review readiness.
+    """
+
+    if not row.is_current:
+        return "HISTORICAL"
+    if review_ready:
+        return "REVIEW_READY"
+    lifecycle = row.lifecycle.value
+    outcome = row.semantic_outcome.value if row.semantic_outcome else None
+    if lifecycle in {"QUEUED", "RUNNING", "AWAITING_RENDER"}:
+        return "PENDING"
+    if lifecycle == "CANCELLED":
+        return "CANCELLED"
+    if lifecycle == "BLOCKED":
+        return "BLOCKED"
+    if lifecycle == "FAILED" or outcome == "FAILED":
+        return "FAILED"
+    if outcome == "NO_OUTPUT":
+        return "NO_OUTPUT"
+    if outcome in {"DEFERRED_PROVIDER", "DEFERRED_EVIDENCE", "TTS_UNAVAILABLE",
+                   "UPSTREAM_REVALIDATION_REQUIRED", "NEEDS_MANUAL_TRANSCRIPT_REVIEW"}:
+        return "DEFERRED"
+    if outcome == "REJECTED_QUALITY":
+        return "REJECTED"
+    return "DIAGNOSTIC"
+
+
+def _render_artifact_response(database: Session, row: RenderExecution) -> RenderArtifactResponse:
+    """Build one Results entry, enriched for transformed Stage 6 media.
+
+    The bound materialization's review surface comes from the same shared
+    read-only readiness evaluator the API and export use; the verified
+    materialization artifact endpoint is advertised for transformed media.
+    """
+
+    purpose = getattr(row.artifact_purpose, "value", row.artifact_purpose)
+    base: dict[str, object] = {
+        "id": row.id,
+        "source_video_id": row.source_video_id,
+        "clip_candidate_id": row.clip_candidate_id,
+        "artifact_purpose": purpose,
+        "lifecycle": getattr(row.lifecycle, "value", row.lifecycle),
+        "qc_status": (
+            None if row.qc_status is None else getattr(row.qc_status, "value", row.qc_status)
+        ),
+        "cache_eligible": row.cache_eligible,
+        "is_current": row.is_current,
+        "created_at": row.created_at,
+    }
+    if purpose != RenderArtifactPurpose.TRANSFORMED_SHORT.value:
+        return RenderArtifactResponse(
+            **base,  # type: ignore[arg-type]
+            kind="CORE_SOURCE_VALIDATION",
+            materialization_state="CORE",
+            artifact_endpoint="render_execution",
+        )
+    envelope = (
+        database.get(ClipMaterialization, row.materialization_id, populate_existing=True)
+        if row.materialization_id is not None
+        else None
+    )
+    if envelope is None:
+        # A transformed render without its bound envelope is diagnostic: it is never
+        # presented as a reviewable transformed Short.
+        return RenderArtifactResponse(
+            **base,  # type: ignore[arg-type]
+            kind="TRANSFORMED_SHORT",
+            materialization_state="DIAGNOSTIC",
+            artifact_endpoint="materialization",
+            artifact_available=False,
+            historical=not row.is_current,
+        )
+    readiness, freshness, effective = _materialization_live_readiness(database, envelope)
+    review_ready = bool(readiness.get("review_ready"))
+    inspection = _artifact_inspection(database, envelope)
+    return RenderArtifactResponse(
+        **base,  # type: ignore[arg-type]
+        kind="TRANSFORMED_SHORT",
+        materialization_id=envelope.id,
+        materialization_lifecycle=envelope.lifecycle.value,
+        semantic_outcome=(
+            envelope.semantic_outcome.value if envelope.semantic_outcome else None
+        ),
+        human_review_required=bool(envelope.human_review_required),
+        publication_ready=False,
+        review_ready=review_ready,
+        materialization_effective=effective,
+        live_freshness=freshness,
+        materialization_state=_materialization_state(envelope, review_ready, freshness),
+        readiness_reasons=[str(item) for item in (readiness.get("reasons") or [])],
+        findings=[
+            dict(item) for item in (envelope.quality_findings or []) if isinstance(item, dict)
+        ],
+        selection_id=envelope.selection_id,
+        render_contract_id=envelope.render_contract_id,
+        artifact_endpoint="materialization",
+        artifact_available=bool(inspection and inspection.available),
+        historical=(
+            bool(inspection.historical)
+            if inspection is not None
+            else not envelope.is_current
+        ),
+    )
+
+
+def _artifact_inspection(database: Session, envelope: ClipMaterialization) -> object | None:
+    from app.materialization.readiness import verify_artifact
+
+    try:
+        return verify_artifact(database, StorageService(get_settings().storage_root), envelope)
+    except Exception:
+        return None
 
 
 def _visual_composition_response(
