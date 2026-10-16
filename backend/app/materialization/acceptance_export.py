@@ -23,9 +23,8 @@ from pathlib import Path
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.core.enums import MaterializationOutcome, RenderArtifactPurpose
 from app.core.settings import Settings
-from app.models import ClipMaterialization, ProcessingJob
+from app.models import ClipMaterialization, ProcessingJob, SourceVideo
 from app.models.render_execution import RenderExecution
 from app.services.storage import StorageService
 
@@ -36,12 +35,6 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
-
-
-def _finite(value: object) -> bool:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return False
-    return value == value and value not in (float("inf"), float("-inf"))
 
 
 def _ledger_counts(ledger: object) -> dict[str, object]:
@@ -72,85 +65,48 @@ def _resolved_artifact_path(storage: StorageService, render: RenderExecution) ->
     return path if path.is_file() else None
 
 
-def _authored_ass_reference(render: RenderExecution) -> tuple[str, str]:
-    """Return the authored ASS (relative_path, sha256) from the persisted request."""
-
-    payload = render.request_payload if isinstance(render.request_payload, dict) else {}
-    spec = payload.get("spec") if isinstance(payload.get("spec"), dict) else {}
-    authored = spec.get("authored") if isinstance(spec.get("authored"), dict) else {}
-    ref = authored.get("authored_ass") if isinstance(authored.get("authored_ass"), dict) else {}
-    return str(ref.get("relative_path") or ""), str(ref.get("sha256") or "")
-
-
-def _authored_ass_path(storage: StorageService, envelope: ClipMaterialization) -> Path:
-    return (
-        storage.source_directory(envelope.source_video_id)
-        / "materializations"
-        / str(envelope.id)
-        / "authored.ass"
-    )
-
-
 def genuine_acceptance_reasons(
     session: Session, storage: StorageService, envelope: ClipMaterialization
 ) -> list[str]:
     """Concrete reasons a materialization is NOT genuine acceptance (empty == genuine).
 
-    Acceptance eligibility verifies live prerequisites, the effective completed
-    materialization, the exact reverse-bound TRANSFORMED_SHORT render/output/repair
-    identity, the final assessment, QC, and the actual on-disk artifact hash. It
-    never relies on ``is_current``/``COMPLETE`` labels alone.
+    Delegates to the single authoritative read-only readiness view
+    (:func:`app.materialization.readiness.evaluate_readiness`) shared by the API
+    and the exporter. It reuses the finalizer's own live-prerequisite, render
+    binding, render identity/QC, assessment, artifact, and referenced-asset checks;
+    it never relies on ``is_current``/``COMPLETE``/``READY_FOR_HUMAN_REVIEW`` labels
+    alone, never treats finite-but-out-of-policy QC as satisfied, and never
+    substitutes a newer file at a deterministic path for the bound accepted asset.
     """
 
-    reasons: list[str] = []
-    if not envelope.is_current:
-        reasons.append("NOT_CURRENT")
-    if envelope.lifecycle.value != "COMPLETE":
-        reasons.append("LIFECYCLE_NOT_COMPLETE")
-    if envelope.semantic_outcome != MaterializationOutcome.READY_FOR_HUMAN_REVIEW:
-        reasons.append("NOT_REVIEW_READY")
-    if not envelope.human_review_required:
-        reasons.append("HUMAN_REVIEW_NOT_REQUIRED")
-    render_id = envelope.render_execution_id
-    if render_id is None:
-        reasons.append("NO_BOUND_RENDER")
-        return reasons
-    render = session.get(RenderExecution, render_id, populate_existing=True)
-    if render is None:
-        reasons.append("RENDER_MISSING")
-        return reasons
-    if not render.is_current:
-        reasons.append("RENDER_NOT_CURRENT")
-    if render.lifecycle.value != "COMPLETE":
-        reasons.append("RENDER_NOT_COMPLETE")
-    if render.materialization_id != envelope.id:
-        reasons.append("RENDER_NOT_REVERSE_BOUND")
-    if render.artifact_purpose != RenderArtifactPurpose.TRANSFORMED_SHORT:
-        reasons.append("RENDER_NOT_TRANSFORMED_SHORT")
-    payload = render.request_payload if isinstance(render.request_payload, dict) else {}
-    expected = str(payload.get("expected_output_fingerprint") or "")
-    if expected and expected != envelope.output_fingerprint:
-        reasons.append("EXPECTED_OUTPUT_FINGERPRINT_MISMATCH")
-    if str(payload.get("materialization_id") or "") not in {"", str(envelope.id)}:
-        reasons.append("REPAIR_REVISION_MISMATCH")
-    metrics = dict(envelope.metrics or {})
-    if not metrics.get("assessment_fingerprint"):
-        reasons.append("MISSING_FINAL_ASSESSMENT")
-    qc = render.qc_result if isinstance(render.qc_result, dict) else {}
-    measured = qc.get("measured") if isinstance(qc.get("measured"), dict) else {}
-    if not _finite(measured.get("final_integrated_lufs")) or not _finite(
-        measured.get("final_true_peak_dbtp")
-    ):
-        reasons.append("MISSING_QC_MEASUREMENT")
-    artifact = _resolved_artifact_path(storage, render)
-    if artifact is None:
-        reasons.append("ARTIFACT_MISSING")
-    else:
-        reference = render.artifact_reference if isinstance(render.artifact_reference, dict) else {}
-        recorded = str(reference.get("sha256") or "")
-        if not recorded or _sha256_file(artifact) != recorded:
-            reasons.append("ARTIFACT_HASH_MISMATCH")
-    return reasons
+    from app.materialization.readiness import evaluate_readiness
+
+    return list(evaluate_readiness(session, storage, envelope).reasons)
+
+
+def _identity_snapshot(
+    envelope: ClipMaterialization, render: RenderExecution | None
+) -> dict[str, object]:
+    """The exact accepted materialization/input/output/repair/render/assessment identity."""
+
+    metrics = envelope.metrics if isinstance(envelope.metrics, Mapping) else {}
+    reference = (
+        render.artifact_reference
+        if render is not None and isinstance(render.artifact_reference, Mapping)
+        else {}
+    )
+    return {
+        "materialization_id": str(envelope.id),
+        "input_fingerprint": envelope.input_fingerprint,
+        "output_fingerprint": envelope.output_fingerprint,
+        "repair_count": int(envelope.repair_count or 0),
+        "render_execution_id": (
+            str(envelope.render_execution_id) if envelope.render_execution_id else None
+        ),
+        "render_output_fingerprint": render.output_fingerprint if render is not None else None,
+        "artifact_sha256": str(reference.get("sha256") or ""),
+        "assessment_fingerprint": metrics.get("assessment_fingerprint"),
+    }
 
 
 def export_materialization(
@@ -161,7 +117,15 @@ def export_materialization(
     *,
     case_label: str | None = None,
 ) -> dict[str, object]:
-    """Export one materialization's exact lineage into ``output_root/<case>/``."""
+    """Export one materialization's exact lineage into ``output_root/<case>/``.
+
+    The package is assembled in an export-owned staging directory and published
+    only after the copied artifact bytes are verified against the accepted
+    reference hash and the authoritative rows are refreshed and confirmed to
+    represent the SAME identity. A previously valid package is never overwritten
+    while a replacement is being constructed, and no other worker's temporary
+    files are swept.
+    """
 
     parsed = materialization_id if isinstance(materialization_id, uuid.UUID) else uuid.UUID(
         str(materialization_id)
@@ -173,7 +137,8 @@ def export_materialization(
         f"{envelope.clip_candidate_id}-{envelope.profile_key}-{str(envelope.id)[:8]}"
     )
     case_dir = output_root / case
-    case_dir.mkdir(parents=True, exist_ok=True)
+    staging_dir = output_root / f".staging-{case}-{uuid.uuid4().hex}"
+    staging_dir.mkdir(parents=True, exist_ok=False)
 
     render_id = envelope.render_execution_id
     render = (
@@ -181,80 +146,74 @@ def export_materialization(
         if render_id is not None
         else None
     )
+    initial_identity = _identity_snapshot(envelope, render)
+    expected_artifact_sha = str(initial_identity.get("artifact_sha256") or "")
 
-    genuine_reasons = genuine_acceptance_reasons(session, storage, envelope)
-    genuine = not genuine_reasons
+    from app.materialization.readiness import evaluate_readiness
+
+    readiness = evaluate_readiness(session, storage, envelope)
 
     artifact_name: str | None = None
     artifact_sha: str | None = None
+    artifact_verified = True
     if render is not None:
         source = _resolved_artifact_path(storage, render)
         if source is not None:
             artifact_name = "final.mp4"
-            shutil.copyfile(source, case_dir / artifact_name)
-            artifact_sha = _sha256_file(case_dir / artifact_name)
+            shutil.copyfile(source, staging_dir / "final.mp4")
+            artifact_sha = _sha256_file(staging_dir / "final.mp4")
+            if expected_artifact_sha and artifact_sha != expected_artifact_sha.lower():
+                artifact_verified = False
 
-    # The exact accepted authored ASS (never the artifact_reference JSON): resolve
-    # it deterministically and verify its bytes against the persisted hash.
-    ass_relative, ass_expected_sha = (
-        _authored_ass_reference(render) if render is not None else ("", "")
-    )
+    # Copy the exact bound authored ASS and every referenced narration/supporting
+    # asset from the persisted render request, verifying each against its accepted
+    # hash. A newer file at the deterministic authored.ass path is never
+    # substituted for the bound accepted asset.
     authored_ass_sha: str | None = None
-    ass_source = _authored_ass_path(storage, envelope)
-    if ass_source.is_file():
-        shutil.copyfile(ass_source, case_dir / "authored.ass")
-        authored_ass_sha = _sha256_file(case_dir / "authored.ass")
-    elif ass_relative:
-        try:
-            candidate = storage.resolve_relative(ass_relative)
-        except Exception:
-            candidate = None
-        if candidate is not None and candidate.is_file():
-            shutil.copyfile(candidate, case_dir / "authored.ass")
-            authored_ass_sha = _sha256_file(case_dir / "authored.ass")
-
-    # Copy the exact referenced narration/supporting assets, verifying each hash.
-    asset_dir = case_dir / "assets"
+    ass_expected_sha = ""
     copied_assets: list[dict[str, object]] = []
-    asset_refs: list[tuple[str, str, str]] = []
-    for chunk in envelope.narration_references or []:
-        if isinstance(chunk, Mapping):
-            asset_refs.append(
-                ("narration", str(chunk.get("relative_path") or ""), str(chunk.get("sha256") or ""))
-            )
-    for item in envelope.asset_references or []:
-        if isinstance(item, Mapping):
-            asset_refs.append(
-                ("supporting", str(item.get("relative_path") or ""), str(item.get("sha256") or ""))
-            )
-    for kind, relative_path, expected_sha in asset_refs:
-        if not relative_path:
+    asset_dir = staging_dir / "assets"
+    for asset in readiness.assets:
+        record = asset.as_dict()
+        record["copied"] = False
+        if asset.kind == "authored_ass":
+            ass_expected_sha = asset.expected_sha256
+            if asset.present and asset.verified:
+                source_path = storage.resolve_relative(asset.relative_path)
+                shutil.copyfile(source_path, staging_dir / "authored.ass")
+                authored_ass_sha = _sha256_file(staging_dir / "authored.ass")
+                record["copied"] = True
+            copied_assets.append(record)
             continue
-        try:
-            source_path = storage.resolve_relative(relative_path)
-        except Exception:
-            source_path = None
-        if source_path is None or not source_path.is_file():
-            copied_assets.append(
-                {"kind": kind, "relative_path": relative_path, "copied": False,
-                 "reason": "MISSING", "sha256": expected_sha}
-            )
-            continue
-        actual_sha = _sha256_file(source_path)
-        verified = bool(expected_sha) and actual_sha == expected_sha
-        asset_dir.mkdir(parents=True, exist_ok=True)
-        target = asset_dir / f"{kind}-{source_path.name}"
-        if source_path.resolve() != target.resolve():
-            shutil.copyfile(source_path, target)
-        copied_assets.append(
-            {
-                "kind": kind,
-                "relative_path": relative_path,
-                "copied": True,
-                "sha256": actual_sha,
-                "verified": verified,
-            }
-        )
+        if asset.present:
+            source_path = storage.resolve_relative(asset.relative_path)
+            asset_dir.mkdir(parents=True, exist_ok=True)
+            target = asset_dir / f"{asset.kind}-{source_path.name}"
+            if source_path.resolve() != target.resolve():
+                shutil.copyfile(source_path, target)
+            record["copied"] = True
+        copied_assets.append(record)
+
+    # Refresh the authoritative rows and re-verify the SAME identity before
+    # publishing: a changed generation (even one that would independently be
+    # review-ready) can never be exported under the originally captured identity.
+    session.expire_all()
+    fresh = session.get(ClipMaterialization, parsed, populate_existing=True)
+    fresh_render = (
+        session.get(RenderExecution, fresh.render_execution_id, populate_existing=True)
+        if fresh is not None and fresh.render_execution_id is not None
+        else None
+    )
+    recheck = evaluate_readiness(session, storage, fresh) if fresh is not None else None
+    fresh_identity = _identity_snapshot(fresh, fresh_render) if fresh is not None else {}
+    reasons = list(recheck.reasons) if recheck is not None else ["MATERIALIZATION_MISSING"]
+    if fresh_identity != initial_identity:
+        reasons.append("EXPORT_IDENTITY_CHANGED")
+    if not artifact_verified:
+        reasons.append("EXPORT_ARTIFACT_MISMATCH")
+    if readiness.review_ready and recheck is not None and not recheck.review_ready:
+        reasons.append("EVIDENCE_CHANGED_DURING_EXPORT")
+    genuine = not reasons
 
     metrics = dict(envelope.metrics or {})
     index: dict[str, object] = {
@@ -264,11 +223,14 @@ def export_materialization(
         "profile_key": envelope.profile_key,
         "priority": envelope.priority.value,
         "genuine_acceptance": genuine,
-        "genuine_acceptance_reasons": genuine_reasons,
+        "genuine_acceptance_reasons": reasons,
+        "diagnostic": not genuine,
+        "readiness": recheck.as_dict() if recheck is not None else {},
+        "identity": fresh_identity,
         "lifecycle": envelope.lifecycle.value,
         "semantic_outcome": envelope.semantic_outcome.value if envelope.semantic_outcome else None,
         "human_review_required": bool(envelope.human_review_required),
-        "publication_ready": bool(envelope.publication_ready),
+        "publication_ready": False,
         "is_current": bool(envelope.is_current),
         "repair_count": int(envelope.repair_count or 0),
         "repair_actions": [dict(item) for item in (envelope.repair_actions or [])],
@@ -302,16 +264,24 @@ def export_materialization(
         "component_checkpoints": dict(envelope.component_checkpoints or {}),
         "artifact_file": artifact_name,
     }
-    (case_dir / "index.json").write_text(
+    (staging_dir / "index.json").write_text(
         json.dumps(index, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
     )
 
     manifest_lines = []
-    for entry in sorted(case_dir.rglob("*")):
+    for entry in sorted(staging_dir.rglob("*")):
         if entry.is_file() and entry.name != "SHA256SUMS":
-            relative = entry.relative_to(case_dir).as_posix()
+            relative = entry.relative_to(staging_dir).as_posix()
             manifest_lines.append(f"{_sha256_file(entry)}  {relative}")
-    (case_dir / "SHA256SUMS").write_text("\n".join(manifest_lines) + "\n", encoding="utf-8")
+    (staging_dir / "SHA256SUMS").write_text(
+        "\n".join(manifest_lines) + "\n", encoding="utf-8"
+    )
+
+    # Publish only the fully built, verified staging package. A previously valid
+    # package is removed only after the replacement is complete.
+    if case_dir.exists():
+        shutil.rmtree(case_dir)
+    shutil.move(str(staging_dir), str(case_dir))
     return {"case": case, "directory": str(case_dir), "index": index, "genuine": genuine}
 
 
@@ -380,28 +350,68 @@ def discover_eligible_materializations(
     return eligible
 
 
-def inventory_source_readiness(session: Session, *, limit: int = 8) -> dict[str, object]:
+def inventory_source_readiness(
+    session: Session, *, limit: int = 8, storage: StorageService | None = None
+) -> dict[str, object]:
     """A bounded read-only inventory of existing source/candidate readiness.
 
     Reporting this separately prevents an *empty completed-materialization
-    inventory* from being misread as "source media is unavailable": the concrete
-    prerequisite counts below show whether sources/candidates exist but simply are
-    not yet review-ready.
+    inventory* from being misread as "source media is unavailable": each entry
+    reports the concrete prerequisite stage reached (candidate, usable
+    refinement, materialization, review-ready) so a count alone never stands in
+    for eligibility, and absence is explained by named reasons.
     """
 
-    from app.models import ClipCandidate
-    from app.models.source_video import SourceVideo
+    from app.models import CandidateRefinement, ClipCandidate
 
+    if storage is None:
+        from app.core.settings import get_settings
+
+        storage = StorageService(get_settings().storage_root)
     sources = session.scalars(
         select(SourceVideo).order_by(SourceVideo.created_at.desc()).limit(max(1, int(limit)))
     ).all()
+    usable_refinement_statuses = {
+        "CANDIDATE_REFINED",
+        "FINAL_TRANSCRIPT_READY",
+        "NEEDS_MANUAL_TRANSCRIPT_REVIEW",
+        "PROVIDER_DEGRADED",
+    }
     entries: list[dict[str, object]] = []
     for source in sources:
-        candidate_count = len(
-            session.scalars(
-                select(ClipCandidate.id).where(ClipCandidate.source_video_id == source.id)
-            ).all()
+        candidates = session.scalars(
+            select(ClipCandidate.id).where(
+                ClipCandidate.source_video_id == source.id,
+                ClipCandidate.is_current.is_(True),
+            )
+        ).all()
+        refinements = session.scalars(
+            select(CandidateRefinement.status).where(
+                CandidateRefinement.source_video_id == source.id
+            )
+        ).all()
+        materializations = session.scalars(
+            select(ClipMaterialization).where(
+                ClipMaterialization.source_video_id == source.id,
+                ClipMaterialization.is_current.is_(True),
+            )
+        ).all()
+        has_usable_refinement = any(
+            getattr(status, "value", str(status)) in usable_refinement_statuses
+            for status in refinements
         )
+        review_ready = sum(
+            1 for row in materializations if not genuine_acceptance_reasons(session, storage, row)
+        )
+        reasons: list[str] = []
+        if not candidates:
+            reasons.append("NO_CURRENT_CANDIDATE")
+        if not has_usable_refinement:
+            reasons.append("NO_USABLE_REFINEMENT")
+        if not materializations:
+            reasons.append("NO_MATERIALIZATION")
+        elif review_ready == 0:
+            reasons.append("NO_REVIEW_READY_MATERIALIZATION")
         entries.append(
             {
                 "source_video_id": str(source.id),
@@ -410,10 +420,20 @@ def inventory_source_readiness(session: Session, *, limit: int = 8) -> dict[str,
                 "lifecycle": getattr(
                     source.lifecycle_state, "value", str(source.lifecycle_state)
                 ),
-                "candidate_count": candidate_count,
+                "candidate_count": len(candidates),
+                "refinement_count": len(refinements),
+                "has_usable_refinement": has_usable_refinement,
+                "current_materialization_count": len(materializations),
+                "review_ready_materializations": review_ready,
+                "prerequisite_reasons": reasons,
+                "review_ready": review_ready > 0,
             }
         )
-    return {"source_count": len(entries), "sources": entries}
+    return {
+        "source_count": len(entries),
+        "review_ready_source_count": sum(1 for entry in entries if entry["review_ready"]),
+        "sources": entries,
+    }
 
 
 def export_tts_audition(

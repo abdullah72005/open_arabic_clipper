@@ -98,6 +98,7 @@ def build_materialization_providers(
     writing: MaterializationWritingProvider | None = None,
     critique: MaterializationCritiqueProvider | None = None,
     narration: object | None = None,
+    narration_fidelity: Callable[[object], Mapping[str, object]] | None = None,
     storage: StorageService | None = None,
 ) -> MaterializationProviders:
     """Build the production provider bundle from the configured materialization mode.
@@ -123,6 +124,7 @@ def build_materialization_providers(
             critique=critique,
             narration=narration,
             allow_hosted=hosted,
+            narration_fidelity=narration_fidelity,
         )
 
     mode = settings.materialization_semantic_mode()
@@ -151,7 +153,13 @@ def build_materialization_providers(
                 _narration_factory(settings, storage) if storage is not None else None
             ),
             narration_fidelity=(
-                _narration_fidelity_validator(settings, storage) if storage is not None else None
+                narration_fidelity
+                if narration_fidelity is not None
+                else (
+                    _narration_fidelity_validator(settings, storage)
+                    if storage is not None
+                    else None
+                )
             ),
         )
     # Deterministic (or an unavailable local-only adapter): zero hosted calls.
@@ -160,6 +168,7 @@ def build_materialization_providers(
         critique=critique,
         narration=narration,
         allow_hosted=False,
+        narration_fidelity=narration_fidelity,
     )
 
 
@@ -206,6 +215,21 @@ def _narration_fidelity_validator(
     from app.materialization.tts_gemini import validate_narration_fidelity
     from app.transcription.engine import WhisperEngine
 
+    def runtime_identity() -> dict[str, object]:
+        """The effective ASR runtime/options that participate in validation identity."""
+
+        try:
+            options = settings.targeted_transcription_options("FINAL_CLIP")
+        except Exception:
+            return {"provider": "faster-whisper"}
+        return {
+            "provider": "faster-whisper",
+            "model": getattr(options, "model", ""),
+            "device": getattr(options, "device", ""),
+            "compute_type": getattr(options, "compute_type", ""),
+            "beam_size": getattr(options, "beam_size", None),
+        }
+
     def validate(audio: object) -> Mapping[str, object]:
         relative = str(getattr(audio, "relative_path", "") or "")
         expected = str(getattr(audio, "text", "") or "")
@@ -235,7 +259,26 @@ def _narration_fidelity_validator(
     #: Marks this as the settings-built validator so the executor may rebind it to
     #: the per-run cancellation event; injected test validators are left untouched.
     validate._stage6_rebindable = True  # type: ignore[attr-defined]
+    validate.runtime_identity = runtime_identity  # type: ignore[attr-defined]
     return validate
+
+
+def build_local_narration_fidelity_validator(
+    settings: Settings,
+    storage: StorageService,
+    *,
+    cancel_event: object | None = None,
+    is_cancelled: Callable[[], bool] | None = None,
+) -> Callable[[object], Mapping[str, object]]:
+    """Public factory for the settings-built local audio-backed fidelity validator.
+
+    Used by the production executor and by the CLI TTS audition so both validate
+    generated audio through the same leased Whisper engine and strict comparison.
+    """
+
+    return _narration_fidelity_validator(
+        settings, storage, cancel_event=cancel_event, is_cancelled=is_cancelled
+    )
 
 
 def _admission_callable(controller: object) -> Callable[[], bool]:
@@ -946,6 +989,7 @@ def build_materialization_executor(
     writing: MaterializationWritingProvider | None = None,
     critique: MaterializationCritiqueProvider | None = None,
     narration: object | None = None,
+    narration_fidelity: Callable[[object], Mapping[str, object]] | None = None,
 ) -> MaterializationExecutor:
     """Build the production Stage 6 executor lazily and network-free."""
 
@@ -955,7 +999,12 @@ def build_materialization_executor(
         config=settings.stage6_config(),
         storage=storage,
         providers=build_materialization_providers(
-            settings, writing=writing, critique=critique, narration=narration, storage=storage
+            settings,
+            writing=writing,
+            critique=critique,
+            narration=narration,
+            narration_fidelity=narration_fidelity,
+            storage=storage,
         ),
     )
 

@@ -397,51 +397,99 @@ class GeminiCritiqueProvider(_GeminiChatAdapter):
 
 
 def _parse_copies(content: Mapping[str, object], requested: Sequence[int]) -> dict[int, str] | None:
+    """Strictly parse the writing response against the exact requested block set.
+
+    The response is validated as a whole before any copy is accepted: every
+    requested block index must appear exactly once, an unexpected/duplicate/
+    malformed entry invalidates the entire response (``None``), and a favorable
+    remainder is never retained. There is no partial acceptance.
+    """
+
     raw = content.get("copies")
     if not isinstance(raw, list):
         return None
-    requested_set = set(requested)
+    requested_list = list(requested)
+    requested_set = set(requested_list)
+    if len(requested_set) != len(requested_list) or not requested_set:
+        return None
     copies: dict[int, str] = {}
     for item in raw:
         if not isinstance(item, Mapping):
-            continue
+            return None
         index = item.get("block_index")
-        if isinstance(index, bool) or not isinstance(index, int) or index not in requested_set:
-            continue
-        copies[index] = str(item.get("text", "") or "")
+        if isinstance(index, bool) or not isinstance(index, int):
+            return None
+        if index not in requested_set or index in copies:
+            return None
+        text = item.get("text", "")
+        if not isinstance(text, str):
+            return None
+        copies[index] = text
+    if set(copies) != requested_set:
+        return None
     return copies
 
 
 def _parse_critique(
     content: Mapping[str, object], requested: Sequence[int]
 ) -> dict[int, BlockCritique] | None:
+    """Strictly parse the critique response against the exact requested block set.
+
+    The response is validated as a whole before any decision is created: every
+    requested block index must appear exactly once with exactly one valid finding
+    for every requested dimension. An unexpected, duplicate, malformed, missing,
+    or extra entry invalidates the entire response (``None``); a favorable
+    remainder is never retained. There is no partial acceptance.
+    """
+
     raw = content.get("blocks")
     if not isinstance(raw, list):
         return None
-    requested_set = set(requested)
+    requested_list = list(requested)
+    requested_set = set(requested_list)
+    if len(requested_set) != len(requested_list) or not requested_set:
+        return None
     dimensions = set(CRITIQUE_DIMENSIONS)
     levels = set(CRITIQUE_LEVELS)
     blocks: dict[int, BlockCritique] = {}
     for item in raw:
         if not isinstance(item, Mapping):
-            continue
+            return None
         index = item.get("block_index")
-        if isinstance(index, bool) or not isinstance(index, int) or index not in requested_set:
-            continue
+        if isinstance(index, bool) or not isinstance(index, int):
+            return None
+        if index not in requested_set or index in blocks:
+            return None
+        raw_findings = item.get("findings")
+        if not isinstance(raw_findings, list):
+            return None
         findings: list[CritiqueDimensionFinding] = []
-        for finding in item.get("findings") or []:
+        seen: set[str] = set()
+        for finding in raw_findings:
             if not isinstance(finding, Mapping):
-                continue
-            dimension = str(finding.get("dimension", ""))
-            level = str(finding.get("level", ""))
-            if dimension not in dimensions or level not in levels:
-                continue
+                return None
+            dimension = finding.get("dimension")
+            level = finding.get("level")
+            if not isinstance(dimension, str) or dimension not in dimensions:
+                return None
+            if not isinstance(level, str) or level not in levels:
+                return None
+            if dimension in seen:
+                return None
+            seen.add(dimension)
+            evidence = finding.get("evidence", "")
             findings.append(
                 CritiqueDimensionFinding(
-                    dimension=dimension, level=level, evidence=str(finding.get("evidence", ""))
+                    dimension=dimension,
+                    level=level,
+                    evidence="" if evidence is None else str(evidence),
                 )
             )
+        if seen != dimensions:
+            return None
         blocks[index] = BlockCritique(block_index=index, findings=tuple(findings))
+    if set(blocks) != requested_set:
+        return None
     return blocks
 
 

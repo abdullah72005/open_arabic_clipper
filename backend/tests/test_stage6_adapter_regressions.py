@@ -148,27 +148,34 @@ def test_audition_rejection_and_identity_change_are_truthful(engine) -> None:  #
         model="model-b",
         voice_factory=_FakeVoiceProvider,
     )
-    # A changed model is a genuinely new audition, never a cache hit.
-    assert second.raw_calls == 9
-    assert not any(sample.cached for sample in second.samples)
+    # A changed model does not silently authorize a second nine-call comparison:
+    # the durable identity mismatch is reported and zero calls are made.
+    assert second.status == "AUDITION_IDENTITY_MISMATCH"
+    assert second.raw_calls == 0
+    assert second.samples == ()
 
     # The default export writes into the audition root and never copies a file
     # onto itself.
-    exported = export_tts_audition(settings, [sample.as_dict() for sample in second.samples])
+    exported = export_tts_audition(settings, [sample.as_dict() for sample in first.samples])
     assert Path(exported["root"]).is_dir()
 
 
-def test_export_discovery_and_real_authored_ass(engine) -> None:  # type: ignore[no-untyped-def]
+def test_export_never_substitutes_seeded_labels_or_deterministic_path(engine) -> None:  # type: ignore[no-untyped-def]
     settings = get_settings()
     materialization_id = _seed_completed_materialization(engine, "sources/s1/final.mp4")
     with Session(engine) as session:
         envelope = session.get(ClipMaterialization, materialization_id)
         assert envelope is not None
         source_id = envelope.source_video_id
-        assert materialization_id in discover_eligible_materializations(session, storage=_storage())
+        # A seeded COMPLETE/READY label alone does not establish genuine media: the
+        # authoritative readiness view requires live prerequisites, render identity,
+        # QC, assessment, and bound asset hashes.
+        assert materialization_id not in discover_eligible_materializations(
+            session, storage=_storage()
+        )
 
-        # Write the real authored ASS at its deterministic managed path and prove
-        # the export copies those exact bytes (never the artifact_reference JSON).
+        # Write a *newer* file at the deterministic authored.ass path: it must never
+        # substitute for the (absent) bound accepted ASS reference.
         ass_path = (
             _storage().source_directory(source_id)
             / "materializations"
@@ -176,16 +183,21 @@ def test_export_discovery_and_real_authored_ass(engine) -> None:  # type: ignore
             / "authored.ass"
         )
         ass_path.parent.mkdir(parents=True, exist_ok=True)
-        ass_bytes = b"[Script Info]\nScriptType: v4.00+\n"
-        ass_path.write_bytes(ass_bytes)
+        ass_path.write_bytes(b"[Script Info]\nScriptType: v4.00+\n")
 
         result = export_materializations(session, settings, [materialization_id])
     case = Path(result["cases"][0]["directory"])
-    assert (case / "authored.ass").read_bytes() == ass_bytes
-    # The genuine case passes every prerequisite check.
-    assert result["cases"][0]["genuine_acceptance"] is True
+    assert not (case / "authored.ass").exists()
+    assert result["cases"][0]["genuine_acceptance"] is False
+    index = __import__("json").loads((case / "index.json").read_text(encoding="utf-8"))
+    assert index["diagnostic"] is True
+    assert index["publication_ready"] is False
+    reasons = set(index["genuine_acceptance_reasons"])
+    assert "AUTHORED_ASS_MISSING" in reasons
+    assert "STALE_UPSTREAM_INPUTS" in reasons
+    assert "RENDER_BINDING_INVALID" in reasons
 
-    # Demote the bound render and change its purpose: it is no longer eligible.
+    # Demote the bound render and change its purpose: still not eligible.
     with Session(engine) as session:
         envelope = session.get(ClipMaterialization, materialization_id)
         assert envelope is not None

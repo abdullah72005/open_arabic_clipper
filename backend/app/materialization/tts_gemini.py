@@ -163,12 +163,40 @@ class GeminiNarrationSynthesizer:
         if not self._key_present:
             return None
         try:
-            self._client = self._client_factory() if self._client_factory else self._build_client()
+            client = self._client_factory() if self._client_factory else self._build_client()
+        except MaterializationProviderError:
+            raise
         except Exception:
             raise MaterializationProviderError(
                 ProviderErrorCategory.PROVIDER_ERROR.value, "gemini tts client construction failed"
             ) from None
-        return self._client
+        self._disable_interactions_retries(client)
+        self._client = client
+        return client
+
+    @staticmethod
+    def _disable_interactions_retries(client: object) -> None:
+        """Establish the verified no-retry boundary on the private Interactions client.
+
+        The generated Interactions resource ignores the parent ``HttpRetryOptions``
+        (an ``attempts=0`` parent is normalized to one before the Interactions
+        bridge consumes it) and retries from its own
+        ``sdk_configuration.retry_config``; the durable gateway must observe
+        exactly one raw HTTP request per reserved attempt. Only this client-local
+        Interactions configuration is changed — never the shared generateContent
+        retry configuration, and never a global SDK monkeypatch. If the installed
+        SDK cannot establish the verified no-retry behavior, fail closed before
+        any invocation.
+        """
+
+        interactions = getattr(client, "interactions", None)
+        sdk_configuration = getattr(interactions, "sdk_configuration", None)
+        if sdk_configuration is None or not hasattr(sdk_configuration, "retry_config"):
+            raise MaterializationProviderError(
+                ProviderErrorCategory.PROVIDER_ERROR.value,
+                "installed SDK cannot establish the no-retry interactions boundary",
+            )
+        sdk_configuration.retry_config = None
 
     def synthesize(self, request: NarrationSynthesisRequest) -> NarrationAudio:
         if not self._key_present:

@@ -691,19 +691,14 @@ def cancel_materialization(
 ) -> uuid.UUID:
     """Cooperatively cancel the current Stage 6 generation for a candidate.
 
-    Marks the active MATERIALIZATION job and the envelope ``CANCELLED`` in one
-    short transaction (the executor polls the exact job status), and cancels an
-    active transformed render through the existing render cancellation convention.
-    Never cancels unrelated core validation/history work, and a cancelled envelope
-    is never revived by the finalizer.
+    Resolves the requested/default profile exactly as POST does and delegates the
+    authoritative cancellation to :func:`cancel_materialization_by_id`, so the
+    candidate-scoped and id-scoped entry points share one implementation.
     """
 
     candidate = _lock_candidate(session, candidate_id)
     if candidate is None:
         raise MaterializationQueueError("candidate does not exist")
-    # Resolve the requested/default profile exactly as POST does: an omitted or
-    # unknown explicit key resolves to the neutral ``default`` generation, so a
-    # cancel never targets another profile's newest current envelope.
     from app.materialization.profiles import profile_from_row
     from app.materialization.service import _current_profile
 
@@ -719,6 +714,64 @@ def cancel_materialization(
     ).first()
     if envelope is None:
         raise MaterializationQueueError("materialization does not exist")
+    cancelled = _cancel_envelope(session, envelope.id)
+    return uuid.UUID(str(cancelled.id))
+
+
+def _load_envelope_by_id(
+    session: Session, materialization_id: uuid.UUID | str
+) -> ClipMaterialization:
+    try:
+        parsed = (
+            materialization_id
+            if isinstance(materialization_id, uuid.UUID)
+            else uuid.UUID(str(materialization_id))
+        )
+    except (TypeError, ValueError):
+        raise MaterializationQueueError("materialization does not exist") from None
+    envelope = session.get(ClipMaterialization, parsed, populate_existing=True)
+    if envelope is None:
+        raise MaterializationQueueError("materialization does not exist")
+    return envelope
+
+
+def cancel_materialization_by_id(
+    session: Session, materialization_id: uuid.UUID | str
+) -> ClipMaterialization:
+    """Cooperatively cancel one *exact* materialization id (generation authority).
+
+    Under the candidate-first lock order, operates on the requested envelope and
+    requires it to be the exact current generation; a historical/stale id is
+    refused with a truthful reason and makes no mutation or delivery. A repeated
+    cancellation of the same cancelled current row is idempotent.
+    """
+
+    loaded = _load_envelope_by_id(session, materialization_id)
+    candidate = _lock_candidate(session, loaded.clip_candidate_id)
+    if candidate is None:
+        raise MaterializationQueueError("candidate does not exist")
+    # Re-read under the lock: the operation must target the requested envelope,
+    # never resolve a historical id into a newer current envelope.
+    envelope = session.get(ClipMaterialization, loaded.id, populate_existing=True)
+    if envelope is None:
+        raise MaterializationQueueError("materialization does not exist")
+    return _cancel_envelope(session, envelope.id)
+
+
+def _cancel_envelope(session: Session, materialization_id: uuid.UUID) -> ClipMaterialization:
+    """Cancel one exact current envelope; idempotent for an already-cancelled row."""
+
+    envelope = session.get(
+        ClipMaterialization, materialization_id, populate_existing=True, with_for_update=True
+    )
+    if envelope is None:
+        raise MaterializationQueueError("materialization does not exist")
+    if not envelope.is_current:
+        raise MaterializationQueueError("MATERIALIZATION_NOT_CURRENT")
+    if envelope.lifecycle is MaterializationLifecycle.CANCELLED:
+        # Idempotent: the same cancelled current generation is already terminal.
+        session.commit()
+        return envelope
 
     for job in session.scalars(
         select(ProcessingJob).where(
@@ -758,7 +811,214 @@ def cancel_materialization(
     envelope.publication_ready = False
     envelope.cache_eligible = False
     session.commit()
-    return uuid.UUID(str(envelope.id))
+    return envelope
+
+
+def resume_materialization_by_id(
+    session: Session,
+    materialization_id: uuid.UUID | str,
+    *,
+    settings: Settings | None = None,
+    dispatcher: object | None = None,
+) -> MaterializationQueueOutcome:
+    """Resume one *exact* materialization id using its persisted options.
+
+    The requested envelope's exact persisted options and matching checkpoints are
+    used; a historical/stale id is refused. A verified completed result returns the
+    verified cache. An explicit resume of a cancelled current generation creates a
+    new fenced job while preserving accepted components, budgets, and repair usage;
+    old jobs stay terminal and no uncertain provider attempt is spent.
+    """
+
+    resolved_settings = settings or get_settings()
+    loaded = _load_envelope_by_id(session, materialization_id)
+    candidate = _lock_candidate(session, loaded.clip_candidate_id)
+    if candidate is None:
+        raise MaterializationQueueError("candidate does not exist")
+    envelope = session.get(ClipMaterialization, loaded.id, populate_existing=True)
+    if envelope is None:
+        raise MaterializationQueueError("materialization does not exist")
+    if not envelope.is_current:
+        raise MaterializationQueueError("MATERIALIZATION_NOT_CURRENT")
+
+    request = envelope.request_payload if isinstance(envelope.request_payload, dict) else {}
+    priority = str(request.get("priority") or envelope.priority.value)
+    profile_key = request.get("requested_profile_key", request.get("profile_key"))
+    supporting_requested = str(request.get("supporting_requested") or "OFF")
+
+    active = _active_job(session, envelope.id)
+    if active is not None:
+        _recover_active_job(
+            session,
+            candidate.id,
+            active,
+            envelope,
+            settings=resolved_settings,
+            dispatcher=dispatcher,
+            priority=priority,
+            profile_key=profile_key,
+            supporting_requested=supporting_requested,
+            force=True,
+        )
+        session.commit()
+        return _outcome(
+            active,
+            envelope,
+            queued=False,
+            active=True,
+            phase=resolve_job_phase(session, active, envelope),
+        )
+
+    if envelope.lifecycle is MaterializationLifecycle.COMPLETE:
+        cache_state = _completed_cache_state(session, envelope, settings=resolved_settings)
+        if cache_state == CACHE_VALID:
+            session.commit()
+            return _outcome(None, envelope, queued=False, cached=True)
+        if cache_state == CACHE_RECOVERABLE:
+            envelope.lifecycle = MaterializationLifecycle.AWAITING_RENDER
+            envelope.cache_eligible = False
+            envelope.render_execution_id = None
+            envelope.human_review_required = False
+            envelope.publication_ready = False
+            envelope.semantic_outcome = None
+            session.flush()
+            return _route_awaiting_render(
+                session, candidate.id, envelope, settings=resolved_settings, dispatcher=dispatcher
+            )
+        session.commit()
+        return _outcome(
+            None,
+            envelope,
+            queued=False,
+            skipped_reason=(
+                envelope.semantic_outcome.value if envelope.semantic_outcome else "COMPLETE"
+            ),
+        )
+
+    if envelope.lifecycle is MaterializationLifecycle.AWAITING_RENDER:
+        return _route_awaiting_render(
+            session, candidate.id, envelope, settings=resolved_settings, dispatcher=dispatcher
+        )
+
+    if envelope.lifecycle is MaterializationLifecycle.BLOCKED:
+        session.commit()
+        return _outcome(None, envelope, queued=False, skipped_reason="BLOCKED")
+
+    # QUEUED/RUNNING/FAILED/CANCELLED: an explicit resume may create a new fenced
+    # job for this exact envelope, preserving accepted components, budgets, repair
+    # usage, and unresolved uncertainty (the gateway refuses to re-spend uncertain
+    # attempts). Cancelled jobs are never revived.
+    return _resume_envelope_job(
+        session,
+        candidate.id,
+        envelope,
+        settings=resolved_settings,
+        dispatcher=dispatcher,
+        priority=priority,
+        profile_key=profile_key,
+        supporting_requested=supporting_requested,
+    )
+
+
+def resume_materialization(
+    session: Session,
+    candidate_id: uuid.UUID | str,
+    *,
+    profile_key: str | None = None,
+    settings: Settings | None = None,
+    dispatcher: object | None = None,
+) -> MaterializationQueueOutcome:
+    """Candidate-scoped compatibility wrapper over the authoritative id resume.
+
+    Resolves the requested/default profile exactly as POST does, then delegates to
+    :func:`resume_materialization_by_id` so the candidate/CLI entry points share one
+    implementation and never silently create a replacement generation.
+    """
+
+    candidate = _lock_candidate(session, candidate_id)
+    if candidate is None:
+        raise MaterializationQueueError("candidate does not exist")
+    from app.materialization.profiles import profile_from_row
+    from app.materialization.service import _current_profile
+
+    resolved_profile_key = profile_from_row(_current_profile(session, profile_key)).profile_key
+    envelope = session.scalars(
+        select(ClipMaterialization)
+        .where(
+            ClipMaterialization.clip_candidate_id == candidate.id,
+            ClipMaterialization.profile_key == resolved_profile_key,
+            ClipMaterialization.is_current.is_(True),
+        )
+        .order_by(ClipMaterialization.created_at.desc())
+    ).first()
+    if envelope is None:
+        raise MaterializationQueueError("materialization does not exist")
+    return resume_materialization_by_id(
+        session, envelope.id, settings=settings, dispatcher=dispatcher
+    )
+
+
+def _resume_envelope_job(
+    session: Session,
+    candidate_id: uuid.UUID,
+    envelope: ClipMaterialization,
+    *,
+    settings: Settings,
+    dispatcher: object | None,
+    priority: str,
+    profile_key: object,
+    supporting_requested: str,
+) -> MaterializationQueueOutcome:
+    """Create/recover one fenced MATERIALIZATION job for an exact envelope."""
+
+    if envelope.active_job_id is not None:
+        envelope.active_job_id = None
+        session.flush()
+
+    job = ProcessingJob(
+        source_video_id=envelope.source_video_id,
+        kind=JobKind.MATERIALIZATION,
+        candidate_refinement_id=envelope.refinement_id,
+        materialization_id=envelope.id,
+    )
+    session.add(job)
+    session.flush()
+
+    if not bind_active_job(session, envelope.id, job.id):
+        session.rollback()
+        shared = session.get(ClipMaterialization, envelope.id, populate_existing=True)
+        assert shared is not None
+        shared_active = _active_job(session, shared.id)
+        return _outcome(
+            shared_active,
+            shared,
+            queued=False,
+            active=shared_active is not None,
+        )
+
+    if envelope.lifecycle is not MaterializationLifecycle.AWAITING_RENDER:
+        envelope.lifecycle = MaterializationLifecycle.QUEUED
+    payload = dict(active_envelope_payload(envelope))
+    payload.setdefault("priority", priority)
+    payload.setdefault("supporting_requested", supporting_requested)
+    payload.setdefault("requested_profile_key", profile_key)
+    envelope.request_payload = payload
+    session.commit()
+    session.refresh(job)
+    session.refresh(envelope)
+
+    _dispatch_or_mark(
+        session,
+        candidate_id,
+        job,
+        envelope,
+        priority=priority,
+        profile_key=profile_key if isinstance(profile_key, str) else None,
+        supporting_requested=supporting_requested,
+        force=True,
+    )
+    return _outcome(job, envelope, queued=True)
+
 
 
 def get_job(session: Session, job_id: uuid.UUID | str) -> ProcessingJob | None:
@@ -798,9 +1058,12 @@ __all__ = [
     "MaterializationQueueError",
     "MaterializationQueueOutcome",
     "cancel_materialization",
+    "cancel_materialization_by_id",
     "get_job",
     "queue_materialization",
     "resolve_job_options",
     "resolve_job_phase",
+    "resume_materialization",
+    "resume_materialization_by_id",
     "validate_candidate_for_materialization",
 ]

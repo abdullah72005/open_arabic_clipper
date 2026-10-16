@@ -1,11 +1,13 @@
 "use client";
 
+import Link from "next/link";
 import { useEffect, useRef, useState } from "react";
 
 import {
   api,
   ApiError,
   type Job,
+  type Materialization,
   type RightsStatus
 } from "@/lib/api-client";
 import {
@@ -62,10 +64,27 @@ export function ProduceRunner() {
   const [status, setStatus] = useState("");
   const [error, setError] = useState("");
   const [result, setResult] = useState<{ id: string; url: string } | null>(null);
+  const [materialization, setMaterialization] = useState<Materialization | null>(null);
   const [running, setRunning] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
+  const materializationRef = useRef<string | null>(null);
 
   useEffect(() => () => abortRef.current?.abort(), []);
+
+  // Cancel is server-authoritative: request cancellation of the exact current
+  // materialization *before* stopping the client poll, so the worker sees the
+  // cancel rather than continuing to spend provider/render work.
+  const cancel = async () => {
+    const id = materializationRef.current;
+    if (id) {
+      try {
+        await api.cancelMaterialization(id);
+      } catch {
+        // Best effort: still stop the local poll.
+      }
+    }
+    abortRef.current?.abort();
+  };
 
   const run = async () => {
     const trimmed = url.trim();
@@ -80,6 +99,8 @@ export function ProduceRunner() {
     setRunning(true);
     setError("");
     setResult(null);
+    setMaterialization(null);
+    materializationRef.current = null;
     setSteps(initialStepStates());
 
     let currentKey: ProduceStepKey | null = null;
@@ -224,16 +245,29 @@ export function ProduceRunner() {
       }
       setStep("compose", "done");
 
-      activate("render");
-      setStatus("Rendering the final clip (Stage 5.2)…");
-      await runQueued(await api.queueRenderExecution(candidate.id));
-      const render = await api.getCandidateRenderExecution(candidate.id);
-      if (render.lifecycle !== "COMPLETE" || !render.cache_eligible) {
-        throw new Error(render.error_code ?? `The render did not complete (${render.lifecycle}).`);
+      activate("materialize");
+      setStatus("Materializing the transformed short (Stage 6)…");
+      const queued = await api.queueMaterialization(candidate.id);
+      materializationRef.current = queued.materialization_id;
+      if (queued.job_id && !queued.cached) {
+        await runQueued(queued);
       }
-      setStep("render", "done");
-      setResult({ id: render.id, url: api.renderExecutionArtifactUrl(render.id) });
-      setStatus("Final clip ready.");
+      const produced = queued.materialization_id
+        ? await api.getMaterialization(queued.materialization_id)
+        : await api.getCandidateMaterialization(candidate.id);
+      materializationRef.current = produced.id;
+      setMaterialization(produced);
+      if (produced.artifact_available) {
+        setResult({ id: produced.id, url: api.materializationArtifactUrl(produced.id) });
+      }
+      setStep("materialize", "done");
+      setStatus(
+        produced.readiness.review_ready
+          ? "Transformed short ready for human review."
+          : `Materialization ${produced.lifecycle}${
+              produced.semantic_outcome ? ` (${produced.semantic_outcome})` : ""
+            }.`
+      );
     } catch (cause) {
       if (cause instanceof DOMException && cause.name === "AbortError") {
         setStatus("Cancelled.");
@@ -288,7 +322,7 @@ export function ProduceRunner() {
           {running && (
             <button
               className="button danger"
-              onClick={() => abortRef.current?.abort()}
+              onClick={() => void cancel()}
               style={{ marginLeft: 8 }}
               type="button"
             >
@@ -317,18 +351,54 @@ export function ProduceRunner() {
         {error && <p className="error">{error}</p>}
       </section>
 
-      {result && (
+      {materialization && (
         <section className="card">
-          <h3>Final result</h3>
-          <video controls playsInline src={result.url} style={{ width: "100%", borderRadius: 12 }} />
+          <h3>Transformed short (Stage 6)</h3>
+          {result && (
+            <video
+              controls
+              playsInline
+              src={result.url}
+              style={{ width: "100%", borderRadius: 12 }}
+            />
+          )}
           <p>
-            <a className="button" download href={result.url}>
-              Download MP4
-            </a>
+            <strong>Lifecycle:</strong> {materialization.lifecycle}
+            {materialization.semantic_outcome ? ` · ${materialization.semantic_outcome}` : ""}
+          </p>
+          <p>
+            <strong>Review:</strong>{" "}
+            {materialization.readiness.review_ready
+              ? "ready for human review"
+              : `not ready (${materialization.readiness.reasons.join(", ") || materialization.live_freshness})`}
           </p>
           <p className="muted">
-            This is the Stage 5.2 rendered clip for the selected candidate. Publication eligibility is
-            evaluated separately from transcript readiness.
+            Render {materialization.render_execution_id ?? "—"} · output{" "}
+            {materialization.output_fingerprint.slice(0, 12)} · publication_ready=false
+          </p>
+          {materialization.findings.length > 0 && (
+            <ul className="muted">
+              {materialization.findings.slice(0, 8).map((finding, index) => (
+                <li key={index}>
+                  {String(finding.dimension ?? "finding")}: {String(finding.level ?? "")}
+                </li>
+              ))}
+            </ul>
+          )}
+          <p>
+            {materialization.artifact_available && result ? (
+              <a className="button" download href={result.url}>
+                Download transformed MP4
+              </a>
+            ) : (
+              <span className="muted">No verified transformed artifact is available.</span>
+            )}{" "}
+            <Link className="button" href={`/sources/${materialization.source_video_id}`}>
+              Source
+            </Link>
+          </p>
+          <p className="muted">
+            Publication eligibility is evaluated separately from transcript readiness.
           </p>
         </section>
       )}

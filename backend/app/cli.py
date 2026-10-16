@@ -31,7 +31,11 @@ from app.core.enums import (
 )
 from app.core.settings import get_settings
 from app.db.session import create_session_factory
-from app.materialization.queue import MaterializationQueueError, queue_materialization
+from app.materialization.queue import (
+    MaterializationQueueError,
+    queue_materialization,
+    resume_materialization,
+)
 from app.materialization.service import MaterializationError
 from app.models import (
     AudioAnalysis,
@@ -1445,9 +1449,7 @@ def materialization_resume(
 
     with create_session_factory()() as session:
         try:
-            outcome = queue_materialization(
-                session, candidate_id, profile_key=profile_key, force=True
-            )
+            outcome = resume_materialization(session, candidate_id, profile_key=profile_key)
         except (MaterializationError, MaterializationQueueError) as error:
             raise typer.BadParameter(str(error)) from error
     typer.echo(
@@ -1570,6 +1572,10 @@ def stage6_tts_audition(
     """Audition exactly three prebuilt voices on three fixed scripts (<=9 calls)."""
 
     from app.materialization.acceptance_export import export_tts_audition
+    from app.materialization.executor import (
+        _admission_callable,
+        build_local_narration_fidelity_validator,
+    )
     from app.materialization.tts_audition import run_audition
     from app.materialization.tts_gemini import GeminiNarrationSynthesizer
     from app.services.storage import StorageService
@@ -1592,11 +1598,21 @@ def stage6_tts_audition(
             source_id="audition",
         )
 
+    # Every audition sample is validated with the local audio-backed fidelity
+    # check; a missing/deferred/rejected result makes the voice nonviable rather
+    # than silently proposing it.
+    fidelity = build_local_narration_fidelity_validator(settings, storage)
+    # Shared HIGH admission is checked before any synthesis attempt is reserved.
+    admit = _admission_callable(settings.gemini_admission_controller())
+
     result = run_audition(
         settings=settings,
         storage=storage,
         model=resolved_model,
+        api_version=settings.materialization_tts_api_version,
         voice_factory=voice_factory,
+        fidelity=fidelity,
+        admit=admit,
     )
     exported = export_tts_audition(settings, [sample.as_dict() for sample in result.samples],
                                    output_root=output_root)

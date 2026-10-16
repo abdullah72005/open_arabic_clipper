@@ -47,7 +47,7 @@ from app.core.enums import (
 )
 from app.core.settings import get_settings
 from app.db.session import create_session_factory
-from app.materialization.queue import queue_materialization
+from app.materialization.queue import MaterializationQueueError, queue_materialization
 from app.materialization.service import MaterializationError
 from app.models import (
     CandidateAnalysis,
@@ -663,11 +663,23 @@ class VisualCompositionQueueResponse(BaseModel):
 
 
 class MaterializationQueueResponse(BaseModel):
-    job_id: UUID | None
-    status: str
-    queued: bool
-    cached: bool
-    active: bool
+    job_id: UUID | None = None
+    status: str = ""
+    queued: bool = False
+    cached: bool = False
+    active: bool = False
+    #: Rich review surface (Stage 6 Task 8): exact generation/render identity,
+    #: durable phase, lifecycle, semantic outcome, flags and reasons.
+    materialization_id: UUID | None = None
+    render_execution_id: UUID | None = None
+    phase: str | None = None
+    lifecycle: str | None = None
+    semantic_outcome: str | None = None
+    human_review_required: bool = False
+    publication_ready: bool = False
+    review_ready: bool = False
+    reasons: list[str] = []
+    skipped_reason: str | None = None
     model_config = {"extra": "allow"}
 
 
@@ -688,6 +700,17 @@ class MaterializationResponse(BaseModel):
     output_fingerprint: str
     policy_version: str
     schema_version: str
+    #: Exact bindings and review surface (Stage 6 Task 8).
+    render_execution_id: UUID | None = None
+    selection_id: UUID | None = None
+    render_contract_id: UUID | None = None
+    is_effective: bool = False
+    live_freshness: str = "UNKNOWN"
+    readiness: dict[str, object] = {}
+    component_statuses: dict[str, object] = {}
+    findings: list[dict[str, object]] = []
+    provider_attempts: dict[str, object] = {}
+    artifact_available: bool = False
     model_config = {"extra": "allow"}
 
 
@@ -1745,13 +1768,7 @@ def create_app(
             )
         except MaterializationError as error:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
-        return MaterializationQueueResponse(
-            job_id=outcome.job_id,
-            status=outcome.status,
-            queued=outcome.queued,
-            cached=outcome.cached,
-            active=outcome.active,
-        )
+        return _materialization_queue_response(database, outcome)
 
     @app.get(
         "/api/candidates/{candidate_id}/materialization",
@@ -1768,7 +1785,92 @@ def create_app(
         row = _current_materialization(database, candidate_id, profile_key=profile_key)
         if row is None:
             raise HTTPException(status_code=404, detail="materialization not found")
-        return _materialization_response(row)
+        return _materialization_response(database, row)
+
+    @app.get(
+        "/api/materializations/{materialization_id}",
+        response_model=MaterializationResponse,
+    )
+    def get_materialization(
+        materialization_id: UUID, database: Session = Depends(session)
+    ) -> MaterializationResponse:
+        # Historical access is explicitly marked via live_freshness/is_current;
+        # a non-current row is never mislabeled current/publishable.
+        row = database.get(ClipMaterialization, materialization_id, populate_existing=True)
+        if row is None:
+            raise HTTPException(status_code=404, detail="materialization not found")
+        return _materialization_response(database, row)
+
+    @app.post(
+        "/api/materializations/{materialization_id}/cancel",
+        response_model=MaterializationResponse,
+    )
+    def cancel_materialization_by_id_endpoint(
+        materialization_id: UUID, database: Session = Depends(session)
+    ) -> MaterializationResponse:
+        from app.materialization.queue import cancel_materialization_by_id
+
+        try:
+            row = cancel_materialization_by_id(database, materialization_id)
+        except MaterializationError as error:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
+        except MaterializationQueueError as error:
+            detail = str(error)
+            code = 404 if "does not exist" in detail else status.HTTP_409_CONFLICT
+            raise HTTPException(status_code=code, detail=detail) from error
+        row = database.get(ClipMaterialization, materialization_id, populate_existing=True)
+        assert row is not None
+        return _materialization_response(database, row)
+
+    @app.post(
+        "/api/materializations/{materialization_id}/resume",
+        response_model=MaterializationQueueResponse,
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    def resume_materialization_by_id_endpoint(
+        materialization_id: UUID, database: Session = Depends(session)
+    ) -> MaterializationQueueResponse:
+        from app.materialization.queue import resume_materialization_by_id
+
+        try:
+            outcome = resume_materialization_by_id(database, materialization_id)
+        except MaterializationError as error:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
+        except MaterializationQueueError as error:
+            detail = str(error)
+            code = 404 if "does not exist" in detail else status.HTTP_409_CONFLICT
+            raise HTTPException(status_code=code, detail=detail) from error
+        return _materialization_queue_response(database, outcome)
+
+    @app.get("/api/materializations/{materialization_id}/artifact")
+    def get_materialization_artifact(
+        materialization_id: UUID, database: Session = Depends(session)
+    ) -> FileResponse:
+        # Serve only the exact reverse-bound, verified artifact bytes through the
+        # shared read-only verifier. A corrupt/missing/wrong-purpose/wrong-generation
+        # artifact is never served; historical access stays explicit via headers.
+        from app.materialization.readiness import verify_artifact
+
+        row = database.get(ClipMaterialization, materialization_id, populate_existing=True)
+        if row is None:
+            raise HTTPException(status_code=404, detail="materialization not found")
+        try:
+            inspection = verify_artifact(
+                database, StorageService(settings.storage_root), row
+            )
+        except Exception:
+            inspection = None
+        if inspection is None or not inspection.available or not inspection.relative_path:
+            raise HTTPException(status_code=404, detail="artifact is not available")
+        path = StorageService(settings.storage_root).resolve_relative(inspection.relative_path)
+        headers = {
+            "X-ClipFactory-Artifact-Historical": "true" if inspection.historical else "false",
+            "X-ClipFactory-Artifact-Sha256": inspection.sha256 or "",
+            "X-ClipFactory-Render-Execution-Id": inspection.render_execution_id or "",
+        }
+        return FileResponse(
+            path, media_type="video/mp4", filename=path.name, headers=headers
+        )
 
     @app.get(
         "/api/candidates/{candidate_id}/stage5-2-handoff",
@@ -2444,7 +2546,118 @@ def _current_materialization(
     ).first()
 
 
-def _materialization_response(row: ClipMaterialization) -> MaterializationResponse:
+def _materialization_component_statuses(row: ClipMaterialization) -> dict[str, object]:
+    checkpoints = row.component_checkpoints if isinstance(row.component_checkpoints, dict) else {}
+    statuses: dict[str, object] = {}
+    for name, entry in checkpoints.items():
+        if isinstance(entry, dict):
+            statuses[str(name)] = entry.get("status")
+    return statuses
+
+
+def _materialization_provider_attempts(row: ClipMaterialization) -> dict[str, object]:
+    from app.materialization.repository import ledger_counts
+
+    ledger = row.call_ledger if isinstance(row.call_ledger, dict) else {}
+    counts = ledger_counts(ledger)
+    counts.pop("total", None)
+    return counts
+
+
+def _materialization_live_readiness(
+    database: Session, row: ClipMaterialization
+) -> tuple[dict[str, object], str, bool]:
+    """Read-only authoritative readiness for one materialization (shared view).
+
+    Returns ``(readiness_dict, freshness, is_effective)``. Freshness, lifecycle,
+    and review readiness are separate: an unavailable verdict reports ``UNKNOWN``
+    freshness and ``is_effective=False`` rather than fabricating currentness.
+    """
+
+    from app.materialization.readiness import FRESHNESS_UNKNOWN, evaluate_readiness
+
+    try:
+        storage = StorageService(get_settings().storage_root)
+        view = evaluate_readiness(database, storage, row)
+        return view.as_dict(), view.freshness, view.is_effective
+    except Exception:
+        # A read view never fails the request; absence of evidence is reported as
+        # not review-ready with unknown freshness rather than fabricated.
+        return (
+            {
+                "review_ready": False,
+                "reasons": ["READINESS_UNAVAILABLE"],
+                "publication_ready": False,
+                "freshness": FRESHNESS_UNKNOWN,
+                "is_effective": False,
+            },
+            FRESHNESS_UNKNOWN,
+            False,
+        )
+
+
+def _materialization_queue_response(
+    database: Session, outcome: object
+) -> MaterializationQueueResponse:
+    """Rich queue/resume response with exact identity, phase, flags and reasons."""
+
+    envelope = None
+    materialization_id = getattr(outcome, "materialization_id", None)
+    if materialization_id is not None:
+        envelope = database.get(
+            ClipMaterialization, materialization_id, populate_existing=True
+        )
+    review_ready = False
+    reasons: list[str] = []
+    lifecycle: str | None = None
+    semantic_outcome: str | None = None
+    human = False
+    publication = False
+    if envelope is not None:
+        view, _freshness, _effective = _materialization_live_readiness(database, envelope)
+        review_ready = bool(view.get("review_ready"))
+        reasons = [str(item) for item in (view.get("reasons") or [])]
+        lifecycle = envelope.lifecycle.value
+        semantic_outcome = envelope.semantic_outcome.value if envelope.semantic_outcome else None
+        human = bool(envelope.human_review_required)
+        publication = bool(envelope.publication_ready)
+    return MaterializationQueueResponse(
+        job_id=outcome.job_id,
+        status=outcome.status,
+        queued=outcome.queued,
+        cached=outcome.cached,
+        active=outcome.active,
+        materialization_id=materialization_id,
+        render_execution_id=getattr(outcome, "render_execution_id", None),
+        phase=getattr(outcome, "phase", None),
+        lifecycle=lifecycle,
+        semantic_outcome=semantic_outcome,
+        human_review_required=human,
+        publication_ready=publication,
+        review_ready=review_ready,
+        reasons=reasons,
+        skipped_reason=getattr(outcome, "skipped_reason", None),
+    )
+
+
+def _materialization_artifact_available(
+    database: Session, row: ClipMaterialization
+) -> bool:
+    """Read-only artifact verification shared with the download endpoint."""
+
+    from app.materialization.readiness import verify_artifact
+
+    try:
+        storage = StorageService(get_settings().storage_root)
+        return bool(verify_artifact(database, storage, row).available)
+    except Exception:
+        return False
+
+
+def _materialization_response(
+    database: Session, row: ClipMaterialization
+) -> MaterializationResponse:
+    readiness, freshness, effective = _materialization_live_readiness(database, row)
     return MaterializationResponse(
         id=row.id,
         source_video_id=row.source_video_id,
@@ -2462,6 +2675,16 @@ def _materialization_response(row: ClipMaterialization) -> MaterializationRespon
         output_fingerprint=row.output_fingerprint,
         policy_version=row.policy_version,
         schema_version=row.schema_version,
+        render_execution_id=row.render_execution_id,
+        selection_id=row.selection_id,
+        render_contract_id=row.render_contract_id,
+        is_effective=effective,
+        live_freshness=freshness,
+        readiness=readiness,
+        component_statuses=_materialization_component_statuses(row),
+        findings=[dict(item) for item in (row.quality_findings or []) if isinstance(item, dict)],
+        provider_attempts=_materialization_provider_attempts(row),
+        artifact_available=_materialization_artifact_available(database, row),
     )
 
 

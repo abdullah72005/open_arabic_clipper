@@ -287,10 +287,13 @@ def test_accepted_writing_before_critique_crash_resumes_writing(
         inputs,
         ComponentProviders(writing=writing, critique=critique),
     )
-    prepare_materialization(resume_context)
-    # The completed writing response is reused; only critique re-executes.
+    resumed = prepare_materialization(resume_context)
+    # The completed writing response is reused. The uncertain critique attempt
+    # already consumed its budget and is never silently re-invoked by an ordinary
+    # resume; the generation defers truthfully instead.
     assert len(writing.calls) == 1
-    assert len(critique.calls) == 2
+    assert len(critique.calls) == 1
+    assert resumed.authored_blocks == []
 
 
 def test_accepted_script_replay_uses_load_component_and_resume(
@@ -413,11 +416,20 @@ def test_accepted_synthesis_is_reused_on_resume(component_fixture: Any) -> None:
     writing = ScriptedWritingProvider()
     critique = AcceptingCritiqueProvider()
     synthesizer = CountingNarrationSynthesizer()
+
+    def accept(_audio: Any) -> Mapping[str, object]:
+        return {"status": "ACCEPTED", "findings": [], "asr_identity": {"model": "fake"}}
+
     context = _context(
         session,
         owner,
         narration_inputs,
-        ComponentProviders(writing=writing, critique=critique, narration=synthesizer),
+        ComponentProviders(
+            writing=writing,
+            critique=critique,
+            narration=synthesizer,
+            narration_fidelity=accept,
+        ),
     )
     first = prepare_materialization(context)
     assert first.narration_references
@@ -429,7 +441,12 @@ def test_accepted_synthesis_is_reused_on_resume(component_fixture: Any) -> None:
             session,
             owner,
             narration_inputs,
-            ComponentProviders(writing=writing, critique=critique, narration=synthesizer),
+            ComponentProviders(
+                writing=writing,
+                critique=critique,
+                narration=synthesizer,
+                narration_fidelity=accept,
+            ),
         )
     )
     assert len(synthesizer.calls) == first_synthesis_calls

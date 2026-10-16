@@ -160,6 +160,9 @@ def _inject_deterministic_providers(
     writing = writing if writing is not None else FakeWritingProvider({1: _ANNOTATION_COPY})
     critique = critique if critique is not None else FakeCritiqueProvider(accepted={1: True})
 
+    def _fidelity(_audio: Any) -> dict[str, object]:
+        return {"status": "ACCEPTED", "findings": [], "asr_identity": {"model": "synthetic"}}
+
     def _builder(session: Session, storage: Any, settings: Any, **kwargs: Any) -> Any:
         return _real_builder(
             session,
@@ -168,6 +171,9 @@ def _inject_deterministic_providers(
             writing=writing,
             critique=critique,
             narration=narration,
+            # Synthetic narration is validated by an accepting fixture validator;
+            # production always uses the real local audio-backed check.
+            narration_fidelity=_fidelity if narration is not None else None,
         )
 
     monkeypatch.setattr(tasks_module, "build_materialization_executor", _builder, raising=False)

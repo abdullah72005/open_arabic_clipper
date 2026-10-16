@@ -9,7 +9,7 @@ export const PRODUCE_STEP_KEYS = [
   "select",
   "contract",
   "compose",
-  "render"
+  "materialize"
 ] as const;
 
 export type ProduceStepKey = (typeof PRODUCE_STEP_KEYS)[number];
@@ -29,7 +29,7 @@ export const PRODUCE_STEPS: ProduceStep[] = [
   { key: "select", label: "Select final plan", detail: "Stage 4.3 deterministic final-plan selection." },
   { key: "contract", label: "Render contract", detail: "Stage 5.0 executable render contract." },
   { key: "compose", label: "Visual composition", detail: "Stage 5.1 framing, captions, and overlays." },
-  { key: "render", label: "Render final clip", detail: "Stage 5.2 encode and technical QC." }
+  { key: "materialize", label: "Materialize & assess", detail: "Stage 6 transformed short: render, narration, QC, and final review assessment." }
 ];
 
 export type StepState = "pending" | "active" | "done" | "error";

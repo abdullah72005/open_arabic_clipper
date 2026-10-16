@@ -272,13 +272,29 @@ def test_critique_adapter_parses_categorical_findings() -> None:
 
 
 def test_critique_unknown_grounding_is_not_accepted() -> None:
+    # A structurally complete response whose critical grounding dimension is
+    # UNKNOWN defers (unknown is never approval). The whole response is valid; the
+    # block verdict is DEFERRED, so the block is not accepted.
+    transport = _Transport()
+    findings = _complete_findings(GROUNDING_ENTAILMENT="UNKNOWN")
+    payload = {"blocks": [{"block_index": 1, "findings": findings}]}
+    transport.set_handler(lambda request: _Ok(payload).as_response())
+    result = _critique_provider(transport).critique(_critique_request())
+    assert result.deferred is False
+    assert result.decision(1) is False
+    assert result.verdict(1) == "DEFERRED"
+
+
+def test_critique_incomplete_dimensions_invalidate_whole_response() -> None:
+    # A structural violation anywhere invalidates the entire response; a favorable
+    # remainder is never retained. Here block 1 omits most dimensions.
     transport = _Transport()
     payload = {
         "blocks": [
             {
                 "block_index": 1,
                 "findings": [
-                    {"dimension": "GROUNDING_ENTAILMENT", "level": "UNKNOWN", "evidence": "?"},
+                    {"dimension": "GROUNDING_ENTAILMENT", "level": "PASS", "evidence": "e"},
                     {"dimension": "SUBSTANTIVE_ADDED_VALUE", "level": "PASS", "evidence": "e"},
                 ],
             }
@@ -286,7 +302,9 @@ def test_critique_unknown_grounding_is_not_accepted() -> None:
     }
     transport.set_handler(lambda request: _Ok(payload).as_response())
     result = _critique_provider(transport).critique(_critique_request())
-    assert result.decision(1) is False
+    assert result.deferred is True
+    assert result.reason_code == "MALFORMED_OUTPUT"
+    assert result.blocks == {}
 
 
 def test_critique_critical_concern_is_not_accepted() -> None:

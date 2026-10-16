@@ -131,6 +131,7 @@ def _seed_completed_materialization(engine: Engine, storage_relative: str) -> uu
             request_payload={
                 "materialization_id": str(materialization_id),
                 "expected_output_fingerprint": output_fingerprint,
+                "spec": {"authored": {"repair_revision": 0}},
             },
             artifact_reference={"relative_path": storage_relative, "sha256": artifact_sha},
             qc_result={"measured": {"final_integrated_lufs": -16.0, "final_true_peak_dbtp": -2.0}},
@@ -175,7 +176,10 @@ def test_discover_eligible_returns_review_ready_only(engine: Engine) -> None:
     _seed_completed_materialization(engine, "sources/s1/final.mp4")
     with Session(engine) as session:
         eligible = discover_eligible_materializations(session, limit=4)
-        assert len(eligible) == 1
+    # Seeded lifecycle/outcome labels alone never establish genuine readiness: the
+    # synthetic fixture has no bound authored ASS/asset hashes, no render
+    # identity/QC fingerprints, and no live prerequisites, so nothing is eligible.
+    assert eligible == []
 
 
 class _FakeVoiceProvider:
@@ -230,8 +234,15 @@ def test_audition_runs_at_most_nine_calls_then_caches(engine: Engine) -> None:
         providers[voice] = _FakeVoiceProvider(voice)
         return providers[voice]
 
+    def accept(_audio: object) -> dict[str, object]:
+        return {"status": "ACCEPTED", "findings": []}
+
     result = run_audition(
-        settings=settings, storage=storage, model="fake-tts", voice_factory=factory
+        settings=settings,
+        storage=storage,
+        model="fake-tts",
+        voice_factory=factory,
+        fidelity=accept,
     )
     assert len(result.samples) == len(AUDITION_VOICES) * len(AUDITION_SCRIPTS)
     assert result.raw_calls == 9
@@ -239,7 +250,11 @@ def test_audition_runs_at_most_nine_calls_then_caches(engine: Engine) -> None:
 
     providers.clear()
     cached = run_audition(
-        settings=settings, storage=storage, model="fake-tts", voice_factory=factory
+        settings=settings,
+        storage=storage,
+        model="fake-tts",
+        voice_factory=factory,
+        fidelity=accept,
     )
     assert cached.raw_calls == 0
     assert all(sample.cached for sample in cached.samples)

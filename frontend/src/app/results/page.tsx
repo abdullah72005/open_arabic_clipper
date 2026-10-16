@@ -11,13 +11,17 @@ export default function ResultsPage() {
   return (
     <>
       <h2>Results</h2>
-      <p className="muted">Rendered final clips (Stage 5.2). Every finished render appears here.</p>
+      <p className="muted">
+        Rendered media. <strong>Transformed Shorts</strong> (Stage 6) are the reviewable outputs;
+        core source validations (Stage 5.2) are technical checks, not final clips.
+      </p>
       <ApiState load={load}>
         {(artifacts) =>
           artifacts.length ? (
             <div className="grid">
               {artifacts.map((artifact) => {
                 const url = api.renderExecutionArtifactUrl(artifact.id);
+                const transformed = artifact.artifact_purpose === "TRANSFORMED_SHORT";
                 return (
                   <section className="card" key={artifact.id}>
                     <video
@@ -27,6 +31,13 @@ export default function ResultsPage() {
                       src={url}
                       style={{ width: "100%", borderRadius: 12 }}
                     />
+                    <p>
+                      <strong>
+                        {transformed
+                          ? "Transformed Short (Stage 6)"
+                          : "Core source validation (Stage 5.2)"}
+                      </strong>
+                    </p>
                     <p className="muted">
                       {new Date(artifact.created_at).toLocaleString()} ·{" "}
                       {artifact.qc_status ?? artifact.lifecycle}

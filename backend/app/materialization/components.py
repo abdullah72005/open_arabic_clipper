@@ -37,6 +37,7 @@ from app.materialization.providers import (
     CritiqueRequest,
     CritiqueResult,
     MaterializationCritiqueProvider,
+    MaterializationProviderError,
     MaterializationScript,
     MaterializationWritingProvider,
     WritingRequest,
@@ -44,6 +45,7 @@ from app.materialization.providers import (
 )
 from app.materialization.repository import (
     ATTEMPT_FAILED_KNOWN,
+    ATTEMPT_RESERVED,
     ATTEMPT_RESPONDED,
     ATTEMPT_UNCERTAIN,
     PRE_RENDER_CONTEXT_METRIC,
@@ -104,6 +106,29 @@ _RESPONDED_DELIVERY_REASONS = frozenset({"MALFORMED_OUTPUT", "SAFETY_REFUSAL"})
 #: provider but no response was received (ambiguous transport loss).
 _UNCERTAIN_DELIVERY_REASONS = frozenset({"TIMEOUT", "CONNECTION"})
 _RATE_LIMITED_REASON = "RATE_LIMITED"
+#: A prior attempt left RESERVED (crash in the reserve→call gap) or UNCERTAIN
+#: (ambiguous transport loss) is unresolved uncertainty: a later ordinary
+#: recovery/redelivery must never silently invoke the provider again.
+_UNCERTAIN_UNRESOLVED_REASON = "PROVIDER_UNCERTAIN_UNRESOLVED"
+
+
+def _raised_attempt_status(error: BaseException) -> str:
+    """Classify a *raised* typed provider error into a truthfully durable status.
+
+    A typed ``MaterializationProviderError`` whose category is a known HTTP
+    rejection is ``FAILED_KNOWN``; an ambiguous transport loss (timeout/
+    connection) is ``UNCERTAIN``. Any untyped exception from a hosted call is
+    ambiguous and therefore conservatively ``UNCERTAIN``. Content is irrelevant
+    here: a received HTTP response is classified by the caller, not by an
+    exception.
+    """
+
+    category = str(getattr(error, "category", "") or "")
+    if category in _UNCERTAIN_DELIVERY_REASONS:
+        return ATTEMPT_UNCERTAIN
+    if category:
+        return ATTEMPT_FAILED_KNOWN
+    return ATTEMPT_UNCERTAIN
 
 
 def _delivery_status(response: object) -> str:
@@ -178,6 +203,7 @@ def _narration_chunk_fingerprint(
     inputs: MaterializationInputs,
     request: NarrationSynthesisRequest,
     config: Stage6Config,
+    synth_identity: Mapping[str, object] | None = None,
 ) -> str:
     return stable_digest(
         {
@@ -188,6 +214,11 @@ def _narration_chunk_fingerprint(
             "identity": request.identity(),
             "language_hint": request.language_hint,
             "narration_policy_version": config.naturalness_policy_version,
+            # The EFFECTIVE synthesizer runtime identity (resolved model/API/voice/
+            # style/settings), not only the request/profile fields: a changed
+            # synthesizer must invalidate the accepted audio rather than silently
+            # reuse another model's output.
+            "synthesizer_identity": dict(synth_identity or {}),
         }
     )
 
@@ -267,6 +298,13 @@ class DurableRequestGateway:
                 return None, "DEFERRED", None
             if self._context.admission is not None and not self._context.admission():
                 return None, "DEFERRED", None
+            # Never silently retry matching uncertain/reserved work: an ordinary
+            # recovery or redelivery defers truthfully instead (the prior attempt
+            # already consumed its budget). A crash-left reservation is recovered
+            # durably as UNCERTAIN ("a reservation without durable response").
+            if self.unresolved_attempt(component, dependency_fingerprint):
+                self._recover_reservations(component, dependency_fingerprint)
+                return None, "DEFERRED", None
             entry = reserve_attempt(
                 self._context.session,
                 self._context.owner,
@@ -280,6 +318,16 @@ class DurableRequestGateway:
                 return None, "DEFERRED", attempt_id
             try:
                 response = operation()
+            except MaterializationProviderError as error:
+                if str(getattr(error, "category", "")) == _RATE_LIMITED_REASON:
+                    self._notify_rate_limited()
+                save_attempt_result(
+                    self._context.session,
+                    self._context.owner,
+                    attempt_id,
+                    status=_raised_attempt_status(error),
+                )
+                raise
             except Exception:
                 save_attempt_result(
                     self._context.session,
@@ -323,21 +371,49 @@ class DurableRequestGateway:
         except Exception:
             return
 
-    def has_uncertain_attempt(self, component: str, dependency_fingerprint: str) -> bool:
-        """True when an ambiguous (UNCERTAIN) attempt already consumed the budget.
+    def unresolved_attempt(self, component: str, dependency_fingerprint: str) -> bool:
+        """True when a matching attempt is already unresolved uncertainty.
 
-        An uncertain attempt may have reached the provider, so a later run must
-        never silently retry it; the generation defers honestly instead.
+        A ``RESERVED`` attempt is a crash in the reserve→call gap; an ``UNCERTAIN``
+        attempt is an ambiguous transport loss. Either way the request may have
+        reached the provider, so a later ordinary run must never silently retry
+        it; the generation defers honestly instead. Only a *new* explicitly
+        authorized attempt (allocated under the remaining durable budget) may
+        retry, and that path never consults this guard.
         """
 
         for entry in ledger_entries(self._ledger()):
             if (
                 entry.get("component") == component
                 and entry.get("dependency_fingerprint") == dependency_fingerprint
-                and entry.get("status") == ATTEMPT_UNCERTAIN
+                and entry.get("status") in {ATTEMPT_RESERVED, ATTEMPT_UNCERTAIN}
             ):
                 return True
         return False
+
+    #: Backwards-compatible alias for callers that only reasoned about UNCERTAIN.
+    has_uncertain_attempt = unresolved_attempt
+
+    def _recover_reservations(self, component: str, dependency_fingerprint: str) -> None:
+        """Durably mark crash-left RESERVED attempts as UNCERTAIN.
+
+        A reservation without a durable response is unresolved uncertainty, never
+        permission to invoke again. Normalizing it here keeps the persisted ledger
+        truthful for observers and later recovery.
+        """
+
+        for entry in ledger_entries(self._ledger()):
+            if (
+                entry.get("component") == component
+                and entry.get("dependency_fingerprint") == dependency_fingerprint
+                and entry.get("status") == ATTEMPT_RESERVED
+            ):
+                save_attempt_result(
+                    self._context.session,
+                    self._context.owner,
+                    str(entry.get("attempt_id")),
+                    status=ATTEMPT_UNCERTAIN,
+                )
 
 
 def _response_identity(response: object) -> object:
@@ -666,7 +742,9 @@ class CheckpointedNarrationSynthesizer:
         return dict(self._synthesizer.runtime_identity())
 
     def synthesize(self, request: NarrationSynthesisRequest) -> NarrationAudio:
-        dep = _narration_chunk_fingerprint(self._inputs, request, self._gateway._config)
+        dep = _narration_chunk_fingerprint(
+            self._inputs, request, self._gateway._config, self.runtime_identity()
+        )
         stored = self._stored_chunk(request.chunk_id, dep)
         if stored is not None:
             self.reused = True
@@ -708,26 +786,71 @@ class CheckpointedNarrationSynthesizer:
             raise RuntimeError("NARRATION_FIDELITY_FAILED")
         return audio
 
+    def _validation_input_fingerprint(
+        self, audio: NarrationAudio, request: NarrationSynthesisRequest
+    ) -> str:
+        """Fingerprint the *validation* inputs, separate from the synthesis inputs.
+
+        An accepted synthesis is keyed by the spoken script, language/register,
+        and effective synthesizer identity. Validation is keyed independently by
+        the actual immutable audio hash, the exact expected script, the
+        validation-policy version, and the effective ASR runtime/options, so a
+        changed ASR configuration reruns local validation (spending no TTS call)
+        even though the accepted synthesis is preserved.
+        """
+
+        runtime: dict[str, object] = {}
+        identity_fn = getattr(self._validator, "runtime_identity", None)
+        if callable(identity_fn):
+            try:
+                runtime = dict(identity_fn())
+            except Exception:
+                # Missing runtime evidence must never imply a reusable validation:
+                # a sentinel makes the fingerprint mismatch any recorded identity.
+                runtime = {"runtime_identity": "ERROR"}
+        else:
+            runtime = {"runtime_identity": "ABSENT"}
+        return stable_digest(
+            {
+                "component": "NARRATION.VALIDATION",
+                "chunk_id": audio.chunk_id,
+                "audio_sha256": audio.sha256,
+                "expected_text": audio.text or request.text,
+                "validation_policy_version": self._gateway._config.naturalness_policy_version,
+                "runtime_identity": runtime,
+            }
+        )
+
     def _ensure_fidelity(
         self, audio: NarrationAudio, request: NarrationSynthesisRequest, dep: str
     ) -> bool:
         """Run the separate, idempotently-checkpointed local fidelity validation.
 
         The synthesis checkpoint is persisted before this call. An already
-        ACCEPTED validation is reused without re-running ASR; a missing or
-        non-accepted validation runs exactly once more and is persisted. Unknown
-        (deferred) or rejected fidelity does not accept the chunk.
+        ACCEPTED validation is reused only when its persisted validation-input
+        fingerprint (audio hash, exact script, policy version, effective ASR
+        runtime/options) matches the current one; a changed ASR configuration
+        reruns validation without repeating synthesis. A missing production
+        validator defers, never returns True. Unknown (deferred) or rejected
+        fidelity never accepts the chunk.
         """
 
         if self._validator is None:
-            return True
-        if self._stored_validation_status(request.chunk_id, dep) == "ACCEPTED":
+            return False
+        fingerprint = self._validation_input_fingerprint(audio, request)
+        stored = self._stored_validation(request.chunk_id, dep)
+        if (
+            stored is not None
+            and str(stored.get("status") or "") == "ACCEPTED"
+            and str(stored.get("input_fingerprint") or "") == fingerprint
+        ):
             return True
         validation = dict(self._validator(audio))
+        validation["input_fingerprint"] = fingerprint
         self._record_validation(request.chunk_id, dep, validation)
         return str(validation.get("status") or "") == "ACCEPTED"
 
-    def _stored_validation_status(self, chunk_id: str, dep: str) -> str | None:
+    def _stored_validation(self, chunk_id: str, dep: str) -> Mapping[str, object] | None:
         from app.models import ClipMaterialization
 
         row = self._gateway.context.session.get(
@@ -747,9 +870,7 @@ class CheckpointedNarrationSynthesizer:
         if not isinstance(chunk, Mapping) or chunk.get("dependency_fingerprint") != dep:
             return None
         validation = chunk.get("validation")
-        if not isinstance(validation, Mapping):
-            return None
-        return str(validation.get("status") or "") or None
+        return dict(validation) if isinstance(validation, Mapping) else None
 
     def _record_validation(
         self, chunk_id: str, dep: str, validation: Mapping[str, object]

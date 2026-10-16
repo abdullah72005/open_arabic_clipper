@@ -286,7 +286,7 @@ def _api_response(materialization_id: uuid.UUID) -> Any:
     try:
         row = session.get(ClipMaterialization, materialization_id)
         assert row is not None
-        return _materialization_response(row)
+        return _materialization_response(session, row)
     finally:
         session.close()
 
