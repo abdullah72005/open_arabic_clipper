@@ -205,7 +205,12 @@ def _completed_cache_state(
     # approximation, so ordinary POST and resume converge on one verdict.
     from app.materialization.readiness import evaluate_readiness
 
-    view = evaluate_readiness(session, storage, envelope)
+    try:
+        view = evaluate_readiness(session, storage, envelope)
+    except Exception:
+        # A completed result whose readiness cannot be recomputed is never returned
+        # as verified cache; it is recovered through the durable router.
+        return CACHE_RECOVERABLE
     if view.review_ready:
         return CACHE_VALID
     if view.reasons and all(reason in _ASSESSMENT_RECOVERY_REASONS for reason in view.reasons):
