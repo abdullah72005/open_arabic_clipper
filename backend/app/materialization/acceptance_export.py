@@ -13,12 +13,14 @@ the genuine set and ``storage/benchmarks/stage-6/tts-audition/`` for auditions.
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
 import shutil
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from pathlib import Path
 
 from sqlalchemy import select
@@ -128,7 +130,7 @@ def _identity_snapshot(
     }
 
 
-def export_materialization(
+def _build_package(
     session: Session,
     storage: StorageService,
     materialization_id: uuid.UUID | str,
@@ -136,14 +138,13 @@ def export_materialization(
     *,
     case_label: str | None = None,
 ) -> dict[str, object]:
-    """Export one materialization's exact lineage into ``output_root/<case>/``.
+    """Assemble one materialization's exact lineage in an export-owned staging dir.
 
-    The package is assembled in an export-owned staging directory and published
-    only after the copied artifact bytes are verified against the accepted
-    reference hash and the authoritative rows are refreshed and confirmed to
-    represent the SAME identity. A previously valid package is never overwritten
-    while a replacement is being constructed, and no other worker's temporary
-    files are swept.
+    The package is staged (never published here) only after the copied artifact
+    bytes are verified against the accepted reference hash and the authoritative
+    rows are refreshed and confirmed to represent the SAME identity. Publication
+    (into an immutable versioned directory) is a separate step so a failure while
+    building can never disturb the currently published package or the catalog.
     """
 
     parsed = materialization_id if isinstance(materialization_id, uuid.UUID) else uuid.UUID(
@@ -155,7 +156,6 @@ def export_materialization(
     case = case_label or (
         f"{envelope.clip_candidate_id}-{envelope.profile_key}-{str(envelope.id)[:8]}"
     )
-    case_dir = output_root / case
     staging_dir = output_root / f".staging-{case}-{uuid.uuid4().hex}"
     staging_dir.mkdir(parents=True, exist_ok=False)
 
@@ -329,34 +329,15 @@ def export_materialization(
         "\n".join(manifest_lines) + "\n", encoding="utf-8"
     )
 
-    # Publish only a fully built, verified staging package. A previously valid
-    # package is never deleted before the replacement is verified, and a
-    # diagnostic export never replaces a valid acceptance package: the last valid
-    # package is preserved and the diagnostic package is published separately.
-    published = genuine or not case_dir.exists()
-    diagnostic_directory: str | None = None
-    if published:
-        backup: Path | None = None
-        if case_dir.exists():
-            backup = output_root / f".replaced-{case}-{uuid.uuid4().hex}"
-            os.replace(case_dir, backup)
-        os.replace(staging_dir, case_dir)
-        if backup is not None:
-            shutil.rmtree(backup)
-        published_directory = case_dir
-    else:
-        published_directory = output_root / f"diagnostic-{case}-{uuid.uuid4().hex[:10]}"
-        os.replace(staging_dir, published_directory)
-        diagnostic_directory = str(published_directory)
-    package_identity = _sha256_file(published_directory / "SHA256SUMS")
+    package_identity = _sha256_file(staging_dir / "SHA256SUMS")
     return {
         "case": case,
-        "directory": str(published_directory),
-        "diagnostic_directory": diagnostic_directory,
-        "published": published,
+        "staging_dir": staging_dir,
         "package_identity": package_identity,
         "index": index,
         "genuine": genuine,
+        "materialization_id": str(envelope.id),
+        "clip_candidate_id": str(envelope.clip_candidate_id),
     }
 
 
@@ -368,41 +349,250 @@ def export_materializations(
     output_root: Path | None = None,
     case_labels: Sequence[str | None] | None = None,
 ) -> dict[str, object]:
-    """Export a bounded set of materializations and a top-level catalog.
+    """Export a bounded set of materializations and a versioned catalog.
 
-    Only a verified genuine package replaces a case's published package; a
-    diagnostic export is published separately (``diagnostic_directory``) and never
-    overwrites the last valid acceptance package. The catalog is updated atomically
-    and references the published package identity.
+    Each verified package is published into an immutable versioned directory
+    ``packages/<case>/<package_identity>/`` (a diagnostic/failed attempt into a
+    separate versioned diagnostic directory) BEFORE the catalog pointer is
+    switched. The versioned catalog is keyed by stable case identity, keeps the
+    published valid reference separate from diagnostic attempt references, merges
+    without dropping unrelated cases, and is read/merged/written under an
+    export-owned process lock then atomically replaced. A failure before catalog
+    replacement leaves the previous reference and bytes usable.
     """
 
     storage = StorageService(settings.storage_root)
     root = output_root or (settings.storage_root / "benchmarks" / "stage-6" / "manual-acceptance")
     root.mkdir(parents=True, exist_ok=True)
     labels = list(case_labels or [])
-    catalog: list[dict[str, object]] = []
+    results: list[dict[str, object]] = []
     for index, materialization_id in enumerate(materialization_ids):
         label = labels[index] if index < len(labels) else None
-        result = export_materialization(
-            session, storage, materialization_id, root, case_label=label
-        )
-        catalog.append(
+        build = _build_package(session, storage, materialization_id, root, case_label=label)
+        published = _publish_case_package(root, build)
+        results.append(
             {
-                "case": result["case"],
-                "directory": result["directory"],
-                "genuine_acceptance": result["genuine"],
-                "published": result["published"],
-                "diagnostic_directory": result.get("diagnostic_directory"),
-                "package_identity": result.get("package_identity"),
+                "case": build["case"],
+                "materialization_id": build["materialization_id"],
+                "clip_candidate_id": build["clip_candidate_id"],
+                "published_reference": published["published_reference"],
+                "diagnostic_attempts": published["diagnostic_attempts"],
+                "public": {
+                    "case": published["case"],
+                    "directory": published["directory"],
+                    "genuine_acceptance": published["genuine_acceptance"],
+                    "published": published["published"],
+                    "diagnostic_directory": published["diagnostic_directory"],
+                    "package_identity": published["package_identity"],
+                },
             }
         )
+
+    # Switch the catalog pointer only after every package is published; merge into
+    # the existing catalog under the export-owned lock, then atomically replace.
+    with _catalog_lock(root):
+        catalog = _read_catalog(root / "catalog.json")
+        for result in results:
+            _merge_case_into_catalog(catalog, result)
+        _write_catalog_atomic(root, catalog)
+    return {
+        "root": str(root),
+        "cases": [result["public"] for result in results],
+        "catalog": catalog,
+    }
+
+
+def _publish_case_package(root: Path, build: dict[str, object]) -> dict[str, object]:
+    """Publish a verified staging package into an immutable versioned directory.
+
+    Contents are published before the catalog pointer is switched (by the caller):
+    a genuine package becomes ``packages/<case>/<package_identity>/`` and a
+    diagnostic/failed attempt a separate versioned diagnostic directory. The last
+    valid package is never renamed, deleted, or overwritten.
+    """
+
+    case = str(build["case"])
+    package_identity = str(build["package_identity"])
+    staging_dir = Path(build["staging_dir"])
+    genuine = bool(build["genuine"])
+    packages_dir = root / "packages" / case
+    packages_dir.mkdir(parents=True, exist_ok=True)
+    if genuine:
+        target = packages_dir / package_identity
+        if target.exists():
+            # Idempotent republish: an identical immutable package already exists.
+            shutil.rmtree(staging_dir, ignore_errors=True)
+        else:
+            os.replace(staging_dir, target)
+        return {
+            "case": case,
+            "directory": str(target),
+            "diagnostic_directory": None,
+            "published": True,
+            "genuine_acceptance": True,
+            "package_identity": package_identity,
+            "published_reference": {
+                "identity": package_identity,
+                "directory": target.relative_to(root).as_posix(),
+                "genuine_acceptance": True,
+            },
+            "diagnostic_attempts": [],
+        }
+    target = packages_dir / f"diagnostic-{package_identity[:16]}-{uuid.uuid4().hex[:8]}"
+    os.replace(staging_dir, target)
+    return {
+        "case": case,
+        "directory": str(target),
+        "diagnostic_directory": str(target),
+        "published": False,
+        "genuine_acceptance": False,
+        "package_identity": package_identity,
+        "published_reference": None,
+        "diagnostic_attempts": [
+            {
+                "identity": package_identity,
+                "directory": target.relative_to(root).as_posix(),
+                "genuine_acceptance": False,
+            }
+        ],
+    }
+
+
+def export_materialization(
+    session: Session,
+    storage: StorageService,
+    materialization_id: uuid.UUID | str,
+    output_root: Path,
+    *,
+    case_label: str | None = None,
+) -> dict[str, object]:
+    """Build and publish one package into an immutable versioned directory.
+
+    Retained for direct callers: the staging package is published immediately
+    (catalog merging is performed by :func:`export_materializations`). The last
+    valid package is never overwritten by a diagnostic or failed attempt.
+    """
+
+    build = _build_package(session, storage, materialization_id, output_root, case_label=case_label)
+    published = _publish_case_package(output_root, build)
+    return {**published, "index": build["index"], "genuine": build["genuine"]}
+
+
+#: Versioned catalog schema keyed by stable case identity.
+CATALOG_VERSION = 2
+
+
+@contextmanager
+def _catalog_lock(root: Path) -> Iterator[None]:
+    """Serialize catalog read/merge/write with an export-owned process lock."""
+
+    lock_path = root / ".catalog.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(lock_path, "a+", encoding="utf-8")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+
+
+def _read_catalog(catalog_path: Path) -> dict[str, object]:
+    """Read the versioned catalog, migrating (and preserving) any legacy form."""
+
+    if not catalog_path.is_file():
+        return {"version": CATALOG_VERSION, "cases": {}}
+    try:
+        data = json.loads(catalog_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"version": CATALOG_VERSION, "cases": {}}
+    if not isinstance(data, dict):
+        return {"version": CATALOG_VERSION, "cases": {}}
+    raw_cases = data.get("cases")
+    cases: dict[str, object] = {}
+    if isinstance(raw_cases, dict):
+        for key, value in raw_cases.items():
+            cases[str(key)] = value
+    elif isinstance(raw_cases, list):
+        # Legacy flat-catalog list: preserve each entry under its case key.
+        for entry in raw_cases:
+            if not isinstance(entry, dict) or not entry.get("case"):
+                continue
+            published = (
+                {
+                    "identity": entry.get("package_identity"),
+                    "directory": entry.get("directory"),
+                    "genuine_acceptance": True,
+                }
+                if entry.get("published")
+                else None
+            )
+            diagnostics = (
+                [
+                    {
+                        "directory": entry.get("diagnostic_directory"),
+                        "identity": entry.get("package_identity"),
+                        "genuine_acceptance": False,
+                    }
+                ]
+                if entry.get("diagnostic_directory")
+                else []
+            )
+            cases[str(entry["case"])] = {
+                "case": str(entry["case"]),
+                "published": published,
+                "diagnostic_attempts": diagnostics,
+            }
+    return {"version": CATALOG_VERSION, "cases": cases}
+
+
+def _write_catalog_atomic(root: Path, catalog: dict[str, object]) -> None:
+    """Atomically replace the catalog file after a full merge."""
+
     catalog_path = root / "catalog.json"
-    temporary = root / f".catalog-{uuid.uuid4().hex}.json"
+    temporary = root / f".catalog-{uuid.uuid4().hex}.tmp"
     temporary.write_text(
-        json.dumps({"cases": catalog}, ensure_ascii=False, indent=2), encoding="utf-8"
+        json.dumps(catalog, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
     )
     os.replace(temporary, catalog_path)
-    return {"root": str(root), "cases": catalog}
+
+
+def _merge_case_into_catalog(catalog: dict[str, object], entry: Mapping[str, object]) -> None:
+    """Merge one case's references without dropping unrelated cases.
+
+    A diagnostic/failed attempt never replaces the published valid reference: only
+    a verified genuine package updates ``published``. Other case keys are left
+    exactly as read from the existing catalog.
+    """
+
+    cases = catalog.get("cases")
+    if not isinstance(cases, dict):
+        cases = {}
+        catalog["cases"] = cases
+    case = str(entry["case"])
+    existing = cases.get(case)
+    if not isinstance(existing, dict):
+        existing = {"case": case, "published": None, "diagnostic_attempts": []}
+    published = entry.get("published_reference")
+    if isinstance(published, Mapping):
+        existing["published"] = dict(published)
+    attempts = existing.get("diagnostic_attempts")
+    if not isinstance(attempts, list):
+        attempts = []
+    for attempt in entry.get("diagnostic_attempts", []) or []:
+        if not isinstance(attempt, Mapping):
+            continue
+        if not any(
+            isinstance(item, Mapping) and item.get("identity") == attempt.get("identity")
+            for item in attempts
+        ):
+            attempts.append(dict(attempt))
+    existing["diagnostic_attempts"] = attempts
+    if entry.get("materialization_id") is not None:
+        existing["materialization_id"] = entry.get("materialization_id")
+    if entry.get("clip_candidate_id") is not None:
+        existing["clip_candidate_id"] = entry.get("clip_candidate_id")
+    cases[case] = existing
 
 
 def discover_eligible_materializations(

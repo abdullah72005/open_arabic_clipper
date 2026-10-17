@@ -384,6 +384,10 @@ export interface RenderArtifact {
   artifact_endpoint: "render_execution" | "materialization";
   artifact_available: boolean;
   historical: boolean;
+  render_output_fingerprint: string | null;
+  repair_revision: number | null;
+  artifact_sha256: string | null;
+  bound_render: boolean;
 }
 
 export interface MaterializationReadiness {

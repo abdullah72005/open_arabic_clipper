@@ -195,8 +195,11 @@ explicit `volume=<gain>dB` gain point on the narration track.
   historical/diagnostic media. No automatic publication approval.
 - Real manual acceptance (approximately three clips, maximum four) over authorized
   source media, and the human media review. No authorized source media is
-  configured in this environment and no hosted provider key is present, so no
-  genuine `MANUAL CHECK REQUIRED NOW` artifact exists.
+  configured in this environment, so no genuine `MANUAL CHECK REQUIRED NOW`
+  artifact exists. A hosted `GEMINI_API_KEY` IS configured (and was used for a live
+  adapter validation and the bounded 3x3 TTS audition, which returned no
+  technically viable voice — see `STATUS.md`); the missing prerequisite is the
+  authorized media, not the provider credential.
 
 Until a genuine manual-acceptance run exists, no acceptance claim is made.
 

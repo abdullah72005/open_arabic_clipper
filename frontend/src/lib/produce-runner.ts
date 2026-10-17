@@ -123,7 +123,17 @@ export type CancelOutcome =
   | { status: "no_active_work" }
   | { status: "unconfirmed"; error: string };
 
+/**
+ * Per-run controller disposition. ``RUNNING`` is active work; ``STOPPING`` means
+ * local stop intent has been expressed but server cancellation is being
+ * reconciled; ``CANCEL_UNCONFIRMED`` means a cancellation attempt failed and must
+ * be retried (or resolved by authoritative reads); ``TERMINAL`` means the run has
+ * settled and no further reconciliation is required.
+ */
+export type RunState = "RUNNING" | "STOPPING" | "CANCEL_UNCONFIRMED" | "TERMINAL";
+
 export interface ProduceRun {
+  readonly state: RunState;
   readonly outcome: Promise<ProduceOutcome>;
   readonly requestStop: () => Promise<CancelOutcome>;
 }
@@ -143,6 +153,15 @@ function defaultSleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function isTerminalLifecycle(lifecycle: string): boolean {
+  return lifecycle === "CANCELLED" || lifecycle === "COMPLETE" || lifecycle === "FAILED" ||
+    lifecycle === "BLOCKED";
+}
+
+function isTerminalJob(status: string): boolean {
+  return status === "CANCELLED" || status === "SUCCEEDED" || status === "FAILED";
+}
+
 /**
  * Run the single-candidate Produce chain (ingest → Stage 4 → Stage 5 → Stage 6).
  *
@@ -154,6 +173,16 @@ function defaultSleep(ms: number): Promise<void> {
  * review (``readiness.review_ready`` and a verified artifact); ``artifact_available``
  * alone never suffices. Blocked, deferred, rejected, cancelled, stale, no-output,
  * and unavailable outcomes are surfaced explicitly.
+ *
+ * Cancellation is owned by one per-run controller. Local stop intent
+ * (``STOPPING``) is never reported as server cancellation: ``outcome`` settles to
+ * ``cancelled`` only when server cancellation is acknowledged, no active work
+ * remains, or authoritative reads establish the run's work already terminated.
+ * Every in-flight create/queue operation (including pre-Stage-6 ones) is tracked
+ * and reconciled, so a late-returned identity is cancelled before declaring "no
+ * active work". An unconfirmed cancellation keeps the controller alive
+ * (``CANCEL_UNCONFIRMED``) so a retry performs fresh reconciliation rather than a
+ * false confirmation.
  */
 export function runProduceChain(
   api: ProduceApi,
@@ -162,41 +191,93 @@ export function runProduceChain(
   callbacks: ProduceCallbacks
 ): ProduceRun {
   const sleep = callbacks.sleep ?? defaultSleep;
-  let stopRequested = false;
-  let submission: Promise<MaterializationQueueResponse> | null = null;
+  let state: RunState = "RUNNING";
+
+  let settleOutcome!: (value: ProduceOutcome) => void;
+  let rejectOutcome!: (reason: unknown) => void;
+  const outcome = new Promise<ProduceOutcome>((resolve, reject) => {
+    settleOutcome = resolve;
+    rejectOutcome = reject;
+  });
+
+  // Exact identities discovered for THIS run. Only these are ever cancelled.
   let materializationId: string | null = null;
   let activeJobId: string | null = null;
-  let cancelResolved: CancelOutcome | null = null;
+  let pendingQueueJobId: string | null = null;
+  let ingestJobId: string | null = null;
+  let submittedSourceId: string | null = null;
+
+  const inFlight = new Set<Promise<unknown>>();
+  let lastCancel: CancelOutcome | null = null;
   let cancelInFlight: Promise<CancelOutcome> | null = null;
 
-  const assertNotStopped = () => {
-    if (stopRequested) throw new StopRequested();
+  const checkStop = (): void => {
+    if (state !== "RUNNING") throw new StopRequested();
+  };
+
+  const track = <T,>(operation: Promise<T>, capture?: (value: T) => void): Promise<T> => {
+    const wrapped = operation.then((value) => {
+      capture?.(value);
+      return value;
+    });
+    inFlight.add(wrapped);
+    const remove = () => inFlight.delete(wrapped);
+    void wrapped.then(remove, remove);
+    return wrapped;
+  };
+
+  const drainInFlight = async (): Promise<void> => {
+    // Loop because a drained operation may synchronously register another.
+    for (let attempt = 0; attempt < 64; attempt += 1) {
+      const pending = [...inFlight];
+      if (pending.length === 0) return;
+      await Promise.allSettled(pending);
+    }
+  };
+
+  const captureQueuedJob = (stage: QueuedJob | null | undefined): void => {
+    if (stage && stage.job_id) pendingQueueJobId = stage.job_id;
+  };
+
+  const lifecycleOutcome = (lifecycle: string): CancelOutcome =>
+    isTerminalLifecycle(lifecycle)
+      ? { status: "confirmed" }
+      : { status: "unconfirmed", error: `materialization ${lifecycle}` };
+
+  const jobOutcome = (status: string): CancelOutcome =>
+    isTerminalJob(status) ? { status: "confirmed" } : { status: "unconfirmed", error: `job ${status}` };
+
+  // Resolve the exact active ingest job observed for this submitted source. Never
+  // a job that does not belong to this run's source.
+  const findActiveIngestJob = async (): Promise<string | null> => {
+    if (!submittedSourceId) return null;
+    try {
+      const jobs = await api.listJobs();
+      const active = jobs.find(
+        (job) => job.source_video_id === submittedSourceId && isActiveJobStatus(job.status)
+      );
+      return active ? active.id : null;
+    } catch {
+      return null;
+    }
   };
 
   const performCancellation = async (): Promise<CancelOutcome> => {
-    // Reconcile an in-flight submission so the exact returned identity (if any)
-    // is cancelled before server cancellation is declared complete.
-    if (submission) {
+    const id = materializationId;
+    if (id) {
       try {
-        await submission;
-      } catch {
-        // The submission failure is surfaced by the outcome promise.
-      }
-    }
-    if (materializationId) {
-      try {
-        const row = await api.cancelMaterialization(materializationId);
-        if (row.lifecycle === "CANCELLED") return { status: "confirmed" };
-        return { status: "unconfirmed", error: `materialization ${row.lifecycle}` };
+        const row = await api.cancelMaterialization(id);
+        return lifecycleOutcome(row.lifecycle);
       } catch (cause) {
         return { status: "unconfirmed", error: errorMessage(cause) };
       }
     }
-    if (activeJobId) {
+    let jobId = activeJobId ?? pendingQueueJobId ?? ingestJobId;
+    if (!jobId) jobId = await findActiveIngestJob();
+    if (jobId) {
       try {
-        const job = await api.cancelJob(activeJobId);
-        if (job.status === "CANCELLED") return { status: "confirmed" };
-        return { status: "unconfirmed", error: `job ${job.status}` };
+        const job = await api.cancelJob(jobId);
+        return jobOutcome(job.status);
       } catch (cause) {
         return { status: "unconfirmed", error: errorMessage(cause) };
       }
@@ -204,40 +285,58 @@ export function runProduceChain(
     return { status: "no_active_work" };
   };
 
-  const requestStop = (): Promise<CancelOutcome> => {
-    stopRequested = true;
-    // A confirmed/no-work cancellation is terminal; an unconfirmed cancellation
-    // keeps a truthful retry path (each retry is a fresh attempt, never a
-    // swallowed failure displayed as success).
-    if (cancelResolved && cancelResolved.status !== "unconfirmed") {
-      return Promise.resolve(cancelResolved);
+  const settleCancellation = (result: CancelOutcome): void => {
+    if (result.status === "unconfirmed") {
+      state = "CANCEL_UNCONFIRMED";
+      return;
     }
+    state = "TERMINAL";
+    lastCancel = result;
+    settleOutcome({
+      kind: "cancelled",
+      detail: result.status === "no_active_work" ? "no active work" : "server cancellation confirmed"
+    });
+  };
+
+  const requestStop = (): Promise<CancelOutcome> => {
+    if (state === "TERMINAL") {
+      return Promise.resolve(lastCancel ?? { status: "confirmed" });
+    }
+    if (state === "RUNNING") state = "STOPPING";
     if (cancelInFlight) return cancelInFlight;
-    cancelInFlight = performCancellation()
-      .then((result) => {
-        if (result.status !== "unconfirmed") cancelResolved = result;
-        return result;
-      })
-      .finally(() => {
-        cancelInFlight = null;
-      });
+    cancelInFlight = (async () => {
+      // Fresh reconciliation on every attempt: await outstanding create/queue
+      // operations (capturing late-returned identities) before deciding.
+      await drainInFlight();
+      const result = await performCancellation();
+      settleCancellation(result);
+      return result;
+    })().finally(() => {
+      cancelInFlight = null;
+    });
     return cancelInFlight;
   };
 
-  const outcome = (async (): Promise<ProduceOutcome> => {
+  const body = (async (): Promise<void> => {
     const activate = (key: ProduceStepKey) => callbacks.onStep(key, "active");
     const waitForJob = async (jobId: string): Promise<Job> => {
       activeJobId = jobId;
       try {
         for (;;) {
-          assertNotStopped();
+          checkStop();
           const job = await api.getJob(jobId);
+          checkStop();
           if (isTerminalJobStatus(job.status)) return job;
           await sleep(POLL_INTERVAL_MS);
         }
       } finally {
         if (activeJobId === jobId) activeJobId = null;
       }
+    };
+    const queue = async (operation: Promise<QueuedJob>): Promise<QueuedJob> => {
+      const stage = await track(operation, captureQueuedJob);
+      checkStop();
+      return stage;
     };
     const runQueued = async (stage: QueuedJob | null | undefined): Promise<void> => {
       if (!stage || !stage.job_id) return;
@@ -251,8 +350,9 @@ export function runProduceChain(
       const started = Date.now();
       let sawJob = false;
       for (;;) {
-        assertNotStopped();
+        checkStop();
         const jobs = (await api.listJobs()).filter((job) => job.source_video_id === sourceId);
+        checkStop();
         if (jobs.length > 0) sawJob = true;
         const active = jobs.filter((job) => isActiveJobStatus(job.status));
         const newest = [...jobs].sort(
@@ -260,11 +360,13 @@ export function runProduceChain(
         )[0];
         const observed = active[0] ?? newest;
         if (observed) {
+          ingestJobId = observed.id;
           callbacks.onStatus(`Processing: ${observed.kind} (${observed.status.toLowerCase()})`);
         }
         if (active.length === 0 && sawJob) {
           try {
             await api.getCandidateAnalysis(sourceId);
+            checkStop();
             return;
           } catch (cause) {
             if (!(cause instanceof ApiError && cause.status === 404)) throw cause;
@@ -280,9 +382,13 @@ export function runProduceChain(
     };
 
     try {
+      checkStop();
       activate("ingest");
       callbacks.onStatus("Submitting source…");
-      const sources = await api.submitUrls([url], rightsStatus);
+      const sources = await track(api.submitUrls([url], rightsStatus), (created) => {
+        if (created[0]) submittedSourceId = created[0].id;
+      });
+      checkStop();
       const source = sources[0];
       if (!source) throw new Error("The source was not created.");
       callbacks.onStatus("Ingesting, transcribing, and finding candidates…");
@@ -290,6 +396,7 @@ export function runProduceChain(
       callbacks.onStep("ingest", "done");
 
       const candidate = selectTopCandidate(await api.listCandidates(source.id, { limit: 100 }));
+      checkStop();
       if (!candidate) throw new Error("No retained clip candidate was found for this source.");
       callbacks.onStatus(
         `Selected candidate ${candidate.candidate_key} (score ${Math.round(candidate.clip_score * 100)}%).`
@@ -297,13 +404,15 @@ export function runProduceChain(
 
       activate("refine");
       callbacks.onStatus("Refining transcript at final-clip quality…");
-      await runQueued(await api.queueCandidateRefinement(candidate.id, "FINAL_CLIP"));
+      await runQueued(await queue(api.queueCandidateRefinement(candidate.id, "FINAL_CLIP")));
       let refinements = await api.listCandidateRefinements(candidate.id);
+      checkStop();
       let effective = pickEffectiveRefinement(refinements);
       if (!effective) {
         callbacks.onStatus("Final refinement is unresolved; running candidate-grade refinement…");
-        await runQueued(await api.queueCandidateRefinement(candidate.id, "CANDIDATE"));
+        await runQueued(await queue(api.queueCandidateRefinement(candidate.id, "CANDIDATE")));
         refinements = await api.listCandidateRefinements(candidate.id);
+        checkStop();
         effective = pickEffectiveRefinement(refinements);
       }
       if (!effective) throw new Error("No usable transcript refinement was produced.");
@@ -311,8 +420,9 @@ export function runProduceChain(
 
       activate("analyze");
       callbacks.onStatus("Analyzing transformation eligibility (Stage 4.0)…");
-      await runQueued(await api.queueTransformationAnalysis(candidate.id));
+      await runQueued(await queue(api.queueTransformationAnalysis(candidate.id)));
       const analysis = await api.getCandidateTransformationAnalysis(candidate.id);
+      checkStop();
       if (analysis.recommended_strategies.length === 0) {
         throw new Error(
           `No transformation strategy is recommended (${analysis.eligibility_outcome ?? "unknown"}).`
@@ -322,8 +432,9 @@ export function runProduceChain(
 
       activate("plan");
       callbacks.onStatus("Generating a transformation plan (Stage 4.1)…");
-      await runQueued(await api.queueTransformationPlans(candidate.id));
+      await runQueued(await queue(api.queueTransformationPlans(candidate.id)));
       const planSet = await api.getCandidateTransformationPlans(candidate.id);
+      checkStop();
       if (planSet.plans.length === 0) {
         throw new Error(`No transformation plan was produced (${planSet.planning_outcome ?? "none"}).`);
       }
@@ -331,13 +442,15 @@ export function runProduceChain(
 
       activate("govern");
       callbacks.onStatus("Governing the plan (Stage 4.2)…");
-      await runQueued(await api.queueTransformationGovernance(candidate.id));
+      await runQueued(await queue(api.queueTransformationGovernance(candidate.id)));
       await api.getCandidateTransformationGovernance(candidate.id);
+      checkStop();
       callbacks.onStep("govern", "done");
 
       activate("select");
       callbacks.onStatus("Selecting the final plan (Stage 4.3)…");
       const selection = await api.createTransformationSelection(candidate.id);
+      checkStop();
       if (!selection.selected_plan_id || !selection.effective) {
         throw new Error(
           `No final plan could be selected (${selection.selection_reason_codes.join(", ") || selection.status}).`
@@ -348,6 +461,7 @@ export function runProduceChain(
       activate("contract");
       callbacks.onStatus("Building the render contract (Stage 5.0)…");
       const contract = await api.createRenderContract(candidate.id);
+      checkStop();
       if (!contract.contract_ready || !contract.effective) {
         throw new Error(
           `The render contract is not executable (${contract.reason_codes.join(", ") || contract.status}).`
@@ -357,8 +471,9 @@ export function runProduceChain(
 
       activate("compose");
       callbacks.onStatus("Composing framing, captions, and overlays (Stage 5.1)…");
-      await runQueued(await api.queueVisualComposition(candidate.id));
+      await runQueued(await queue(api.queueVisualComposition(candidate.id)));
       const composition = await api.getCandidateVisualComposition(candidate.id);
+      checkStop();
       if (!composition.plan_ready) {
         throw new Error(
           `Visual composition is not ready (${composition.reason_codes.join(", ") || composition.status}).`
@@ -368,17 +483,17 @@ export function runProduceChain(
 
       activate("materialize");
       callbacks.onStatus("Materializing the transformed short (Stage 6)…");
-      submission = api.queueMaterialization(candidate.id).then((response) => {
+      checkStop();
+      const queued = await track(api.queueMaterialization(candidate.id), (response) => {
         materializationId = response.materialization_id;
-        return response;
+        if (response.job_id) pendingQueueJobId = response.job_id;
       });
-      const queued = await submission;
+      checkStop();
       const id = queued.materialization_id;
       if (!id) throw new Error("The materialization was not created.");
-      assertNotStopped();
 
       const result = await pollMaterialization(api, id, {
-        isStopped: () => stopRequested,
+        checkStop,
         sleep,
         onStatus: callbacks.onStatus,
         onMaterialization: callbacks.onMaterialization,
@@ -389,20 +504,30 @@ export function runProduceChain(
       } else if (result.kind === "ready") {
         callbacks.onStep("materialize", "done");
       }
-      return result;
+      settleOutcome(result);
     } catch (cause) {
       if (cause instanceof StopRequested) {
-        return { kind: "cancelled", detail: "stop requested" };
+        // Local stop intent is not server cancellation. Leave the outcome pending;
+        // the controller resolves it once cancellation is acknowledged (or an
+        // authoritative read establishes the work already terminated).
+        return;
       }
-      throw cause;
+      rejectOutcome(cause);
     }
   })();
+  void body;
 
-  return { outcome, requestStop };
+  return {
+    get state() {
+      return state;
+    },
+    outcome,
+    requestStop
+  };
 }
 
 interface PollOptions {
-  isStopped: () => boolean;
+  checkStop: () => void;
   sleep: (ms: number) => Promise<void>;
   onStatus: (text: string) => void;
   onMaterialization: (value: Materialization | null) => void;
@@ -414,7 +539,9 @@ interface PollOptions {
  * outcome. The durable ID is fixed for the whole run; render/finalizer job
  * identities change underneath it and are never assumed. At most one bounded
  * durable-resume recovery is attempted for a stalled pending-finalization
- * generation; no provider retries are ever driven by polling.
+ * generation; no provider retries are ever driven by polling. A stop intent
+ * aborts polling (throwing ``StopRequested``) so cancellation ownership stays
+ * with the controller and a later result is never exposed.
  */
 async function pollMaterialization(
   api: ProduceApi,
@@ -427,11 +554,13 @@ async function pollMaterialization(
   let resumeAttempts = 0;
 
   for (;;) {
-    if (options.isStopped()) return { kind: "cancelled", detail: "stop requested" };
+    options.checkStop();
     const materialization = await api.getMaterialization(id).catch((cause: unknown) => {
       if (cause instanceof ApiError && cause.status === 404) return null;
       throw cause;
     });
+    // A stop requested while this GET was in flight must not expose what it returned.
+    options.checkStop();
     if (materialization === null) {
       return { kind: "diagnostic", detail: "materialization not found" };
     }
@@ -443,6 +572,7 @@ async function pollMaterialization(
       materialization.is_current &&
       materialization.artifact_available
     ) {
+      options.checkStop();
       options.onResult({ id, url: api.materializationArtifactUrl(id) });
       options.onStatus("Transformed short ready for human review.");
       return { kind: "ready", detail: "" };
@@ -490,6 +620,7 @@ async function pollMaterialization(
         // The authoritative state is reported by the next read; a conflict is not
         // retried in a loop.
       }
+      options.checkStop();
     }
 
     if (Date.now() - started > CHAIN_TIMEOUT_MS) {

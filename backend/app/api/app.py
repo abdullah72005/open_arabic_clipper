@@ -836,6 +836,14 @@ class RenderArtifactResponse(BaseModel):
     artifact_endpoint: str = "render_execution"
     artifact_available: bool = True
     historical: bool = False
+    #: Exact render/output/repair identity of THIS listed render row, so a caller
+    #: can bind the verdict and media to the listed render rather than the current
+    #: generation. ``bound_render`` is true only for the exact reverse-bound
+    #: ``TRANSFORMED_SHORT`` render whose committed assessment governs readiness.
+    render_output_fingerprint: str | None = None
+    repair_revision: int | None = None
+    artifact_sha256: str | None = None
+    bound_render: bool = False
     model_config = {"extra": "allow"}
 
 
@@ -1995,6 +2003,12 @@ def create_app(
             raise HTTPException(status_code=404, detail="artifact is not available") from error
         if not path.is_file() or path.stat().st_size <= 0:
             raise HTTPException(status_code=404, detail="artifact is not available")
+        # A transformed render is inspectable only after verifying its OWN persisted
+        # artifact identity (size + SHA-256), never by trusting a deterministic path.
+        if row.artifact_purpose is RenderArtifactPurpose.TRANSFORMED_SHORT:
+            available, _sha = _verify_transformed_render_artifact(storage_service, row)
+            if not available:
+                raise HTTPException(status_code=404, detail="artifact is not available")
         return FileResponse(path, media_type="video/mp4", filename=path.name)
 
     @app.get("/api/render-executions", response_model=list[RenderArtifactResponse])
@@ -2736,9 +2750,25 @@ def _render_artifact_response(database: Session, row: RenderExecution) -> Render
     The bound materialization's review surface comes from the same shared
     read-only readiness evaluator the API and export use; the verified
     materialization artifact endpoint is advertised for transformed media.
+
+    A listed render inherits the current materialization's review readiness ONLY
+    when it is the exact reverse-bound render (``envelope.render_execution_id ==
+    row.id`` with matching output/repair identity). Every older/non-bound render
+    is classified HISTORICAL or DIAGNOSTIC truthfully, keeps its own lineage, and
+    is served only through its own verified render-by-ID artifact route; the
+    current materialization's artifact URL is never substituted.
     """
 
     purpose = getattr(row.artifact_purpose, "value", row.artifact_purpose)
+    request = row.request_payload if isinstance(row.request_payload, dict) else {}
+    raw_spec = request.get("spec")
+    raw_authored = raw_spec.get("authored") if isinstance(raw_spec, dict) else None
+    raw_revision = raw_authored.get("repair_revision") if isinstance(raw_authored, dict) else None
+    repair_revision = (
+        int(raw_revision)
+        if isinstance(raw_revision, int) and not isinstance(raw_revision, bool)
+        else None
+    )
     base: dict[str, object] = {
         "id": row.id,
         "source_video_id": row.source_video_id,
@@ -2751,13 +2781,17 @@ def _render_artifact_response(database: Session, row: RenderExecution) -> Render
         "cache_eligible": row.cache_eligible,
         "is_current": row.is_current,
         "created_at": row.created_at,
+        "render_output_fingerprint": row.output_fingerprint or None,
+        "repair_revision": repair_revision,
     }
     if purpose != RenderArtifactPurpose.TRANSFORMED_SHORT.value:
+        reference = row.artifact_reference if isinstance(row.artifact_reference, dict) else {}
         return RenderArtifactResponse(
             **base,  # type: ignore[arg-type]
             kind="CORE_SOURCE_VALIDATION",
             materialization_state="CORE",
             artifact_endpoint="render_execution",
+            artifact_sha256=str(reference.get("sha256") or "") or None,
         )
     envelope = (
         database.get(ClipMaterialization, row.materialization_id, populate_existing=True)
@@ -2767,45 +2801,108 @@ def _render_artifact_response(database: Session, row: RenderExecution) -> Render
     if envelope is None:
         # A transformed render without its bound envelope is diagnostic: it is never
         # presented as a reviewable transformed Short.
+        storage = StorageService(get_settings().storage_root)
+        available, sha = _verify_transformed_render_artifact(storage, row)
         return RenderArtifactResponse(
             **base,  # type: ignore[arg-type]
             kind="TRANSFORMED_SHORT",
             materialization_state="DIAGNOSTIC",
-            artifact_endpoint="materialization",
-            artifact_available=False,
+            artifact_endpoint="render_execution",
+            artifact_available=available,
+            artifact_sha256=sha,
             historical=not row.is_current,
+            bound_render=False,
         )
-    readiness, freshness, effective = _materialization_live_readiness(database, envelope)
-    review_ready = bool(readiness.get("review_ready"))
-    inspection = _artifact_inspection(database, envelope)
+
+    from app.materialization.finalization import _validate_render_binding
+
+    bound = (
+        str(row.id) == str(envelope.render_execution_id)
+        and _validate_render_binding(envelope, row) is None
+    )
+    if bound:
+        readiness, freshness, effective = _materialization_live_readiness(database, envelope)
+        review_ready = bool(readiness.get("review_ready"))
+        inspection = _artifact_inspection(database, envelope)
+        return RenderArtifactResponse(
+            **base,  # type: ignore[arg-type]
+            kind="TRANSFORMED_SHORT",
+            materialization_id=envelope.id,
+            materialization_lifecycle=envelope.lifecycle.value,
+            semantic_outcome=(
+                envelope.semantic_outcome.value if envelope.semantic_outcome else None
+            ),
+            human_review_required=bool(envelope.human_review_required),
+            publication_ready=False,
+            review_ready=review_ready,
+            materialization_effective=effective,
+            live_freshness=freshness,
+            materialization_state=_materialization_state(envelope, review_ready, freshness),
+            readiness_reasons=[str(item) for item in (readiness.get("reasons") or [])],
+            findings=[
+                dict(item) for item in (envelope.quality_findings or []) if isinstance(item, dict)
+            ],
+            selection_id=envelope.selection_id,
+            render_contract_id=envelope.render_contract_id,
+            artifact_endpoint="materialization",
+            artifact_available=bool(inspection and inspection.available),
+            artifact_sha256=inspection.sha256 if inspection is not None else None,
+            historical=(
+                bool(inspection.historical)
+                if inspection is not None
+                else not envelope.is_current
+            ),
+            bound_render=True,
+        )
+
+    # A retained older/stale render for the same candidate: it never inherits the
+    # current materialization's readiness or artifact, and is inspectable only
+    # through its own verified render-by-ID artifact route.
+    storage = StorageService(get_settings().storage_root)
+    available, sha = _verify_transformed_render_artifact(storage, row)
+    historical = not row.is_current
     return RenderArtifactResponse(
         **base,  # type: ignore[arg-type]
         kind="TRANSFORMED_SHORT",
-        materialization_id=envelope.id,
-        materialization_lifecycle=envelope.lifecycle.value,
-        semantic_outcome=(
-            envelope.semantic_outcome.value if envelope.semantic_outcome else None
-        ),
-        human_review_required=bool(envelope.human_review_required),
+        materialization_id=row.materialization_id,
+        materialization_lifecycle=None,
+        semantic_outcome=None,
+        human_review_required=False,
         publication_ready=False,
-        review_ready=review_ready,
-        materialization_effective=effective,
-        live_freshness=freshness,
-        materialization_state=_materialization_state(envelope, review_ready, freshness),
-        readiness_reasons=[str(item) for item in (readiness.get("reasons") or [])],
-        findings=[
-            dict(item) for item in (envelope.quality_findings or []) if isinstance(item, dict)
-        ],
+        review_ready=False,
+        materialization_effective=False,
+        live_freshness="HISTORICAL" if historical else "UNKNOWN",
+        materialization_state="HISTORICAL" if historical else "DIAGNOSTIC",
+        readiness_reasons=["HISTORICAL_RENDER"] if historical else ["RENDER_NOT_BOUND"],
+        findings=[],
         selection_id=envelope.selection_id,
         render_contract_id=envelope.render_contract_id,
-        artifact_endpoint="materialization",
-        artifact_available=bool(inspection and inspection.available),
-        historical=(
-            bool(inspection.historical)
-            if inspection is not None
-            else not envelope.is_current
-        ),
+        artifact_endpoint="render_execution",
+        artifact_available=available,
+        artifact_sha256=sha,
+        historical=True,
+        bound_render=False,
     )
+
+
+def _verify_transformed_render_artifact(
+    storage: StorageService, row: RenderExecution
+) -> tuple[bool, str | None]:
+    """Verify a single transformed render's OWN persisted identity + artifact bytes.
+
+    Historical inspection is permitted only when this exact render's artifact
+    reference resolves and its actual on-disk size/digest match the recorded
+    reference; the current materialization's artifact is never substituted.
+    """
+
+    from app.materialization.finalization import _artifact_identity
+
+    if row.lifecycle is not RenderExecutionLifecycle.COMPLETE or not row.cache_eligible:
+        return False, None
+    identity = _artifact_identity(storage, row)
+    if isinstance(identity, str):
+        return False, None
+    return True, identity.sha256
 
 
 def _artifact_inspection(database: Session, envelope: ClipMaterialization) -> object | None:

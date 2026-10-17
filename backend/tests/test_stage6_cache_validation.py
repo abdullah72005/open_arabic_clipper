@@ -729,7 +729,7 @@ def test_export_verifies_copied_destination_bytes(
 def test_diagnostic_export_preserves_last_valid_package(
     engine: Engine, monkeypatch: Any
 ) -> None:
-    """A diagnostic export never replaces a valid acceptance package."""
+    """A diagnostic export never replaces a valid published package or its catalog reference."""
 
     import json
     from pathlib import Path
@@ -747,9 +747,15 @@ def test_diagnostic_export_preserves_last_valid_package(
         genuine = export_materializations(session, settings, [materialization_id])
     finally:
         session.close()
-    valid_directory = Path(genuine["cases"][0]["directory"])
-    assert genuine["cases"][0]["genuine_acceptance"] is True
+    genuine_case = genuine["cases"][0]
+    assert genuine_case["genuine_acceptance"] is True
+    case = genuine_case["case"]
+    valid_identity = genuine_case["package_identity"]
+    valid_directory = Path(genuine_case["directory"])
+    # Published into an immutable versioned directory: packages/<case>/<identity>/.
+    assert valid_directory.parts[-3:] == ("packages", case, valid_identity)
     valid_index_before = (valid_directory / "index.json").read_text(encoding="utf-8")
+    root = valid_directory.parents[2]
 
     _tampering_copyfile(monkeypatch)
     session = _session()
@@ -762,19 +768,121 @@ def test_diagnostic_export_preserves_last_valid_package(
     assert diagnostic_case["published"] is False
     diagnostic_directory = Path(str(diagnostic_case["diagnostic_directory"]))
     assert diagnostic_directory.is_dir()
+    assert diagnostic_directory != valid_directory
     diagnostic_index = json.loads(
         (diagnostic_directory / "index.json").read_text(encoding="utf-8")
     )
     assert diagnostic_index["diagnostic"] is True
-    # The last valid package is preserved untouched.
+    # The last valid package is preserved untouched (immutable versioned directory).
     assert (valid_directory / "index.json").read_text(encoding="utf-8") == valid_index_before
-    preserved = json.loads(
-        (valid_directory / "index.json").read_text(encoding="utf-8")
-    )
+    preserved = json.loads((valid_directory / "index.json").read_text(encoding="utf-8"))
     assert preserved["genuine_acceptance"] is True
-    # The catalog is updated atomically and references the diagnostic package.
-    catalog = json.loads(
-        (valid_directory.parent / "catalog.json").read_text(encoding="utf-8")
+
+    # The versioned catalog keeps the published valid reference and records the
+    # diagnostic attempt separately; the published reference is never replaced.
+    catalog = json.loads((root / "catalog.json").read_text(encoding="utf-8"))
+    assert catalog["version"] == 2
+    entry = catalog["cases"][case]
+    assert entry["published"]["identity"] == valid_identity
+    assert entry["diagnostic_attempts"]
+    assert all(
+        attempt["genuine_acceptance"] is False for attempt in entry["diagnostic_attempts"]
     )
-    assert catalog["cases"][0]["diagnostic_directory"] == str(diagnostic_directory)
-    assert catalog["cases"][0]["published"] is False
+
+
+def test_export_catalog_merge_preserves_unrelated_cases(
+    engine: Engine, monkeypatch: Any
+) -> None:
+    """A later export merges into the catalog without dropping unrelated cases."""
+
+    import json
+    from pathlib import Path
+
+    from test_stage6_real_executor import _write_source
+
+    from app.materialization.acceptance_export import export_materializations
+
+    settings = get_settings()
+    _candidate_id, materialization_id, _render_id, _storage = _complete_materialization(
+        engine, monkeypatch, media_writer=_write_source
+    )
+    session = _session()
+    try:
+        first_export = export_materializations(
+            session, settings, [materialization_id], case_labels=["case-alpha"]
+        )
+    finally:
+        session.close()
+    first_case = first_export["cases"][0]["case"]
+    first_identity = first_export["cases"][0]["package_identity"]
+    assert first_case == "case-alpha"
+
+    session = _session()
+    try:
+        second_export = export_materializations(
+            session, settings, [materialization_id], case_labels=["case-beta"]
+        )
+    finally:
+        session.close()
+    second_case = second_export["cases"][0]["case"]
+    assert second_case == "case-beta"
+
+    root = Path(first_export["root"])
+    catalog = json.loads((root / "catalog.json").read_text(encoding="utf-8"))
+    # Both cases survive: the later export did not drop the earlier one.
+    assert first_case in catalog["cases"]
+    assert second_case in catalog["cases"]
+    assert catalog["cases"][first_case]["published"]["identity"] == first_identity
+    # Both immutable packages remain on disk.
+    assert (Path(first_export["cases"][0]["directory"]) / "index.json").is_file()
+    assert (Path(second_export["cases"][0]["directory"]) / "index.json").is_file()
+
+
+def test_export_failure_before_catalog_publication_keeps_previous_reference(
+    engine: Engine, monkeypatch: Any
+) -> None:
+    """A catalog-publication failure leaves the published reference and bytes usable."""
+
+    import json
+    from pathlib import Path
+
+    import pytest
+    from test_stage6_real_executor import _write_source
+
+    import app.materialization.acceptance_export as export_module
+    from app.materialization.acceptance_export import export_materializations
+
+    _candidate_id, materialization_id, _render_id, _storage = _complete_materialization(
+        engine, monkeypatch, media_writer=_write_source
+    )
+    settings = get_settings()
+    session = _session()
+    try:
+        genuine = export_materializations(session, settings, [materialization_id])
+    finally:
+        session.close()
+    case = genuine["cases"][0]["case"]
+    valid_identity = genuine["cases"][0]["package_identity"]
+    valid_directory = Path(genuine["cases"][0]["directory"])
+    valid_index_before = (valid_directory / "index.json").read_text(encoding="utf-8")
+    root = valid_directory.parents[2]
+
+    # A later (diagnostic-causing) export stages and publishes its package, but the
+    # catalog replacement fails: the previous reference and bytes must survive.
+    _tampering_copyfile(monkeypatch)
+
+    def fail_write(*_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError("catalog write failed")
+
+    monkeypatch.setattr(export_module, "_write_catalog_atomic", fail_write)
+    session = _session()
+    try:
+        with pytest.raises(RuntimeError):
+            export_materializations(session, settings, [materialization_id])
+    finally:
+        session.close()
+
+    catalog = json.loads((root / "catalog.json").read_text(encoding="utf-8"))
+    assert catalog["cases"][case]["published"]["identity"] == valid_identity
+    assert catalog["cases"][case]["diagnostic_attempts"] == []
+    assert (valid_directory / "index.json").read_text(encoding="utf-8") == valid_index_before

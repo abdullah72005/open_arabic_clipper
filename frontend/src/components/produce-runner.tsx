@@ -66,6 +66,7 @@ export function ProduceRunner() {
   const [running, setRunning] = useState(false);
   const [cancelState, setCancelState] = useState<CancelState | null>(null);
   const runRef = useRef<ProduceRun | null>(null);
+  const runTokenRef = useRef<symbol | null>(null);
 
   useEffect(() => () => void runRef.current?.requestStop(), []);
 
@@ -94,6 +95,9 @@ export function ProduceRunner() {
       setError("Paste a public, permitted media link first.");
       return;
     }
+    // Never start another Produce run while a previous run's cancellation is
+    // still unresolved: its controller must own reconciliation to completion.
+    if (running) return;
     setRunning(true);
     setError("");
     setStatus("");
@@ -102,15 +106,30 @@ export function ProduceRunner() {
     setCancelState(null);
     setSteps(initialStepStates());
 
+    // A per-run identity token guards every callback against an obsolete run
+    // updating a newer one (the callbacks can fire synchronously before the run
+    // object itself is assigned).
+    const token = Symbol("produce-run");
+    runTokenRef.current = token;
+    const isCurrent = () => runTokenRef.current === token;
     const produceRun = runProduceChain(api, trimmed, rightsStatus, {
-      onStep: (key: ProduceStepKey, state) => setSteps((p) => ({ ...p, [key]: state })),
-      onStatus: setStatus,
-      onMaterialization: setMaterialization,
-      onResult: setResult
+      onStep: (key: ProduceStepKey, state) => {
+        if (isCurrent()) setSteps((p) => ({ ...p, [key]: state }));
+      },
+      onStatus: (text) => {
+        if (isCurrent()) setStatus(text);
+      },
+      onMaterialization: (value) => {
+        if (isCurrent()) setMaterialization(value);
+      },
+      onResult: (value) => {
+        if (isCurrent()) setResult(value);
+      }
     });
     runRef.current = produceRun;
     produceRun.outcome
       .then((outcome) => {
+        if (!isCurrent()) return;
         if (outcome.kind === "ready" || outcome.kind === "cancelled") {
           if (outcome.kind === "cancelled") setStatus("Cancelled.");
           return;
@@ -123,10 +142,16 @@ export function ProduceRunner() {
         setStatus(describeOutcome(outcome));
       })
       .catch((cause) => {
+        if (!isCurrent()) return;
         setError(cause instanceof Error ? cause.message : "Production failed.");
         setStatus("");
       })
       .finally(() => {
+        // The controller is retained until the outcome settles, i.e. until server
+        // cancellation is acknowledged or authoritative reads establish the work
+        // already terminated. Only then is it safe to clear and re-enable Produce.
+        if (!isCurrent()) return;
+        runTokenRef.current = null;
         setRunning(false);
         runRef.current = null;
       });
@@ -169,7 +194,7 @@ export function ProduceRunner() {
           <button className="button" disabled={running} type="submit">
             {running ? "Producing…" : "Produce final clip"}
           </button>
-          {running && cancelState?.status !== "confirmed" && (
+          {running && cancelState?.status !== "confirmed" && cancelState?.status !== "unconfirmed" && (
             <button
               className="button danger"
               disabled={cancelState?.status === "requesting"}
@@ -183,7 +208,8 @@ export function ProduceRunner() {
         </p>
         {cancelState?.status === "unconfirmed" && (
           <p className="error">
-            Cancellation could not be confirmed: {cancelState.error}.{" "}
+            Cancellation could not be confirmed: {cancelState.error}. Server work may still be
+            running.{" "}
             <button className="button danger" onClick={() => void cancel()} type="button">
               Retry cancel
             </button>

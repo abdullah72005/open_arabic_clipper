@@ -20,9 +20,14 @@ const STATE_LABELS: Record<RenderArtifact["materialization_state"], string> = {
   DIAGNOSTIC: "Diagnostic media"
 };
 
-function artifactUrl(artifact: RenderArtifact): string {
-  if (artifact.artifact_endpoint === "materialization" && artifact.materialization_id) {
-    return api.materializationArtifactUrl(artifact.materialization_id);
+function artifactUrl(artifact: RenderArtifact): string | null {
+  // Bind the media to the listed render exactly: the materialization endpoint is
+  // used only for the exact bound render, the render-by-ID endpoint for everything
+  // else. Never substitute another artifact as a fallback.
+  if (artifact.artifact_endpoint === "materialization") {
+    return artifact.materialization_id
+      ? api.materializationArtifactUrl(artifact.materialization_id)
+      : null;
   }
   return api.renderExecutionArtifactUrl(artifact.id);
 }
@@ -43,18 +48,20 @@ export default function ResultsPage() {
           artifacts.length ? (
             <div className="grid">
               {artifacts.map((artifact) => {
-                const url = artifactUrl(artifact);
+                const url = artifact.artifact_available ? artifactUrl(artifact) : null;
                 const transformed = artifact.kind === "TRANSFORMED_SHORT";
                 const reviewReady = transformed && artifact.review_ready;
                 return (
                   <section className="card" key={artifact.id}>
-                    <video
-                      controls
-                      playsInline
-                      preload="metadata"
-                      src={url}
-                      style={{ width: "100%", borderRadius: 12 }}
-                    />
+                    {url && (
+                      <video
+                        controls
+                        playsInline
+                        preload="metadata"
+                        src={url}
+                        style={{ width: "100%", borderRadius: 12 }}
+                      />
+                    )}
                     <p>
                       <strong>
                         {transformed ? "Transformed Short (Stage 6)" : "Core source validation (Stage 5.2)"}
@@ -94,9 +101,15 @@ export default function ResultsPage() {
                         : ""}
                     </p>
                     <p>
-                      <a className="button" download href={url}>
-                        Download MP4
-                      </a>{" "}
+                      {url ? (
+                        <a className="button" download href={url}>
+                          Download MP4
+                        </a>
+                      ) : (
+                        <span className="muted">
+                          No verified artifact is available for this render; media is not offered.
+                        </span>
+                      )}{" "}
                       <Link className="button" href={`/sources/${artifact.source_video_id}`}>
                         Source
                       </Link>

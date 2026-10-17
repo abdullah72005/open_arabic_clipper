@@ -6,9 +6,11 @@ persists the returned bytes as immutable lossless audio through StorageService.
 Returned MIME is honored: an ``audio/wav`` payload is saved as-is (never
 double-wrapped), a headerless ``audio/l16`` payload is wrapped exactly once using
 its declared sample rate/channels, and any other container is refused rather than
-misinterpreted. The API key is never logged or serialized; the SDK client is
-built lazily, its automatic retries are disabled, and the key is scrubbed on
-release.
+misinterpreted. The declared container may carry parameters (the live provider
+echoes ``audio/l16; rate=24000; channels=1``); the base type and its parameters
+are parsed together and must agree with any numeric fields on the payload. The
+API key is never logged or serialized; the SDK client is built lazily, its
+automatic retries are disabled, and the key is scrubbed on release.
 
 Local fidelity validation is a *separate* step: it transcribes the synthesized
 WAV with the existing leased faster-whisper engine and applies the strict
@@ -46,6 +48,47 @@ GEMINI_TTS_SAMPLE_RATE = 24_000
 GEMINI_TTS_MIME_PCM = "audio/l16"
 GEMINI_TTS_MIME_WAV = "audio/wav"
 _SUPPORTED_MIME = frozenset({GEMINI_TTS_MIME_PCM, GEMINI_TTS_MIME_WAV})
+
+
+def _parse_audio_mime(mime: str) -> tuple[str, dict[str, str]]:
+    """Split a provider container string into its base type and parameters.
+
+    The provider may echo a parameterized container (``audio/l16; rate=24000;
+    channels=1``) rather than the bare requested type. Parameters are parsed,
+    never dropped, so PCM metadata is honored from the response while unknown
+    base containers stay refused.
+    """
+
+    segments = [segment.strip() for segment in mime.split(";")]
+    base = segments[0].lower()
+    params: dict[str, str] = {}
+    for segment in segments[1:]:
+        if not segment:
+            continue
+        key, _, value = segment.partition("=")
+        params[key.strip().lower()] = value.strip()
+    return base, params
+
+
+def _resolve_int(declared: object, parametric: str | None) -> int | None:
+    """Resolve an integer from the declared field and/or a container parameter.
+
+    Returns ``None`` when the two sources disagree (a response is never
+    interpreted from conflicting metadata) or when neither yields an integer.
+    """
+
+    if isinstance(declared, bool):
+        return None
+    declared_int = declared if isinstance(declared, int) else None
+    param_int: int | None = None
+    if parametric is not None:
+        try:
+            param_int = int(parametric)
+        except ValueError:
+            return None
+    if declared_int is not None and param_int is not None and declared_int != param_int:
+        return None
+    return declared_int if declared_int is not None else param_int
 
 
 def _persist_to_storage(
@@ -278,15 +321,24 @@ class GeminiNarrationSynthesizer:
             # A response without a declared container is refused: the format is
             # never guessed from the request.
             raise MaterializationProviderError(ProviderErrorCategory.MALFORMED_OUTPUT.value)
-        if mime == GEMINI_TTS_MIME_WAV:
+        base_mime, mime_params = _parse_audio_mime(mime)
+        if base_mime == GEMINI_TTS_MIME_WAV:
             wav_bytes = raw
-        elif mime == GEMINI_TTS_MIME_PCM:
-            # Raw PCM cannot be wrapped without explicit, unambiguous metadata.
-            if not (isinstance(sample_rate, int) and sample_rate > 0) or not (
-                isinstance(channels, int) and channels > 0
+        elif base_mime == GEMINI_TTS_MIME_PCM:
+            # The live provider echoes a parameterized container
+            # (e.g. ``audio/l16; rate=24000; channels=1``); the declared numeric
+            # fields and any container parameters must agree before raw PCM is
+            # wrapped, and neither is ever guessed.
+            resolved_rate = _resolve_int(sample_rate, mime_params.get("rate"))
+            resolved_channels = _resolve_int(channels, mime_params.get("channels"))
+            if (
+                resolved_rate is None
+                or resolved_rate <= 0
+                or resolved_channels is None
+                or resolved_channels <= 0
             ):
                 raise MaterializationProviderError(ProviderErrorCategory.MALFORMED_OUTPUT.value)
-            wav_bytes = wrap_pcm_as_wav(raw, sample_rate=sample_rate, channels=channels)
+            wav_bytes = wrap_pcm_as_wav(raw, sample_rate=resolved_rate, channels=resolved_channels)
         else:
             raise MaterializationProviderError(ProviderErrorCategory.MALFORMED_OUTPUT.value)
         try:

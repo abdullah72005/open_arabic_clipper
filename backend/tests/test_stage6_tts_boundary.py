@@ -147,6 +147,65 @@ def test_tts_wav_is_not_double_wrapped() -> None:
     assert persisted["narr-1"] == wav
 
 
+def test_tts_parameterized_pcm_mime_is_wrapped_from_declared_params() -> None:
+    # The live provider echoes a parameterized container rather than bare
+    # ``audio/l16``; the declared params must drive the single PCM wrap.
+    payload = _interaction_response(
+        "audio/l16; rate=24000; channels=1", b"\x10\x20" * 50, rate=None, channels=None
+    )
+    transport = _Transport(payload)
+    persisted: dict[str, bytes] = {}
+
+    def persist(chunk_id: str, data: bytes) -> tuple[str, str]:
+        persisted[chunk_id] = data
+        return f"narration/{chunk_id}.wav", "c" * 64
+
+    provider = GeminiNarrationSynthesizer(
+        api_key="fake-key", client_factory=transport.client, persist=persist
+    )
+    audio = provider.synthesize(_request())
+
+    assert audio.sample_rate == 24_000
+    assert audio.channels == 1
+    info = inspect_wav(persisted["narr-1"])
+    assert info.sample_rate == 24_000
+    assert info.channels == 1
+
+
+def test_tts_conflicting_pcm_metadata_is_refused() -> None:
+    # A container parameter that disagrees with the declared numeric field is
+    # never reconciled by guessing.
+    payload = _interaction_response(
+        "audio/l16; rate=24000; channels=1", b"\x10\x20" * 50, rate=48_000, channels=1
+    )
+    transport = _Transport(payload)
+    provider = GeminiNarrationSynthesizer(
+        api_key="fake-key", client_factory=transport.client, persist=lambda c, d: ("p", "h")
+    )
+    try:
+        provider.synthesize(_request())
+    except MaterializationProviderError as error:
+        assert error.category == "MALFORMED_OUTPUT"
+    else:  # pragma: no cover
+        raise AssertionError("expected MALFORMED_OUTPUT")
+
+
+def test_tts_unknown_parameterized_container_is_refused() -> None:
+    payload = _interaction_response(
+        "audio/mpeg; rate=24000", b"\x10\x20" * 50, rate=None, channels=None
+    )
+    transport = _Transport(payload)
+    provider = GeminiNarrationSynthesizer(
+        api_key="fake-key", client_factory=transport.client, persist=lambda c, d: ("p", "h")
+    )
+    try:
+        provider.synthesize(_request())
+    except MaterializationProviderError as error:
+        assert error.category == "MALFORMED_OUTPUT"
+    else:  # pragma: no cover
+        raise AssertionError("expected MALFORMED_OUTPUT")
+
+
 def test_tts_missing_key_is_unavailable_and_raises() -> None:
     provider = GeminiNarrationSynthesizer(api_key=None)
     assert provider.available() is False

@@ -1,5 +1,102 @@
 # Runtime status
 
+> Correction (2026-10-17): a hosted `GEMINI_API_KEY` IS configured in this
+> environment (verified present and used for the live adapter validation and the
+> bounded 3x3 TTS audition). Any earlier section below that says "no hosted
+> provider key is present" is stale; the only missing external prerequisite is
+> authorized source media.
+
+## Stage 6: frontend cancellation ownership, Results render binding, immutable export publication, and live TTS audition (2026-10-17, continuation)
+
+Status: **the three remaining implementation blockers are corrected with mounted-UI
+and backend regressions, and the bounded hosted TTS audition was actually run
+end-to-end against the configured provider. A real adapter defect was found and
+fixed: the live provider echoes a parameterized PCM container
+(`audio/l16; rate=24000; channels=1`), which the adapter had rejected. The
+audition spent exactly nine raw synthesis calls (3 voices x 3 scripts) and
+returned NO technically viable voice, so no provisional voice was recorded. Stage
+6 remains NOT FROZEN; `publication_ready` stays false.**
+
+### Corrections
+1. **Frontend cancellation ownership (`frontend/src/lib/produce-runner.ts`,
+   `components/produce-runner.tsx`).** A stop request now belongs to one per-run
+   controller (`RunState = RUNNING | STOPPING | CANCEL_UNCONFIRMED | TERMINAL`)
+   rather than the browser poll loop: `requestStop` drains every in-flight
+   create/queue operation (`drainInFlight`), reconciles the exact returned
+   materialization (Stage 6) or legacy ingest job (`findActiveIngestJob`),
+   performs the exact cancellation (`performCancellation`), and only settles to
+   `TERMINAL` when the server confirms (`settleCancellation`); a failed cancel is
+   `CANCEL_UNCONFIRMED` with a fresh retry, the controller/identities are retained
+   across retry, Produce is disabled while unresolved, and stale run callbacks are
+   ignored via a `runTokenRef` identity guard. Regressions:
+   `frontend/src/components/produce-runner.dom.test.tsx` (5 mounted jsdom tests:
+   cancel-fail-then-settle-then-retry, late pre-Stage-6 queue response, active
+   ingest cancellation, late Stage 6 submission cancel, stop during pending GET)
+   plus the existing orchestrator tests.
+2. **Results verdict bound to the exact render (`backend/app/api/app.py`,
+   `frontend/src/app/results/page.tsx`, `frontend/src/lib/api-client.ts`).**
+   `RenderArtifactResponse` (transformed short) now carries
+   `render_output_fingerprint`, `repair_revision`, `artifact_sha256`, and
+   `bound_render`; readiness is inherited only when the envelope
+   `render_execution_id == row.id` and the reverse render binding validates, with a
+   HISTORICAL/DIAGNOSTIC non-bound path that never inherits readiness. The
+   render-by-id artifact endpoint re-verifies the transformed artifact (size +
+   SHA-256) via `_verify_transformed_render_artifact`, and the Results UI suppresses
+   unverified artifact actions. Regressions: `test_stage6_results_boundary.py`
+   (7 tests incl. fresh POST -> pending -> executor/callback/finalizer -> ready, a
+   retained historical render not inheriting readiness, and a corrupt historical
+   artifact being suppressed).
+3. **Immutable export publication
+   (`backend/app/materialization/acceptance_export.py`).** Each case is published
+   into an immutable, content-versioned directory
+   `packages/<case_label>/<package_identity>/` with diagnostic attempts kept
+   separate; the catalog is now version 2 (`CATALOG_VERSION = 2`), keyed by case
+   with a separate published reference plus diagnostic attempts, and read/merge/
+   write happen under an exclusive process lock (`_catalog_lock`, `fcntl`) with an
+   atomic replace (`_write_catalog_atomic`) after bytes are published
+   (`_publish_case_package`, `_merge_case_into_catalog`). Regressions:
+   `test_stage6_cache_validation.py` (diagnostic preservation, unrelated-case merge,
+   catalog-publication-failure preservation).
+
+### Task 7 hosted provider validation (live)
+- **Adapter defect fixed (`backend/app/materialization/tts_gemini.py`).** The live
+  `gemini-3.8-flash-tts` Interactions (`v1beta`) response returns
+  `mime_type = "audio/l16; rate=24000; channels=1"`. The adapter matched the bare
+  `audio/l16` with strict equality and raised `MALFORMED_OUTPUT`, so every
+  synthesis failed. `_parse_audio_mime` / `_resolve_int` now parse the base
+  container plus parameters, require the declared numeric fields and container
+  parameters to agree (never guessed), keep unknown containers refused, and wrap
+  PCM exactly once. Verified live (single call: 3.36 s, 24 kHz, mono WAV) and by
+  `test_stage6_tts_boundary.py` (12 tests, incl. parameterized-PCM, conflicting
+  metadata, and unknown-container refusals).
+- **Audition result (truthful negative).** `python -m app.cli stage6-tts-audition`
+  ran the fixed 3 voices x 3 scripts set: `raw_calls = 9`, `provisional_voice =
+  null`, `status = OK`. All three voices ACCEPTED the English script; every
+  Egyptian-Arabic and Arabic/English code-switch script was `REJECTED`
+  (`MEANING_MISMATCH`) — the local audio-backed fidelity comparison is strict
+  (near-miss spelling/variant transcripts such as `فكراها` vs `فاكراها` are not
+  accepted), and `Achird` additionally failed two provider calls
+  (`UNCERTAIN:MaterializationProviderError`). Because no voice cleared all three
+  scripts, the conservative default stands: **no provisional voice; the hosted TTS
+  voice remains an unresolved product decision, not a placeholder.** The
+  comparison gate was NOT loosened (that would weaken Stage 6).
+
+### Verification (this session)
+- Docker `oac-stage6-test` (Python 3.12.14, real FFmpeg 7.1.5, google-genai
+  2.31.0) + PostgreSQL `oac-stage6-pg-v4`:
+  - focused backend batch (`results_boundary`, `cache_validation`,
+    `adapter_regressions`, `tts_boundary`, `rc_corrections`, `rc_v4_corrections`,
+    `api_cli_acceptance`, `durable_router`, `materialization_core`,
+    `supporting_narration`, `blocker_regressions`): **144 passed**.
+  - `test_stage6_tts_boundary.py`: 12 passed.
+- Frontend: `vitest run` **69 passed** (10 files, incl. the new mounted DOM suite);
+  `eslint src --max-warnings=0` clean; `next build` succeeded (compiled, 10/10
+  static pages); `tsc --noEmit` retains only the pre-existing
+  `job-poller.test.tsx` test-only typing error.
+- Live hosted validation: 1 provider probe call (adapter fix) + 9 audition calls
+  = 10 hosted synthesis calls; no other live provider calls.
+- `HANDOFF.md` and `oac_implementation_evidence.txt` remain untracked.
+
 ## Stage 6: SOL six-defect corrections — Produce state machine, truthful cancel, Results assessment, resume revalidation, cache/assessment unification, export integrity (2026-10-17, continuation)
 
 Status: **the six SOL-reopened defects are corrected with behavioral regressions
@@ -101,12 +198,14 @@ authorized-media acceptance. Stage 6 is NOT FROZEN.**
 
 ### BLOCKERS (not done)
 
-- Task 9 genuine authorized-media acceptance: no authorized source media and no
-  hosted provider key are configured here, so no genuine
-  `MANUAL CHECK REQUIRED NOW` artifact exists. This is a real external
-  prerequisite, not a code gap.
-- Actual hosted writing/TTS quality and the provisional voice audition against a
-  real provider remain outstanding (no hosted key present).
+- Task 9 genuine authorized-media acceptance: no authorized source media is
+  available in this environment, so no genuine `MANUAL CHECK REQUIRED NOW`
+  artifact exists. This is a real external prerequisite, not a code gap. (A hosted
+  `GEMINI_API_KEY` IS configured; only authorized media is missing. This corrects
+  an earlier status note that wrongly implied no hosted key was present.)
+- Actual hosted writing/TTS quality and the provisional voice audition were not
+  exercised in that session; they are addressed in the next session's section
+  above (live adapter validation + a truthful-negative audition).
 
 ### NON-BLOCKING LIMITATIONS
 

@@ -195,7 +195,9 @@ def test_export_never_substitutes_seeded_labels_or_deterministic_path(engine) ->
     reasons = set(index["genuine_acceptance_reasons"])
     assert "AUTHORED_ASS_MISSING" in reasons
     assert "STALE_UPSTREAM_INPUTS" in reasons
-    assert "RENDER_BINDING_INVALID" in reasons
+    # The seeded render's binding is valid, but its missing QC/measured identity
+    # keeps the case non-genuine (never fabricated from the seeded labels).
+    assert "MISSING_LOUDNESS_EVIDENCE" in reasons
 
     # Demote the bound render and change its purpose: still not eligible.
     with Session(engine) as session:
