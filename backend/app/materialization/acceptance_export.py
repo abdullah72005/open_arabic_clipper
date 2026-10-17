@@ -46,11 +46,16 @@ class CatalogIntegrityError(RuntimeError):
 
 
 def _package_integrity_reasons(package_dir: Path, package_identity: str | None) -> list[str]:
-    """Concrete reasons an *existing* immutable package is not intact (empty == ok).
+    """Concrete reasons a package is not a genuine acceptance package (empty == ok).
 
-    Directory naming is never integrity evidence: the manifest must hash to the
-    declared package identity, the index must be present and mark the package
-    genuine, and every file listed in the manifest must exist and hash exactly.
+    Directory naming is never integrity evidence, and neither is a self-consistent
+    manifest alone: the manifest must hash to the declared package identity, the
+    index must be the supported acceptance structure and mark the package genuine,
+    a required nonempty artifact filename and its recorded SHA-256 must be present,
+    the actual nonempty artifact must match the index/manifest identity, every
+    required referenced asset must be present and verified, and every manifest path
+    must stay inside the package and hash exactly. The same verifier is applied to
+    package reuse and to legacy-catalog migration.
     """
 
     reasons: list[str] = []
@@ -77,7 +82,7 @@ def _package_integrity_reasons(package_dir: Path, package_identity: str | None) 
         return ["PACKAGE_INDEX_INVALID"]
     if index.get("genuine_acceptance") is not True:
         return ["PACKAGE_INDEX_NOT_GENUINE"]
-    listed: set[str] = set()
+    listed: dict[str, str] = {}
     for line in manifest_lines:
         if not line.strip():
             continue
@@ -85,7 +90,13 @@ def _package_integrity_reasons(package_dir: Path, package_identity: str | None) 
         if not separator or not digest or not relative:
             reasons.append("PACKAGE_MANIFEST_INVALID")
             continue
-        listed.add(relative)
+        # Manifest paths must stay inside the package: an absolute or escaping
+        # path is not a valid acceptance reference.
+        relative_path = Path(relative)
+        if relative_path.is_absolute() or ".." in relative_path.parts:
+            reasons.append(f"PACKAGE_PATH_ESCAPES:{relative}")
+            continue
+        listed[relative] = digest.lower()
         target = package_dir / relative
         if not target.is_file():
             reasons.append(f"PACKAGE_FILE_MISSING:{relative}")
@@ -99,10 +110,84 @@ def _package_integrity_reasons(package_dir: Path, package_identity: str | None) 
         reasons.append("PACKAGE_MANIFEST_EMPTY")
     if "index.json" not in listed:
         reasons.append("PACKAGE_INDEX_UNLISTED")
-    artifact_file = index.get("artifact_file")
-    if isinstance(artifact_file, str) and artifact_file and artifact_file not in listed:
-        reasons.append(f"PACKAGE_ARTIFACT_UNLISTED:{artifact_file}")
+    _artifact_reasons(package_dir, index, listed, reasons)
+    _referenced_asset_reasons(index, reasons)
     return reasons
+
+
+def _artifact_reasons(
+    package_dir: Path, index: Mapping[str, object], listed: Mapping[str, str], reasons: list[str]
+) -> None:
+    """Require actual, nonempty, identity-matching transformed media.
+
+    Explicit favorable booleans and a self-consistent manifest are insufficient: a
+    genuine package must declare a required artifact filename and its recorded
+    SHA-256, that file must exist nonempty inside the package, and its actual hash
+    must match both the index record and the manifest entry.
+    """
+
+    artifact_file = index.get("artifact_file")
+    if not isinstance(artifact_file, str) or not artifact_file:
+        reasons.append("PACKAGE_ARTIFACT_MISSING")
+        return
+    recorded_sha = index.get("render_artifact_sha256")
+    if not isinstance(recorded_sha, str) or not recorded_sha:
+        reasons.append("PACKAGE_ARTIFACT_SHA_MISSING")
+        return
+    recorded_sha = recorded_sha.lower()
+    artifact_path = package_dir / artifact_file
+    if not artifact_path.is_file():
+        reasons.append(f"PACKAGE_ARTIFACT_FILE_MISSING:{artifact_file}")
+        return
+    try:
+        if artifact_path.stat().st_size <= 0:
+            reasons.append(f"PACKAGE_ARTIFACT_EMPTY:{artifact_file}")
+            return
+        actual_sha = _sha256_file(artifact_path)
+    except OSError:
+        reasons.append(f"PACKAGE_ARTIFACT_UNREADABLE:{artifact_file}")
+        return
+    if actual_sha != recorded_sha:
+        reasons.append(f"PACKAGE_ARTIFACT_SHA_MISMATCH:{artifact_file}")
+    manifest_sha = listed.get(artifact_file)
+    if manifest_sha is None:
+        reasons.append(f"PACKAGE_ARTIFACT_UNLISTED:{artifact_file}")
+    elif manifest_sha != actual_sha:
+        reasons.append(f"PACKAGE_ARTIFACT_MANIFEST_MISMATCH:{artifact_file}")
+
+
+def _referenced_asset_reasons(index: Mapping[str, object], reasons: list[str]) -> None:
+    """Require every required referenced asset to be present and verified.
+
+    The index records, for each referenced asset, whether it was copied and
+    verified against its authoritative expected hash. A genuine package must have
+    every copied asset verified (index ↔ asset identity), and an expected authored
+    ASS must be present and match its expected hash.
+    """
+
+    expected_ass = index.get("authored_ass_expected_sha256")
+    if isinstance(expected_ass, str) and expected_ass:
+        actual_ass = index.get("authored_ass_sha256")
+        if not isinstance(actual_ass, str) or actual_ass.lower() != expected_ass.lower():
+            reasons.append("PACKAGE_AUTHORED_ASS_UNVERIFIED")
+    assets = index.get("assets")
+    if isinstance(assets, list):
+        for record in assets:
+            if not isinstance(record, Mapping):
+                reasons.append("PACKAGE_ASSET_RECORD_INVALID")
+                continue
+            if record.get("copied") is not True:
+                continue
+            expected = record.get("expected_sha256")
+            actual = record.get("destination_sha256")
+            if (
+                record.get("destination_verified") is not True
+                or not isinstance(expected, str)
+                or not expected
+                or not isinstance(actual, str)
+                or actual.lower() != expected.lower()
+            ):
+                reasons.append(f"PACKAGE_ASSET_UNVERIFIED:{record.get('kind')}")
 
 
 def _integrity_failure(

@@ -227,6 +227,34 @@ def _lcs_length(left: Sequence[str], right: Sequence[str]) -> int:
     return previous[-1]
 
 
+#: Characters that mark a token as a technical form (rather than an ordinary
+#: word) for the separate protected-atom comparison.
+_TECHNICAL_MARKERS = frozenset("-_.@/:+#")
+
+
+def _protected_atoms(text: str) -> tuple[str, ...]:
+    """Exact ordered *technical/numeric/URL* atoms from raw text.
+
+    Only forms that must survive verbatim become protected atoms: URLs, compound
+    technical forms (``foo/bar``, ``foo.bar``, ``C++``, ``C#``, ``#build``), and
+    Western/Arabic-Indic numbers including simple compound numeric/date forms.
+    **Ordinary Latin words are deliberately excluded** so the documented
+    normalization (contraction expansion, approved-filler removal) is never
+    reversed by a second raw comparison. Order, multiplicity, casing, and digits
+    of the retained atoms are exact.
+    """
+
+    atoms: list[str] = []
+    for token in extract_protected_tokens(text):
+        if (
+            "://" in token
+            or any(character in _TECHNICAL_MARKERS for character in token)
+            or any(character.isdigit() for character in token)
+        ):
+            atoms.append(token.casefold())
+    return tuple(atoms)
+
+
 def transcription_matches(expected: str, actual: str) -> bool:
     """Deterministic ASR-vs-script comparison (never rewrites source evidence).
 
@@ -235,12 +263,14 @@ def transcription_matches(expected: str, actual: str) -> bool:
     non-lexical fillers dropped (the only documented exceptions). The normalized
     *content token sequence* of the actual transcript must then equal the expected
     sequence exactly: every token, its multiplicity, and its order must match. In
-    addition, every protected technical/numeric form (``C++``, ``C#``, ``foo/bar``,
-    URLs, Western and Arabic-Indic numbers, simple compound numeric/date forms) is
-    preserved as one exact atomic token, so ``C++`` is never accepted as ``C``. A
-    permissive similarity ratio is never acceptance authority, so every participant
-    role, negation scope, number association, and code-switch token is preserved.
-    Any difference in sequence, occurrence, order, or protected form is a clear
+    addition, every protected technical/numeric/URL atom (``C++``, ``C#``,
+    ``foo/bar``, URLs, Western and Arabic-Indic numbers, simple compound
+    numeric/date forms) is preserved as one exact atomic token, so ``C++`` is never
+    accepted as ``C`` — while ordinary Latin words do **not** introduce a second raw
+    comparison that would undo the documented normalization. A permissive
+    similarity ratio is never acceptance authority, so every participant role,
+    negation scope, number association, and code-switch content is preserved. Any
+    difference in sequence, occurrence, order, or protected atom is a clear
     mismatch.
 
     This is a thin boolean wrapper over :func:`compare_transcripts`; callers that
@@ -270,10 +300,11 @@ def compare_transcripts(expected: str, actual: str) -> TranscriptComparison:
     """Compare a transcript to the accepted copy, keeping disagreement evidence.
 
     The comparison is exactly as strict as :func:`transcription_matches` (ordered
-    content sequence plus atomic protected forms), but it never silently collapses a
-    disagreement into a single boolean: the returned diff records the normalized
-    token sequences and the first divergence so a caller can defer with a
-    structured reason instead of asserting a confirmed meaning mismatch.
+    content sequence plus opaque technical/numeric/URL atoms), but it never
+    silently collapses a disagreement into a single boolean: the returned diff
+    records the normalized token sequences and the first divergence so a caller can
+    defer with a structured reason instead of asserting a confirmed meaning
+    mismatch.
     """
 
     expected_tokens = _tokenize(expected)
@@ -282,8 +313,8 @@ def compare_transcripts(expected: str, actual: str) -> TranscriptComparison:
     actual_tokens = _tokenize(actual)
     expected_content = _content_tokens(expected_tokens)
     actual_content = _content_tokens(actual_tokens)
-    expected_protected = tuple(token.casefold() for token in extract_protected_tokens(expected))
-    actual_protected = tuple(token.casefold() for token in extract_protected_tokens(actual))
+    expected_protected = _protected_atoms(expected)
+    actual_protected = _protected_atoms(actual)
     findings: list[str] = []
     content_equal = expected_content == actual_content
     protected_equal = expected_protected == actual_protected

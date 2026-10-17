@@ -45,9 +45,21 @@ def _write_package(base: Path) -> str:
     """Write a self-consistent immutable package and return its identity."""
 
     base.mkdir(parents=True, exist_ok=True)
-    (base / "final.mp4").write_bytes(b"genuine-bytes")
+    artifact = base / "final.mp4"
+    artifact.write_bytes(b"genuine-bytes")
+    artifact_sha = _sha256(artifact)
     (base / "index.json").write_text(
-        json.dumps({"genuine_acceptance": True, "artifact_file": "final.mp4"}), encoding="utf-8"
+        json.dumps(
+            {
+                "genuine_acceptance": True,
+                "artifact_file": "final.mp4",
+                "render_artifact_sha256": artifact_sha,
+                "authored_ass_expected_sha256": "",
+                "authored_ass_sha256": None,
+                "assets": [],
+            }
+        ),
+        encoding="utf-8",
     )
     lines = [
         f"{_sha256(entry)}  {entry.relative_to(base).as_posix()}"

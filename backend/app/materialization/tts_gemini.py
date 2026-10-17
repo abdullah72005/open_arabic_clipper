@@ -440,7 +440,7 @@ FIDELITY_REJECTED = "REJECTED"
 #: the deferred/rejected classification, or the audio-failure handling must bump
 #: this so dependent validation fingerprints (which include it) invalidate and a
 #: retained audio is revalidated locally without repeating synthesis.
-FIDELITY_POLICY_VERSION = "stage6-fidelity-v2"
+FIDELITY_POLICY_VERSION = "stage6-fidelity-v3"
 
 #: Findings from ``validate_narration_audio`` that are independently established
 #: audio/content failures: they reject the chunk regardless of the transcript.

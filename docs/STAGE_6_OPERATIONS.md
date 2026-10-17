@@ -46,18 +46,33 @@ and each attempt is classified by the shared pure delivery classification
 (`UNCERTAIN` for transport ambiguity/crash-left reservation, `FAILED_KNOWN` for a
 known HTTP rejection, `RESPONDED` for a received-but-unusable response). The
 durable `consumed-budget.json` floor survives a missing ledger, changed storage
-root, or container restart, so recovery never authorizes a fresh nine-call batch.
-Local narration fidelity is policy-versioned (`stage6-fidelity-v2`): protected
-technical/numeric forms are preserved atomically, and a lone ASR transcript
-disagreement is deferred evidence (never an automatic confirmed meaning mismatch)
-while independently established audio/content failures still reject. Deferral
-never approves a voice or review readiness.
+root, or container restart. A **positive floor without complete retained
+per-request history blocks new synthesis entirely** (`AUDITION_HISTORY_INCOMPLETE`,
+or `AUDITION_BUDGET_EXHAUSTED` at the ceiling): a count alone never proves which
+fixed requests remain safe, and an empty ledger is never recreated and treated as
+complete. A malformed floor fails closed (the specific error is reported and the
+original bytes are preserved), recovery and the budget read/modify/write are
+serialized under the audition ownership lock, and counts are monotonic. Continuation
+is permitted only when complete retained request history proves an attempt is
+unspent and the cumulative ceiling is satisfied.
 
-Published export packages are immutable and self-verifying: an existing
-`packages/<case>/<package_identity>/` is reused only after its manifest, index, and
-every listed file hash re-verify. A corrupt existing package, or an
-unreadable/malformed/unsupported catalog, fails closed and preserves the previous
-reference and the valid staging evidence.
+Local narration fidelity is policy-versioned (`stage6-fidelity-v3`): ordinary
+speech uses the documented normalization (contraction expansion, approved-filler
+removal) with an exact ordered content comparison, while technical/numeric/URL
+forms (`C++`, `C#`, `foo/bar`, URLs, compound numbers) are preserved as separate
+opaque atoms — ordinary Latin words do not introduce a second raw comparison. A
+lone ASR transcript disagreement is deferred evidence (never an automatic confirmed
+meaning mismatch) while independently established audio/content failures still
+reject. Deferral never approves a voice or review readiness.
+
+Published export packages are immutable and self-verifying: a package is genuine
+only with the supported acceptance index structure, a required nonempty artifact
+filename and its recorded SHA-256, an actual nonempty artifact whose hash matches
+both the index record and the manifest entry, verified referenced assets, and
+manifest paths contained inside the package. An index-only/absent/mismatched
+package, a corrupt existing package, or an unreadable/malformed/unsupported
+catalog fails closed (diagnostic) and preserves the previous reference and the
+valid staging evidence; the same verifier is applied to reuse and legacy migration.
 
 ## Objective and ownership
 

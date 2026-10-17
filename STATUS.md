@@ -6,6 +6,95 @@
 > provider key is present" is stale; the only missing external prerequisite is
 > authorized source media.
 
+## Stage 6: SOL p5.1 corrections — sealed budget recovery, media-required package verification, fidelity v3 (2026-10-17, continuation)
+
+Status: **the three SOL-reproduced defects at `451b43a` are corrected with
+regressions. A positive consumed-budget floor without complete retained
+per-request history now blocks new synthesis entirely (an empty ledger is never
+recreated and treated as complete); a malformed floor fails closed and preserves
+its bytes. A package is genuine only with an actual nonempty artifact matching its
+index and manifest identity (index-only/absent/mismatched packages are
+diagnostic). Local fidelity restores the documented normalization (contraction
+expansion, approved-filler removal) while keeping technical/numeric/URL forms as
+opaque atoms. No live hosted calls were made. Stage 6 remains NOT FROZEN;
+`publication_ready` stays false.**
+
+### Corrections
+1. **Seal incomplete-history budget recovery
+   (`backend/app/materialization/tts_audition.py`).** `run_audition` now blocks new
+   synthesis whenever a positive consumed-budget floor is not provably backed by
+   **complete retained per-request history** (`_floor_history_complete`: a linked
+   `manifest_digest` and an exact attempt count): status
+   `AUDITION_HISTORY_INCOMPLETE` (or `AUDITION_BUDGET_EXHAUSTED` at the ceiling),
+   zero calls. The previous behavior — recreating an empty ledger and treating it
+   as complete after restart — is removed (the `manifest_was_absent`/`recovered_extra`
+   allowance is gone). `record_consumed_budget` no longer swallows a malformed prior
+   record: it fails closed with the specific `AuditionError` and preserves the
+   original bytes. Recovery and the budget read/modify/write are serialized under
+   the existing audition ownership lock (`_audition_lock(blocking=True)`), and
+   `record_recovery` uses the inner writer to avoid a nested acquisition, so counts
+   stay monotonic under concurrency. Regressions:
+   `test_stage6_sol_451_regressions.py` (partial-lost-history-across-restart,
+   exhausted-floor, malformed-floor-fails-closed, concurrent-monotonic).
+2. **Require actual media before legacy acceptance publication
+   (`backend/app/materialization/acceptance_export.py`).** `_package_integrity_reasons`
+   now requires the supported acceptance index structure, a required nonempty
+   `artifact_file`, its recorded `render_artifact_sha256`, an actual nonempty
+   artifact whose hash matches both the index record and the manifest entry,
+   verified referenced assets (authored ASS and copied assets), and manifest paths
+   contained inside the package. Index-only, missing-metadata, absent-media,
+   mismatched-identity, and escaping-path packages are diagnostic — never a genuine
+   published reference. The same verifier is applied to package reuse and legacy
+   migration, preserving existing directories and references on failure.
+   Regressions: `test_stage6_sol_451_regressions.py` (index-only, missing metadata,
+   absent media, mismatched identity, path escape, legacy index-only not promoted,
+   legacy valid promoted) plus the retained valid-reuse/atomic-publication tests.
+3. **Fidelity v3 — documented normalization without weakening
+   (`backend/app/materialization/narration.py`,
+   `backend/app/materialization/tts_gemini.py`).** The separate protected
+   comparison now considers only **technical/numeric/URL atoms** (`_protected_atoms`:
+   URLs, compound `-_.@/:+#` forms, `C++`/`C#`, and Western/Arabic-Indic numbers);
+   ordinary Latin words no longer introduce a second raw comparison that reversed
+   the documented normalization. The previously documented equivalences hold again
+   (`"I don't know"` ↔ `"I do not know"`, `"We can start"` ↔ `"We um can start"`),
+   while `C++→C`, `C#→C`, compound-number fragmentation, and changed URLs remain
+   refused, and Arabic spelling/transliteration disagreements remain deferred. The
+   policy is versioned `stage6-fidelity-v3`, so retained audio is revalidated
+   locally (no synthesis) with historical findings preserved.
+   Regressions: `test_stage6_sol_451_regressions.py` (documented equivalences,
+   technical refusals, deferred Arabic disagreement) + `test_stage6_tts_boundary.py`.
+
+### Verification (this session)
+- Docker `oac-stage6-test` (Python 3.12.14, real FFmpeg 7.1.5, google-genai
+  2.31.0) + PostgreSQL `oac-stage6-pg-v4`:
+  - `test_stage6_sol_451_regressions.py` (new, 14): passed.
+  - `cache_validation` + `results_boundary` + `api_cli_acceptance` (26, real
+    FFmpeg, persisted export/HTTP path): passed.
+  - `sol_451 + sol_p5 + tts_boundary + adapter_regressions + supporting_narration
+    + component_recovery + rc_corrections + rc_v4_corrections + sol2 + sol3 +
+    blocker_regressions + materialization_core + durable_router + gemini_boundary
+    + sol3_postgres + finalizer_currentness_postgres` (221): passed.
+  - `ruff check app tests`: clean.
+- Frontend: `vitest run` **72 passed** (incl. 8 mounted DOM tests); `eslint
+  src --max-warnings=0` clean; `tsc --noEmit` retains only the pre-existing
+  `job-poller.test.tsx` test-only typing error.
+- **Zero live provider calls** this session. Preserved recovery evidence: the
+  prior `storage/benchmarks/stage-6/tts-audition/{recovery,consumed-budget}.json`
+  (`consumed_attempts=9`, `probe_calls=1`) stands and now blocks new synthesis; the
+  captured report `/tmp/audition-out.json` (sha256 `2d39a09a…0038`) is unchanged.
+
+### Disposition (corrected)
+- **Fixed**: incomplete-history budget sealing; media-required package verification;
+  fidelity v3 documented normalization.
+- **Validation blockers**: lost acoustic evidence and exhausted audition
+  authorization remain — the floor blocks new synthesis and the audio is
+  irrecoverable.
+- **Unresolved product decision (not a code gap)**: the hosted TTS voice stays
+  **unset by an already-made architectural decision**; any further live generation
+  needs a separately agreed bounded recovery budget.
+- **Externally blocked**: genuine authorized-media acceptance remains outstanding
+  (no authorized source media; a hosted key is present).
+
 ## Stage 6: SOL p5 corrections — cancellation reconciliation, export reuse/migration integrity, audition accounting, fidelity policy v2, evidence recovery (2026-10-17, continuation)
 
 Status: **the SOL-reviewed defects at p5 (`b768f6b`) are corrected with mounted-UI
@@ -115,7 +204,12 @@ recorded durably. Stage 6 remains NOT FROZEN; `publication_ready` stays false.**
 - **Unproven (unresolved product decision)**: the hosted TTS voice. No voice is
   validated; `provisional_voice` remains unset. Any further live generation needs
   a separately agreed bounded recovery budget.
-- **Internally blocked**: none.
+- **Internally blocked** (corrected by the next section): none in this session's
+  own scope, but the SOL review of this revision later reproduced three remaining
+  code defects (incomplete-history budget recovery, index-only package promotion,
+  and a protected-word comparison that reversed documented normalization). Those
+  were required code corrections, so "internally blocked: none" was **not**
+  accurate for the revision as reviewed.
 - **Externally blocked**: Task 9 genuine authorized-media acceptance (no
   authorized source media). A hosted key is present; only authorized media is
   missing.

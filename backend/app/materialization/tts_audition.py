@@ -59,6 +59,7 @@ AUDITION_ACTIVE = "AUDITION_ACTIVE"
 AUDITION_IDENTITY_MISMATCH = "AUDITION_IDENTITY_MISMATCH"
 AUDITION_HISTORY_INVALID = "AUDITION_HISTORY_INVALID"
 AUDITION_BUDGET_EXHAUSTED = "AUDITION_BUDGET_EXHAUSTED"
+AUDITION_HISTORY_INCOMPLETE = "AUDITION_HISTORY_INCOMPLETE"
 
 _STATUS_RESERVED = ATTEMPT_RESERVED
 _STATUS_RESPONDED = ATTEMPT_RESPONDED
@@ -205,6 +206,37 @@ def _identity_digest(identity: Mapping[str, object]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _manifest_digest(manifest: Mapping[str, object]) -> str:
+    canonical = json.dumps(dict(manifest), sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _floor_history_complete(
+    floor: Mapping[str, object] | None, manifest: Mapping[str, object] | None
+) -> bool:
+    """Whether a positive consumed-budget floor is backed by complete history.
+
+    A bare count can never prove which fixed requests remain safe to invoke, so a
+    positive floor is treated as incomplete unless it is linked (by digest and
+    exact attempt count) to the complete retained per-request manifest.
+    """
+
+    if not floor:
+        return True
+    consumed = int(floor.get("consumed_attempts") or 0)
+    if consumed <= 0:
+        return True
+    if manifest is None:
+        return False
+    digest = floor.get("manifest_digest")
+    if not isinstance(digest, str) or not digest:
+        return False
+    attempts = manifest.get("attempts")
+    if not isinstance(attempts, list) or consumed != len(attempts):
+        return False
+    return digest == _manifest_digest(manifest)
+
+
 def _audition_dir(storage: StorageService) -> Path:
     return storage.resolve_relative(Path("benchmarks") / "stage-6" / "tts-audition")
 
@@ -308,28 +340,33 @@ def _load_consumed_budget(storage: StorageService) -> dict[str, object] | None:
         raise AuditionError("malformed consumed-budget attempt count")
     if isinstance(probe, bool) or not isinstance(probe, int) or probe < 0:
         raise AuditionError("malformed consumed-budget probe count")
+    digest = data.get("manifest_digest")
+    if digest is not None and (not isinstance(digest, str) or not digest):
+        raise AuditionError("malformed consumed-budget manifest digest")
     return data
 
 
-def record_consumed_budget(
+def _write_consumed_budget(
     storage: StorageService,
     *,
     consumed_attempts: int,
     probe_calls: int,
     basis: str,
     captured_report_sha256: str | None = None,
+    manifest_digest: str | None = None,
 ) -> dict[str, object]:
-    """Durably record consumed audition attempts (a monotonic floor, never reset)."""
+    """Monotonic floor write. Caller must hold the audition lock.
 
-    root = _audition_dir(storage)
-    root.mkdir(parents=True, exist_ok=True)
-    prior: dict[str, object] | None
-    try:
-        prior = _load_consumed_budget(storage)
-    except AuditionError:
-        prior = None
+    An unreadable/malformed prior record fails closed (``AuditionError``) and its
+    bytes are preserved — a zero-based record is never silently substituted. A
+    ``manifest_digest`` links the floor to the complete retained per-request
+    history; it is retained only while the consumed count is unchanged.
+    """
+
+    prior = _load_consumed_budget(storage)
     prior_consumed = int(prior["consumed_attempts"]) if prior else 0
     prior_probe = int(prior.get("probe_calls", 0)) if prior else 0
+    prior_digest = prior.get("manifest_digest") if prior else None
     record: dict[str, object] = {
         "version": CONSUMED_BUDGET_VERSION,
         "consumed_attempts": max(prior_consumed, int(consumed_attempts)),
@@ -339,11 +376,47 @@ def record_consumed_budget(
     }
     if captured_report_sha256:
         record["captured_report_sha256"] = captured_report_sha256
+    if isinstance(manifest_digest, str) and manifest_digest:
+        record["manifest_digest"] = manifest_digest
+    elif (
+        isinstance(prior_digest, str)
+        and prior_digest
+        and record["consumed_attempts"] == prior_consumed
+    ):
+        record["manifest_digest"] = prior_digest
     storage.atomic_write(
         _consumed_budget_path(storage),
         [json.dumps(record, ensure_ascii=False, sort_keys=True).encode("utf-8")],
     )
     return record
+
+
+def record_consumed_budget(
+    storage: StorageService,
+    *,
+    consumed_attempts: int,
+    probe_calls: int,
+    basis: str,
+    captured_report_sha256: str | None = None,
+    manifest_digest: str | None = None,
+) -> dict[str, object]:
+    """Durably record consumed audition attempts (a monotonic floor, never reset).
+
+    The read/modify/write is serialized under the existing audition ownership lock,
+    and a malformed prior record fails closed instead of being replaced.
+    """
+
+    with _audition_lock(storage, blocking=True) as acquired:
+        if not acquired:  # pragma: no cover - a blocking lock always acquires
+            raise AuditionError("audition lock unavailable for a budget update")
+        return _write_consumed_budget(
+            storage,
+            consumed_attempts=consumed_attempts,
+            probe_calls=probe_calls,
+            basis=basis,
+            captured_report_sha256=captured_report_sha256,
+            manifest_digest=manifest_digest,
+        )
 
 
 def record_recovery(
@@ -411,28 +484,40 @@ def record_recovery(
         "notes": (
             "Recovered from the original audition capture. The probe call remains "
             "part of call accounting. Lost audio/history is reported, never "
-            "reconstructed."
+            "reconstructed. A positive floor without complete per-request history "
+            "blocks new synthesis."
         ),
     }
-    root = _audition_dir(storage)
-    root.mkdir(parents=True, exist_ok=True)
-    storage.atomic_write(
-        _recovery_path(storage),
-        [json.dumps(record, ensure_ascii=False, sort_keys=True).encode("utf-8")],
-    )
-    floor = record_consumed_budget(
-        storage,
-        consumed_attempts=consumed_attempts,
-        probe_calls=int(probe_calls),
-        basis="stage6-tts-audition recovery",
-        captured_report_sha256=report_digest,
-    )
+    # Serialize recovery and the budget read/modify/write under the existing
+    # audition ownership lock; call the inner writer to avoid a nested acquisition.
+    with _audition_lock(storage, blocking=True) as acquired:
+        if not acquired:  # pragma: no cover - a blocking lock always acquires
+            raise AuditionError("audition lock unavailable for recovery")
+        root = _audition_dir(storage)
+        root.mkdir(parents=True, exist_ok=True)
+        storage.atomic_write(
+            _recovery_path(storage),
+            [json.dumps(record, ensure_ascii=False, sort_keys=True).encode("utf-8")],
+        )
+        floor = _write_consumed_budget(
+            storage,
+            consumed_attempts=consumed_attempts,
+            probe_calls=int(probe_calls),
+            basis="stage6-tts-audition recovery",
+            captured_report_sha256=report_digest,
+        )
     return {"recovery": record, "consumed_budget": floor}
 
 
 @contextmanager
-def _audition_lock(storage: StorageService) -> Iterator[bool]:
-    """Exclusive process-safe audition lock; yields False when already held."""
+def _audition_lock(storage: StorageService, *, blocking: bool = False) -> Iterator[bool]:
+    """Exclusive process-safe audition lock.
+
+    A non-blocking acquisition (the default) yields ``False`` when the lock is
+    already held (a concurrent audition reports ``AUDITION_ACTIVE``). Budget
+    read/modify/write uses ``blocking=True`` so recovery and execution serialize
+    instead of racing.
+    """
 
     root = _audition_dir(storage)
     root.mkdir(parents=True, exist_ok=True)
@@ -447,7 +532,8 @@ def _audition_lock(storage: StorageService) -> Iterator[bool]:
             yield True
             return
         try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            flags = fcntl.LOCK_EX if blocking else (fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(handle.fileno(), flags)
             acquired = True
         except OSError:
             acquired = False
@@ -561,19 +647,29 @@ def run_audition(
                     "a new model comparison is not automatically authorized."
                 ),
             )
-        if manifest is None and floor_consumed >= MAX_AUDITION_ATTEMPTS:
-            return AuditionResult(
-                samples=(),
-                provisional_voice=None,
-                raw_calls=0,
-                status=AUDITION_BUDGET_EXHAUSTED,
-                identity=identity,
-                notes=(
-                    "The consumed-budget floor shows the audition budget is already "
-                    "spent; a missing ledger does not authorize another batch."
-                ),
-            )
-        manifest_was_absent = manifest is None
+        if floor_consumed > 0:
+            # Normalize any retained manifest (crash-left RESERVED -> UNCERTAIN)
+            # BEFORE judging completeness, so the digest reflects what is retained.
+            if manifest is not None:
+                _save_manifest(storage, manifest)
+            if not _floor_history_complete(floor, manifest):
+                return AuditionResult(
+                    samples=(),
+                    provisional_voice=None,
+                    raw_calls=0,
+                    status=(
+                        AUDITION_BUDGET_EXHAUSTED
+                        if floor_consumed >= MAX_AUDITION_ATTEMPTS
+                        else AUDITION_HISTORY_INCOMPLETE
+                    ),
+                    identity=identity,
+                    notes=(
+                        "A positive consumed-budget floor without complete retained "
+                        "per-request history cannot prove which fixed requests remain "
+                        "safe to invoke; new synthesis is blocked. A count alone is not "
+                        "authorization, and an empty ledger is never treated as complete."
+                    ),
+                )
         if manifest is None:
             manifest = _new_manifest(identity)
             _save_manifest(storage, manifest)
@@ -606,9 +702,7 @@ def run_audition(
                         continue
                     attempts = manifest.get("attempts")
                     assert isinstance(attempts, list)
-                    recovered_extra = floor_consumed if manifest_was_absent else 0
-                    effective_consumed = max(len(attempts) + recovered_extra, floor_consumed)
-                    if effective_consumed >= MAX_AUDITION_ATTEMPTS:
+                    if len(attempts) >= MAX_AUDITION_ATTEMPTS:
                         sample.error = "ATTEMPT_CEILING"
                         samples.append(sample)
                         continue
@@ -927,6 +1021,7 @@ def _bind_persist(
 __all__ = [
     "AUDITION_ACTIVE",
     "AUDITION_BUDGET_EXHAUSTED",
+    "AUDITION_HISTORY_INCOMPLETE",
     "AUDITION_HISTORY_INVALID",
     "AUDITION_IDENTITY_MISMATCH",
     "AUDITION_OK",
