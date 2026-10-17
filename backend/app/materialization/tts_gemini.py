@@ -23,8 +23,8 @@ from __future__ import annotations
 import base64
 import hashlib
 import threading
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -33,8 +33,8 @@ from google.genai import types
 
 from app.candidates.providers import ProviderErrorCategory
 from app.materialization.narration import (
+    compare_transcripts,
     inspect_wav,
-    transcription_matches,
     validate_narration_audio,
     wrap_pcm_as_wav,
 )
@@ -56,7 +56,9 @@ def _parse_audio_mime(mime: str) -> tuple[str, dict[str, str]]:
     The provider may echo a parameterized container (``audio/l16; rate=24000;
     channels=1``) rather than the bare requested type. Parameters are parsed,
     never dropped, so PCM metadata is honored from the response while unknown
-    base containers stay refused.
+    base containers stay refused. A duplicate parameter whose values disagree is
+    contradictory metadata and is refused (``ValueError``) rather than resolved by
+    position.
     """
 
     segments = [segment.strip() for segment in mime.split(";")]
@@ -65,21 +67,30 @@ def _parse_audio_mime(mime: str) -> tuple[str, dict[str, str]]:
     for segment in segments[1:]:
         if not segment:
             continue
-        key, _, value = segment.partition("=")
-        params[key.strip().lower()] = value.strip()
+        key, separator, value = segment.partition("=")
+        key = key.strip().lower()
+        value = value.strip()
+        if key in params and params[key] != value:
+            raise ValueError(f"conflicting duplicate mime parameter: {key}")
+        params[key] = value
     return base, params
 
 
 def _resolve_int(declared: object, parametric: str | None) -> int | None:
     """Resolve an integer from the declared field and/or a container parameter.
 
-    Returns ``None`` when the two sources disagree (a response is never
-    interpreted from conflicting metadata) or when neither yields an integer.
+    Returns ``None`` when the declared value is present but not a valid integer
+    (invalid non-null metadata is never silently replaced by a parameter), when
+    the two sources disagree (a response is never interpreted from conflicting
+    metadata), or when neither yields an integer.
     """
 
-    if isinstance(declared, bool):
+    if declared is None:
+        declared_int: int | None = None
+    elif isinstance(declared, bool) or not isinstance(declared, int):
         return None
-    declared_int = declared if isinstance(declared, int) else None
+    else:
+        declared_int = declared
     param_int: int | None = None
     if parametric is not None:
         try:
@@ -321,7 +332,14 @@ class GeminiNarrationSynthesizer:
             # A response without a declared container is refused: the format is
             # never guessed from the request.
             raise MaterializationProviderError(ProviderErrorCategory.MALFORMED_OUTPUT.value)
-        base_mime, mime_params = _parse_audio_mime(mime)
+        try:
+            base_mime, mime_params = _parse_audio_mime(mime)
+        except ValueError:
+            # Contradictory duplicate parameters are refused, never resolved by
+            # position.
+            raise MaterializationProviderError(
+                ProviderErrorCategory.MALFORMED_OUTPUT.value
+            ) from None
         if base_mime == GEMINI_TTS_MIME_WAV:
             wav_bytes = raw
         elif base_mime == GEMINI_TTS_MIME_PCM:
@@ -418,6 +436,26 @@ FIDELITY_ACCEPTED = "ACCEPTED"
 FIDELITY_DEFERRED = "DEFERRED"
 FIDELITY_REJECTED = "REJECTED"
 
+#: Version of the local fidelity validation policy. A change to the comparison,
+#: the deferred/rejected classification, or the audio-failure handling must bump
+#: this so dependent validation fingerprints (which include it) invalidate and a
+#: retained audio is revalidated locally without repeating synthesis.
+FIDELITY_POLICY_VERSION = "stage6-fidelity-v2"
+
+#: Findings from ``validate_narration_audio`` that are independently established
+#: audio/content failures: they reject the chunk regardless of the transcript.
+_FIDELITY_AUDIO_FAILURE_FINDINGS = frozenset(
+    {
+        "EMPTY_AUDIO",
+        "SILENT_AUDIO",
+        "TRUNCATED_AUDIO",
+        "CLIPPED_AUDIO",
+        "INVALID_SAMPLE_RATE",
+        "INVALID_CHANNELS",
+        "NARRATION_TOO_LONG",
+    }
+)
+
 
 @dataclass(frozen=True)
 class NarrationFidelityResult:
@@ -427,6 +465,7 @@ class NarrationFidelityResult:
     transcript: str
     findings: tuple[str, ...]
     asr_identity: dict[str, object]
+    diff: dict[str, object] = field(default_factory=dict)
 
     @property
     def accepted(self) -> bool:
@@ -435,9 +474,11 @@ class NarrationFidelityResult:
     def as_dict(self) -> dict[str, object]:
         return {
             "status": self.status,
+            "policy_version": FIDELITY_POLICY_VERSION,
             "transcript": self.transcript,
             "findings": list(self.findings),
             "asr_identity": dict(self.asr_identity),
+            "diff": dict(self.diff),
         }
 
 
@@ -450,22 +491,46 @@ def validate_narration_fidelity(
     lease_factory: Any | None = None,
     cancel_event: threading.Event | None = None,
     is_cancelled: Callable[[], bool] | None = None,
+    audio_validation: Mapping[str, object] | None = None,
 ) -> NarrationFidelityResult:
     """Transcribe the synthesized audio under the heavy-model lease and compare.
 
     Lease loss and (optional) executor cancellation are connected to the Whisper
     child's cancellation event: a lost lease or a cancelled/foreign job sets the
     event, which terminates and reaps the child before the lease is released.
-    Unknown fidelity (empty/unusable transcript, or a lost lease) defers; a clear
-    sequence mismatch rejects. The comparison is the strict exact-sequence check
-    in ``narration.transcription_matches``; a scalar similarity ratio is never
-    accepted as proof of meaning.
+
+    Accept/reject/defer classification (policy ``stage6-fidelity-v2``):
+
+    * an independently established audio/content failure (silent/empty/truncated/
+      clipped/invalid audio, reported by the synthesizer's own validation)
+      rejects;
+    * a lost lease or a missing/unusable transcript defers;
+    * an exact match (ordered content sequences plus atomic protected technical/
+      numeric forms) accepts;
+    * a lone ASR transcript disagreement **defers** with a structured reason/diff
+      — a single disagreeing transcript is evidence, not a confirmed meaning
+      mismatch.
+
+    Deferral never approves a voice or review readiness. The comparison is the
+    strict check in ``narration.compare_transcripts``; a scalar similarity ratio is
+    never accepted as proof of meaning.
     """
 
     from app.runtime.heavy_model_lease import NoopHeavyModelLeaseFactory
 
     factory = lease_factory if lease_factory is not None else NoopHeavyModelLeaseFactory()
     event = cancel_event if cancel_event is not None else threading.Event()
+
+    audio_findings = ()
+    if isinstance(audio_validation, Mapping):
+        raw_findings = audio_validation.get("findings")
+        if isinstance(raw_findings, (list, tuple)):
+            audio_findings = tuple(str(item) for item in raw_findings)
+    established = tuple(item for item in audio_findings if item in _FIDELITY_AUDIO_FAILURE_FINDINGS)
+    if established:
+        # The audio itself is unusable: an independently established failure does
+        # not need (and must not wait on) a transcript.
+        return NarrationFidelityResult(FIDELITY_REJECTED, "", established, {})
 
     def _on_ownership_lost() -> None:
         event.set()
@@ -501,6 +566,7 @@ def validate_narration_fidelity(
         "compute_type": getattr(options, "compute_type", ""),
         "beam_size": getattr(options, "beam_size", None),
         "language": getattr(result, "language", None),
+        "policy_version": FIDELITY_POLICY_VERSION,
     }
     if ownership_lost or event.is_set():
         return NarrationFidelityResult(
@@ -511,16 +577,24 @@ def validate_narration_fidelity(
         return NarrationFidelityResult(
             FIDELITY_DEFERRED, "", ("EMPTY_TRANSCRIPT",), asr_identity
         )
-    if transcription_matches(expected_text, transcript):
+    comparison = compare_transcripts(expected_text, transcript)
+    if comparison.matches:
         return NarrationFidelityResult(FIDELITY_ACCEPTED, transcript, (), asr_identity)
+    # A lone transcript disagreement is deferred evidence, never a confirmed
+    # meaning mismatch. The structured diff preserves exactly what disagreed.
     return NarrationFidelityResult(
-        FIDELITY_REJECTED, transcript, ("MEANING_MISMATCH",), asr_identity
+        FIDELITY_DEFERRED,
+        transcript,
+        ("ASR_TRANSCRIPT_DISAGREEMENT", *comparison.findings),
+        asr_identity,
+        dict(comparison.diff),
     )
 
 
 __all__ = [
     "FIDELITY_ACCEPTED",
     "FIDELITY_DEFERRED",
+    "FIDELITY_POLICY_VERSION",
     "FIDELITY_REJECTED",
     "GEMINI_TTS_API_VERSION",
     "GEMINI_TTS_MIME_PCM",

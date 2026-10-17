@@ -12,6 +12,7 @@ import type {
   RightsStatus,
   Source
 } from "@/lib/api-client";
+import { ApiError } from "@/lib/api-client";
 import type { ProduceApi, QueuedJob } from "@/lib/produce-runner";
 
 vi.mock("next/link", () => ({
@@ -318,18 +319,17 @@ describe("ProduceRunner mounted cancellation ownership", () => {
     await api.getMaterializationStarted.promise;
 
     fireEvent.click(await screen.findByRole("button", { name: "Cancel" }));
+    // Reconciliation freshly reads the exact materialization; resolving it to a
+    // non-terminal state yields an unconfirmed cancellation (never a false one).
+    await act(async () => {
+      api.getMaterializationGate?.resolve(materialization());
+    });
     await screen.findByText(/Cancellation could not be confirmed/);
     // Produce stays disabled while cancellation is unresolved.
     expect(
       (screen.getByRole("button", { name: /Producing/ }) as HTMLButtonElement).disabled
     ).toBe(true);
     expect(api.cancelMaterializationCalls).toEqual(["mat-1"]);
-
-    // Polling settles (the pending read returns) without falsely confirming.
-    await act(async () => {
-      api.getMaterializationGate?.resolve(materialization());
-    });
-    await waitFor(() => expect(screen.queryByText(/Cancellation could not be confirmed/)).toBeTruthy());
 
     // A real retry performs a fresh cancellation and confirms.
     fireEvent.click(screen.getByRole("button", { name: "Retry cancel" }));
@@ -408,5 +408,101 @@ describe("ProduceRunner mounted cancellation ownership", () => {
     });
     await waitFor(() => expect(container.querySelector("video")).toBeNull());
     expect(screen.queryByText(/ready for human review/i)).toBeNull();
+  });
+
+  it("treats an unreadable ingest inventory as unknown, then recovers on retry", async () => {
+    const { api } = produce();
+    const started = deferred<void>();
+    let reads = 0;
+    api.listJobs = () => {
+      reads += 1;
+      if (reads === 1) {
+        started.resolve();
+        return Promise.resolve([]);
+      }
+      return Promise.reject(new ApiError(503, "503 inventory unavailable"));
+    };
+    await started.promise;
+
+    fireEvent.click(await screen.findByRole("button", { name: "Cancel" }));
+    // Inventory failure is UNKNOWN, never "no active work": the cancellation is
+    // unconfirmed with a retryable reason, and nothing is falsely "Cancelled.".
+    await screen.findByText(/Cancellation could not be confirmed/);
+    expect(screen.getByText(/inventory unavailable/)).toBeTruthy();
+    expect(screen.queryByText("Cancelled.")).toBeNull();
+    expect(api.cancelJobCalls).toHaveLength(0);
+
+    // Inventory recovers: a fresh retry can settle truthfully.
+    api.listJobs = () => Promise.resolve([]);
+    fireEvent.click(screen.getByRole("button", { name: "Retry cancel" }));
+    await screen.findByText("Cancelled.");
+    expect(api.cancelJobCalls).toHaveLength(0);
+  });
+
+  it("freshly reads already-ended jobs after a 409 conflict before settling", async () => {
+    const { api } = produce();
+    const started = deferred<void>();
+    const gate = deferred<Awaited<ReturnType<FakeApi["getCandidateTransformationAnalysis"]>>>();
+    api.queueTransformationAnalysis = () =>
+      Promise.resolve({ job_id: "job-ended", status: "QUEUED", cached: false });
+    const lookup = vi
+      .spyOn(api, "getJob")
+      .mockResolvedValue({ ...succeededJob, id: "job-ended" });
+    api.getCandidateTransformationAnalysis = () => {
+      started.resolve();
+      return gate.promise;
+    };
+    api.cancelJob = (id: string) => {
+      api.cancelJobCalls.push(id);
+      return Promise.reject(new ApiError(409, "job cannot be cancelled"));
+    };
+    await started.promise;
+    lookup.mockClear();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Cancel" }));
+    // Each 409 conflict is reconciled by freshly reading the exact run-owned job
+    // (the queued analysis job and the observed ingest job); their verified
+    // terminal state settles the cancellation.
+    await screen.findByText("Cancelled.");
+    expect(api.cancelJobCalls).toEqual(["job-ended", "job-analysis"]);
+    expect(lookup).toHaveBeenCalledTimes(2);
+    expect(screen.queryByText(/Cancellation could not be confirmed/)).toBeNull();
+    await act(async () => gate.resolve({ recommended_strategies: [{}], eligibility_outcome: "ELIGIBLE" }));
+  });
+
+  it("clears verified-terminal jobs and still cancels a later run-owned active target", async () => {
+    const { api } = produce();
+    const started = deferred<void>();
+    const gate = deferred<Awaited<ReturnType<FakeApi["getCandidateTransformationAnalysis"]>>>();
+    api.queueTransformationAnalysis = () =>
+      Promise.resolve({ job_id: "job-ended", status: "QUEUED", cached: false });
+    vi.spyOn(api, "getJob").mockResolvedValue({ ...succeededJob, id: "job-ended" });
+    api.getCandidateTransformationAnalysis = () => {
+      started.resolve();
+      return gate.promise;
+    };
+    api.cancelJob = (id: string) => {
+      api.cancelJobCalls.push(id);
+      if (id === "job-later") {
+        return Promise.resolve({ ...succeededJob, id, status: "CANCELLED" });
+      }
+      return Promise.reject(new ApiError(409, "job cannot be cancelled"));
+    };
+    await started.promise;
+    // A later active target for the same source appears after the old jobs ended.
+    api.activeIngestJob = {
+      ...succeededJob,
+      id: "job-later",
+      kind: "INGEST",
+      status: "RUNNING"
+    };
+
+    fireEvent.click(await screen.findByRole("button", { name: "Cancel" }));
+    await screen.findByText("Cancelled.");
+    // Terminal run-owned identities are cleared, not used to falsely confirm, and
+    // the later run-owned active job is cancelled.
+    expect(api.cancelJobCalls).toEqual(["job-ended", "job-analysis", "job-later"]);
+    expect(screen.queryByText(/Cancellation could not be confirmed/)).toBeNull();
+    await act(async () => gate.resolve({ recommended_strategies: [{}], eligibility_outcome: "ELIGIBLE" }));
   });
 });

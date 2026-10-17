@@ -41,6 +41,88 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+class CatalogIntegrityError(RuntimeError):
+    """Raised when an existing catalog cannot be trusted (fail closed)."""
+
+
+def _package_integrity_reasons(package_dir: Path, package_identity: str | None) -> list[str]:
+    """Concrete reasons an *existing* immutable package is not intact (empty == ok).
+
+    Directory naming is never integrity evidence: the manifest must hash to the
+    declared package identity, the index must be present and mark the package
+    genuine, and every file listed in the manifest must exist and hash exactly.
+    """
+
+    reasons: list[str] = []
+    if not package_dir.is_dir():
+        return ["PACKAGE_MISSING"]
+    manifest = package_dir / "SHA256SUMS"
+    if not manifest.is_file():
+        return ["PACKAGE_MANIFEST_MISSING"]
+    try:
+        manifest_lines = manifest.read_text(encoding="utf-8").splitlines()
+        actual_identity = _sha256_file(manifest)
+    except OSError:
+        return ["PACKAGE_MANIFEST_UNREADABLE"]
+    if package_identity and actual_identity != package_identity:
+        return ["PACKAGE_IDENTITY_MISMATCH"]
+    index_path = package_dir / "index.json"
+    if not index_path.is_file():
+        return ["PACKAGE_INDEX_MISSING"]
+    try:
+        index = json.loads(index_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ["PACKAGE_INDEX_INVALID"]
+    if not isinstance(index, dict):
+        return ["PACKAGE_INDEX_INVALID"]
+    if index.get("genuine_acceptance") is not True:
+        return ["PACKAGE_INDEX_NOT_GENUINE"]
+    listed: set[str] = set()
+    for line in manifest_lines:
+        if not line.strip():
+            continue
+        digest, separator, relative = line.partition("  ")
+        if not separator or not digest or not relative:
+            reasons.append("PACKAGE_MANIFEST_INVALID")
+            continue
+        listed.add(relative)
+        target = package_dir / relative
+        if not target.is_file():
+            reasons.append(f"PACKAGE_FILE_MISSING:{relative}")
+            continue
+        try:
+            if _sha256_file(target) != digest.lower():
+                reasons.append(f"PACKAGE_FILE_MISMATCH:{relative}")
+        except OSError:
+            reasons.append(f"PACKAGE_FILE_UNREADABLE:{relative}")
+    if not listed:
+        reasons.append("PACKAGE_MANIFEST_EMPTY")
+    if "index.json" not in listed:
+        reasons.append("PACKAGE_INDEX_UNLISTED")
+    artifact_file = index.get("artifact_file")
+    if isinstance(artifact_file, str) and artifact_file and artifact_file not in listed:
+        reasons.append(f"PACKAGE_ARTIFACT_UNLISTED:{artifact_file}")
+    return reasons
+
+
+def _integrity_failure(
+    case: str, package_dir: Path, package_identity: str, reasons: Sequence[str]
+) -> dict[str, object]:
+    """A fail-closed publication result: no valid reference, staging preserved."""
+
+    return {
+        "case": case,
+        "directory": str(package_dir),
+        "diagnostic_directory": None,
+        "published": False,
+        "genuine_acceptance": False,
+        "package_identity": package_identity,
+        "published_reference": None,
+        "diagnostic_attempts": [],
+        "integrity_failure": list(reasons),
+    }
+
+
 def _ledger_counts(ledger: object) -> dict[str, object]:
     if not isinstance(ledger, Mapping):
         return {"reserved": 0, "responded": 0, "uncertain": 0, "entries": []}
@@ -370,6 +452,17 @@ def export_materializations(
         label = labels[index] if index < len(labels) else None
         build = _build_package(session, storage, materialization_id, root, case_label=label)
         published = _publish_case_package(root, build)
+        public = {
+            "case": published["case"],
+            "directory": published["directory"],
+            "genuine_acceptance": published["genuine_acceptance"],
+            "published": published["published"],
+            "diagnostic_directory": published["diagnostic_directory"],
+            "package_identity": published["package_identity"],
+        }
+        failure = published.get("integrity_failure")
+        if failure:
+            public["integrity_failure"] = list(failure)
         results.append(
             {
                 "case": build["case"],
@@ -377,22 +470,20 @@ def export_materializations(
                 "clip_candidate_id": build["clip_candidate_id"],
                 "published_reference": published["published_reference"],
                 "diagnostic_attempts": published["diagnostic_attempts"],
-                "public": {
-                    "case": published["case"],
-                    "directory": published["directory"],
-                    "genuine_acceptance": published["genuine_acceptance"],
-                    "published": published["published"],
-                    "diagnostic_directory": published["diagnostic_directory"],
-                    "package_identity": published["package_identity"],
-                },
+                "public": public,
+                "integrity_failure": list(failure) if failure else None,
             }
         )
 
     # Switch the catalog pointer only after every package is published; merge into
     # the existing catalog under the export-owned lock, then atomically replace.
+    # An integrity failure is never merged as a success (its staging evidence is
+    # preserved and the previously published reference is left untouched).
     with _catalog_lock(root):
         catalog = _read_catalog(root / "catalog.json")
         for result in results:
+            if result.get("integrity_failure"):
+                continue
             _merge_case_into_catalog(catalog, result)
         _write_catalog_atomic(root, catalog)
     return {
@@ -407,8 +498,13 @@ def _publish_case_package(root: Path, build: dict[str, object]) -> dict[str, obj
 
     Contents are published before the catalog pointer is switched (by the caller):
     a genuine package becomes ``packages/<case>/<package_identity>/`` and a
-    diagnostic/failed attempt a separate versioned diagnostic directory. The last
-    valid package is never renamed, deleted, or overwritten.
+    diagnostic/failed attempt a separate versioned diagnostic directory. An
+    *existing* target is never assumed intact from its name alone: its manifest,
+    index, and every listed destination file are re-verified before it may be
+    reused. On an integrity mismatch this fails closed with a specific reason — the
+    valid staging evidence is preserved, the existing package is not overwritten,
+    and no successful reference is produced. The last valid package is never
+    renamed, deleted, or overwritten.
     """
 
     case = str(build["case"])
@@ -420,10 +516,20 @@ def _publish_case_package(root: Path, build: dict[str, object]) -> dict[str, obj
     if genuine:
         target = packages_dir / package_identity
         if target.exists():
-            # Idempotent republish: an identical immutable package already exists.
+            reasons = _package_integrity_reasons(target, package_identity)
+            if reasons:
+                return _integrity_failure(case, target, package_identity, reasons)
+            # Verified identical immutable package: the staging duplicate is safe
+            # to drop.
             shutil.rmtree(staging_dir, ignore_errors=True)
         else:
+            staging_reasons = _package_integrity_reasons(staging_dir, package_identity)
+            if staging_reasons:
+                return _integrity_failure(case, staging_dir, package_identity, staging_reasons)
             os.replace(staging_dir, target)
+            published_reasons = _package_integrity_reasons(target, package_identity)
+            if published_reasons:
+                return _integrity_failure(case, target, package_identity, published_reasons)
         return {
             "case": case,
             "directory": str(target),
@@ -431,6 +537,7 @@ def _publish_case_package(root: Path, build: dict[str, object]) -> dict[str, obj
             "published": True,
             "genuine_acceptance": True,
             "package_identity": package_identity,
+            "integrity_failure": None,
             "published_reference": {
                 "identity": package_identity,
                 "directory": target.relative_to(root).as_posix(),
@@ -447,6 +554,7 @@ def _publish_case_package(root: Path, build: dict[str, object]) -> dict[str, obj
         "published": False,
         "genuine_acceptance": False,
         "package_identity": package_identity,
+        "integrity_failure": None,
         "published_reference": None,
         "diagnostic_attempts": [
             {
@@ -498,51 +606,91 @@ def _catalog_lock(root: Path) -> Iterator[None]:
 
 
 def _read_catalog(catalog_path: Path) -> dict[str, object]:
-    """Read the versioned catalog, migrating (and preserving) any legacy form."""
+    """Read the versioned catalog, migrating (and preserving) any legacy form.
+
+    An unreadable, malformed, or unsupported catalog fails closed with
+    :class:`CatalogIntegrityError` rather than being silently reset to an empty
+    catalog: the original file and every existing reference are preserved so a
+    corrupt catalog can never authorize dropping previously published packages.
+
+    A legacy flat-list catalog is migrated conservatively. A published valid
+    reference is established only from explicit favorable metadata
+    (``published`` *and* ``genuine_acceptance`` both true) *and* verified package
+    evidence; an ambiguous entry (including ``published=true`` with
+    ``genuine_acceptance=false``) is preserved as a diagnostic reference and never
+    promoted.
+    """
 
     if not catalog_path.is_file():
         return {"version": CATALOG_VERSION, "cases": {}}
     try:
         data = json.loads(catalog_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {"version": CATALOG_VERSION, "cases": {}}
+    except (OSError, ValueError) as error:
+        raise CatalogIntegrityError(f"unreadable catalog: {error}") from None
     if not isinstance(data, dict):
-        return {"version": CATALOG_VERSION, "cases": {}}
+        raise CatalogIntegrityError("catalog is not a JSON object")
+    if "cases" not in data:
+        raise CatalogIntegrityError("catalog has no cases key")
     raw_cases = data.get("cases")
     cases: dict[str, object] = {}
     if isinstance(raw_cases, dict):
+        # A keyed catalog is only supported at the current version. A different
+        # version is a future/unsupported schema: fail closed rather than
+        # reinterpret it.
+        if data.get("version") != CATALOG_VERSION:
+            raise CatalogIntegrityError(
+                f"unsupported catalog version: {data.get('version')!r}"
+            )
         for key, value in raw_cases.items():
             cases[str(key)] = value
-    elif isinstance(raw_cases, list):
-        # Legacy flat-catalog list: preserve each entry under its case key.
-        for entry in raw_cases:
-            if not isinstance(entry, dict) or not entry.get("case"):
-                continue
-            published = (
-                {
-                    "identity": entry.get("package_identity"),
-                    "directory": entry.get("directory"),
-                    "genuine_acceptance": True,
-                }
-                if entry.get("published")
-                else None
+        return {"version": CATALOG_VERSION, "cases": cases}
+    if not isinstance(raw_cases, list):
+        raise CatalogIntegrityError("catalog cases is neither an object nor a list")
+    root = catalog_path.parent
+    for entry in raw_cases:
+        if not isinstance(entry, dict) or not entry.get("case"):
+            raise CatalogIntegrityError("malformed legacy catalog entry")
+        case = str(entry["case"])
+        directory = entry.get("directory")
+        identity = entry.get("package_identity")
+        published_flag = entry.get("published")
+        genuine_flag = entry.get("genuine_acceptance")
+        diagnostic_dir = entry.get("diagnostic_directory")
+        published: dict[str, object] | None = None
+        if (
+            published_flag is True
+            and genuine_flag is True
+            and isinstance(directory, str)
+            and directory
+            and not _package_integrity_reasons(
+                root / directory, identity if isinstance(identity, str) else None
             )
-            diagnostics = (
-                [
+        ):
+            published = {
+                "identity": identity,
+                "directory": directory,
+                "genuine_acceptance": True,
+            }
+        diagnostics: list[dict[str, object]] = []
+        if published is None:
+            reference_dir = (
+                diagnostic_dir
+                if isinstance(diagnostic_dir, str) and diagnostic_dir
+                else (directory if isinstance(directory, str) and directory else None)
+            )
+            if reference_dir:
+                diagnostics.append(
                     {
-                        "directory": entry.get("diagnostic_directory"),
-                        "identity": entry.get("package_identity"),
+                        "directory": reference_dir,
+                        "identity": identity,
                         "genuine_acceptance": False,
                     }
-                ]
-                if entry.get("diagnostic_directory")
-                else []
-            )
-            cases[str(entry["case"])] = {
-                "case": str(entry["case"]),
-                "published": published,
-                "diagnostic_attempts": diagnostics,
-            }
+                )
+        cases[case] = {
+            "case": case,
+            "published": published,
+            "diagnostic_attempts": diagnostics,
+        }
     return {"version": CATALOG_VERSION, "cases": cases}
 
 

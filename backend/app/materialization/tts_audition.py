@@ -34,26 +34,37 @@ import json
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 
+from app.materialization.delivery import RATE_LIMITED_REASON, raised_attempt_status
 from app.materialization.narration import inspect_wav
+from app.materialization.repository import (
+    ATTEMPT_RESERVED,
+    ATTEMPT_RESPONDED,
+    ATTEMPT_UNCERTAIN,
+)
 from app.materialization.types import NarrationAudio, NarrationSynthesisRequest
 from app.services.storage import StorageService
 
 AUDITION_VOICES = ("Charon", "Kore", "Achird")
 MAX_AUDITION_ATTEMPTS = 9
-MANIFEST_VERSION = "stage6-tts-audition-v3"
+MANIFEST_VERSION = "stage6-tts-audition-v4"
+CONSUMED_BUDGET_VERSION = 1
+RECOVERY_VERSION = 1
 
 #: Result status codes.
 AUDITION_OK = "OK"
 AUDITION_ACTIVE = "AUDITION_ACTIVE"
 AUDITION_IDENTITY_MISMATCH = "AUDITION_IDENTITY_MISMATCH"
 AUDITION_HISTORY_INVALID = "AUDITION_HISTORY_INVALID"
+AUDITION_BUDGET_EXHAUSTED = "AUDITION_BUDGET_EXHAUSTED"
 
-_STATUS_RESERVED = "RESERVED"
-_STATUS_RESPONDED = "RESPONDED"
-_STATUS_UNCERTAIN = "UNCERTAIN"
+_STATUS_RESERVED = ATTEMPT_RESERVED
+_STATUS_RESPONDED = ATTEMPT_RESPONDED
+_STATUS_UNCERTAIN = ATTEMPT_UNCERTAIN
 _STATUS_UNAVAILABLE = "UNAVAILABLE"
+_STATUS_ADMISSION_DENIED = "ADMISSION_DENIED"
 
 
 class AuditionError(RuntimeError):
@@ -99,6 +110,11 @@ class AuditionSample:
     cached: bool = False
     fidelity: dict[str, object] = field(default_factory=dict)
     error: str | None = None
+    #: Typed provider failure category (never inferred for historical uncertainty)
+    #: and its sanitized reason, kept separate from the delivery outcome.
+    category: str | None = None
+    reason: str | None = None
+    delivery_status: str | None = None
 
     @property
     def viable(self) -> bool:
@@ -127,6 +143,9 @@ class AuditionSample:
             "cached": self.cached,
             "fidelity": dict(self.fidelity),
             "error": self.error,
+            "category": self.category,
+            "reason": self.reason,
+            "delivery_status": self.delivery_status,
             "viable": self.viable,
         }
 
@@ -235,9 +254,11 @@ def _load_manifest(storage: StorageService) -> dict[str, object] | None:
             raise AuditionError("malformed audition attempt entry")
         entry = dict(item)
         # A reservation left by a crash is unresolved uncertainty: it is budget
-        # consumed and must never be silently retried.
+        # consumed and must never be silently retried. Its original provider
+        # category is unknown, so none is inferred.
         if entry.get("status") == _STATUS_RESERVED:
             entry["status"] = _STATUS_UNCERTAIN
+            entry.setdefault("uncertainty", "CRASH_LEFT_RESERVATION")
         normalized.append(entry)
     return {
         "version": MANIFEST_VERSION,
@@ -255,6 +276,158 @@ def _save_manifest(storage: StorageService, manifest: Mapping[str, object]) -> N
         path,
         [json.dumps(dict(manifest), ensure_ascii=False, sort_keys=True).encode("utf-8")],
     )
+
+
+def _consumed_budget_path(storage: StorageService) -> Path:
+    return _audition_dir(storage) / "consumed-budget.json"
+
+
+def _recovery_path(storage: StorageService) -> Path:
+    return _audition_dir(storage) / "recovery.json"
+
+
+def _load_consumed_budget(storage: StorageService) -> dict[str, object] | None:
+    """Read the durable consumed-budget floor, failing closed on malformed history.
+
+    The floor survives a missing ledger, a changed storage root, or a container
+    restart so a lost manifest can never authorize another nine-call batch.
+    """
+
+    path = _consumed_budget_path(storage)
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise AuditionError(f"unreadable consumed-budget record: {error}") from None
+    if not isinstance(data, dict) or data.get("version") != CONSUMED_BUDGET_VERSION:
+        raise AuditionError("unrecognized consumed-budget record")
+    consumed = data.get("consumed_attempts")
+    probe = data.get("probe_calls", 0)
+    if isinstance(consumed, bool) or not isinstance(consumed, int) or consumed < 0:
+        raise AuditionError("malformed consumed-budget attempt count")
+    if isinstance(probe, bool) or not isinstance(probe, int) or probe < 0:
+        raise AuditionError("malformed consumed-budget probe count")
+    return data
+
+
+def record_consumed_budget(
+    storage: StorageService,
+    *,
+    consumed_attempts: int,
+    probe_calls: int,
+    basis: str,
+    captured_report_sha256: str | None = None,
+) -> dict[str, object]:
+    """Durably record consumed audition attempts (a monotonic floor, never reset)."""
+
+    root = _audition_dir(storage)
+    root.mkdir(parents=True, exist_ok=True)
+    prior: dict[str, object] | None
+    try:
+        prior = _load_consumed_budget(storage)
+    except AuditionError:
+        prior = None
+    prior_consumed = int(prior["consumed_attempts"]) if prior else 0
+    prior_probe = int(prior.get("probe_calls", 0)) if prior else 0
+    record: dict[str, object] = {
+        "version": CONSUMED_BUDGET_VERSION,
+        "consumed_attempts": max(prior_consumed, int(consumed_attempts)),
+        "probe_calls": max(prior_probe, int(probe_calls)),
+        "basis": basis,
+        "recorded_at": datetime.now(UTC).isoformat(),
+    }
+    if captured_report_sha256:
+        record["captured_report_sha256"] = captured_report_sha256
+    storage.atomic_write(
+        _consumed_budget_path(storage),
+        [json.dumps(record, ensure_ascii=False, sort_keys=True).encode("utf-8")],
+    )
+    return record
+
+
+def record_recovery(
+    storage: StorageService,
+    report: Mapping[str, object],
+    *,
+    probe_calls: int,
+    captured_report_path: Path | None = None,
+) -> dict[str, object]:
+    """Export recovered audition evidence and preserve the consumed budget.
+
+    Surviving audio referenced by the captured report is verified against the
+    captured SHA-256 and left in managed storage; anything missing or mismatched is
+    recorded as lost evidence. Attempts are counted from the captured samples (the
+    authoritative consumed set) and persisted as a durable floor. No provider
+    request ID or response metadata is fabricated.
+    """
+
+    raw_samples = report.get("samples")
+    samples = (
+        [item for item in raw_samples if isinstance(item, Mapping)]
+        if isinstance(raw_samples, list)
+        else []
+    )
+    consumed_attempts = int(report.get("consumed_attempts") or len(samples))
+    recovered: list[dict[str, object]] = []
+    lost: list[dict[str, object]] = []
+    for sample in samples:
+        relative = str(sample.get("relative_path") or "")
+        expected = str(sample.get("sha256") or "")
+        entry = {
+            "voice": sample.get("voice"),
+            "script_id": sample.get("script_id"),
+            "relative_path": relative or None,
+            "expected_sha256": expected or None,
+        }
+        if not relative:
+            lost.append({**entry, "reason": "NO_ARTIFACT_IN_CAPTURE"})
+            continue
+        try:
+            path = storage.resolve_relative(relative)
+        except Exception:
+            path = None
+        if path is None or not path.is_file():
+            lost.append({**entry, "reason": "MISSING_ARTIFACT"})
+            continue
+        actual = hashlib.sha256(path.read_bytes()).hexdigest()
+        if expected and actual != expected:
+            lost.append({**entry, "actual_sha256": actual, "reason": "HASH_MISMATCH"})
+            continue
+        recovered.append({**entry, "actual_sha256": actual, "verified": True})
+
+    report_digest = None
+    if captured_report_path is not None and captured_report_path.is_file():
+        report_digest = hashlib.sha256(captured_report_path.read_bytes()).hexdigest()
+
+    record: dict[str, object] = {
+        "version": RECOVERY_VERSION,
+        "recorded_at": datetime.now(UTC).isoformat(),
+        "consumed_attempts": consumed_attempts,
+        "probe_calls": int(probe_calls),
+        "captured_report_sha256": report_digest,
+        "recovered": recovered,
+        "lost": lost,
+        "notes": (
+            "Recovered from the original audition capture. The probe call remains "
+            "part of call accounting. Lost audio/history is reported, never "
+            "reconstructed."
+        ),
+    }
+    root = _audition_dir(storage)
+    root.mkdir(parents=True, exist_ok=True)
+    storage.atomic_write(
+        _recovery_path(storage),
+        [json.dumps(record, ensure_ascii=False, sort_keys=True).encode("utf-8")],
+    )
+    floor = record_consumed_budget(
+        storage,
+        consumed_attempts=consumed_attempts,
+        probe_calls=int(probe_calls),
+        basis="stage6-tts-audition recovery",
+        captured_report_sha256=report_digest,
+    )
+    return {"recovery": record, "consumed_budget": floor}
 
 
 @contextmanager
@@ -320,10 +493,12 @@ def _attempts_by_fingerprint(manifest: Mapping[str, object]) -> dict[str, dict[s
     attempts = manifest.get("attempts")
     if isinstance(attempts, list):
         for entry in attempts:
-            if isinstance(entry, Mapping):
+            if isinstance(entry, dict):
                 fingerprint = entry.get("request_fingerprint")
                 if isinstance(fingerprint, str):
-                    index[fingerprint] = dict(entry)
+                    # Keep the live entry so a reuse/revalidation mutation is
+                    # persisted by the next manifest save.
+                    index[fingerprint] = entry
     return index
 
 
@@ -336,19 +511,20 @@ def run_audition(
     fidelity: Callable[[NarrationAudio], Mapping[str, object]] | None = None,
     api_version: str = "v1beta",
     admit: Callable[[], bool] | None = None,
+    on_rate_limited: Callable[[], None] | None = None,
 ) -> AuditionResult:
     """Synthesize the bounded audition set and propose one provisional voice.
 
-    Provider availability and shared admission are checked *before* any durable
-    attempt is reserved: a missing key or denied admission spends zero synthesis
-    attempts and never poisons the durable manifest, so configuring a provider
-    afterwards can still run the audition.
+    Shared HIGH admission is checked before *each* new attempt reservation, so a
+    denial (including a cooldown applied by a previous 429) spends no new attempt.
+    Provider availability is likewise checked before reserving. A durable
+    consumed-budget floor survives a lost ledger or changed storage root and can
+    never authorize another nine-call batch.
     """
 
     identity = audition_identity(model, api_version)
     identity_digest = _identity_digest(identity)
     persist = _persist_audition(storage)
-    forced_unavailable = admit is not None and not _admit(admit)
 
     with _audition_lock(storage) as acquired:
         if not acquired:
@@ -362,6 +538,7 @@ def run_audition(
             )
         try:
             manifest = _load_manifest(storage)
+            floor = _load_consumed_budget(storage)
         except AuditionError as error:
             return AuditionResult(
                 samples=(),
@@ -371,6 +548,7 @@ def run_audition(
                 identity=identity,
                 notes=f"Malformed audition history; failing closed: {error}",
             )
+        floor_consumed = int(floor["consumed_attempts"]) if floor else 0
         if manifest is not None and manifest.get("identity_digest") != identity_digest:
             return AuditionResult(
                 samples=(),
@@ -383,6 +561,19 @@ def run_audition(
                     "a new model comparison is not automatically authorized."
                 ),
             )
+        if manifest is None and floor_consumed >= MAX_AUDITION_ATTEMPTS:
+            return AuditionResult(
+                samples=(),
+                provisional_voice=None,
+                raw_calls=0,
+                status=AUDITION_BUDGET_EXHAUSTED,
+                identity=identity,
+                notes=(
+                    "The consumed-budget floor shows the audition budget is already "
+                    "spent; a missing ledger does not authorize another batch."
+                ),
+            )
+        manifest_was_absent = manifest is None
         if manifest is None:
             manifest = _new_manifest(identity)
             _save_manifest(storage, manifest)
@@ -406,20 +597,26 @@ def run_audition(
                         _reuse_attempt(sample, existing, storage, manifest, fidelity, settings)
                         samples.append(sample)
                         continue
-                    # Provider availability and shared admission are checked BEFORE
-                    # reserving a durable attempt: an unavailable provider spends no
-                    # attempt and never poisons the manifest.
                     provider_ready = provider is not None and bool(
                         getattr(provider, "available", lambda: False)()
                     )
-                    if not provider_ready or forced_unavailable:
+                    if not provider_ready:
                         sample.error = _STATUS_UNAVAILABLE
                         samples.append(sample)
                         continue
                     attempts = manifest.get("attempts")
                     assert isinstance(attempts, list)
-                    if len(attempts) >= MAX_AUDITION_ATTEMPTS:
+                    recovered_extra = floor_consumed if manifest_was_absent else 0
+                    effective_consumed = max(len(attempts) + recovered_extra, floor_consumed)
+                    if effective_consumed >= MAX_AUDITION_ATTEMPTS:
                         sample.error = "ATTEMPT_CEILING"
+                        samples.append(sample)
+                        continue
+                    # Shared HIGH admission is checked before EACH new attempt
+                    # reservation: a denial spends no attempt.
+                    if admit is not None and not _admit(admit):
+                        sample.error = _STATUS_ADMISSION_DENIED
+                        sample.reason = "shared HIGH admission denied"
                         samples.append(sample)
                         continue
                     # Reserve durably BEFORE the HTTP operation.
@@ -451,20 +648,23 @@ def run_audition(
                         _bind_persist(provider, persist, voice, script.script_id, fingerprint)
                         audio = provider.synthesize(request)  # type: ignore[attr-defined]
                     except BaseException as error:  # noqa: BLE001 - report honestly
-                        # A crash/exception may or may not have reached the
-                        # provider: record uncertainty, never a retry.
-                        attempt["status"] = _STATUS_UNCERTAIN
+                        if not isinstance(error, Exception):
+                            attempt["status"] = _STATUS_UNCERTAIN
+                            attempt.setdefault("uncertainty", "CALL_INTERRUPTED")
+                            _save_manifest(storage, manifest)
+                            raise
+                        _record_failed_attempt(attempt, sample, error)
+                        if attempt.get("category") == RATE_LIMITED_REASON:
+                            _notify(on_rate_limited)
                         _save_manifest(storage, manifest)
-                        if isinstance(error, Exception):
-                            sample.error = f"UNCERTAIN:{type(error).__name__}"
-                            samples.append(sample)
-                            continue
-                        raise
+                        samples.append(sample)
+                        continue
                     # Persist the accepted response BEFORE local validation.
                     attempt["status"] = _STATUS_RESPONDED
                     attempt["relative_path"] = getattr(audio, "relative_path", "")
                     attempt["sha256"] = getattr(audio, "sha256", "")
                     _save_manifest(storage, manifest)
+                    sample.delivery_status = _STATUS_RESPONDED
                     sample.relative_path = str(getattr(audio, "relative_path", "") or "")
                     sample.sha256 = str(getattr(audio, "sha256", "") or "")
                     sample.duration_seconds = float(getattr(audio, "duration_seconds", 0.0) or 0.0)
@@ -495,6 +695,63 @@ def run_audition(
             notes=notes,
             identity=identity,
         )
+
+
+def _record_failed_attempt(
+    attempt: dict[str, object], sample: AuditionSample, error: Exception
+) -> None:
+    """Classify a raised provider failure truthfully (delivery vs content).
+
+    Uses the same pure classification as production materialization: an ambiguous
+    transport loss is UNCERTAIN, a known HTTP rejection is FAILED_KNOWN, and a
+    received-but-unusable response is RESPONDED with its content validation
+    failure. The typed category and a sanitized reason are persisted; an untyped
+    exception is conservatively UNCERTAIN and never invents a category.
+    """
+
+    status = raised_attempt_status(error)
+    category = str(getattr(error, "category", "") or "") or None
+    reason = _sanitize_reason(
+        getattr(error, "reason_code", None) or category or type(error).__name__,
+        type(error).__name__,
+    )
+    attempt["status"] = status
+    if category:
+        attempt["category"] = category
+    attempt["reason"] = reason
+    if status == _STATUS_UNCERTAIN:
+        attempt.setdefault(
+            "uncertainty", "TRANSPORT_AMBIGUOUS" if category else "UNTYPED_EXCEPTION"
+        )
+    if status == _STATUS_RESPONDED:
+        # A response arrived but its content was unusable: the delivery succeeded
+        # and the content validation failed.
+        validation = {
+            "status": "DEFERRED",
+            "findings": [category or reason],
+            "source": "provider_response",
+        }
+        attempt["content_failure"] = category or reason
+        attempt["validation"] = dict(validation)
+        sample.fidelity = dict(validation)
+    sample.delivery_status = status
+    sample.category = category
+    sample.reason = reason
+    sample.error = f"{status}:{reason}"
+
+
+def _sanitize_reason(value: object, fallback: str) -> str:
+    text = str(value or "").strip() or fallback
+    return text[:200]
+
+
+def _notify(callback: Callable[[], None] | None) -> None:
+    if callback is None:
+        return
+    try:
+        callback()
+    except Exception:
+        return
 
 
 def _admit(admit: Callable[[], bool]) -> bool:
@@ -550,9 +807,14 @@ def _reuse_attempt(
 
     The accepted synthesis is reused without any new raw call. Local validation is
     a *separate* checkpoint: a missing/deferred result, or a changed validation
-    dependency (effective local-validator runtime identity), reruns only the local
-    validator over the verified audio; a known ACCEPTED/REJECTED result is reused
-    unchanged when its dependency identity still matches.
+    dependency (effective local-validator runtime identity **including the
+    validation policy version**), reruns only the local validator over the
+    verified audio. The revalidated result is stored under ``revalidated_fidelity``;
+    the original ``fidelity`` (the historical raw findings) is never rewritten.
+
+    A received-but-unusable response is reused with its recorded content failure.
+    Historical uncertainty keeps whatever category/reason was recorded; a missing
+    historical category is never inferred and the attempt is never retried.
     """
 
     status = str(entry.get("status") or "")
@@ -561,6 +823,7 @@ def _reuse_attempt(
         sha256 = str(entry.get("sha256") or "")
         if _verify_file(storage, relative, sha256):
             sample.cached = True
+            sample.delivery_status = _STATUS_RESPONDED
             sample.relative_path = relative
             sample.sha256 = sha256
             stored_fidelity = entry.get("fidelity")
@@ -576,12 +839,25 @@ def _reuse_attempt(
             if stored_status in {"ACCEPTED", "REJECTED"} and not identity_changed:
                 sample.fidelity = stored
                 return
-            # Rerun the separate local validation over the verified audio (no TTS).
+            # Rerun the separate local validation over the verified audio (no TTS)
+            # and preserve the historical raw findings instead of rewriting them.
             validation = dict(fidelity(_reused_audio(sample)))
             validation.setdefault("validator_identity", current_identity)
             sample.fidelity = validation
-            entry["fidelity"] = dict(validation)
+            entry["revalidated_fidelity"] = dict(validation)
             _save_manifest(storage, manifest)
+            return
+        content_failure = entry.get("content_failure")
+        if content_failure:
+            # The response arrived but its content was unusable: reuse the recorded
+            # classification rather than calling it a missing artifact.
+            stored_validation = entry.get("validation")
+            sample.delivery_status = _STATUS_RESPONDED
+            sample.category = str(entry.get("category") or "") or None
+            sample.reason = str(entry.get("reason") or content_failure)
+            sample.error = f"RESPONDED:{content_failure}"
+            if isinstance(stored_validation, Mapping):
+                sample.fidelity = dict(stored_validation)
             return
         # A spent attempt whose artifact is missing/corrupted is not re-synthesized
         # (that would silently exceed the ceiling).
@@ -590,8 +866,13 @@ def _reuse_attempt(
     if status == _STATUS_UNAVAILABLE:
         sample.error = _STATUS_UNAVAILABLE
         return
-    # RESERVED/UNCERTAIN: unresolved uncertainty, never silently retried.
-    sample.error = "UNCERTAIN"
+    # RESERVED/UNCERTAIN: unresolved uncertainty, never silently retried. Preserve
+    # the recorded category/reason; never infer a missing historical category.
+    sample.delivery_status = _STATUS_UNCERTAIN
+    sample.category = str(entry.get("category") or "") or None
+    reason = str(entry.get("reason") or "") or None
+    sample.reason = reason
+    sample.error = f"UNCERTAIN:{reason}" if reason else "UNCERTAIN"
 
 
 def _attempt_id() -> str:
@@ -645,17 +926,22 @@ def _bind_persist(
 
 __all__ = [
     "AUDITION_ACTIVE",
+    "AUDITION_BUDGET_EXHAUSTED",
     "AUDITION_HISTORY_INVALID",
     "AUDITION_IDENTITY_MISMATCH",
     "AUDITION_OK",
     "AUDITION_SCRIPTS",
     "AUDITION_VOICES",
+    "CONSUMED_BUDGET_VERSION",
     "MAX_AUDITION_ATTEMPTS",
+    "RECOVERY_VERSION",
     "AuditionError",
     "AuditionResult",
     "AuditionSample",
     "AuditionScript",
     "audition_identity",
     "audition_request_identity",
+    "record_consumed_budget",
+    "record_recovery",
     "run_audition",
 ]

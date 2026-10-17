@@ -6,6 +6,120 @@
 > provider key is present" is stale; the only missing external prerequisite is
 > authorized source media.
 
+## Stage 6: SOL p5 corrections — cancellation reconciliation, export reuse/migration integrity, audition accounting, fidelity policy v2, evidence recovery (2026-10-17, continuation)
+
+Status: **the SOL-reviewed defects at p5 (`b768f6b`) are corrected with mounted-UI
+and backend regressions. Cancellation now treats inventory failure as UNKNOWN and
+reconciles an already-ended target from a fresh read; export verifies an existing
+package before reuse, fails closed on a corrupt/malformed/unsupported catalog, and
+preserves legacy diagnostic classification; the audition checks shared admission
+before every attempt, records typed delivery-vs-content outcomes through the same
+pure classification production uses, applies the shared rate-limit cooldown, and
+enforces a durable consumed-budget floor; local fidelity is versioned
+(`stage6-fidelity-v2`) with atomic protected forms and a deferred (not confirmed)
+transcript disagreement; and the spent audition budget plus lost evidence are
+recorded durably. Stage 6 remains NOT FROZEN; `publication_ready` stays false.**
+
+### Corrections
+1. **Cancellation reconciliation (`frontend/src/lib/produce-runner.ts`).** An
+   unreadable inventory is now `UNKNOWN`, never absence: `findActiveIngestJob`
+   returns found/none/unknown, and unknown yields `CANCEL_UNCONFIRMED` with a
+   retryable reason instead of falsely reporting "Cancelled". A failed/already-ended
+   target (`409`) is reconciled by **freshly reading that exact job/materialization**
+   (`resolveJobTarget` / `resolveMaterializationTarget`); only a verified terminal
+   (or 404-absent) read settles, a failed read does not. Run-owned terminal
+   identities are cleared (`clearJobIdentity`) so an old succeeded job cannot hide
+   a later active target, and the inventory is only consulted after run-owned
+   in-flight submissions are drained. Regressions:
+   `frontend/src/components/produce-runner.dom.test.tsx` (now **8** mounted tests,
+   incl. inventory-unavailable-then-recovery, 409-fresh-read, and
+   terminal-cleared-then-later-active-target).
+2. **Export integrity at reuse and migration
+   (`backend/app/materialization/acceptance_export.py`).** `_publish_case_package`
+   no longer trusts `target.exists()`: `_package_integrity_reasons` re-verifies the
+   manifest hash against the declared identity, the index, and every listed
+   destination file hash. On mismatch it fails closed (`integrity_failure`) without
+   deleting the valid staging evidence or overwriting the existing package, and the
+   catalog is not updated as successful. `_read_catalog` fails closed
+   (`CatalogIntegrityError`) on an unreadable/malformed/unsupported catalog instead
+   of resetting it to empty, and legacy migration establishes a published reference
+   only from explicit favorable metadata *and* verified package evidence — a
+   `published=true, genuine_acceptance=false` entry is preserved as diagnostic.
+   Regressions: `backend/tests/test_stage6_sol_p5_regressions.py` (corrupt reuse,
+   malformed/unsupported catalog, legacy diagnostic, valid reuse).
+3. **Audition admission and delivery accounting
+   (`backend/app/materialization/tts_audition.py`, `app/cli.py`).** Shared HIGH
+   admission is checked before *each* new attempt (a denial spends none) and a 429
+   notifies the same admission controller's cooldown so later samples cannot proceed
+   through it. Failures are classified by the shared pure
+   `app/materialization/delivery.py` (also used by production materialization): a
+   timeout/transport ambiguity is `UNCERTAIN`, a known HTTP rejection is
+   `FAILED_KNOWN`, and a received-but-unusable response is `RESPONDED` with its
+   content validation failure; a crash-left reservation is `UNCERTAIN`. The typed
+   category and a sanitized reason are persisted, and historical uncertainty never
+   has a category inferred for it.
+4. **Fidelity policy v2 (`app/materialization/narration.py`,
+   `app/materialization/tts_gemini.py`, `app/materialization/executor.py`).**
+   `compare_transcripts` preserves ordered content, multiplicity, negation, numbers,
+   and — reusing `app.transcription.dialect.extract_protected_tokens` atomically —
+   protected technical/numeric forms (so `C++`/`C#` are never accepted as `C`,
+   URLs and compound numbers stay exact). A **lone ASR transcript disagreement is
+   now `DEFERRED`** with a structured reason/diff, not a confirmed
+   `MEANING_MISMATCH`; independently established audio/content failures
+   (silent/empty/truncated/clipped/invalid) still `REJECT`. The policy version
+   (`FIDELITY_POLICY_VERSION = "stage6-fidelity-v2"`) participates in the validator
+   runtime identity, so retained audio is revalidated locally (no synthesis) on a
+   policy change, and the historical raw findings are preserved under
+   `revalidated_fidelity` rather than rewritten. MIME parsing now refuses
+   conflicting duplicate parameters and invalid non-null declared numeric metadata
+   while retaining the working parameterized PCM response. Regressions:
+   `test_stage6_tts_boundary.py` (19) + `test_stage6_sol_p5_regressions.py`.
+5. **Evidence recovery and spent budget
+   (`app/materialization/tts_audition.py`, `app/cli.py`
+   `stage6-tts-audition-recover`).** `record_recovery`/`record_consumed_budget`
+   verify any surviving captured audio against its recorded hash and write a
+   durable `consumed-budget.json` floor (plus a `recovery.json` record) under
+   managed storage, so a missing ledger, a changed storage root, or a container
+   restart can never authorize another nine-call batch. `run_audition` refuses a
+   missing-ledger run against an exhausted floor (`AUDITION_BUDGET_EXHAUSTED`).
+
+### Verification (this session)
+- Docker `oac-stage6-test` (Python 3.12.14, real FFmpeg 7.1.5, google-genai
+  2.31.0) + PostgreSQL `oac-stage6-pg-v4`:
+  - `test_stage6_sol_p5_regressions.py` (new, 14): passed.
+  - `test_stage6_tts_boundary.py` (19), `adapter_regressions`, `sol2_regressions`,
+    `sol3_regressions`, `supporting_narration`, `blocker_regressions` (62):
+    passed.
+  - `results_boundary` + `cache_validation` (20, real FFmpeg): passed.
+  - `adapter_regressions` + `api_cli_acceptance` + `rc_corrections` +
+    `rc_v4_corrections` (51): passed.
+  - `ruff check app tests`: clean.
+- Frontend: `vitest run` **72 passed** (10 files, incl. 8 mounted DOM tests);
+  `eslint src --max-warnings=0` clean; `next build` succeeded; `tsc --noEmit`
+  retains only the pre-existing `job-poller.test.tsx` test-only typing error.
+- **No live provider calls** were made in this session. The prior session's
+  accounting stands: 1 probe + 9 audition = 10 hosted synthesis calls. Recovery
+  confirms 9 audition attempts + 1 probe; all audition audio is **lost**
+  (ephemeral container storage) and is recorded as such.
+- Durable evidence paths (managed storage, gitignored runtime data):
+  `storage/benchmarks/stage-6/tts-audition/recovery.json` and
+  `storage/benchmarks/stage-6/tts-audition/consumed-budget.json`
+  (`consumed_attempts=9`, `probe_calls=1`). The captured report
+  (`/tmp/audition-out.json`, sha256 `2d39a09a…0038`) is preserved unchanged.
+
+### Fixed / unproven / blocked
+- **Fixed**: cancellation reconciliation; export reuse/migration integrity;
+  audition admission/delivery accounting + cooldown + budget floor; fidelity
+  policy v2 (protected forms, deferred disagreement, versioned fingerprints) and
+  MIME hardening; evidence recovery.
+- **Unproven (unresolved product decision)**: the hosted TTS voice. No voice is
+  validated; `provisional_voice` remains unset. Any further live generation needs
+  a separately agreed bounded recovery budget.
+- **Internally blocked**: none.
+- **Externally blocked**: Task 9 genuine authorized-media acceptance (no
+  authorized source media). A hosted key is present; only authorized media is
+  missing.
+
 ## Stage 6: frontend cancellation ownership, Results render binding, immutable export publication, and live TTS audition (2026-10-17, continuation)
 
 Status: **the three remaining implementation blockers are corrected with mounted-UI
@@ -71,15 +185,18 @@ returned NO technically viable voice, so no provisional voice was recorded. Stag
   metadata, and unknown-container refusals).
 - **Audition result (truthful negative).** `python -m app.cli stage6-tts-audition`
   ran the fixed 3 voices x 3 scripts set: `raw_calls = 9`, `provisional_voice =
-  null`, `status = OK`. All three voices ACCEPTED the English script; every
-  Egyptian-Arabic and Arabic/English code-switch script was `REJECTED`
-  (`MEANING_MISMATCH`) — the local audio-backed fidelity comparison is strict
-  (near-miss spelling/variant transcripts such as `فكراها` vs `فاكراها` are not
-  accepted), and `Achird` additionally failed two provider calls
-  (`UNCERTAIN:MaterializationProviderError`). Because no voice cleared all three
-  scripts, the conservative default stands: **no provisional voice; the hosted TTS
-  voice remains an unresolved product decision, not a placeholder.** The
-  comparison gate was NOT loosened (that would weaken Stage 6).
+  null`, `status = OK`. The captured result is exactly: **two accepted English
+  samples, five rejected comparisons, and two uncertain failures** (Achird failed
+  two provider calls). "No voice validated" is justified by that evidence.
+  **Confirmed failure of all three voices' Arabic speech is NOT established** —
+  the five rejections were strict transcript-disagreement comparisons, which the
+  later `stage6-fidelity-v2` policy reclassifies as *deferred* evidence, not
+  confirmed meaning mismatches. No voice cleared all three scripts, so the
+  conservative default stands: **no provisional voice; the hosted TTS voice
+  remains an unresolved product decision, not a placeholder.** The comparison gate
+  was NOT loosened (that would weaken Stage 6). The audio/history was produced in
+  an ephemeral container storage root and is irrecoverable; the consumed budget is
+  preserved (see the next section).
 
 ### Verification (this session)
 - Docker `oac-stage6-test` (Python 3.12.14, real FFmpeg 7.1.5, google-genai

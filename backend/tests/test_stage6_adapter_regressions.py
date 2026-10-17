@@ -95,7 +95,7 @@ def test_unknown_critical_critique_defers_not_accepted() -> None:
     assert script.deferred is True
 
 
-def test_repeated_name_role_reversal_is_rejected() -> None:
+def test_repeated_name_role_reversal_is_not_accepted() -> None:
     class Engine:
         def transcribe(self, *args: object, **kwargs: object) -> object:
             return type(
@@ -108,8 +108,11 @@ def test_repeated_name_role_reversal_is_rejected() -> None:
         engine=Engine(),
         options=object(),
     )
-    assert result.status == "REJECTED"
-    assert "MEANING_MISMATCH" in result.findings
+    # The role reversal is still detected (never accepted); a lone transcript
+    # disagreement is deferred evidence, not a confirmed meaning mismatch.
+    assert result.status == "DEFERRED"
+    assert result.accepted is False
+    assert "ASR_TRANSCRIPT_DISAGREEMENT" in result.findings
 
 
 def test_narration_assets_are_content_addressed(tmp_path: Path) -> None:

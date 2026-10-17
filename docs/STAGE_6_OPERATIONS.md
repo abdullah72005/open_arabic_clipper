@@ -30,12 +30,34 @@ python -m app.cli production-profile-import path/to/profile.json
 # Read-only exports (never fabricate eligibility).
 python -m app.cli stage6-acceptance-export [--discover] [--limit 4] [--materialization-id ID ...]
 python -m app.cli stage6-tts-audition                      # 3 voices x 3 scripts, <=9 calls
+
+# Recover surviving audition evidence and preserve the consumed-budget floor.
+python -m app.cli stage6-tts-audition-recover --report path/to/captured.json --probe-calls 1
 ```
 
 An omitted `--profile-key` (and an omitted API `profile_key`) resolves to the
 current `channel_key='default'` profile when one exists, otherwise to the neutral
 no-voice profile. `stage6-tts-audition` makes zero live calls without a configured
 `GEMINI_API_KEY` and reports that honestly.
+
+Audition accounting is truthful: shared HIGH admission is checked before *each*
+attempt (a denial spends no attempt), a 429 applies the shared rate/quota cooldown,
+and each attempt is classified by the shared pure delivery classification
+(`UNCERTAIN` for transport ambiguity/crash-left reservation, `FAILED_KNOWN` for a
+known HTTP rejection, `RESPONDED` for a received-but-unusable response). The
+durable `consumed-budget.json` floor survives a missing ledger, changed storage
+root, or container restart, so recovery never authorizes a fresh nine-call batch.
+Local narration fidelity is policy-versioned (`stage6-fidelity-v2`): protected
+technical/numeric forms are preserved atomically, and a lone ASR transcript
+disagreement is deferred evidence (never an automatic confirmed meaning mismatch)
+while independently established audio/content failures still reject. Deferral
+never approves a voice or review readiness.
+
+Published export packages are immutable and self-verifying: an existing
+`packages/<case>/<package_identity>/` is reused only after its manifest, index, and
+every listed file hash re-verify. A corrupt existing package, or an
+unreadable/malformed/unsupported catalog, fails closed and preserves the previous
+reference and the valid staging evidence.
 
 ## Objective and ownership
 

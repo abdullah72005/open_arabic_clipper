@@ -17,11 +17,17 @@ import httpx
 from google import genai
 from google.genai import types
 
-from app.materialization.narration import inspect_wav, wrap_pcm_as_wav
+from app.materialization.narration import (
+    compare_transcripts,
+    inspect_wav,
+    transcription_matches,
+    wrap_pcm_as_wav,
+)
 from app.materialization.providers import MaterializationProviderError
 from app.materialization.tts_gemini import (
     FIDELITY_ACCEPTED,
     FIDELITY_DEFERRED,
+    FIDELITY_POLICY_VERSION,
     FIDELITY_REJECTED,
     GEMINI_TTS_MODEL,
     GeminiNarrationSynthesizer,
@@ -293,7 +299,7 @@ def test_fidelity_defers_on_empty_transcript() -> None:
     assert "EMPTY_TRANSCRIPT" in result.findings
 
 
-def test_fidelity_rejects_negation_scope_reversal() -> None:
+def test_fidelity_defers_on_transcript_disagreement_not_confirmed_mismatch() -> None:
     engine = _FakeASREngine("this will increase the price")
     result = validate_narration_fidelity(
         __import__("pathlib").Path("x.wav"),
@@ -301,5 +307,91 @@ def test_fidelity_rejects_negation_scope_reversal() -> None:
         engine=engine,
         options=_Opts(),
     )
+    # A lone ASR disagreement is deferred evidence, never a confirmed mismatch.
+    assert result.status == FIDELITY_DEFERRED
+    assert result.accepted is False
+    assert "ASR_TRANSCRIPT_DISAGREEMENT" in result.findings
+    assert result.diff.get("expected_tokens")
+    assert result.as_dict()["policy_version"] == FIDELITY_POLICY_VERSION
+
+
+def test_fidelity_rejects_independently_established_audio_failure() -> None:
+    engine = _FakeASREngine("this will not increase the price")
+    result = validate_narration_fidelity(
+        __import__("pathlib").Path("x.wav"),
+        expected_text="this will not increase the price",
+        engine=engine,
+        options=_Opts(),
+        audio_validation={"findings": ["SILENT_AUDIO"], "ok": False},
+    )
     assert result.status == FIDELITY_REJECTED
-    assert "MEANING_MISMATCH" in result.findings
+    assert "SILENT_AUDIO" in result.findings
+
+
+def test_transcription_preserves_protected_technical_forms() -> None:
+    assert transcription_matches("Use C++ now", "Use C++ now")
+    assert not transcription_matches("Use C++ now", "Use C now")
+    assert not transcription_matches("Use C# now", "Use C now")
+    assert not transcription_matches("run foo/bar here", "run foo bar here")
+
+
+def test_transcription_preserves_compound_numbers() -> None:
+    assert transcription_matches("Pay 1,000 now", "Pay 1,000 now")
+    assert not transcription_matches("Pay 1,000 now", "Pay 1000 now")
+    assert not transcription_matches("Call 555-1234", "Call 5551234")
+
+
+def test_transcription_preserves_roles_order_multiplicity_and_negation() -> None:
+    assert not transcription_matches("Ali told Sara", "Sara told Ali")  # role reversal
+    assert not transcription_matches("the quick brown fox", "the quick fox")  # omission
+    assert not transcription_matches("very very good", "very good")  # repetition
+    assert not transcription_matches("a b c", "c b a")  # ordering
+    assert not transcription_matches("I will not approve", "I will approve")  # negation
+
+
+def test_transcription_defers_on_spelling_and_transliteration_disagreements() -> None:
+    # Arabic spelling variant and a Latin transliteration are disagreements, not
+    # confirmations: the comparison still fails, so the caller must defer.
+    spelling = compare_transcripts(
+        "الموضوع مش بالبساطة اللي الناس فاكراها",
+        "الموضوع مش بالبساطة اللي الناس فكراها",
+    )
+    assert spelling.matches is False
+    assert "CONTENT_SEQUENCE_MISMATCH" in spelling.findings
+    transliteration = compare_transcripts(
+        "الـ rollout الجديد", "الرولاوت الجديد",
+    )
+    assert transliteration.matches is False
+
+
+def test_tts_duplicate_conflicting_mime_parameter_is_refused() -> None:
+    provider = GeminiNarrationSynthesizer(
+        api_key="fake", persist=lambda chunk, data: ("review.wav", "a" * 64)
+    )
+    audio = {
+        "mime_type": "audio/l16; rate=48000; rate=24000; channels=1",
+        "data": base64.b64encode(b"\x10\x20" * 50).decode(),
+    }
+    try:
+        provider._narration_from_interaction(_request(), {"output_audio": audio}, "Kore", "")
+    except MaterializationProviderError as error:
+        assert error.category == "MALFORMED_OUTPUT"
+    else:  # pragma: no cover
+        raise AssertionError("expected MALFORMED_OUTPUT")
+
+
+def test_tts_invalid_declared_numeric_metadata_is_refused() -> None:
+    provider = GeminiNarrationSynthesizer(
+        api_key="fake", persist=lambda chunk, data: ("review.wav", "a" * 64)
+    )
+    audio = {
+        "mime_type": "audio/l16; channels=1",
+        "sample_rate": "24000",
+        "data": base64.b64encode(b"\x10\x20" * 50).decode(),
+    }
+    try:
+        provider._narration_from_interaction(_request(), {"output_audio": audio}, "Kore", "")
+    except MaterializationProviderError as error:
+        assert error.category == "MALFORMED_OUTPUT"
+    else:  # pragma: no cover
+        raise AssertionError("expected MALFORMED_OUTPUT")

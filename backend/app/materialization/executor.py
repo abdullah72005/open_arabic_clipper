@@ -212,7 +212,10 @@ def _narration_fidelity_validator(
 ) -> Callable[[object], Mapping[str, object]]:
     """Build the local audio-backed fidelity validator under the heavy-model lease."""
 
-    from app.materialization.tts_gemini import validate_narration_fidelity
+    from app.materialization.tts_gemini import (
+        FIDELITY_POLICY_VERSION,
+        validate_narration_fidelity,
+    )
     from app.transcription.engine import WhisperEngine
 
     def runtime_identity() -> dict[str, object]:
@@ -221,13 +224,14 @@ def _narration_fidelity_validator(
         try:
             options = settings.targeted_transcription_options("FINAL_CLIP")
         except Exception:
-            return {"provider": "faster-whisper"}
+            return {"provider": "faster-whisper", "policy_version": FIDELITY_POLICY_VERSION}
         return {
             "provider": "faster-whisper",
             "model": getattr(options, "model", ""),
             "device": getattr(options, "device", ""),
             "compute_type": getattr(options, "compute_type", ""),
             "beam_size": getattr(options, "beam_size", None),
+            "policy_version": FIDELITY_POLICY_VERSION,
         }
 
     def validate(audio: object) -> Mapping[str, object]:
@@ -251,6 +255,7 @@ def _narration_fidelity_validator(
                 lease_factory=lease_factory,
                 cancel_event=cancel_event,  # type: ignore[arg-type]
                 is_cancelled=is_cancelled,
+                audio_validation=getattr(audio, "validation", {}),
             )
         except Exception:
             return {"status": "DEFERRED", "findings": ["FIDELITY_UNAVAILABLE"]}

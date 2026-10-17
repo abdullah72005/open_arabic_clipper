@@ -24,6 +24,11 @@ from sqlalchemy.orm import Session
 
 from app.core.enums import MaterializationLifecycle, MaterializationOutcome
 from app.core.settings import Settings
+from app.materialization.delivery import (
+    RATE_LIMITED_REASON,
+    delivery_status,
+    raised_attempt_status,
+)
 from app.materialization.fingerprints import output_fingerprint, stable_digest
 from app.materialization.inputs import MaterializationInputs
 from app.materialization.narration import NarrationSynthesizer
@@ -44,7 +49,6 @@ from app.materialization.providers import (
     WritingResult,
 )
 from app.materialization.repository import (
-    ATTEMPT_FAILED_KNOWN,
     ATTEMPT_RESERVED,
     ATTEMPT_RESPONDED,
     ATTEMPT_UNCERTAIN,
@@ -98,58 +102,16 @@ class ComponentContext:
     on_rate_limited: Callable[[], None] | None = None
 
 
-#: Provider failure categories that mean the HTTP response was received (even if
-#: its semantic content was unusable). A malformed/safety-refused response is a
-#: truthful RESPONDED attempt; only its *content* was not accepted.
-_RESPONDED_DELIVERY_REASONS = frozenset({"MALFORMED_OUTPUT", "SAFETY_REFUSAL"})
-#: Provider failure categories that mean the request may have reached the
-#: provider but no response was received (ambiguous transport loss).
-_UNCERTAIN_DELIVERY_REASONS = frozenset({"TIMEOUT", "CONNECTION"})
-_RATE_LIMITED_REASON = "RATE_LIMITED"
+#: The pure delivery classification is shared with the bounded TTS audition so
+#: both interpret a provider outcome identically (delivery outcome vs content
+#: validity). See :mod:`app.materialization.delivery`.
+_RATE_LIMITED_REASON = RATE_LIMITED_REASON
+_delivery_status = delivery_status
+_raised_attempt_status = raised_attempt_status
 #: A prior attempt left RESERVED (crash in the reserve→call gap) or UNCERTAIN
 #: (ambiguous transport loss) is unresolved uncertainty: a later ordinary
 #: recovery/redelivery must never silently invoke the provider again.
 _UNCERTAIN_UNRESOLVED_REASON = "PROVIDER_UNCERTAIN_UNRESOLVED"
-
-
-def _raised_attempt_status(error: BaseException) -> str:
-    """Classify a *raised* typed provider error into a truthfully durable status.
-
-    A typed ``MaterializationProviderError`` whose category is a known HTTP
-    rejection is ``FAILED_KNOWN``; an ambiguous transport loss (timeout/
-    connection) is ``UNCERTAIN``. Any untyped exception from a hosted call is
-    ambiguous and therefore conservatively ``UNCERTAIN``. Content is irrelevant
-    here: a received HTTP response is classified by the caller, not by an
-    exception.
-    """
-
-    category = str(getattr(error, "category", "") or "")
-    if category in _UNCERTAIN_DELIVERY_REASONS:
-        return ATTEMPT_UNCERTAIN
-    if category:
-        return ATTEMPT_FAILED_KNOWN
-    return ATTEMPT_UNCERTAIN
-
-
-def _delivery_status(response: object) -> str:
-    """Classify a returned provider response into a truthful attempt outcome.
-
-    A non-deferred response (or a received response whose content is unusable) is
-    RESPONDED; an ambiguous transport loss after possible submission is UNCERTAIN;
-    a known provider rejection is FAILED_KNOWN. Only a RESPONDED *and validated*
-    response may become an accepted checkpoint.
-    """
-
-    deferred = bool(getattr(response, "deferred", False))
-    reason = getattr(response, "reason_code", None)
-    reason_code = str(reason) if reason else ""
-    if not deferred:
-        return ATTEMPT_RESPONDED
-    if reason_code in _UNCERTAIN_DELIVERY_REASONS:
-        return ATTEMPT_UNCERTAIN
-    if reason_code in _RESPONDED_DELIVERY_REASONS:
-        return ATTEMPT_RESPONDED
-    return ATTEMPT_FAILED_KNOWN
 
 
 def script_dependency_inputs(

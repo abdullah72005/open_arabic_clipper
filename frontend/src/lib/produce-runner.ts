@@ -247,42 +247,143 @@ export function runProduceChain(
   const jobOutcome = (status: string): CancelOutcome =>
     isTerminalJob(status) ? { status: "confirmed" } : { status: "unconfirmed", error: `job ${status}` };
 
-  // Resolve the exact active ingest job observed for this submitted source. Never
-  // a job that does not belong to this run's source.
-  const findActiveIngestJob = async (): Promise<string | null> => {
-    if (!submittedSourceId) return null;
+  type InventoryResult =
+    | { status: "found"; jobId: string }
+    | { status: "none" }
+    | { status: "unknown"; error: string };
+
+  // Resolve the exact active ingest job observed for this submitted source. An
+  // unavailable inventory is UNKNOWN, never absence: a failed read cannot prove
+  // that no run-owned work exists.
+  const findActiveIngestJob = async (): Promise<InventoryResult> => {
+    if (!submittedSourceId) return { status: "none" };
     try {
       const jobs = await api.listJobs();
       const active = jobs.find(
         (job) => job.source_video_id === submittedSourceId && isActiveJobStatus(job.status)
       );
-      return active ? active.id : null;
-    } catch {
-      return null;
+      return active ? { status: "found", jobId: active.id } : { status: "none" };
+    } catch (cause) {
+      return { status: "unknown", error: errorMessage(cause) };
+    }
+  };
+
+  // Forget a target that is verified terminal/absent so an old succeeded job can
+  // never permanently hide a later active target.
+  const clearJobIdentity = (id: string): void => {
+    if (activeJobId === id) activeJobId = null;
+    if (pendingQueueJobId === id) pendingQueueJobId = null;
+    if (ingestJobId === id) ingestJobId = null;
+  };
+
+  const readJob = async (id: string): Promise<{ ok: true; job: Job | null } | { ok: false; error: string }> => {
+    try {
+      return { ok: true, job: await api.getJob(id) };
+    } catch (cause) {
+      if (cause instanceof ApiError && cause.status === 404) return { ok: true, job: null };
+      return { ok: false, error: errorMessage(cause) };
+    }
+  };
+
+  const readMaterialization = async (
+    id: string
+  ): Promise<{ ok: true; row: Materialization | null } | { ok: false; error: string }> => {
+    try {
+      return { ok: true, row: await api.getMaterialization(id) };
+    } catch (cause) {
+      if (cause instanceof ApiError && cause.status === 404) return { ok: true, row: null };
+      return { ok: false, error: errorMessage(cause) };
+    }
+  };
+
+  // A failed cancel (e.g. 409 because the target already ended) is reconciled by
+  // freshly reading the exact target. Only a verified terminal read settles
+  // ("terminal"); a failed/unavailable read stays unconfirmed.
+  const resolveJobTarget = async (jobId: string): Promise<CancelOutcome | "terminal"> => {
+    try {
+      const job = await api.cancelJob(jobId);
+      return jobOutcome(job.status);
+    } catch (cause) {
+      const cancelError = errorMessage(cause);
+      const read = await readJob(jobId);
+      if (!read.ok) {
+        return {
+          status: "unconfirmed",
+          error: `${cancelError}; state read failed: ${read.error}`
+        };
+      }
+      if (read.job === null || isTerminalJob(read.job.status)) return "terminal";
+      return { status: "unconfirmed", error: cancelError };
+    }
+  };
+
+  const resolveMaterializationTarget = async (
+    id: string
+  ): Promise<CancelOutcome | "terminal"> => {
+    try {
+      const row = await api.cancelMaterialization(id);
+      return lifecycleOutcome(row.lifecycle);
+    } catch (cause) {
+      const cancelError = errorMessage(cause);
+      const read = await readMaterialization(id);
+      if (!read.ok) {
+        return {
+          status: "unconfirmed",
+          error: `${cancelError}; state read failed: ${read.error}`
+        };
+      }
+      if (read.row === null || isTerminalLifecycle(read.row.lifecycle)) return "terminal";
+      return { status: "unconfirmed", error: cancelError };
     }
   };
 
   const performCancellation = async (): Promise<CancelOutcome> => {
-    const id = materializationId;
-    if (id) {
-      try {
-        const row = await api.cancelMaterialization(id);
-        return lifecycleOutcome(row.lifecycle);
-      } catch (cause) {
-        return { status: "unconfirmed", error: errorMessage(cause) };
-      }
+    let sawTerminal = false;
+
+    // Stage 6: the exact durable materialization for this run.
+    if (materializationId) {
+      const id = materializationId;
+      const outcome = await resolveMaterializationTarget(id);
+      if (outcome !== "terminal") return outcome;
+      sawTerminal = true;
+      if (materializationId === id) materializationId = null;
     }
-    let jobId = activeJobId ?? pendingQueueJobId ?? ingestJobId;
-    if (!jobId) jobId = await findActiveIngestJob();
-    if (jobId) {
-      try {
-        const job = await api.cancelJob(jobId);
-        return jobOutcome(job.status);
-      } catch (cause) {
-        return { status: "unconfirmed", error: errorMessage(cause) };
-      }
+
+    // Jobs this run itself created/observed. Only exact run-owned identities are
+    // ever cancelled; a terminal one is cleared so a later active target is seen.
+    const known = [
+      ...new Set(
+        [activeJobId, pendingQueueJobId, ingestJobId].filter(
+          (value): value is string => Boolean(value)
+        )
+      )
+    ];
+    for (const jobId of known) {
+      const outcome = await resolveJobTarget(jobId);
+      if (outcome !== "terminal") return outcome;
+      sawTerminal = true;
+      clearJobIdentity(jobId);
     }
-    return { status: "no_active_work" };
+
+    // Only after draining run-owned submissions do we consult the source
+    // inventory. A failed inventory is unknown, never "no active work".
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      const inventory = await findActiveIngestJob();
+      if (inventory.status === "unknown") {
+        return {
+          status: "unconfirmed",
+          error: `ingest inventory unavailable: ${inventory.error}`
+        };
+      }
+      if (inventory.status === "none") {
+        return sawTerminal ? { status: "confirmed" } : { status: "no_active_work" };
+      }
+      const outcome = await resolveJobTarget(inventory.jobId);
+      if (outcome !== "terminal") return outcome;
+      sawTerminal = true;
+      clearJobIdentity(inventory.jobId);
+    }
+    return { status: "unconfirmed", error: "run-owned work changed during cancellation" };
   };
 
   const settleCancellation = (result: CancelOutcome): void => {

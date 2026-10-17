@@ -27,6 +27,7 @@ from app.materialization.types import (
     NarrationSynthesisRequest,
 )
 from app.render.binding import expand_contractions
+from app.transcription.dialect import extract_protected_tokens
 
 
 @dataclass(frozen=True)
@@ -233,22 +234,78 @@ def transcription_matches(expected: str, actual: str) -> bool:
     orthographic variants are folded, contractions expanded, and clear
     non-lexical fillers dropped (the only documented exceptions). The normalized
     *content token sequence* of the actual transcript must then equal the expected
-    sequence exactly: every token, its multiplicity, and its order must match. A
-    permissive similarity ratio is never acceptance authority, so every
-    participant role, negation scope, number association, and code-switch token is
-    preserved. Any difference in sequence, occurrence, or order is a clear
-    meaning mismatch.
+    sequence exactly: every token, its multiplicity, and its order must match. In
+    addition, every protected technical/numeric form (``C++``, ``C#``, ``foo/bar``,
+    URLs, Western and Arabic-Indic numbers, simple compound numeric/date forms) is
+    preserved as one exact atomic token, so ``C++`` is never accepted as ``C``. A
+    permissive similarity ratio is never acceptance authority, so every participant
+    role, negation scope, number association, and code-switch token is preserved.
+    Any difference in sequence, occurrence, order, or protected form is a clear
+    mismatch.
+
+    This is a thin boolean wrapper over :func:`compare_transcripts`; callers that
+    must report *why* a transcript disagreed use the structured result directly.
+    """
+
+    return compare_transcripts(expected, actual).matches
+
+
+@dataclass(frozen=True)
+class TranscriptComparison:
+    """Structured, deterministic ASR-vs-script comparison evidence."""
+
+    matches: bool
+    findings: tuple[str, ...]
+    diff: dict[str, object]
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "matches": self.matches,
+            "findings": list(self.findings),
+            "diff": dict(self.diff),
+        }
+
+
+def compare_transcripts(expected: str, actual: str) -> TranscriptComparison:
+    """Compare a transcript to the accepted copy, keeping disagreement evidence.
+
+    The comparison is exactly as strict as :func:`transcription_matches` (ordered
+    content sequence plus atomic protected forms), but it never silently collapses a
+    disagreement into a single boolean: the returned diff records the normalized
+    token sequences and the first divergence so a caller can defer with a
+    structured reason instead of asserting a confirmed meaning mismatch.
     """
 
     expected_tokens = _tokenize(expected)
     if not expected_tokens:
-        return True
+        return TranscriptComparison(True, (), {})
     actual_tokens = _tokenize(actual)
     expected_content = _content_tokens(expected_tokens)
     actual_content = _content_tokens(actual_tokens)
-    if expected_content != actual_content:
-        return False
-    return True
+    expected_protected = tuple(token.casefold() for token in extract_protected_tokens(expected))
+    actual_protected = tuple(token.casefold() for token in extract_protected_tokens(actual))
+    findings: list[str] = []
+    content_equal = expected_content == actual_content
+    protected_equal = expected_protected == actual_protected
+    if not protected_equal:
+        findings.append("PROTECTED_TOKEN_MISMATCH")
+    if not content_equal:
+        findings.append("CONTENT_SEQUENCE_MISMATCH")
+    shared = min(len(expected_content), len(actual_content))
+    first_divergence = next(
+        (index for index in range(shared) if expected_content[index] != actual_content[index]),
+        shared if len(expected_content) != len(actual_content) else None,
+    )
+    diff: dict[str, object] = {}
+    if findings:
+        diff = {
+            "expected_tokens": list(expected_content),
+            "actual_tokens": list(actual_content),
+            "expected_protected": list(expected_protected),
+            "actual_protected": list(actual_protected),
+            "first_divergence": first_divergence,
+        }
+    return TranscriptComparison(not findings, tuple(findings), diff)
 
 
 def _is_subsequence(needle: Sequence[str], haystack: Sequence[str]) -> bool:
@@ -398,7 +455,9 @@ def _optional_str(value: object) -> str | None:
 __all__ = [
     "FakeNarrationSynthesizer",
     "NarrationSynthesizer",
+    "TranscriptComparison",
     "WavInfo",
+    "compare_transcripts",
     "inspect_wav",
     "narration_requests",
     "transcription_matches",

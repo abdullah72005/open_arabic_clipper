@@ -1574,6 +1574,7 @@ def stage6_tts_audition(
     from app.materialization.acceptance_export import export_tts_audition
     from app.materialization.executor import (
         _admission_callable,
+        _rate_limit_notifier,
         build_local_narration_fidelity_validator,
     )
     from app.materialization.tts_audition import run_audition
@@ -1602,8 +1603,11 @@ def stage6_tts_audition(
     # check; a missing/deferred/rejected result makes the voice nonviable rather
     # than silently proposing it.
     fidelity = build_local_narration_fidelity_validator(settings, storage)
-    # Shared HIGH admission is checked before any synthesis attempt is reserved.
-    admit = _admission_callable(settings.gemini_admission_controller())
+    # Shared HIGH admission is checked before EACH synthesis attempt, and a 429
+    # notifies the same controller so its cooldown blocks later samples.
+    controller = settings.gemini_admission_controller()
+    admit = _admission_callable(controller)
+    on_rate_limited = _rate_limit_notifier(controller)
 
     result = run_audition(
         settings=settings,
@@ -1613,6 +1617,7 @@ def stage6_tts_audition(
         voice_factory=voice_factory,
         fidelity=fidelity,
         admit=admit,
+        on_rate_limited=on_rate_limited,
     )
     exported = export_tts_audition(settings, [sample.as_dict() for sample in result.samples],
                                    output_root=output_root)
@@ -1621,6 +1626,35 @@ def stage6_tts_audition(
     if not key_value:
         payload["notes"] = "GEMINI_API_KEY not configured; audition not run."
     typer.echo(json.dumps(payload, ensure_ascii=False, default=str))
+
+
+@app.command("stage6-tts-audition-recover")
+def stage6_tts_audition_recover(
+    report: Path = typer.Option(..., "--report", help="Captured audition result JSON"),
+    probe_calls: int = typer.Option(1, "--probe-calls", help="Hosted probe calls to include"),
+) -> None:
+    """Recover surviving audition evidence and persist the consumed-budget floor.
+
+    Recovers any surviving audio referenced by the captured report (verifying each
+    against its captured hash) into managed storage, records lost evidence
+    truthfully, and writes a durable consumed-budget floor so a missing ledger, a
+    changed storage root, or a container restart can never authorize another
+    nine-call batch. The probe call remains part of call accounting.
+    """
+
+    from app.materialization.tts_audition import record_recovery
+    from app.services.storage import StorageService
+
+    settings = get_settings()
+    storage = StorageService(settings.storage_root)
+    if not report.is_file():
+        typer.echo(json.dumps({"error": f"report not found: {report}"}, ensure_ascii=False))
+        raise typer.Exit(code=1)
+    payload = json.loads(report.read_text(encoding="utf-8"))
+    result = record_recovery(
+        storage, payload, probe_calls=int(probe_calls), captured_report_path=report
+    )
+    typer.echo(json.dumps(result, ensure_ascii=False, default=str))
 
 
 if __name__ == "__main__":
