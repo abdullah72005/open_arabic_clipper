@@ -46,33 +46,48 @@ and each attempt is classified by the shared pure delivery classification
 (`UNCERTAIN` for transport ambiguity/crash-left reservation, `FAILED_KNOWN` for a
 known HTTP rejection, `RESPONDED` for a received-but-unusable response). The
 durable `consumed-budget.json` floor survives a missing ledger, changed storage
-root, or container restart. A **positive floor without complete retained
-per-request history blocks new synthesis entirely** (`AUDITION_HISTORY_INCOMPLETE`,
-or `AUDITION_BUDGET_EXHAUSTED` at the ceiling): a count alone never proves which
-fixed requests remain safe, and an empty ledger is never recreated and treated as
-complete. A malformed floor fails closed (the specific error is reported and the
-original bytes are preserved), recovery and the budget read/modify/write are
-serialized under the audition ownership lock, and counts are monotonic. Continuation
-is permitted only when complete retained request history proves an attempt is
-unspent and the cumulative ceiling is satisfied.
+root, or container restart. A **positive floor is proven by a versioned
+history-prefix proof** (`HISTORY_PROOF_VERSION`) that links its count `N` to the
+first `N` retained attempt identities (audition identity plus each attempt's
+immutable `attempt_id`, `ordinal`, `request_fingerprint`, `voice`, and
+`script_id`); delivery-status refinement and local fidelity data are excluded, so a
+legitimate append or local validation update does not invalidate it. Additional
+retained attempts after the verified prefix are allowed. A floor **without** a
+validated proof blocks new synthesis entirely (`AUDITION_HISTORY_INCOMPLETE`, or
+`AUDITION_BUDGET_EXHAUSTED` at the ceiling): a bare count never proves which fixed
+requests remain safe, and an empty ledger is never recreated and treated as
+complete. A legacy full-manifest `manifest_digest` is upgraded to a prefix proof
+only when the complete retained manifest still matches; otherwise counts are
+retained and new calls are blocked. A malformed floor fails closed (the specific
+error is reported and the original bytes are preserved), recovery and the budget
+read/modify/write are serialized under the audition ownership lock (no nested
+acquisition), and counts are monotonic. Continuation is permitted only when the
+proof validates and the cumulative ceiling is satisfied.
 
-Local narration fidelity is policy-versioned (`stage6-fidelity-v3`): ordinary
+Local narration fidelity is policy-versioned (`stage6-fidelity-v4`): ordinary
 speech uses the documented normalization (contraction expansion, approved-filler
 removal) with an exact ordered content comparison, while technical/numeric/URL
 forms (`C++`, `C#`, `foo/bar`, URLs, compound numbers) are preserved as separate
-opaque atoms — ordinary Latin words do not introduce a second raw comparison. A
-lone ASR transcript disagreement is deferred evidence (never an automatic confirmed
-meaning mismatch) while independently established audio/content failures still
-reject. Deferral never approves a voice or review readiness.
+opaque atoms compared **verbatim, including case** (`/Account` is not `/account`) —
+ordinary Latin words do not introduce a second raw comparison. A lone ASR
+transcript disagreement is deferred evidence (never an automatic confirmed meaning
+mismatch) while independently established audio/content failures still reject.
+Deferral never approves a voice or review readiness.
 
 Published export packages are immutable and self-verifying: a package is genuine
 only with the supported acceptance index structure, a required nonempty artifact
 filename and its recorded SHA-256, an actual nonempty artifact whose hash matches
-both the index record and the manifest entry, verified referenced assets, and
-manifest paths contained inside the package. An index-only/absent/mismatched
-package, a corrupt existing package, or an unreadable/malformed/unsupported
-catalog fails closed (diagnostic) and preserves the previous reference and the
-valid staging evidence; the same verifier is applied to reuse and legacy migration.
+both the index record and the manifest entry, and — for **every required bound
+referenced asset** — an unambiguous `exported_relative_path`, kept separate from
+the source `relative_path`, that resolves to an actual nonempty file whose hash
+matches the authoritative expected hash, the index record, and the manifest entry.
+A `copied=false`/missing record, an absent/unlisted/symlinked/escaping path, a
+destination-name collision between distinct assets, or a missing requirement set
+all fail; `destination_verified` booleans and bare index claims are never integrity
+evidence. An index-only/absent/mismatched package, a corrupt existing package, or
+an unreadable/malformed/unsupported catalog fails closed (diagnostic) and preserves
+the previous reference and the valid staging evidence; the same verifier is applied
+to reuse and legacy migration.
 
 ## Objective and ownership
 

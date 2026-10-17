@@ -241,7 +241,8 @@ def _protected_atoms(text: str) -> tuple[str, ...]:
     **Ordinary Latin words are deliberately excluded** so the documented
     normalization (contraction expansion, approved-filler removal) is never
     reversed by a second raw comparison. Order, multiplicity, casing, and digits
-    of the retained atoms are exact.
+    of the retained atoms are exact: a technical form or URL is never passed
+    through the general word case-fold (so ``/Account`` is not ``/account``).
     """
 
     atoms: list[str] = []
@@ -251,7 +252,7 @@ def _protected_atoms(text: str) -> tuple[str, ...]:
             or any(character in _TECHNICAL_MARKERS for character in token)
             or any(character.isdigit() for character in token)
         ):
-            atoms.append(token.casefold())
+            atoms.append(token)
     return tuple(atoms)
 
 
@@ -266,8 +267,10 @@ def transcription_matches(expected: str, actual: str) -> bool:
     addition, every protected technical/numeric/URL atom (``C++``, ``C#``,
     ``foo/bar``, URLs, Western and Arabic-Indic numbers, simple compound
     numeric/date forms) is preserved as one exact atomic token, so ``C++`` is never
-    accepted as ``C`` — while ordinary Latin words do **not** introduce a second raw
-    comparison that would undo the documented normalization. A permissive
+    accepted as ``C``. Protected forms are compared verbatim — including case (so
+    ``https://x/Account`` is not ``https://x/account``) — and never inherit the
+    general word case-fold, while ordinary Latin words do **not** introduce a second
+    raw comparison that would undo the documented normalization. A permissive
     similarity ratio is never acceptance authority, so every participant role,
     negation scope, number association, and code-switch content is preserved. Any
     difference in sequence, occurrence, order, or protected atom is a clear

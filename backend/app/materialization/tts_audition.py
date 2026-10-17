@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -52,6 +52,8 @@ MAX_AUDITION_ATTEMPTS = 9
 MANIFEST_VERSION = "stage6-tts-audition-v4"
 CONSUMED_BUDGET_VERSION = 1
 RECOVERY_VERSION = 1
+#: Versioned history-prefix proof format for the consumed-budget floor.
+HISTORY_PROOF_VERSION = 1
 
 #: Result status codes.
 AUDITION_OK = "OK"
@@ -211,30 +213,202 @@ def _manifest_digest(manifest: Mapping[str, object]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+#: Immutable per-attempt identity fields used by the versioned history proof.
+#: Deliberately excludes delivery-status refinement (RESERVED/RESPONDED/UNCERTAIN),
+#: the audio path/hash, and any local ``fidelity``/``revalidated_fidelity`` data so
+#: a later append or local revalidation never invalidates an otherwise valid proof.
+_ATTEMPT_IDENTITY_FIELDS = (
+    "attempt_id",
+    "ordinal",
+    "request_fingerprint",
+    "voice",
+    "script_id",
+)
+
+
+def _attempt_identity_entry(attempt: Mapping[str, object]) -> dict[str, object]:
+    return {field: attempt.get(field) for field in _ATTEMPT_IDENTITY_FIELDS}
+
+
+def _history_prefix_digest(identity_digest: str, prefix: Sequence[Mapping[str, object]]) -> str:
+    payload = {
+        "identity_digest": identity_digest,
+        "attempts": [_attempt_identity_entry(attempt) for attempt in prefix],
+    }
+    canonical = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _valid_prefix(manifest: Mapping[str, object], prefix: Sequence[object]) -> bool:
+    """Whether the first ``N`` retained attempts are a valid, ordered identity prefix.
+
+    Every entry must carry the immutable fields, be consecutively ordinal from 1,
+    be unique by attempt id/ordinal/fingerprint, and its fingerprint must match the
+    fixed audition request identity (reconstructed from the manifest's own model).
+    """
+
+    identity = manifest.get("identity")
+    model = identity.get("model") if isinstance(identity, Mapping) else None
+    if not isinstance(model, str) or not model:
+        return False
+    by_script = {script.script_id: script for script in AUDITION_SCRIPTS}
+    seen_ids: set[object] = set()
+    seen_ordinals: set[object] = set()
+    seen_fingerprints: set[object] = set()
+    for index, entry in enumerate(prefix, start=1):
+        if not isinstance(entry, Mapping):
+            return False
+        attempt_id = entry.get("attempt_id")
+        voice = entry.get("voice")
+        script_id = entry.get("script_id")
+        ordinal = entry.get("ordinal")
+        fingerprint = entry.get("request_fingerprint")
+        if not isinstance(attempt_id, str) or not attempt_id:
+            return False
+        if not isinstance(voice, str) or voice not in AUDITION_VOICES:
+            return False
+        script = by_script.get(script_id) if isinstance(script_id, str) else None
+        if script is None:
+            return False
+        if isinstance(ordinal, bool) or not isinstance(ordinal, int) or ordinal != index:
+            return False
+        if not isinstance(fingerprint, str) or not fingerprint:
+            return False
+        expected = _identity_digest(audition_request_identity(voice, script, model))
+        if fingerprint != expected:
+            return False
+        if (
+            attempt_id in seen_ids
+            or ordinal in seen_ordinals
+            or fingerprint in seen_fingerprints
+        ):
+            return False
+        seen_ids.add(attempt_id)
+        seen_ordinals.add(ordinal)
+        seen_fingerprints.add(fingerprint)
+    return True
+
+
+def _history_prefix_proof(
+    manifest: Mapping[str, object], consumed: int
+) -> dict[str, object] | None:
+    """A versioned proof linking the floor count to the first ``consumed`` attempts.
+
+    Returns ``None`` when the retained evidence cannot support the count (too few
+    attempts, an invalid prefix, or no identity). Additional retained attempts after
+    the prefix are allowed and never affect the proof.
+    """
+
+    attempts = manifest.get("attempts")
+    identity_digest = manifest.get("identity_digest")
+    if (
+        not isinstance(attempts, list)
+        or not isinstance(identity_digest, str)
+        or not identity_digest
+    ):
+        return None
+    if consumed <= 0 or len(attempts) < consumed:
+        return None
+    prefix = attempts[:consumed]
+    if not _valid_prefix(manifest, prefix):
+        return None
+    return {
+        "version": HISTORY_PROOF_VERSION,
+        "count": consumed,
+        "identity_digest": identity_digest,
+        "digest": _history_prefix_digest(identity_digest, prefix),
+    }
+
+
+def _proof_matches(proof: object, manifest: Mapping[str, object] | None) -> bool:
+    if not isinstance(proof, Mapping) or proof.get("version") != HISTORY_PROOF_VERSION:
+        return False
+    consumed = proof.get("count")
+    if isinstance(consumed, bool) or not isinstance(consumed, int) or consumed <= 0:
+        return False
+    if manifest is None:
+        return False
+    built = _history_prefix_proof(manifest, consumed)
+    if built is None:
+        return False
+    return (
+        built.get("digest") == proof.get("digest")
+        and built.get("identity_digest") == proof.get("identity_digest")
+    )
+
+
+def _floor_history_proof(
+    floor: Mapping[str, object] | None, manifest: Mapping[str, object] | None
+) -> dict[str, object] | None:
+    """A validated versioned prefix proof for the floor, or ``None``.
+
+    A versioned ``history_proof`` is validated against the retained prefix. A legacy
+    full-manifest ``manifest_digest`` is accepted (and upgraded in memory) only when
+    it matches the COMPLETE retained manifest exactly; any other legacy form is
+    unproven and yields ``None`` (block new synthesis).
+    """
+
+    if not floor:
+        return None
+    consumed = int(floor.get("consumed_attempts") or 0)
+    if consumed <= 0:
+        return None
+    if manifest is None:
+        return None
+    proof = floor.get("history_proof")
+    if isinstance(proof, Mapping) and proof.get("version") == HISTORY_PROOF_VERSION:
+        if not _proof_matches(proof, manifest):
+            return None
+        return _history_prefix_proof(manifest, consumed)
+    legacy = floor.get("manifest_digest")
+    if isinstance(legacy, str) and legacy:
+        attempts = manifest.get("attempts")
+        if (
+            isinstance(attempts, list)
+            and consumed == len(attempts)
+            and legacy == _manifest_digest(manifest)
+        ):
+            return _history_prefix_proof(manifest, consumed)
+    return None
+
+
 def _floor_history_complete(
     floor: Mapping[str, object] | None, manifest: Mapping[str, object] | None
 ) -> bool:
     """Whether a positive consumed-budget floor is backed by complete history.
 
     A bare count can never prove which fixed requests remain safe to invoke, so a
-    positive floor is treated as incomplete unless it is linked (by digest and
-    exact attempt count) to the complete retained per-request manifest.
+    positive floor is treated as incomplete unless it is backed by a validated
+    versioned history-prefix proof over the retained attempts.
     """
 
-    if not floor:
+    if not floor or int(floor.get("consumed_attempts") or 0) <= 0:
         return True
-    consumed = int(floor.get("consumed_attempts") or 0)
-    if consumed <= 0:
-        return True
-    if manifest is None:
-        return False
-    digest = floor.get("manifest_digest")
-    if not isinstance(digest, str) or not digest:
-        return False
-    attempts = manifest.get("attempts")
+    return _floor_history_proof(floor, manifest) is not None
+
+
+def _legacy_digest_proof(
+    storage: StorageService, digest: str, consumed: int
+) -> dict[str, object] | None:
+    """Upgrade a legacy full-manifest digest to a prefix proof, or ``None``.
+
+    Only the COMPLETE retained manifest may be upgraded: the digest must match it
+    and the consumed count must equal its full attempt count. Missing history is
+    never manufactured.
+    """
+
+    try:
+        retained = _load_manifest(storage)
+    except AuditionError:
+        return None
+    if retained is None:
+        return None
+    attempts = retained.get("attempts")
     if not isinstance(attempts, list) or consumed != len(attempts):
-        return False
-    return digest == _manifest_digest(manifest)
+        return None
+    if digest != _manifest_digest(retained):
+        return None
+    return _history_prefix_proof(retained, consumed)
 
 
 def _audition_dir(storage: StorageService) -> Path:
@@ -343,6 +517,17 @@ def _load_consumed_budget(storage: StorageService) -> dict[str, object] | None:
     digest = data.get("manifest_digest")
     if digest is not None and (not isinstance(digest, str) or not digest):
         raise AuditionError("malformed consumed-budget manifest digest")
+    proof = data.get("history_proof")
+    if proof is not None:
+        if not isinstance(proof, dict) or proof.get("version") != HISTORY_PROOF_VERSION:
+            raise AuditionError("unrecognized consumed-budget history proof")
+        count = proof.get("count")
+        if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
+            raise AuditionError("malformed consumed-budget history proof count")
+        if not isinstance(proof.get("digest"), str) or not proof.get("digest"):
+            raise AuditionError("malformed consumed-budget history proof digest")
+        if not isinstance(proof.get("identity_digest"), str) or not proof.get("identity_digest"):
+            raise AuditionError("malformed consumed-budget history proof identity")
     return data
 
 
@@ -353,19 +538,24 @@ def _write_consumed_budget(
     probe_calls: int,
     basis: str,
     captured_report_sha256: str | None = None,
+    history_proof: Mapping[str, object] | None = None,
     manifest_digest: str | None = None,
 ) -> dict[str, object]:
     """Monotonic floor write. Caller must hold the audition lock.
 
     An unreadable/malformed prior record fails closed (``AuditionError``) and its
     bytes are preserved — a zero-based record is never silently substituted. A
-    ``manifest_digest`` links the floor to the complete retained per-request
-    history; it is retained only while the consumed count is unchanged.
+    versioned ``history_proof`` links the floor to the first ``N`` retained attempt
+    identities. A legacy full-manifest ``manifest_digest`` is upgraded to a prefix
+    proof when the complete retained manifest still matches; otherwise it is stored
+    as-is (and will block until it can be proven). Either proof is retained only
+    while the consumed count is unchanged.
     """
 
     prior = _load_consumed_budget(storage)
     prior_consumed = int(prior["consumed_attempts"]) if prior else 0
     prior_probe = int(prior.get("probe_calls", 0)) if prior else 0
+    prior_proof = prior.get("history_proof") if prior else None
     prior_digest = prior.get("manifest_digest") if prior else None
     record: dict[str, object] = {
         "version": CONSUMED_BUDGET_VERSION,
@@ -376,14 +566,19 @@ def _write_consumed_budget(
     }
     if captured_report_sha256:
         record["captured_report_sha256"] = captured_report_sha256
-    if isinstance(manifest_digest, str) and manifest_digest:
-        record["manifest_digest"] = manifest_digest
-    elif (
-        isinstance(prior_digest, str)
-        and prior_digest
-        and record["consumed_attempts"] == prior_consumed
-    ):
-        record["manifest_digest"] = prior_digest
+    proof = dict(history_proof) if isinstance(history_proof, Mapping) else None
+    legacy = manifest_digest if isinstance(manifest_digest, str) and manifest_digest else None
+    if proof is None and legacy is not None:
+        proof = _legacy_digest_proof(storage, legacy, int(record["consumed_attempts"]))
+    if proof is not None:
+        record["history_proof"] = proof
+    elif legacy is not None:
+        record["manifest_digest"] = legacy
+    elif record["consumed_attempts"] == prior_consumed:
+        if isinstance(prior_proof, Mapping):
+            record["history_proof"] = dict(prior_proof)
+        elif isinstance(prior_digest, str) and prior_digest:
+            record["manifest_digest"] = prior_digest
     storage.atomic_write(
         _consumed_budget_path(storage),
         [json.dumps(record, ensure_ascii=False, sort_keys=True).encode("utf-8")],
@@ -398,12 +593,15 @@ def record_consumed_budget(
     probe_calls: int,
     basis: str,
     captured_report_sha256: str | None = None,
+    history_proof: Mapping[str, object] | None = None,
     manifest_digest: str | None = None,
 ) -> dict[str, object]:
     """Durably record consumed audition attempts (a monotonic floor, never reset).
 
     The read/modify/write is serialized under the existing audition ownership lock,
-    and a malformed prior record fails closed instead of being replaced.
+    and a malformed prior record fails closed instead of being replaced. A legacy
+    ``manifest_digest`` is upgraded to a versioned history-prefix proof when the
+    complete retained manifest still matches.
     """
 
     with _audition_lock(storage, blocking=True) as acquired:
@@ -415,6 +613,7 @@ def record_consumed_budget(
             probe_calls=probe_calls,
             basis=basis,
             captured_report_sha256=captured_report_sha256,
+            history_proof=history_proof,
             manifest_digest=manifest_digest,
         )
 
@@ -649,26 +848,40 @@ def run_audition(
             )
         if floor_consumed > 0:
             # Normalize any retained manifest (crash-left RESERVED -> UNCERTAIN)
-            # BEFORE judging completeness, so the digest reflects what is retained.
+            # BEFORE judging completeness, so the proof reflects what is retained.
             if manifest is not None:
                 _save_manifest(storage, manifest)
-            if not _floor_history_complete(floor, manifest):
+            proof = _floor_history_proof(floor, manifest)
+            if proof is None:
+                retained = len(manifest["attempts"]) if manifest is not None else 0
+                effective = max(floor_consumed, retained)
                 return AuditionResult(
                     samples=(),
                     provisional_voice=None,
                     raw_calls=0,
                     status=(
                         AUDITION_BUDGET_EXHAUSTED
-                        if floor_consumed >= MAX_AUDITION_ATTEMPTS
+                        if effective >= MAX_AUDITION_ATTEMPTS
                         else AUDITION_HISTORY_INCOMPLETE
                     ),
                     identity=identity,
                     notes=(
-                        "A positive consumed-budget floor without complete retained "
-                        "per-request history cannot prove which fixed requests remain "
+                        "A positive consumed-budget floor without a validated "
+                        "history-prefix proof cannot prove which fixed requests remain "
                         "safe to invoke; new synthesis is blocked. A count alone is not "
                         "authorization, and an empty ledger is never treated as complete."
                     ),
+                )
+            if floor.get("history_proof") != proof:
+                # Upgrade a legacy full-manifest digest proof to the versioned
+                # history-prefix proof (only complete retained evidence reaches here).
+                _write_consumed_budget(
+                    storage,
+                    consumed_attempts=floor_consumed,
+                    probe_calls=int(floor.get("probe_calls", 0) or 0),
+                    basis="migrated history-prefix proof",
+                    captured_report_sha256=floor.get("captured_report_sha256"),
+                    history_proof=proof,
                 )
         if manifest is None:
             manifest = _new_manifest(identity)
@@ -1028,6 +1241,7 @@ __all__ = [
     "AUDITION_SCRIPTS",
     "AUDITION_VOICES",
     "CONSUMED_BUDGET_VERSION",
+    "HISTORY_PROOF_VERSION",
     "MAX_AUDITION_ATTEMPTS",
     "RECOVERY_VERSION",
     "AuditionError",

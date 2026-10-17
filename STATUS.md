@@ -6,6 +6,97 @@
 > provider key is present" is stale; the only missing external prerequisite is
 > authorized source media.
 
+## Stage 6: SOL 8b6 corrections — verified exported asset bytes, case-sensitive protected atoms, versioned history-prefix budget proof (2026-10-17, continuation)
+
+Status: **the three SOL-reproduced defects at `8b6c992` are corrected with
+regressions. A package is genuine only when every required bound referenced asset
+resolves to an actual nonempty file inside the package whose hash matches its
+authoritative expected hash, its index record, and the manifest entry (index
+claims and `destination_verified` booleans are never integrity evidence). Protected
+technical/numeric/URL atoms are compared verbatim (case-sensitive). A positive
+consumed-budget floor is proven by a versioned history-prefix proof that survives a
+legitimate append or local fidelity update. No live hosted calls were made. Stage 6
+remains NOT FROZEN; `publication_ready` stays false.**
+
+### Corrections
+1. **Verified exported assets from bytes
+   (`backend/app/materialization/acceptance_export.py`).** `_package_integrity_reasons`
+   now delegates required-asset verification to `_required_asset_reasons`, which
+   derives the required set from the package's own bound reference records
+   (`assets`) and cross-checks the authoritative expected authored-ASS hash against
+   them. Every required asset must: be covered (a `copied=false`/missing record
+   fails), declare an unambiguous `exported_relative_path` (an absolute or `..`
+   path, a symlink component, or a missing path fails), resolve to an actual
+   nonempty file whose SHA-256 matches its authoritative `expected_sha256`, its
+   index `destination_sha256`, and its manifest entry, and never share a destination
+   with a distinct asset (collision). A missing/malformed requirement set (`assets`
+   absent or non-list while an ASS/reference requirement is declared) can no longer
+   imply an empty set. `destination_verified` booleans are not consulted. The same
+   verifier is applied before genuine publication, on reuse, and during legacy
+   migration; legacy packages lacking this evidence remain diagnostic. New
+   `_build_package` records add `exported_relative_path` (kept separate from the
+   source `relative_path`) and assign package-unique destinations. Retained:
+   immutable directories, catalog preservation, locking, atomic publication.
+2. **Case-sensitive protected atoms (`backend/app/materialization/narration.py`).**
+   `_protected_atoms` no longer case-folds: URLs and technical/numeric forms are
+   preserved verbatim, so `https://example.test/Account?token=AbC` is not accepted as
+   `.../account?token=abc`. Ordinary speech keeps the documented normalization
+   (contraction/filler equivalences) with all negation/order/multiplicity
+   protections; `C++→C`, `C#→C`, compound-number fragmentation, changed URLs, and
+   spelling/transliteration disagreements remain refused/deferred. Versioned
+   `stage6-fidelity-v4` (`tts_gemini.FIDELITY_POLICY_VERSION`) so dependent
+   validation checkpoints invalidate and retained audio is revalidated locally
+   without synthesis, preserving historical findings.
+3. **Versioned history-prefix budget proof
+   (`backend/app/materialization/tts_audition.py`).** The consumed-budget floor now
+   links its count `N` to the **first `N` retained attempt identities** via a
+   versioned `history_proof` (`HISTORY_PROOF_VERSION = 1`): a digest over the
+   audition identity plus each attempt's immutable `attempt_id`, `ordinal`,
+   `request_fingerprint`, `voice`, and `script_id`. Required fields, consecutive
+   ordinals, uniqueness, and reconstructed request identities are validated, and
+   additional retained attempts after the prefix are allowed. Delivery-status
+   refinement and local `fidelity`/`revalidated_fidelity` data are excluded, so a
+   legitimate append or local validation update no longer invalidates the proof. A
+   legacy full-manifest `manifest_digest` is upgraded to a prefix proof only when
+   the complete retained manifest still matches (at record time and at the run gate);
+   otherwise counts are retained and new synthesis is blocked. Incomplete history
+   still blocks without exceeding the ceiling, uncertain fingerprints are never
+   repeated, and all recovery updates stay under the existing ownership lock with no
+   nested acquisition. Effective consumption is `max(floor, retained)`.
+
+### Verification (this session)
+- Docker `oac-stage6-test` (Python 3.12.14, real FFmpeg 7.1.5, google-genai
+  2.31.0) + PostgreSQL `oac-stage6-pg-v4`:
+  - `test_stage6_sol_8b6_regressions.py` (new, 19): passed — required-asset bytes,
+    index-claim/`destination_verified` independence, hash/manifest/expected
+    matching, symlink/escape/collision rejection, missing-metadata rejection,
+    case-sensitive URL/technical atoms, v4 policy, linked-prefix append/restart,
+    legacy-digest upgrade, local-fidelity-update stability, crash-left reservation,
+    stale/proven-legacy blocking.
+  - `test_stage6_sol_8b6 + sol_451 + sol_p5 + tts_boundary + supporting_narration +
+    durable_router + gemini_boundary` (104): passed.
+  - `adapter_regressions + rc_corrections + rc_v4_corrections + results_boundary +
+    cache_validation + api_cli_acceptance` (71, real FFmpeg, persisted positive
+    export/HTTP path incl. a new `exported_relative_path`/destination-byte
+    assertion): passed.
+  - `ruff check app tests`: clean.
+- **Zero live provider calls** this session. Preserved recovery evidence unchanged:
+  `storage/benchmarks/stage-6/tts-audition/{recovery,consumed-budget}.json`
+  (`consumed_attempts=9`, `probe_calls=1`; the floor now blocks new synthesis) and
+  the captured report `/tmp/audition-out.json` (sha256 `2d39a09a…0038`).
+
+### Disposition (corrected)
+- **Fixed**: verified exported asset bytes; case-sensitive protected atoms;
+  versioned history-prefix budget proof.
+- **Validation blockers**: lost acoustic evidence and exhausted audition
+  authorization remain — the floor blocks new synthesis and the audio is
+  irrecoverable.
+- **Unresolved product decision (not a code gap)**: the hosted TTS voice stays
+  **unset by an already-made architectural decision**; further generation needs a
+  separately agreed bounded recovery budget.
+- **Externally blocked**: genuine authorized-media acceptance remains outstanding
+  (no authorized source media; a hosted key is present).
+
 ## Stage 6: SOL p5.1 corrections — sealed budget recovery, media-required package verification, fidelity v3 (2026-10-17, continuation)
 
 Status: **the three SOL-reproduced defects at `451b43a` are corrected with
@@ -86,6 +177,11 @@ opaque atoms. No live hosted calls were made. Stage 6 remains NOT FROZEN;
 ### Disposition (corrected)
 - **Fixed**: incomplete-history budget sealing; media-required package verification;
   fidelity v3 documented normalization.
+- **Later corrected by the next section**: the SOL review of this revision
+  reproduced three further defects — index-claim/`destination_verified` asset
+  acceptance, case-folded protected atoms, and a full-manifest budget proof that a
+  legitimate append/fidelity update invalidated. So "fixed" above was **not** final
+  for the revision as reviewed.
 - **Validation blockers**: lost acoustic evidence and exhausted audition
   authorization remain — the floor blocks new synthesis and the audio is
   irrecoverable.

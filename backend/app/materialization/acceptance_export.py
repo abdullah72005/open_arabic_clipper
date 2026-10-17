@@ -53,7 +53,9 @@ def _package_integrity_reasons(package_dir: Path, package_identity: str | None) 
     index must be the supported acceptance structure and mark the package genuine,
     a required nonempty artifact filename and its recorded SHA-256 must be present,
     the actual nonempty artifact must match the index/manifest identity, every
-    required referenced asset must be present and verified, and every manifest path
+    required bound referenced asset must declare an unambiguous exported relative
+    path resolving to an actual nonempty file whose hash matches its authoritative
+    expected hash, the index record, and the manifest entry, and every manifest path
     must stay inside the package and hash exactly. The same verifier is applied to
     package reuse and to legacy-catalog migration.
     """
@@ -111,7 +113,7 @@ def _package_integrity_reasons(package_dir: Path, package_identity: str | None) 
     if "index.json" not in listed:
         reasons.append("PACKAGE_INDEX_UNLISTED")
     _artifact_reasons(package_dir, index, listed, reasons)
-    _referenced_asset_reasons(index, reasons)
+    _required_asset_reasons(package_dir, index, listed, reasons)
     return reasons
 
 
@@ -156,38 +158,140 @@ def _artifact_reasons(
         reasons.append(f"PACKAGE_ARTIFACT_MANIFEST_MISMATCH:{artifact_file}")
 
 
-def _referenced_asset_reasons(index: Mapping[str, object], reasons: list[str]) -> None:
-    """Require every required referenced asset to be present and verified.
+def _exported_path(package_dir: Path, value: object) -> Path | None:
+    """Resolve one exported relative asset path inside the package, or ``None``.
 
-    The index records, for each referenced asset, whether it was copied and
-    verified against its authoritative expected hash. A genuine package must have
-    every copied asset verified (index ↔ asset identity), and an expected authored
-    ASS must be present and match its expected hash.
+    A required asset's exported path must be an unambiguous relative path that
+    stays inside the package: an absolute path or any ``..`` component is rejected.
+    """
+
+    if not isinstance(value, str) or not value:
+        return None
+    relative = Path(value)
+    if relative.is_absolute() or not relative.parts or ".." in relative.parts:
+        return None
+    return package_dir / relative
+
+
+def _symlink_component(package_dir: Path, relative: Path) -> bool:
+    """Whether any component of an exported relative path is a symlink."""
+
+    current = package_dir
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            return True
+    return False
+
+
+def _declares_reference_requirements(index: Mapping[str, object]) -> bool:
+    """Whether the index declares any reference that requires an exported asset."""
+
+    for key in ("narration_references", "asset_references"):
+        value = index.get(key)
+        if isinstance(value, list) and any(
+            isinstance(item, Mapping) and item.get("relative_path") for item in value
+        ):
+            return True
+    return False
+
+
+def _required_asset_reasons(
+    package_dir: Path,
+    index: Mapping[str, object],
+    listed: Mapping[str, str],
+    reasons: list[str],
+) -> None:
+    """Require every bound referenced asset to resolve to verified exported bytes.
+
+    The required asset set is the package's own bound reference records
+    (``assets``), with the authoritative expected authored-ASS hash cross-checked
+    against them. Favorable booleans (``destination_verified``) or self-consistent
+    index claims are never integrity evidence: each required asset must declare an
+    unambiguous exported relative path that resolves to an actual nonempty file
+    whose hash matches its authoritative expected hash, the index record, and the
+    manifest entry. A missing/malformed requirement set never implies an empty one.
     """
 
     expected_ass = index.get("authored_ass_expected_sha256")
-    if isinstance(expected_ass, str) and expected_ass:
-        actual_ass = index.get("authored_ass_sha256")
-        if not isinstance(actual_ass, str) or actual_ass.lower() != expected_ass.lower():
-            reasons.append("PACKAGE_AUTHORED_ASS_UNVERIFIED")
-    assets = index.get("assets")
-    if isinstance(assets, list):
-        for record in assets:
-            if not isinstance(record, Mapping):
-                reasons.append("PACKAGE_ASSET_RECORD_INVALID")
-                continue
-            if record.get("copied") is not True:
-                continue
+    declared_ass = expected_ass if isinstance(expected_ass, str) and expected_ass else ""
+    raw_assets = index.get("assets")
+    if raw_assets is None:
+        entries: list[object] = []
+    elif isinstance(raw_assets, list):
+        entries = raw_assets
+    else:
+        reasons.append("PACKAGE_ASSET_METADATA_INVALID")
+        return
+    if not entries and (declared_ass or _declares_reference_requirements(index)):
+        reasons.append("PACKAGE_ASSET_METADATA_MISSING")
+
+    records: list[Mapping[str, object]] = []
+    for raw in entries:
+        if not isinstance(raw, Mapping):
+            reasons.append("PACKAGE_ASSET_RECORD_INVALID")
+            continue
+        records.append(raw)
+
+    authored_records = [record for record in records if record.get("kind") == "authored_ass"]
+    if declared_ass:
+        if not authored_records:
+            reasons.append("PACKAGE_AUTHORED_ASS_RECORD_MISSING")
+        for record in authored_records:
             expected = record.get("expected_sha256")
-            actual = record.get("destination_sha256")
-            if (
-                record.get("destination_verified") is not True
-                or not isinstance(expected, str)
-                or not expected
-                or not isinstance(actual, str)
-                or actual.lower() != expected.lower()
-            ):
-                reasons.append(f"PACKAGE_ASSET_UNVERIFIED:{record.get('kind')}")
+            if not isinstance(expected, str) or expected.lower() != declared_ass.lower():
+                reasons.append("PACKAGE_AUTHORED_ASS_EXPECTED_MISMATCH")
+
+    seen: dict[str, tuple[str, str, str]] = {}
+    for record in records:
+        kind = str(record.get("kind") or "")
+        exported = record.get("exported_relative_path")
+        if not isinstance(exported, str) or not exported:
+            reasons.append(f"PACKAGE_ASSET_PATH_MISSING:{kind}")
+            continue
+        relative = Path(exported)
+        key = relative.as_posix()
+        identity = (
+            kind,
+            str(record.get("relative_path") or ""),
+            str(record.get("expected_sha256") or ""),
+        )
+        previous = seen.get(key)
+        if previous is not None and previous != identity:
+            reasons.append(f"PACKAGE_ASSET_PATH_COLLISION:{key}")
+            continue
+        seen[key] = identity
+        target = _exported_path(package_dir, exported)
+        if target is None:
+            reasons.append(f"PACKAGE_ASSET_PATH_ESCAPES:{exported}")
+            continue
+        if _symlink_component(package_dir, relative):
+            reasons.append(f"PACKAGE_ASSET_SYMLINK:{exported}")
+            continue
+        if not target.is_file():
+            reasons.append(f"PACKAGE_ASSET_FILE_MISSING:{exported}")
+            continue
+        try:
+            if target.stat().st_size <= 0:
+                reasons.append(f"PACKAGE_ASSET_EMPTY:{exported}")
+                continue
+            actual = _sha256_file(target)
+        except OSError:
+            reasons.append(f"PACKAGE_ASSET_UNREADABLE:{exported}")
+            continue
+        expected = record.get("expected_sha256")
+        if not isinstance(expected, str) or not expected:
+            reasons.append(f"PACKAGE_ASSET_EXPECTED_MISSING:{kind}")
+        elif actual != expected.lower():
+            reasons.append(f"PACKAGE_ASSET_HASH_MISMATCH:{exported}")
+        recorded = record.get("destination_sha256")
+        if isinstance(recorded, str) and recorded and actual != recorded.lower():
+            reasons.append(f"PACKAGE_ASSET_INDEX_MISMATCH:{exported}")
+        manifest_sha = listed.get(key)
+        if manifest_sha is None:
+            reasons.append(f"PACKAGE_ASSET_UNLISTED:{exported}")
+        elif manifest_sha != actual:
+            reasons.append(f"PACKAGE_ASSET_MANIFEST_MISMATCH:{exported}")
 
 
 def _integrity_failure(
@@ -356,29 +460,52 @@ def _build_package(
     elif expected_artifact_sha:
         artifact_verified = False
 
+    authored_ass_sha: str | None = None
+    ass_expected_sha = ""
+    copied_assets: list[dict[str, object]] = []
+    used_exported: set[str] = set()
+
+    def _unique_exported(preferred: str, source_relative: str) -> str:
+        """A package-unique exported relative path (distinct assets never collide)."""
+
+        if preferred not in used_exported:
+            used_exported.add(preferred)
+            return preferred
+        stem = hashlib.sha256(source_relative.encode("utf-8")).hexdigest()[:8]
+        base = Path(preferred)
+        candidate = f"assets/{base.stem}-{stem}{base.suffix}"
+        counter = 1
+        while candidate in used_exported:
+            candidate = f"assets/{base.stem}-{stem}-{counter}{base.suffix}"
+            counter += 1
+        used_exported.add(candidate)
+        return candidate
+
     # Copy the exact bound authored ASS and every referenced narration/supporting
     # asset from the persisted render request, then verify the COPIED destination
     # bytes against each authoritative expected hash. A missing or mismatched copy
     # invalidates acceptance: rechecking an unchanged source file never verifies the
-    # destination bytes actually published.
-    authored_ass_sha: str | None = None
-    ass_expected_sha = ""
-    copied_assets: list[dict[str, object]] = []
-    asset_dir = staging_dir / "assets"
+    # destination bytes actually published. Each record carries the SOURCE reference
+    # path separately from the EXPORTED destination path so the verifier can resolve
+    # the actual bytes inside the package.
     for asset in readiness.assets:
         record = asset.as_dict()
         record["copied"] = False
         record["destination_sha256"] = None
         record["destination_verified"] = False
+        record["exported_relative_path"] = None
         expected = asset.expected_sha256
         if asset.kind == "authored_ass":
             ass_expected_sha = expected
             if asset.present and asset.verified:
                 source_path = storage.resolve_relative(asset.relative_path)
-                destination = staging_dir / "authored.ass"
+                exported = _unique_exported("authored.ass", asset.relative_path)
+                destination = staging_dir / exported
+                destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(source_path, destination)
                 authored_ass_sha = _sha256_file(destination)
                 record["copied"] = True
+                record["exported_relative_path"] = exported
                 record["destination_sha256"] = authored_ass_sha
                 record["destination_verified"] = bool(expected) and (
                     authored_ass_sha == expected.lower()
@@ -392,12 +519,16 @@ def _build_package(
             continue
         if asset.present:
             source_path = storage.resolve_relative(asset.relative_path)
-            asset_dir.mkdir(parents=True, exist_ok=True)
-            target = asset_dir / f"{asset.kind}-{source_path.name}"
+            exported = _unique_exported(
+                f"assets/{asset.kind}-{source_path.name}", asset.relative_path
+            )
+            target = staging_dir / exported
+            target.parent.mkdir(parents=True, exist_ok=True)
             if source_path.resolve() != target.resolve():
                 shutil.copyfile(source_path, target)
             destination_sha = _sha256_file(target)
             record["copied"] = True
+            record["exported_relative_path"] = exported
             record["destination_sha256"] = destination_sha
             record["destination_verified"] = bool(expected) and (
                 destination_sha == expected.lower()

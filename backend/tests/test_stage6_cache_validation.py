@@ -705,6 +705,13 @@ def test_export_verifies_copied_destination_bytes(
         for reason in genuine_index["genuine_acceptance_reasons"]
         if reason.startswith("EXPORT_ASSET")
     ]
+    # The bound asset records its source reference separately from its exported
+    # destination path, and the destination bytes actually exist in the package.
+    authored_records = [
+        record for record in genuine_index["assets"] if record.get("kind") == "authored_ass"
+    ]
+    assert authored_records and authored_records[0]["exported_relative_path"] == "authored.ass"
+    assert (Path(genuine_case["directory"]) / "authored.ass").is_file()
 
     # Corrupt only the destination copy of the bound ASS: the copied bytes no longer
     # match the authoritative expected hash, so acceptance must be invalidated.

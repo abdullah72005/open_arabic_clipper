@@ -350,7 +350,7 @@ def test_arabic_spelling_disagreement_remains_deferred() -> None:
         options=_Opts(),
     )
     assert result.status == "DEFERRED"
-    assert result.as_dict()["policy_version"] == "stage6-fidelity-v3"
+    assert result.as_dict()["policy_version"] == "stage6-fidelity-v4"
     assert not compare_transcripts(
         "الموضوع مش بالبساطة اللي الناس فاكراها",
         "الموضوع مش بالبساطة اللي الناس فكراها",
