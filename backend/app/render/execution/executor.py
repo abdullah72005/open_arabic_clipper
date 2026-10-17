@@ -13,10 +13,12 @@ child is reaped on every exit path.
 
 from __future__ import annotations
 
+import hashlib
 import threading
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
 
@@ -403,14 +405,7 @@ class RenderExecutionExecutor:
             self._block(row, "CANDIDATE_NOT_CURRENT")
             return row
         try:
-            spec = self._spec_builder(
-                self._session,
-                candidate,
-                artifact_purpose=row.artifact_purpose.value,
-                delivery_profile_key=row.delivery_profile_key,
-                settings=self._settings,
-                storage=self._storage,
-            )
+            spec = self._build_spec(row, candidate)
         except RenderExecutionError as error:
             if error.blocked:
                 self._block(row, error.reason_code)
@@ -450,6 +445,18 @@ class RenderExecutionExecutor:
             source_absolute_path=source_absolute,
             attempt_directory=str(attempt_directory),
         )
+        # Localize every referenced authored asset through StorageService: verify
+        # its immutable identity/hash and copy it to a controlled attempt-local
+        # name. The compiler only ever sees allow-listed localized filenames, so a
+        # provider path, URL, traversal, or mutable same-path replacement can
+        # never reach FFmpeg.
+        if getattr(spec, "authored", None) is not None:
+            runtime = replace(
+                runtime,
+                asset_localized_paths=localize_authored_assets(
+                    self._storage, spec.authored, attempt_directory
+                ),
+            )
         try:
             compiled = self._compiler(spec, runtime)
         except Exception as error:  # noqa: BLE001
@@ -457,6 +464,7 @@ class RenderExecutionExecutor:
             raise
 
         ass_data = self._verified_ass_bytes(spec)
+        authored_ass_data = self._verified_authored_ass_bytes(spec)
 
         if not self._begin_attempt(row):
             self.skipped_duplicate = True
@@ -470,6 +478,7 @@ class RenderExecutionExecutor:
             timeout_seconds=self._config.max_render_seconds,
             poll_seconds=self._config.cancel_poll_seconds,
             ass_bytes=ass_data,
+            authored_ass_bytes=authored_ass_data,
             deadline=attempt_deadline,
         )
         try:
@@ -480,12 +489,16 @@ class RenderExecutionExecutor:
             # A cancellation/ownership stop observed at the runner error boundary
             # (e.g. a cancel committed between the runner's last poll and its
             # exception exit) enters the cancellation path; otherwise the
-            # truthful timeout/probe-error classification is preserved.
+            # truthful timeout/probe-error classification is preserved. A
+            # RenderProcessError's partial measurement manifest (e.g. a completed
+            # unmastered analysis) is persisted under this render fence so the
+            # Stage 6 finalizer can justify a bounded repair.
             if self._should_stop():
                 raise RenderCancelled("render stopped during output probing") from error
             self._fail(
                 row,
                 "RENDER_TIMEOUT" if isinstance(error, RenderTimeout) else error.reason_code,
+                partial_manifest=getattr(error, "manifest", None),
             )
             raise
 
@@ -576,6 +589,48 @@ class RenderExecutionExecutor:
         self._session.expire_all()
         return True
 
+    def _build_spec(self, row: RenderExecution, candidate: Any) -> Any:
+        """Build the exact request for this row, purpose-aware.
+
+        A transformed row bound to a materialization loads that exact
+        materialization (by id/output fingerprint); every other row keeps the
+        injected/core builder.
+        """
+
+        from app.render.execution.policy import TRANSFORMED_SHORT
+        from app.render.execution.service import build_spec_for_row
+
+        if row.artifact_purpose.value == TRANSFORMED_SHORT and row.materialization_id is not None:
+            return build_spec_for_row(self._session, candidate, row, self._settings, self._storage)
+        return self._spec_builder(
+            self._session,
+            candidate,
+            artifact_purpose=row.artifact_purpose.value,
+            delivery_profile_key=row.delivery_profile_key,
+            settings=self._settings,
+            storage=self._storage,
+        )
+
+    def _verified_authored_ass_bytes(self, spec: Any) -> bytes:
+        """Load and hash-verify the Stage 6 authored ASS for an authored payload."""
+
+        payload = getattr(spec, "authored", None)
+        if payload is None:
+            return b""
+        reference = payload.authored_ass
+        path = (self._storage.storage_root / reference.relative_path).resolve()
+        try:
+            path.relative_to(self._storage.storage_root)
+        except ValueError as error:
+            raise RenderExecutionError("ASS_MISSING") from error
+        data = path.read_bytes()
+        import hashlib
+
+        actual = hashlib.sha256(data).hexdigest()
+        if not reference.sha256 or actual != reference.sha256.lower():
+            raise RenderExecutionError("ASS_HASH_MISMATCH")
+        return bytes(data)
+
     def _verified_ass_bytes(self, spec: Any) -> bytes:
         relative = spec.ass.relative_path
         path = (self._storage.storage_root / relative).resolve()
@@ -663,14 +718,7 @@ class RenderExecutionExecutor:
                 ).first()
 
             try:
-                fresh = self._spec_builder(
-                    self._session,
-                    locked,
-                    artifact_purpose=row.artifact_purpose.value,
-                    delivery_profile_key=row.delivery_profile_key,
-                    settings=self._settings,
-                    storage=self._storage,
-                )
+                fresh = self._build_spec(row, locked)
             except RenderExecutionError as error:
                 self._safe_rollback()
                 if error.blocked:
@@ -754,9 +802,12 @@ class RenderExecutionExecutor:
         reason_code: str,
         *,
         qc: TechnicalQCResult | None = None,
+        partial_manifest: Mapping[str, object] | None = None,
     ) -> None:
         if self._job_id is None:
-            mark_failed(self._session, row, reason_code, qc=qc)
+            mark_failed(
+                self._session, row, reason_code, qc=qc, partial_manifest=partial_manifest
+            )
             self._commit_or_rollback()
             return
         if not self._claimed:
@@ -766,6 +817,7 @@ class RenderExecutionExecutor:
             row,
             reason_code,
             qc=qc,
+            partial_manifest=partial_manifest,
             job_id=self._job_id,
             claim_version=self._claim_version,
         )
@@ -829,6 +881,48 @@ class RenderExecutionExecutor:
         self._fail(row, getattr(error, "reason_code", "RENDER_PROCESS_FAILED"))
 
 
+def localize_authored_assets(
+    storage: StorageService, payload: Any, attempt_directory: Path
+) -> dict[str, str]:
+    """Verify and localize every referenced authored (non-source) asset.
+
+    Returns an ``asset_id -> filename`` map of controlled, attempt-local copies
+    inside ``attempt_directory``. Each asset's byte hash and declared size are
+    verified against its immutable managed storage identity; no provider path,
+    URL, traversal, or symlink escape is accepted. Used by
+    :class:`RenderExecutionExecutor` on the production runtime factory.
+    """
+
+    mapping: dict[str, str] = {}
+    attempt_directory.mkdir(parents=True, exist_ok=True)
+    for asset in payload.assets:
+        if asset.role == "SOURCE_VIDEO":
+            continue
+        source = (storage.storage_root / asset.storage_relative_path).resolve()
+        try:
+            source.relative_to(storage.storage_root)
+        except ValueError as error:
+            raise RenderExecutionError("ASSET_PATH_INVALID") from error
+        if not source.is_file():
+            raise RenderExecutionError("ASSET_MISSING")
+        data = source.read_bytes()
+        if not asset.sha256 or hashlib.sha256(data).hexdigest() != asset.sha256.lower():
+            raise RenderExecutionError("ASSET_HASH_MISMATCH")
+        if asset.size_bytes and len(data) != asset.size_bytes:
+            raise RenderExecutionError("ASSET_SIZE_MISMATCH")
+        safe_id = "".join(
+            character if character.isalnum() or character in "-_" else "_"
+            for character in asset.asset_id
+        )
+        suffix = source.suffix.lower()
+        if not suffix or len(suffix) > 8 or not suffix[1:].isalnum():
+            suffix = ".bin"
+        name = f"asset-{safe_id}{suffix}"
+        (attempt_directory / name).write_bytes(data)
+        mapping[asset.asset_id] = name
+    return mapping
+
+
 def _as_uuid(value: uuid.UUID | str) -> uuid.UUID:
     if isinstance(value, uuid.UUID):
         return value
@@ -866,4 +960,5 @@ __all__ = [
     "RenderAdmissionUnavailable",
     "RenderExecutionExecutor",
     "build_render_execution_executor",
+    "localize_authored_assets",
 ]

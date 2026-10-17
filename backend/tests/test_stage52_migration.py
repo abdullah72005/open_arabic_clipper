@@ -115,8 +115,9 @@ def test_stage_5_2_migration_is_reversible_and_preserves_prior_stages() -> None:
         assert accepted == 1
 
         # Downgrade must remove Stage 5.2 jobs/rows itself on a populated
-        # database (no test-side cleanup masking the defect).
-        command.downgrade(config, "-1")
+        # database (no test-side cleanup masking the defect). Stage 6 advanced
+        # head to 0024, so target the Stage 5.1 revision below 0022 explicitly.
+        command.downgrade(config, "20260918_0021")
         inspector = inspect(engine)
         assert "render_executions" not in inspector.get_table_names()
         assert "visual_composition_plans" in inspector.get_table_names()
@@ -176,7 +177,8 @@ def test_stage_5_2_postgresql_alembic_upgrade(monkeypatch: pytest.MonkeyPatch) -
             indexes = {index["name"] for index in inspector.get_indexes("render_executions")}
             assert "uq_render_executions_current_scope" in indexes
 
-            command.downgrade(config, "-1")
+            # Stage 6 advanced head to 0024; target the revision below 0022.
+            command.downgrade(config, "20260918_0021")
             inspector = inspect(engine)
             assert "render_executions" not in inspector.get_table_names()
             assert "render_execution_id" not in {

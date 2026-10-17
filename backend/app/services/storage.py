@@ -121,6 +121,24 @@ class StorageService:
         self._validate_owned_destination(resolved)
         return resolved.relative_to(self.storage_root).as_posix()
 
+    def resolve_relative(self, relative_path: Path | str) -> Path:
+        """Resolve a storage-relative path (as returned by ``storage_relative``).
+
+        Used by read-only consumers of a managed asset (for example the local ASR
+        fidelity check) so the filesystem path is always derived by the storage
+        owner, never assembled by a caller.
+        """
+
+        candidate = Path(relative_path)
+        if candidate.is_absolute():
+            raise StorageValidationError("absolute paths are not allowed")
+        resolved = (self.storage_root / candidate).resolve()
+        try:
+            resolved.relative_to(self.storage_root)
+        except ValueError as error:
+            raise StorageValidationError("path traversal outside storage root") from error
+        return resolved
+
     def resolve(self, category: StorageCategory | str, relative_path: Path | str) -> Path:
         """Resolve a relative path safely within its configured category root."""
 

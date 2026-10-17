@@ -31,6 +31,12 @@ from app.core.enums import (
 )
 from app.core.settings import get_settings
 from app.db.session import create_session_factory
+from app.materialization.queue import (
+    MaterializationQueueError,
+    queue_materialization,
+    resume_materialization,
+)
+from app.materialization.service import MaterializationError
 from app.models import (
     AudioAnalysis,
     AudioArtifact,
@@ -991,6 +997,75 @@ def visual_composition_status(candidate_id: UUID) -> None:
     typer.echo(json.dumps(payload, ensure_ascii=False, default=str))
 
 
+@app.command("materialize")
+def materialize(
+    candidate_id: UUID,
+    priority: str = typer.Option("CANDIDATE", "--priority"),
+    profile_key: str | None = typer.Option(None, "--profile-key"),
+    supporting: str = typer.Option("OFF", "--supporting"),
+    force: bool = typer.Option(False, "--force/--no-force"),
+) -> None:
+    """Queue one explicit candidate-scoped Stage 6 materialization run."""
+
+    with create_session_factory()() as session:
+        try:
+            outcome = queue_materialization(
+                session,
+                candidate_id,
+                priority=priority,
+                profile_key=profile_key,
+                supporting_requested=supporting,
+                force=force,
+            )
+        except MaterializationError as error:
+            raise typer.BadParameter(str(error)) from error
+    typer.echo(
+        json.dumps(
+            {
+                "job_id": str(outcome.job_id) if outcome.job_id else None,
+                "status": outcome.status,
+                "queued": outcome.queued,
+                "cached": outcome.cached,
+                "active": outcome.active,
+            }
+        )
+    )
+
+
+@app.command("materialization-status")
+def materialization_status(candidate_id: UUID) -> None:
+    """Print the current Stage 6 materialization without mutating anything."""
+
+    from sqlalchemy import select
+
+    from app.models import ClipMaterialization
+
+    with create_session_factory()() as session:
+        row = session.scalars(
+            select(ClipMaterialization)
+            .where(
+                ClipMaterialization.clip_candidate_id == candidate_id,
+                ClipMaterialization.is_current.is_(True),
+            )
+            .order_by(ClipMaterialization.created_at.desc())
+        ).first()
+        if row is None:
+            raise typer.BadParameter("materialization does not exist")
+        payload = {
+            "id": str(row.id),
+            "priority": row.priority.value,
+            "lifecycle": row.lifecycle.value,
+            "semantic_outcome": row.semantic_outcome.value if row.semantic_outcome else None,
+            "human_review_required": bool(row.human_review_required),
+            "publication_ready": bool(row.publication_ready),
+            "repair_count": int(row.repair_count or 0),
+            "reason_codes": list(row.reason_codes or []),
+            "input_fingerprint": row.input_fingerprint,
+            "output_fingerprint": row.output_fingerprint,
+        }
+    typer.echo(json.dumps(payload, ensure_ascii=False, default=str))
+
+
 @app.command("stage5-2-handoff")
 def stage5_2_handoff(candidate_id: UUID) -> None:
     """Print the read-only Stage 5.1 -> Stage 5.2 handoff."""
@@ -1358,6 +1433,228 @@ def benchmark_reconstruction(
             ensure_ascii=False,
         )
     )
+
+
+@app.command("materialization-resume")
+def materialization_resume(
+    candidate_id: UUID,
+    profile_key: str | None = typer.Option(None, "--profile-key"),
+) -> None:
+    """Resume one candidate's Stage 6 generation, reusing accepted checkpoints.
+
+    ``force`` bypasses the completed-cache short-circuit so a DEFERRED/BLOCKED
+    generation re-enters the executor; it never erases checkpoints, repair usage,
+    or budgets.
+    """
+
+    with create_session_factory()() as session:
+        try:
+            outcome = resume_materialization(session, candidate_id, profile_key=profile_key)
+        except (MaterializationError, MaterializationQueueError) as error:
+            raise typer.BadParameter(str(error)) from error
+    typer.echo(
+        json.dumps(
+            {
+                "materialization_id": str(outcome.materialization_id)
+                if outcome.materialization_id
+                else None,
+                "job_id": str(outcome.job_id) if outcome.job_id else None,
+                "status": outcome.status,
+                "queued": outcome.queued,
+                "active": outcome.active,
+                "phase": outcome.phase,
+            }
+        )
+    )
+
+
+@app.command("materialization-cancel")
+def materialization_cancel(
+    candidate_id: UUID,
+    profile_key: str | None = typer.Option(None, "--profile-key"),
+) -> None:
+    """Cooperatively cancel the current Stage 6 generation for one candidate."""
+
+    from app.materialization.queue import cancel_materialization
+
+    with create_session_factory()() as session:
+        try:
+            materialization_id = cancel_materialization(
+                session, candidate_id, profile_key=profile_key
+            )
+        except (MaterializationError, MaterializationQueueError) as error:
+            raise typer.BadParameter(str(error)) from error
+    typer.echo(
+        json.dumps({"materialization_id": str(materialization_id), "lifecycle": "CANCELLED"})
+    )
+
+
+@app.command("production-profile-import")
+def production_profile_import(path: Path) -> None:
+    """Import one strict JSON production profile as a new current revision."""
+
+    from app.materialization.profiles import ProfileImportError, import_profile
+
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise typer.BadParameter(f"could not read profile JSON: {error}") from error
+    with create_session_factory()() as session:
+        try:
+            row = import_profile(session, payload)
+        except ProfileImportError as error:
+            raise typer.BadParameter(str(error)) from error
+    typer.echo(
+        json.dumps(
+            {
+                "id": str(row.id),
+                "channel_key": row.channel_key,
+                "revision": int(row.revision),
+                "narration_allowed": bool(row.narration_allowed),
+                "tts_provider": row.tts_provider,
+                "tts_voice": row.tts_voice,
+            }
+        )
+    )
+
+
+@app.command("stage6-acceptance-export")
+def stage6_acceptance_export(
+    materialization_id: list[UUID] = typer.Option(None, "--materialization-id"),
+    discover: bool = typer.Option(False, "--discover/--no-discover"),
+    limit: int = typer.Option(4, "--limit"),
+    output_root: Path | None = typer.Option(None, "--output-root"),
+) -> None:
+    """Export the genuine acceptance package (read-only) for reviewed clips.
+
+    With ``--discover`` a bounded inventory of currently review-ready
+    materializations is used. No eligibility is fabricated: an absent
+    prerequisite simply yields fewer cases.
+    """
+
+    from app.materialization.acceptance_export import (
+        discover_eligible_materializations,
+        export_materializations,
+        inventory_source_readiness,
+    )
+
+    settings = get_settings()
+    with create_session_factory()() as session:
+        ids = list(materialization_id or [])
+        if discover or not ids:
+            ids = discover_eligible_materializations(session, limit=limit)
+        if not ids:
+            # An empty completed inventory is *not* proof that source media is
+            # unavailable: report the bounded concrete prerequisite evidence.
+            inventory = inventory_source_readiness(session, limit=limit)
+            typer.echo(
+                json.dumps(
+                    {
+                        "root": None,
+                        "cases": [],
+                        "reason": "NO_ELIGIBLE_MEDIA",
+                        "source_inventory": inventory,
+                    },
+                    ensure_ascii=False,
+                    default=str,
+                )
+            )
+            return
+        result = export_materializations(session, settings, ids, output_root=output_root)
+    typer.echo(json.dumps(result, ensure_ascii=False, default=str))
+
+
+@app.command("stage6-tts-audition")
+def stage6_tts_audition(
+    model: str | None = typer.Option(None, "--model"),
+    output_root: Path | None = typer.Option(None, "--output-root"),
+) -> None:
+    """Audition exactly three prebuilt voices on three fixed scripts (<=9 calls)."""
+
+    from app.materialization.acceptance_export import export_tts_audition
+    from app.materialization.executor import (
+        _admission_callable,
+        _rate_limit_notifier,
+        build_local_narration_fidelity_validator,
+    )
+    from app.materialization.tts_audition import run_audition
+    from app.materialization.tts_gemini import GeminiNarrationSynthesizer
+    from app.services.storage import StorageService
+
+    settings = get_settings()
+    storage = StorageService(settings.storage_root)
+    resolved_model = model or settings.materialization_tts_model
+    key = settings.gemini_api_key
+    key_value = key.get_secret_value() if key is not None else ""
+
+    def voice_factory(voice: str) -> object | None:
+        if not key_value:
+            return None
+        return GeminiNarrationSynthesizer(
+            api_key=key_value,
+            model=resolved_model,
+            api_version=settings.materialization_tts_api_version,
+            voice=voice,
+            storage=storage,
+            source_id="audition",
+        )
+
+    # Every audition sample is validated with the local audio-backed fidelity
+    # check; a missing/deferred/rejected result makes the voice nonviable rather
+    # than silently proposing it.
+    fidelity = build_local_narration_fidelity_validator(settings, storage)
+    # Shared HIGH admission is checked before EACH synthesis attempt, and a 429
+    # notifies the same controller so its cooldown blocks later samples.
+    controller = settings.gemini_admission_controller()
+    admit = _admission_callable(controller)
+    on_rate_limited = _rate_limit_notifier(controller)
+
+    result = run_audition(
+        settings=settings,
+        storage=storage,
+        model=resolved_model,
+        api_version=settings.materialization_tts_api_version,
+        voice_factory=voice_factory,
+        fidelity=fidelity,
+        admit=admit,
+        on_rate_limited=on_rate_limited,
+    )
+    exported = export_tts_audition(settings, [sample.as_dict() for sample in result.samples],
+                                   output_root=output_root)
+    payload = result.as_dict()
+    payload["export"] = exported
+    if not key_value:
+        payload["notes"] = "GEMINI_API_KEY not configured; audition not run."
+    typer.echo(json.dumps(payload, ensure_ascii=False, default=str))
+
+
+@app.command("stage6-tts-audition-recover")
+def stage6_tts_audition_recover(
+    report: Path = typer.Option(..., "--report", help="Captured audition result JSON"),
+    probe_calls: int = typer.Option(1, "--probe-calls", help="Hosted probe calls to include"),
+) -> None:
+    """Recover surviving audition evidence and persist the consumed-budget floor.
+
+    Recovers any surviving audio referenced by the captured report (verifying each
+    against its captured hash) into managed storage, records lost evidence
+    truthfully, and writes a durable consumed-budget floor so a missing ledger, a
+    changed storage root, or a container restart can never authorize another
+    nine-call batch. The probe call remains part of call accounting.
+    """
+
+    from app.materialization.tts_audition import record_recovery
+    from app.services.storage import StorageService
+
+    settings = get_settings()
+    storage = StorageService(settings.storage_root)
+    if not report.is_file():
+        typer.echo(json.dumps({"error": f"report not found: {report}"}, ensure_ascii=False))
+        raise typer.Exit(code=1)
+    payload = json.loads(report.read_text(encoding="utf-8"))
+    result = record_recovery(
+        storage, payload, probe_calls=int(probe_calls), captured_report_path=report
+    )
+    typer.echo(json.dumps(result, ensure_ascii=False, default=str))
 
 
 if __name__ == "__main__":

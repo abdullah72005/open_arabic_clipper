@@ -372,13 +372,12 @@ def _live_request_freshness(session: Session, row: RenderExecution, settings: Se
     if candidate is None:
         return "STALE"
     try:
-        spec = build_render_spec(
+        spec = build_spec_for_row(
             session,
             candidate,
-            artifact_purpose=row.artifact_purpose.value,
-            delivery_profile_key=row.delivery_profile_key,
-            settings=settings,
-            storage=StorageService(settings.storage_root),
+            row,
+            settings,
+            StorageService(settings.storage_root),
             stream_probe=None,
         )
         recomputed = request_input_fingerprint(spec, settings.stage52_config())
@@ -1020,6 +1019,8 @@ def persist_envelope(
     spec: RenderSpec,
     input_fingerprint: str,
     delivery_profile_key: str,
+    materialization_id: uuid.UUID | None = None,
+    expected_output_fingerprint: str = "",
 ) -> RenderExecution:
     existing = session.scalars(
         select(RenderExecution)
@@ -1028,19 +1029,28 @@ def persist_envelope(
     ).first()
     if existing is not None:
         return cast(RenderExecution, existing)
+    from app.render.execution.policy import TRANSFORMED_SHORT
+
+    payload = request_payload(spec)
+    if materialization_id is not None:
+        payload["materialization_id"] = str(materialization_id)
+        payload["expected_output_fingerprint"] = expected_output_fingerprint
     row = RenderExecution(
         id=uuid.uuid4(),
         source_video_id=candidate.source_video_id,
         clip_candidate_id=candidate.id,
         render_contract_id=_as_uuid(spec.render_contract_id),
         visual_composition_plan_id=_as_uuid(spec.visual_plan_id),
+        materialization_id=materialization_id,
         artifact_purpose=RenderArtifactPurpose(spec.artifact_purpose),
         lifecycle=RenderExecutionLifecycle.QUEUED,
         is_current=True,
         input_fingerprint=input_fingerprint,
         delivery_profile_key=delivery_profile_key,
-        request_payload=request_payload(spec),
+        request_payload=payload,
         omitted_requirements=[item.as_dict() for item in spec.omitted],
+        # Only the transformed path is a genuine Stage 6 render.
+        stage6_implemented=spec.artifact_purpose == TRANSFORMED_SHORT,
         policy_version=EXECUTION_POLICY_VERSION,
         schema_version=EXECUTION_SCHEMA_VERSION,
         fingerprint_version=EXECUTION_FINGERPRINT_VERSION,
@@ -1048,6 +1058,48 @@ def persist_envelope(
     session.add(row)
     session.flush()
     return row
+
+
+def build_spec_for_row(
+    session: Session,
+    candidate: ClipCandidate,
+    row: RenderExecution,
+    settings: Settings,
+    storage: StorageService,
+    stream_probe: Any | None = None,
+) -> RenderSpec:
+    """Rebuild the exact request for a persisted row, purpose-aware.
+
+    A transformed row loads the *exact bound materialization* (by id and expected
+    output fingerprint) rather than whichever materialization happens to be
+    newest; core rows keep the frozen source-validation builder.
+    """
+
+    from app.render.execution.policy import TRANSFORMED_SHORT
+
+    if row.artifact_purpose.value == TRANSFORMED_SHORT and row.materialization_id is not None:
+        from app.materialization.rendering import build_transformed_render_spec
+
+        expected = str((row.request_payload or {}).get("expected_output_fingerprint") or "")
+        return build_transformed_render_spec(
+            session,
+            candidate,
+            materialization_id=row.materialization_id,
+            expected_output_fingerprint=expected,
+            delivery_profile_key=row.delivery_profile_key,
+            settings=settings,
+            storage=storage,
+            stream_probe=stream_probe,
+        )
+    return build_render_spec(
+        session,
+        candidate,
+        artifact_purpose=row.artifact_purpose.value,
+        delivery_profile_key=row.delivery_profile_key,
+        settings=settings,
+        storage=storage,
+        stream_probe=stream_probe,
+    )
 
 
 def _as_uuid(value: object) -> uuid.UUID | None:
@@ -1340,6 +1392,7 @@ def mark_failed(
     reason_code: str,
     *,
     qc: TechnicalQCResult | None = None,
+    partial_manifest: Mapping[str, object] | None = None,
     job_id: uuid.UUID | None = None,
     claim_version: int = -1,
 ) -> bool:
@@ -1349,6 +1402,7 @@ def mark_failed(
         RenderExecutionLifecycle.FAILED,
         reason_code,
         qc=qc,
+        partial_manifest=partial_manifest,
         job_id=job_id,
         claim_version=claim_version,
     )
@@ -1378,15 +1432,22 @@ def _mark_terminal(
     reason_code: str,
     *,
     qc: TechnicalQCResult | None = None,
+    partial_manifest: Mapping[str, object] | None = None,
     job_id: uuid.UUID | None = None,
     claim_version: int = -1,
 ) -> bool:
+    if partial_manifest:
+        manifest = dict(partial_manifest)
+    elif qc is not None:
+        manifest = dict(qc.measured)
+    else:
+        manifest = {}
     values: dict[str, Any] = dict(
         lifecycle=lifecycle,
         cache_eligible=False,
         qc_status=(RenderQCStatus(qc.status) if qc is not None and qc.status == "FAIL" else None),
         artifact_reference={},
-        execution_manifest=dict(qc.measured) if qc is not None else {},
+        execution_manifest=manifest,
         qc_result=qc.as_dict() if qc is not None else {},
         output_fingerprint="",
         reason_codes=[reason_code],
@@ -1412,6 +1473,7 @@ def cache_hit(
     candidate_id: uuid.UUID,
     settings: Settings,
     *,
+    artifact_purpose: str = CORE_SOURCE_VALIDATION,
     expected_input_fingerprint: str | None = None,
     runtime_identity: RuntimeIdentity | None = None,
 ) -> RenderExecution | None:
@@ -1424,7 +1486,7 @@ def cache_hit(
     """
 
     config = settings.stage52_config()
-    row = get_current_render_execution(session, candidate_id)
+    row = get_current_render_execution(session, candidate_id, artifact_purpose=artifact_purpose)
     if row is None:
         return None
     if (
@@ -1468,14 +1530,7 @@ def cache_hit(
     if candidate is None:
         return None
     try:
-        spec = build_render_spec(
-            session,
-            candidate,
-            artifact_purpose=row.artifact_purpose.value,
-            delivery_profile_key=row.delivery_profile_key,
-            settings=settings,
-            storage=storage,
-        )
+        spec = build_spec_for_row(session, candidate, row, settings, storage)
     except Exception:
         return None
     if request_input_fingerprint(spec, config) != row.input_fingerprint:

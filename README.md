@@ -27,7 +27,11 @@ authorize content; Stage 4.3 deterministically selects zero or one current
 survivor. Stage 5.0 then turns the selection into a durable, evidence-bound
 execution/render contract, and Stage 5.1 produces a deterministic visual
 composition, framing, and FINAL_CLIP caption plan (a plan, not a rendered
-video). Stages 5.2 and 6 remain unimplemented.
+video). Stage 5.2 executes a current executable render contract as a
+deterministic source-core validation artifact. Stage 6 transformed-short
+materialization is partially implemented: its durable persistence and
+deterministic materialization core exist, while the authored renderer
+integration, semantic/TTS providers, API/CLI/UI, and real acceptance remain.
 
 Only process material you own or are explicitly authorized to process. URL
 ingest downloads permitted public sources directly; an optional outbound proxy
@@ -507,6 +511,31 @@ position. See [Stage 5.2 operations](docs/STAGE_5_2_OPERATIONS.md).
 CLI: `render-execution`, `render-execution-status`, `render-execution-artifact`.
 API: `POST/GET /api/candidates/{id}/render-execution`, `GET
 /api/render-executions/{id}`, `GET /api/render-executions/{id}/artifact`.
+
+### Stage 6 transformed-short materialization (in progress)
+
+Stage 6 owns authored content, timeline, and editing decisions for one explicitly
+selected candidate. It builds on the selected Stage 4 plan, usable FINAL_CLIP
+evidence, a current Stage 5.0 execution contract, a current Stage 5.1
+composition, materialized original value, optional narration/supporting assets,
+and a final authored timeline/audio recipe executed by the reusable Stage 5.2
+renderer. It adds a `MATERIALIZATION` job kind, the `TRANSFORMED_SHORT` render
+purpose, and two tables (`channel_production_profiles`,
+`clip_materializations`) via migration `20261014_0023`, and adds no
+`PipelineStage`, `PipelineRun`, or `_NEXT_STAGE` entry.
+
+Implemented so far: the durable persistence and the deterministic
+`backend/app/materialization` core (versioned policy/budgets, immutable types,
+DB-independent inputs, stable fingerprints that keep a voice-only change from
+invalidating no-narration output, profile semantic-context matching,
+authored-copy validation with a claim ledger and slot resolution, authored
+timeline/audio-recipe construction with hero protection, a rights-gated
+supporting-visual library, a provider-neutral narration synthesis interface, and
+categorical assessment that is always `publication_ready=false`). Remaining:
+semantic/TTS provider adapters, the DB-assembly service/queue/executor and final
+renderer integration (authored cards, output overlays, mixed/mastered audio), the
+candidate-scoped API/CLI/UI, and real manual acceptance. See
+[Stage 6 operations](docs/STAGE_6_OPERATIONS.md).
 
 
 Stage 3 semantic mode defaults to `deterministic`: zero Gemini calls and zero

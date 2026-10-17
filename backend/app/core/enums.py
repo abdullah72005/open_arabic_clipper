@@ -44,6 +44,7 @@ class JobKind(str, Enum):
     TRANSFORMATION_GOVERNANCE = "TRANSFORMATION_GOVERNANCE"
     VISUAL_COMPOSITION = "VISUAL_COMPOSITION"
     RENDER_EXECUTION = "RENDER_EXECUTION"
+    MATERIALIZATION = "MATERIALIZATION"
 
 
 class JobStatus(str, Enum):
@@ -725,9 +726,15 @@ class RenderArtifactPurpose(str, Enum):
     ``CORE_SOURCE_VALIDATION`` executes only the ordered ``SOURCE_MEDIA``
     occurrences; authored material is deliberately omitted and reported. It is a
     terminal validation output, never a publication-final artifact.
+
+    ``TRANSFORMED_SHORT`` executes a frozen Stage 6 authored timeline (authored
+    cards/overlays, mixed source + narration audio, supporting visuals) from the
+    original source plus accepted lossless assets. It remains a
+    human-review-ready artifact and is never publication-ready by itself.
     """
 
     CORE_SOURCE_VALIDATION = "CORE_SOURCE_VALIDATION"
+    TRANSFORMED_SHORT = "TRANSFORMED_SHORT"
 
 
 class RenderExecutionLifecycle(str, Enum):
@@ -748,3 +755,139 @@ class RenderQCStatus(str, Enum):
     PASS = "PASS"
     WARN = "WARN"
     FAIL = "FAIL"
+
+
+class MaterializationPriority(str, Enum):
+    """Stage 6 materialization quality tier.
+
+    Only ``CANDIDATE`` and ``FINAL_CLIP`` are valid: an INDEX materialization is
+    never produced. The tier participates in the output fingerprint, so one tier
+    can never satisfy another.
+    """
+
+    CANDIDATE = "CANDIDATE"
+    FINAL_CLIP = "FINAL_CLIP"
+
+
+class MaterializationLifecycle(str, Enum):
+    """Stage 6 processing lifecycle (separate from semantic outcome)."""
+
+    QUEUED = "QUEUED"
+    RUNNING = "RUNNING"
+    AWAITING_RENDER = "AWAITING_RENDER"
+    COMPLETE = "COMPLETE"
+    BLOCKED = "BLOCKED"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+
+
+class MaterializationOutcome(str, Enum):
+    """Truthful Stage 6 semantic outcome (independent of technical lifecycle).
+
+    ``READY_FOR_HUMAN_REVIEW`` is the successful final semantic state and is
+    transcript/artefact readiness for review, never publication authorization.
+    A technically complete render with a degraded or deferred semantic result
+    must use the matching non-success outcome.
+    """
+
+    READY_FOR_HUMAN_REVIEW = "READY_FOR_HUMAN_REVIEW"
+    MATERIALIZED_WITH_CAUTION = "MATERIALIZED_WITH_CAUTION"
+    NO_OUTPUT = "NO_OUTPUT"
+    DEFERRED_PROVIDER = "DEFERRED_PROVIDER"
+    DEFERRED_EVIDENCE = "DEFERRED_EVIDENCE"
+    TTS_UNAVAILABLE = "TTS_UNAVAILABLE"
+    BLOCKED_VERIFICATION = "BLOCKED_VERIFICATION"
+    REJECTED_QUALITY = "REJECTED_QUALITY"
+    UPSTREAM_REVALIDATION_REQUIRED = "UPSTREAM_REVALIDATION_REQUIRED"
+    NEEDS_MANUAL_TRANSCRIPT_REVIEW = "NEEDS_MANUAL_TRANSCRIPT_REVIEW"
+    FAILED = "FAILED"
+
+
+class MaterializationComponent(str, Enum):
+    """Closed set of Stage 6 component checkpoints with independent identity."""
+
+    SCRIPT = "SCRIPT"
+    NARRATION = "NARRATION"
+    SUPPORTING = "SUPPORTING"
+    TIMELINE = "TIMELINE"
+    RENDER = "RENDER"
+    ASSESSMENT = "ASSESSMENT"
+
+
+class MaterializationSlotResolution(str, Enum):
+    """Explicit decision for one authored/contract slot."""
+
+    PENDING = "PENDING"
+    FULFILLED = "FULFILLED"
+    DECLINED = "DECLINED"
+    DEFERRED = "DEFERRED"
+    BLOCKED = "BLOCKED"
+
+
+class SupportingVisualMode(str, Enum):
+    """Operator supporting-visual request; default OFF."""
+
+    OFF = "OFF"
+    AUTO = "AUTO"
+    ON = "ON"
+
+
+class SupportingVisualStyle(str, Enum):
+    """Bounded supporting-visual style vocabulary."""
+
+    AUTO = "AUTO"
+    ABSTRACT_LOOP = "ABSTRACT_LOOP"
+    STOCK_BROLL = "STOCK_BROLL"
+    CUSTOM_LIBRARY = "CUSTOM_LIBRARY"
+
+
+class SupportingAssetRights(str, Enum):
+    """Local supporting-asset rights classification (never legal advice)."""
+
+    EXPLICIT_COMPATIBLE = "EXPLICIT_COMPATIBLE"
+    UNKNOWN = "UNKNOWN"
+    CONFLICTING = "CONFLICTING"
+
+
+class ClaimClass(str, Enum):
+    """Claim-ledger classification for materialized authored copy."""
+
+    SOURCE_SUPPORTED = "SOURCE_SUPPORTED"
+    SOURCE_GROUNDED_INFERENCE = "SOURCE_GROUNDED_INFERENCE"
+    EXTERNAL_REQUIRES_VERIFICATION = "EXTERNAL_REQUIRES_VERIFICATION"
+
+
+class QualityDimension(str, Enum):
+    """Closed Stage 6 categorical quality dimensions (no aggregate score)."""
+
+    SLOT_FULFILLMENT = "SLOT_FULFILLMENT"
+    SUBSTANTIVE_VALUE = "SUBSTANTIVE_VALUE"
+    GROUNDING_VERIFICATION = "GROUNDING_VERIFICATION"
+    FIDELITY_ATTRIBUTION = "FIDELITY_ATTRIBUTION"
+    HERO_PRESERVATION = "HERO_PRESERVATION"
+    PACING_CONTEXT_DENSITY = "PACING_CONTEXT_DENSITY"
+    NARRATION_NECESSITY = "NARRATION_NECESSITY"
+    LANGUAGE_REGISTER_NATURALNESS = "LANGUAGE_REGISTER_NATURALNESS"
+    AUDIO_MASTERING_INTELLIGIBILITY = "AUDIO_MASTERING_INTELLIGIBILITY"
+    VISUAL_CAPTION_READABILITY = "VISUAL_CAPTION_READABILITY"
+    OVEREDIT_DISTRACTION = "OVEREDIT_DISTRACTION"
+    SOURCE_DOMINANCE_ORIGINALITY = "SOURCE_DOMINANCE_ORIGINALITY"
+    PLATFORM_SUITABILITY = "PLATFORM_SUITABILITY"
+    DUPLICATE_EVIDENCE = "DUPLICATE_EVIDENCE"
+
+
+class QualityLevel(str, Enum):
+    """Bounded categorical finding for one quality dimension."""
+
+    SATISFIED = "SATISFIED"
+    CONCERN = "CONCERN"
+    UNMET = "UNMET"
+    UNKNOWN = "UNKNOWN"
+    NOT_APPLICABLE = "NOT_APPLICABLE"
+
+
+class MaterializationRepairOutcome(str, Enum):
+    """Whether a materialization's single repair allowance was spent."""
+
+    UNUSED = "UNUSED"
+    SPENT = "SPENT"

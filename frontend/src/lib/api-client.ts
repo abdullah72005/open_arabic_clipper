@@ -356,6 +356,94 @@ export interface RenderArtifact {
   cache_eligible: boolean;
   is_current: boolean;
   created_at: string;
+  kind: "CORE_SOURCE_VALIDATION" | "TRANSFORMED_SHORT";
+  materialization_id: string | null;
+  materialization_lifecycle: string | null;
+  semantic_outcome: string | null;
+  human_review_required: boolean;
+  publication_ready: boolean;
+  review_ready: boolean;
+  materialization_effective: boolean;
+  live_freshness: string;
+  materialization_state:
+    | "CORE"
+    | "REVIEW_READY"
+    | "PENDING"
+    | "DEFERRED"
+    | "REJECTED"
+    | "NO_OUTPUT"
+    | "BLOCKED"
+    | "FAILED"
+    | "CANCELLED"
+    | "HISTORICAL"
+    | "DIAGNOSTIC";
+  readiness_reasons: string[];
+  findings: Array<Record<string, unknown>>;
+  selection_id: string | null;
+  render_contract_id: string | null;
+  artifact_endpoint: "render_execution" | "materialization";
+  artifact_available: boolean;
+  historical: boolean;
+  render_output_fingerprint: string | null;
+  repair_revision: number | null;
+  artifact_sha256: string | null;
+  bound_render: boolean;
+}
+
+export interface MaterializationReadiness {
+  review_ready: boolean;
+  reasons: string[];
+  freshness?: string;
+  is_effective?: boolean;
+  outcome?: string | null;
+  publication_ready?: boolean;
+}
+
+export interface Materialization {
+  id: string;
+  source_video_id: string;
+  clip_candidate_id: string;
+  profile_key: string;
+  priority: string;
+  lifecycle: string;
+  semantic_outcome: string | null;
+  human_review_required: boolean;
+  publication_ready: boolean;
+  is_current: boolean;
+  repair_count: number;
+  reason_codes: string[];
+  input_fingerprint: string;
+  output_fingerprint: string;
+  policy_version: string;
+  schema_version: string;
+  render_execution_id: string | null;
+  selection_id: string | null;
+  render_contract_id: string | null;
+  is_effective: boolean;
+  live_freshness: string;
+  readiness: MaterializationReadiness;
+  component_statuses: Record<string, unknown>;
+  findings: Array<Record<string, unknown>>;
+  provider_attempts: Record<string, unknown>;
+  artifact_available: boolean;
+}
+
+export interface MaterializationQueueResponse {
+  job_id: string | null;
+  status: string;
+  queued: boolean;
+  cached: boolean;
+  active: boolean;
+  materialization_id: string | null;
+  render_execution_id: string | null;
+  phase: string | null;
+  lifecycle: string | null;
+  semantic_outcome: string | null;
+  human_review_required: boolean;
+  publication_ready: boolean;
+  review_ready: boolean;
+  reasons: string[];
+  skipped_reason: string | null;
 }
 
 type Fetcher = typeof fetch;
@@ -512,6 +600,46 @@ export function createApiClient(baseUrl: string, fetcher: Fetcher = fetch) {
       `${baseUrl.replace(/\/$/, "")}/api/render-executions/${encodeURIComponent(renderExecutionId)}/artifact`,
     listRenderArtifacts: (limit = 50) =>
       request<RenderArtifact[]>(`/api/render-executions?limit=${limit}`),
+    queueMaterialization: (
+      candidateId: string,
+      options: {
+        priority?: string;
+        profileKey?: string;
+        supportingRequested?: string;
+        force?: boolean;
+      } = {}
+    ) => {
+      const query = new URLSearchParams({
+        priority: options.priority ?? "CANDIDATE",
+        supporting_requested: options.supportingRequested ?? "OFF",
+        force: String(options.force ?? false)
+      });
+      if (options.profileKey) query.set("profile_key", options.profileKey);
+      return request<MaterializationQueueResponse>(
+        `/api/candidates/${encodeURIComponent(candidateId)}/materialization?${query.toString()}`,
+        { method: "POST" }
+      );
+    },
+    getCandidateMaterialization: (candidateId: string, profileKey?: string) =>
+      request<Materialization>(
+        `/api/candidates/${encodeURIComponent(candidateId)}/materialization${
+          profileKey ? `?profile_key=${encodeURIComponent(profileKey)}` : ""
+        }`
+      ),
+    getMaterialization: (materializationId: string) =>
+      request<Materialization>(`/api/materializations/${encodeURIComponent(materializationId)}`),
+    cancelMaterialization: (materializationId: string) =>
+      request<Materialization>(
+        `/api/materializations/${encodeURIComponent(materializationId)}/cancel`,
+        { method: "POST" }
+      ),
+    resumeMaterialization: (materializationId: string) =>
+      request<MaterializationQueueResponse>(
+        `/api/materializations/${encodeURIComponent(materializationId)}/resume`,
+        { method: "POST" }
+      ),
+    materializationArtifactUrl: (materializationId: string) =>
+      `${baseUrl.replace(/\/$/, "")}/api/materializations/${encodeURIComponent(materializationId)}/artifact`,
     listJobs: () => request<Job[]>("/jobs"),
     getJob: (id: string) => request<Job>(`/jobs/${encodeURIComponent(id)}`),
     cancelJob: (id: string) => request<Job>(`/jobs/${encodeURIComponent(id)}/cancel`, { method: "POST" }),

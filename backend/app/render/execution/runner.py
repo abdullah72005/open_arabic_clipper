@@ -41,12 +41,25 @@ class RenderTimeout(RuntimeError):
 
 
 class RenderProcessError(RuntimeError):
-    """The FFmpeg process failed or produced no usable artifact."""
+    """The FFmpeg process failed or produced no usable artifact.
 
-    def __init__(self, reason_code: str, detail: str = "") -> None:
+    ``manifest`` optionally carries a partial measurement manifest produced before
+    an MP4 existed (for example a completed unmastered audio analysis), so the
+    Stage 6 finalizer can justify a bounded repair without pretending a failed
+    render completed QC.
+    """
+
+    def __init__(
+        self,
+        reason_code: str,
+        detail: str = "",
+        *,
+        manifest: Mapping[str, object] | None = None,
+    ) -> None:
         super().__init__(reason_code)
         self.reason_code = reason_code
         self.detail = detail
+        self.manifest: dict[str, object] = dict(manifest) if manifest else {}
 
 
 def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
@@ -85,21 +98,29 @@ def _localize_ass(
     if not data:
         raise RenderProcessError("ASS_MISSING", "no canonical ASS bytes were supplied")
     (attempt_directory / compiled.ass_localized_name).write_bytes(data)
+    if compiled.authored_ass_localized_name:
+        authored = context.authored_ass_bytes
+        if not authored:
+            raise RenderProcessError("ASS_MISSING", "no authored ASS bytes were supplied")
+        (attempt_directory / compiled.authored_ass_localized_name).write_bytes(authored)
 
 
-def run_compiled_render(compiled: CompiledRender, context: AttemptContext) -> RenderArtifacts:
-    """Execute one compiled render, returning the artifact plus probe facts."""
+def _run_process_group(
+    argv: list[str] | tuple[str, ...],
+    attempt_directory: Path,
+    context: AttemptContext,
+    deadline: float | None,
+    poll: float,
+) -> tuple[int, str]:
+    """Run one allow-listed child under the shared deadline and cancellation.
 
-    attempt_directory = context.attempt_directory
-    attempt_directory.mkdir(parents=True, exist_ok=True)
-    (attempt_directory / compiled.filtergraph_relative_path).write_text(
-        compiled.filtergraph, encoding="utf-8"
-    )
-    _localize_ass(attempt_directory, compiled, context)
+    Returns ``(returncode, stderr_tail)``; cancellation and deadline exhaustion
+    terminate the process group and raise so no further process starts. The whole
+    authored attempt (mix, measure, master, encode) shares one deadline.
+    """
 
-    poll = context.poll_seconds if context.poll_seconds > 0 else _DEFAULT_POLL_SECONDS
     process = subprocess.Popen(  # noqa: S603 - allow-listed argv, shell=False
-        list(compiled.argv),
+        list(argv),
         cwd=str(attempt_directory),
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
@@ -126,7 +147,6 @@ def run_compiled_render(compiled: CompiledRender, context: AttemptContext) -> Re
     started = time.monotonic()
     timed_out = False
     cancelled = False
-    deadline = context.effective_deadline(started)
     while True:
         if process.poll() is not None:
             break
@@ -162,7 +182,155 @@ def run_compiled_render(compiled: CompiledRender, context: AttemptContext) -> Re
         raise RenderCancelled("render cancelled")
     if timed_out:
         raise RenderTimeout("render timed out")
-    if process.returncode != 0:
+    return process.returncode, stderr_tail
+
+
+def _checkpoint(deadline: float | None, context: AttemptContext) -> None:
+    if context.cancelled():
+        raise RenderCancelled("render cancelled")
+    if deadline is not None and time.monotonic() >= deadline:
+        raise RenderTimeout("render timed out")
+
+
+def _prepare_authored_audio(
+    compiled: CompiledRender,
+    context: AttemptContext,
+    attempt_directory: Path,
+    deadline: float | None,
+    poll: float,
+) -> None:
+    """Execute mix -> measure -> linear master before the final encode.
+
+    Partial measurements are attached to any raised :class:`RenderProcessError`
+    so the finalizer can justify a bounded peak repair from real evidence.
+    """
+
+    from app.render.execution.audio import (
+        LIMITED_RELATIVE_NAME,
+        AudioPreparationError,
+        build_limit_argv,
+        build_master_argv,
+        build_measure_argv,
+        measurement_or_fail,
+        reject_decision,
+        select_mastering,
+        verify_linear_mastering,
+    )
+
+    plan = compiled.audio_preparation
+    assert plan is not None
+    binary = compiled.runtime_identity.ffmpeg_binary
+    partial: dict[str, object] = {}
+
+    (attempt_directory / plan.mix_filtergraph_name).write_text(
+        plan.mix_filtergraph, encoding="utf-8"
+    )
+    _checkpoint(deadline, context)
+    code, stderr = _run_process_group(plan.mix_argv, attempt_directory, context, deadline, poll)
+    if code != 0:
+        raise RenderProcessError(
+            "RENDER_PROCESS_FAILED",
+            stderr[-2048:],
+            manifest={"phase": "MIX", **partial},
+        )
+
+    _checkpoint(deadline, context)
+    unmastered = str(attempt_directory / plan.unmastered_name)
+    code, stderr = _run_process_group(
+        build_measure_argv(binary, unmastered, plan.mastering),
+        attempt_directory,
+        context,
+        deadline,
+        poll,
+    )
+    try:
+        measurement = measurement_or_fail(stderr)
+        partial["mix_measurement"] = measurement.as_dict()
+    except AudioPreparationError as error:
+        raise RenderProcessError(error.reason_code, error.detail, manifest=partial) from error
+
+    # One authorized bounded peak-limiter repair may be applied before the final
+    # linear mastering; it starts from the lossless unmastered mix and is
+    # re-measured so the mastering decision uses the actual limited signal.
+    if float(getattr(plan.mastering, "repair_peak_limit_db", 0.0) or 0.0) > 0.0:
+        _checkpoint(deadline, context)
+        limited = str(attempt_directory / LIMITED_RELATIVE_NAME)
+        code, stderr = _run_process_group(
+            build_limit_argv(binary, unmastered, limited, measurement, plan.mastering),
+            attempt_directory,
+            context,
+            deadline,
+            poll,
+        )
+        if code != 0:
+            raise RenderProcessError(
+                "RENDER_PROCESS_FAILED", stderr[-2048:], manifest={"phase": "LIMIT", **partial}
+            )
+        unmastered = limited
+        partial["peak_limit_applied"] = True
+        _checkpoint(deadline, context)
+        code, stderr = _run_process_group(
+            build_measure_argv(binary, unmastered, plan.mastering),
+            attempt_directory,
+            context,
+            deadline,
+            poll,
+        )
+        try:
+            measurement = measurement_or_fail(stderr)
+            partial["limited_measurement"] = measurement.as_dict()
+        except AudioPreparationError as error:
+            raise RenderProcessError(error.reason_code, error.detail, manifest=partial) from error
+
+    try:
+        decision = select_mastering(measurement, plan.mastering)
+        partial["mastering_decision"] = decision.as_dict()
+        reject_decision(decision)
+    except AudioPreparationError as error:
+        raise RenderProcessError(error.reason_code, error.detail, manifest=partial) from error
+
+    _checkpoint(deadline, context)
+    master = str(attempt_directory / plan.master_name)
+    code, stderr = _run_process_group(
+        build_master_argv(binary, unmastered, master, measurement, decision, plan.mastering),
+        attempt_directory,
+        context,
+        deadline,
+        poll,
+    )
+    if code != 0:
+        raise RenderProcessError(
+            "RENDER_PROCESS_FAILED", stderr[-2048:], manifest={"phase": "MASTER", **partial}
+        )
+    try:
+        verify_linear_mastering(stderr)
+    except AudioPreparationError as error:
+        raise RenderProcessError(error.reason_code, error.detail, manifest=partial) from error
+    partial["phase"] = "MASTERED"
+    partial["master_file"] = plan.master_name
+
+
+def run_compiled_render(compiled: CompiledRender, context: AttemptContext) -> RenderArtifacts:
+    """Execute one compiled render, returning the artifact plus probe facts."""
+
+    attempt_directory = context.attempt_directory
+    attempt_directory.mkdir(parents=True, exist_ok=True)
+    (attempt_directory / compiled.filtergraph_relative_path).write_text(
+        compiled.filtergraph, encoding="utf-8"
+    )
+    _localize_ass(attempt_directory, compiled, context)
+
+    poll = context.poll_seconds if context.poll_seconds > 0 else _DEFAULT_POLL_SECONDS
+    started = time.monotonic()
+    deadline = context.effective_deadline(started)
+
+    if compiled.audio_preparation is not None:
+        _prepare_authored_audio(compiled, context, attempt_directory, deadline, poll)
+
+    returncode, stderr_tail = _run_process_group(
+        compiled.argv, attempt_directory, context, deadline, poll
+    )
+    if returncode != 0:
         raise RenderProcessError("RENDER_PROCESS_FAILED", stderr_tail[-2048:])
 
     output_path = attempt_directory / compiled.output_relative_path

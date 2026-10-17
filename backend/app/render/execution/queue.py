@@ -25,6 +25,7 @@ from app.render.execution.policy import (
     CORE_SOURCE_VALIDATION,
     DEFAULT_DELIVERY_PROFILE_KEY,
     SUPPORTED_ARTIFACT_PURPOSES,
+    TRANSFORMED_SHORT,
     delivery_profile_for,
 )
 from app.render.execution.service import (
@@ -64,6 +65,8 @@ def queue_render_execution(
     *,
     delivery_profile_key: str = DEFAULT_DELIVERY_PROFILE_KEY,
     artifact_purpose: str = CORE_SOURCE_VALIDATION,
+    materialization_id: uuid.UUID | str | None = None,
+    expected_output_fingerprint: str = "",
     force: bool = False,
     settings: Settings | None = None,
     dispatcher: object | None = None,
@@ -81,27 +84,50 @@ def queue_render_execution(
         raise RenderQueueError(error.reason_code) from error
     candidate = prerequisites.candidate
     storage = StorageService(resolved.storage_root)
-    try:
-        spec = build_render_spec(
-            session,
-            candidate,
-            artifact_purpose=artifact_purpose,
-            delivery_profile_key=delivery_profile_key,
-            settings=resolved,
-            storage=storage,
-        )
-    except RenderExecutionError as error:
-        raise RenderQueueError(error.reason_code) from error
-    except (StorageValidationError, OSError):
-        raise RenderQueueError("SOURCE_MEDIA_UNMANAGED") from None
+    if artifact_purpose == TRANSFORMED_SHORT:
+        if not materialization_id or not expected_output_fingerprint:
+            raise RenderQueueError("AUTHORED_MATERIALIZATION_BINDING_INVALID")
+        from app.materialization.rendering import build_transformed_render_spec
+
+        try:
+            spec = build_transformed_render_spec(
+                session,
+                candidate,
+                materialization_id=materialization_id,
+                expected_output_fingerprint=expected_output_fingerprint,
+                delivery_profile_key=delivery_profile_key,
+                settings=resolved,
+                storage=storage,
+            )
+        except RenderExecutionError as error:
+            raise RenderQueueError(error.reason_code) from error
+        except (StorageValidationError, OSError):
+            raise RenderQueueError("SOURCE_MEDIA_UNMANAGED") from None
+    else:
+        try:
+            spec = build_render_spec(
+                session,
+                candidate,
+                artifact_purpose=artifact_purpose,
+                delivery_profile_key=delivery_profile_key,
+                settings=resolved,
+                storage=storage,
+            )
+        except RenderExecutionError as error:
+            raise RenderQueueError(error.reason_code) from error
+        except (StorageValidationError, OSError):
+            raise RenderQueueError("SOURCE_MEDIA_UNMANAGED") from None
     fingerprint = request_input_fingerprint(spec, resolved.stage52_config())
 
     row = _get_or_create_envelope(
         session,
         candidate,
+        artifact_purpose=artifact_purpose,
         spec=spec,
         input_fingerprint=fingerprint,
         delivery_profile_key=delivery_profile_key,
+        materialization_id=uuid.UUID(str(materialization_id)) if materialization_id else None,
+        expected_output_fingerprint=expected_output_fingerprint,
     )
     for _attempt in range(2):
         active = _active_job(session, row)
@@ -117,6 +143,7 @@ def queue_render_execution(
                 session,
                 candidate.id,
                 resolved,
+                artifact_purpose=artifact_purpose,
                 expected_input_fingerprint=fingerprint,
             )
             if cached is not None and cached.id == row.id:
@@ -127,6 +154,7 @@ def queue_render_execution(
                     queued=False,
                     cached=True,
                     active=False,
+                    artifact_purpose=artifact_purpose,
                     delivery_profile_key=delivery_profile_key,
                 )
         job = ProcessingJob(
@@ -147,6 +175,7 @@ def queue_render_execution(
                 queued=True,
                 cached=False,
                 active=False,
+                artifact_purpose=artifact_purpose,
                 delivery_profile_key=delivery_profile_key,
             )
         session.rollback()
@@ -195,9 +224,12 @@ def _get_or_create_envelope(
     session: Session,
     candidate: ClipCandidate,
     *,
+    artifact_purpose: str,
     spec: object,
     input_fingerprint: str,
     delivery_profile_key: str,
+    materialization_id: uuid.UUID | None = None,
+    expected_output_fingerprint: str = "",
 ) -> RenderExecution:
     existing = session.scalars(
         select(RenderExecution)
@@ -207,8 +239,14 @@ def _get_or_create_envelope(
     if existing is not None:
         _reactivate(session, existing, delivery_profile_key)
         return cast(RenderExecution, existing)
+    # Current lookup is scoped by (candidate, artifact_purpose, delivery profile):
+    # creating a transformed row must never demote a coexisting core validation
+    # row (and vice versa).
     current = get_current_render_execution(
-        session, candidate.id, delivery_profile_key=delivery_profile_key
+        session,
+        candidate.id,
+        artifact_purpose=artifact_purpose,
+        delivery_profile_key=delivery_profile_key,
     )
     if current is not None:
         current.is_current = False
@@ -224,6 +262,8 @@ def _get_or_create_envelope(
                 spec=spec,
                 input_fingerprint=input_fingerprint,
                 delivery_profile_key=delivery_profile_key,
+                materialization_id=materialization_id,
+                expected_output_fingerprint=expected_output_fingerprint,
             )
             session.flush()
     except IntegrityError:
@@ -297,6 +337,7 @@ def _active_outcome(row: RenderExecution, job: ProcessingJob) -> RenderQueueOutc
         queued=False,
         cached=False,
         active=True,
+        artifact_purpose=row.artifact_purpose.value,
         delivery_profile_key=row.delivery_profile_key,
     )
 
@@ -358,9 +399,26 @@ def _dispatch(
     run_render_execution.delay(str(render_execution_id), str(job_id), force)
 
 
+def deliver_render_job(
+    render_execution_id: uuid.UUID,
+    job_id: uuid.UUID,
+    force: bool = False,
+    dispatcher: object | None = None,
+) -> None:
+    """Deliver an already-persisted render job to the broker (or injected seam).
+
+    Split out so a caller can persist *all* bindings (forward and reverse)
+    before delivery; a broker failure remains recoverable through the existing
+    ``RENDER_DISPATCH_FAILED`` marker.
+    """
+
+    _dispatch(render_execution_id, job_id, force, dispatcher)
+
+
 __all__ = [
     "RenderQueueError",
     "RenderQueueOutcome",
+    "deliver_render_job",
     "get_render_execution_row",
     "queue_render_execution",
     "with_execution_id",

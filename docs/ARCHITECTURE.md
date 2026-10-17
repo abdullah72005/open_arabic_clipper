@@ -274,3 +274,23 @@ FK, added by migration `20260918_0022`. The current artifact purpose
 `CORE_SOURCE_VALIDATION` is source-core only and never publication-final. See
 `docs/STAGE_5_2_OPERATIONS.md`.
 
+
+## Stage 6 transformed-short materialization (in progress)
+
+Stage 6 is the semantic authoring layer for one explicitly selected candidate. It
+adds `app/materialization/`: versioned `policy`/budgets, immutable `types`,
+DB-independent `inputs`, stable `fingerprints`, channel `profiles` semantic
+matching, deterministic authored-copy `scripting` validation (claim ledger and
+slot resolution), `timeline`/audio-recipe construction with hero protection, a
+rights-gated `supporting` visual library, a provider-neutral `narration` synthesis
+interface, and categorical `acceptance` assessment that is always
+`publication_ready=false`. Stage 6 owns authored content, timeline, and editing
+decisions; the Stage 5.2 renderer remains the deterministic execution engine and
+never authors media. Persistence is two tables (`channel_production_profiles`,
+`clip_materializations`) plus the `MATERIALIZATION` job kind, the
+`TRANSFORMED_SHORT` render purpose, and nullable `materialization_id` FKs added by
+migration `20261014_0023`; there is no new `PipelineStage`, `PipelineRun`,
+`_NEXT_STAGE` entry, or source-lifecycle change. The DB-assembly
+service/queue/executor, the semantic/TTS provider adapters, the authored renderer
+integration, the API/CLI/UI, and real acceptance remain. See
+`docs/STAGE_6_OPERATIONS.md`.

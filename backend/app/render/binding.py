@@ -188,11 +188,16 @@ def align_excerpt(
         return Alignment(structural_valid=True, matched=False, stats={"mode": "no_plan_tokens"})
 
     window_tokens: list[str] = []
-    token_word_index: list[int] = []
-    for word in window:
+    # ``token_window_pos`` maps each token to its *position* in the filtered
+    # ``window`` list (not to the word's global ``index``). Word identity and
+    # window position are distinct spaces: global IDs are dense only by
+    # accident, so indexing ``window`` with a global ID misbinds whenever the
+    # window is a sub-slice of the FINAL_CLIP word evidence.
+    token_window_pos: list[int] = []
+    for position, word in enumerate(window):
         for token in analysis_tokens(word.text):
             window_tokens.append(token)
-            token_word_index.append(word.index)
+            token_window_pos.append(position)
 
     matcher = difflib.SequenceMatcher(None, plan_tokens, window_tokens, autojunk=False)
     matched_plan = 0
@@ -234,10 +239,10 @@ def align_excerpt(
     matched_positions.sort()
     first_token = matched_positions[0]
     last_token = matched_positions[-1]
-    first_word = token_word_index[first_token]
-    last_word = token_word_index[last_token]
-    rebound_start = window[first_word].start
-    rebound_end = window[last_word].end
+    first_word = window[token_window_pos[first_token]]
+    last_word = window[token_window_pos[last_token]]
+    rebound_start = first_word.start
+    rebound_end = last_word.end
     drift = max(abs(rebound_start - start), abs(rebound_end - end))
     return Alignment(
         structural_valid=True,
@@ -245,8 +250,8 @@ def align_excerpt(
         coverage=coverage,
         rebound_start=rebound_start,
         rebound_end=rebound_end,
-        word_start=window[first_word].index,
-        word_end=window[last_word].index,
+        word_start=first_word.index,
+        word_end=last_word.index,
         drift=drift,
         stats={
             "mode": "aligned",

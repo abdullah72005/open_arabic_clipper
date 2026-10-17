@@ -39,9 +39,14 @@ from app.transformation.planning.policy import (  # noqa: F401  (re-exported mar
 # overlap never establishes entailment; only supported quotes, near-exact
 # restatements, or clearly-tied non-factual interpretations are deterministically
 # grounded.
-GOVERNOR_POLICY_VERSION = "stage4.2-v6"
+# v8: a heuristic revision is cleared only by a genuinely complete, favorable
+# semantic review. Every decision-critical dimension (fidelity, substantive
+# value, retention, coherence, narration where relevant, unsupported-claim) must
+# carry a known positive finding; any UNKNOWN/concerning dimension defers
+# governance and cannot produce a selectable approval.
+GOVERNOR_POLICY_VERSION = "stage4.2-v8"
 GOVERNOR_SCHEMA_VERSION = "stage4.2-schema-v1"
-GOVERNOR_VALIDATION_VERSION = "stage4.2-validation-v6"
+GOVERNOR_VALIDATION_VERSION = "stage4.2-validation-v8"
 INPUT_FINGERPRINT_VERSION = "1"
 OUTPUT_FINGERPRINT_VERSION = "1"
 PLAN_GOVERNANCE_FINGERPRINT_VERSION = "1"

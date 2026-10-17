@@ -65,3 +65,61 @@ def test_word_text_rebuilds_from_indexes() -> None:
     words = (ClipWord(0, "a", 0.0, 1.0), ClipWord(1, "b", 1.0, 2.0))
     assert word_text(words, 0, 1) == "a b"
     assert word_text(words, None, None) == "a b"
+
+
+_SPACED_TEXT = "one two three four five six seven eight nine ten eleven twelve"
+
+
+def _spaced_clip(indices: list[int] | None = None, *, step: float = 5.0) -> tuple[ClipWord, ...]:
+    tokens = _SPACED_TEXT.split()
+    resolved = indices if indices is not None else list(range(len(tokens)))
+    return tuple(
+        ClipWord(
+            index=resolved[i],
+            text=token,
+            start=round(i * step, 3),
+            end=round((i + 1) * step, 3),
+            probability=0.9,
+        )
+        for i, token in enumerate(tokens)
+    )
+
+
+def test_dense_global_ids_with_late_filtered_window_returns_authoritative_ids() -> None:
+    # The time window drops the leading words, so the surviving window's
+    # positions (0..6) no longer equal the surviving words' dense global IDs
+    # (5..11). Indexing the filtered window with the global ID used to raise
+    # IndexError or rebind to the wrong words.
+    words = _spaced_clip()
+    block = source_block(
+        "eight nine ten",
+        source_start=words[7].start,
+        source_end=words[9].end,
+        word_start_index=7,
+        word_end_index=9,
+    )
+    alignment = align_excerpt(block, words, planning_refined_start=0.0, planning_refined_end=60.0)
+    assert alignment.matched is True
+    assert alignment.ambiguous is False
+    assert alignment.word_start == 7
+    assert alignment.word_end == 9
+    assert alignment.rebound_start == words[7].start
+    assert alignment.rebound_end == words[9].end
+
+
+def test_sparse_nonzero_ids_return_authoritative_ids_and_times() -> None:
+    indices = [100 + offset for offset in range(12)]
+    words = _spaced_clip(indices)
+    block = source_block(
+        "eight nine ten",
+        source_start=words[7].start,
+        source_end=words[9].end,
+        word_start_index=107,
+        word_end_index=109,
+    )
+    alignment = align_excerpt(block, words, planning_refined_start=0.0, planning_refined_end=60.0)
+    assert alignment.matched is True
+    assert alignment.word_start == 107
+    assert alignment.word_end == 109
+    assert alignment.rebound_start == words[7].start
+    assert alignment.rebound_end == words[9].end
