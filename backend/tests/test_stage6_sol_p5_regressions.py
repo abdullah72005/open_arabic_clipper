@@ -56,6 +56,10 @@ def _write_package(base: Path) -> str:
                 "render_artifact_sha256": artifact_sha,
                 "authored_ass_expected_sha256": "",
                 "authored_ass_sha256": None,
+                # A genuinely valid package carries an explicitly empty
+                # authoritative inventory consistent with no bound declarations.
+                "identity": {"assets": []},
+                "readiness": {"assets": []},
                 "assets": [],
             }
         ),

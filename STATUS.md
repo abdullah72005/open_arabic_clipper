@@ -6,6 +6,75 @@
 > provider key is present" is stale; the only missing external prerequisite is
 > authorized source media.
 
+## Stage 6: SOL 7057 corrections — fail-closed inventory, real narrated export harness (2026-10-18, continuation from p5 @ `7057c11`)
+
+Status: **the three remaining corrections that blocked closure at `7057c11` are
+implemented with regressions. Stage 6 remains NOT FROZEN; `publication_ready` stays
+false. No hosted/provider calls were made.**
+
+### Corrections
+1. **Absent authoritative inventory fails closed
+   (`backend/app/materialization/acceptance_export.py`).** `_required_asset_reasons`
+   no longer returns silently when there is no authoritative inventory. An absent
+   inventory (no `identity.assets` and no `readiness.assets`) is now **always**
+   diagnostic (`PACKAGE_ASSET_INVENTORY_MISSING`): exported-copy evidence
+   (`index.assets`) alone never proves zero requirements. A present-but-malformed
+   `identity`/`readiness` sub-container is reported invalid
+   (`PACKAGE_INVENTORY_INVALID`), never silently treated as absence. `identity.assets`
+   stays authority, `readiness.assets` the permitted complete fallback, and
+   `index.assets` only copy evidence. An explicitly empty inventory is valid only
+   when structurally valid and consistent with every bound reference and ASS
+   declaration (otherwise `PACKAGE_INVENTORY_ASS_MISSING` /
+   `PACKAGE_INVENTORY_REFERENCE_MISMATCH`). Applied before publication, on reuse, and
+   in legacy migration; a genuinely valid positive case (an explicit inventory
+   consistent with no declarations, and a complete nonempty inventory) is preserved.
+2. **Publication test harness repaired
+   (`tests/test_stage6_sol_b141_regressions.py`).** `_publish_result` now submits the
+   actual prepared package instead of an empty surrogate directory, so negative
+   assertions exercise the intended bytes and assert the intended specific refusal
+   reason (`PACKAGE_ASSET_RECORD_MISSING:narration`, `PACKAGE_ASSET_HASH_MISMATCH`)
+   rather than a generic `PACKAGE_MANIFEST_MISSING`. A positive control proves the
+   same helper publishes a complete valid package; reuse and legacy migration are
+   exercised against the intended bytes and preserve existing valid packages/references.
+3. **Real narrated execution for the export regression.** The persisted export case
+   no longer appends a narration reference to arbitrary "WAV" bytes after
+   finalization. It reuses the `test_stage6_milestone` real authored-card +
+   synthetic-narration setup: prepare, real FFmpeg render and finalize with the valid
+   lossless narration asset bound into the render inputs; export succeeds and the
+   exported narration hash is verified against the asset actually rendered; then only
+   the exported narration mapping/file is removed (retaining the ASS and the
+   authoritative inventory) and the intended refusal is asserted. Synthetic media
+   remains integration evidence, never genuine acceptance.
+
+### Verification (this session)
+- Docker `oac-stage6-test` (Python 3.12.14, real FFmpeg 7.1.5):
+  - `test_stage6_sol_b141_regressions.py` (now 26): passed — including absent /
+    malformed / explicitly-empty / nonempty inventory coverage across publication and
+    legacy migration, the publication positive control, and the **real narrated
+    execution/export** refusal.
+  - `test_stage6_sol_451_regressions.py` + `test_stage6_sol_p5_regressions.py` +
+    `test_stage6_sol_8b6_regressions.py` (47): passed (the legacy valid-package
+    fixtures now carry the explicit empty authoritative inventory).
+  - `test_stage6_adapter_regressions.py` + `test_stage6_rc_corrections.py` +
+    `test_stage6_rc_v4_corrections.py` (45) and
+    `test_stage6_api_cli_acceptance.py` + `test_stage6_cache_validation.py` (19,
+    real FFmpeg persisted positive export/HTTP path): passed.
+  - `ruff check app tests`: clean. (`ruff format --check` reports pre-existing drift
+    in `acceptance_export.py` and `test_stage6_sol_451_regressions.py` at lines
+    unrelated to this change; present at HEAD under the installed ruff 0.16.8.)
+- **Zero live provider calls** this session. Preserved recovery evidence unchanged:
+  `storage/benchmarks/stage-6/tts-audition/{recovery,consumed-budget}.json`
+  (`consumed_attempts=9`, `probe_calls=1`).
+
+### Disposition (corrected)
+- **Fixed**: fail-closed absent inventory; repaired publication harness; real
+  narrated export regression.
+- **Code blockers**: none remaining in export verification.
+- **Validation blockers**: lost acoustic evidence and exhausted audition
+  authorization remain.
+- **Externally blocked**: genuine authorized-media acceptance remains outstanding
+  (no authorized source media; a hosted key is present).
+
 ## Stage 6: SOL b141 corrections — complete, self-contained export verification (2026-10-18, continuation)
 
 Status: **the two SOL-reproduced export-integrity defects at `b141097` are

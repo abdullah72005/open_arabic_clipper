@@ -280,13 +280,17 @@ def _normalize_identity_entry(entry: object) -> tuple[str, str, str] | None:
 def _inventory_set(index: Mapping[str, object], key: str) -> tuple[bool, set, bool]:
     """``(present, identities, valid)`` for an ``index[key]["assets"]`` snapshot.
 
-    ``present`` is false when the sub-container or its ``assets`` key is absent
-    (a legacy package); ``valid`` is false when present but malformed.
+    ``present`` is false only when the sub-container or its ``assets`` key is
+    genuinely absent; a present-but-malformed sub-container is reported invalid and
+    is never silently treated as absence. ``valid`` is false when present but
+    malformed.
     """
 
-    container = index.get(key)
-    if not isinstance(container, Mapping):
+    if key not in index:
         return False, set(), True
+    container = index[key]
+    if not isinstance(container, Mapping):
+        return True, set(), False
     assets = container.get("assets")
     if assets is None:
         return False, set(), True
@@ -346,9 +350,11 @@ def _required_asset_reasons(
     ``(kind, source_relative_path, expected_sha256)`` must map to exactly one exported
     record whose bytes verify (through the shared primitive) against the authoritative
     expected hash, the index record, and the manifest entry. Missing, conflicting,
-    duplicate, unexpected, or path-invalid records fail; a missing/incomplete legacy
-    inventory stays diagnostic; an empty inventory is valid only when nothing is
-    declared by any bound source.
+    duplicate, unexpected, or path-invalid records fail. An absent authoritative
+    inventory (no ``identity.assets`` and no ``readiness.assets``) is always
+    diagnostic, so exported-copy evidence alone can never prove zero requirements; an
+    explicitly empty inventory is valid only when structurally valid and consistent
+    with every bound reference and ASS declaration.
     """
 
     declared_raw = index.get("authored_ass_expected_sha256")
@@ -409,10 +415,11 @@ def _required_asset_reasons(
         records[identity] = raw
 
     if required is None:
-        # No authoritative inventory: exported copies alone are not a completeness
-        # proof, so an incomplete legacy inventory stays diagnostic.
-        if records:
-            reasons.append("PACKAGE_ASSET_INVENTORY_MISSING")
+        # An absent authoritative inventory (neither ``identity.assets`` nor
+        # ``readiness.assets``) is always diagnostic: exported-copy evidence
+        # (``index.assets``) alone never proves zero requirements, and missing or
+        # malformed inventory metadata must never silently become absence.
+        reasons.append("PACKAGE_ASSET_INVENTORY_MISSING")
         return
 
     if declared_ass and not any(identity[0] == "authored_ass" for identity in required):

@@ -145,6 +145,11 @@ def _valid_package(base: Path) -> str:
                 "render_artifact_sha256": _sha(artifact),
                 "authored_ass_expected_sha256": "",
                 "authored_ass_sha256": None,
+                # An explicitly empty authoritative inventory is genuinely valid
+                # only when it is structurally valid and consistent with every
+                # bound reference/ASS declaration (here there are none).
+                "identity": {"assets": []},
+                "readiness": {"assets": []},
                 "assets": [],
             }
         ),
