@@ -157,8 +157,9 @@ def _export_synthetic_package(
     import json
     import shutil
 
+    default_root = Path(__file__).resolve().parents[2] / "storage" / "benchmarks"
     root = (
-        Path(os.environ.get("CLIPFACTORY_BENCHMARK_ROOT", "/var/lib/clipfactory/benchmarks"))
+        Path(os.environ.get("CLIPFACTORY_BENCHMARK_ROOT", default_root))
         / "stage-6"
         / "synthetic-integration"
         / case_name
