@@ -74,20 +74,30 @@ transcript disagreement is deferred evidence (never an automatic confirmed meani
 mismatch) while independently established audio/content failures still reject.
 Deferral never approves a voice or review readiness.
 
-Published export packages are immutable and self-verifying: a package is genuine
-only with the supported acceptance index structure, a required nonempty artifact
-filename and its recorded SHA-256, an actual nonempty artifact whose hash matches
-both the index record and the manifest entry, and — for **every required bound
-referenced asset** — an unambiguous `exported_relative_path`, kept separate from
-the source `relative_path`, that resolves to an actual nonempty file whose hash
-matches the authoritative expected hash, the index record, and the manifest entry.
-A `copied=false`/missing record, an absent/unlisted/symlinked/escaping path, a
-destination-name collision between distinct assets, or a missing requirement set
-all fail; `destination_verified` booleans and bare index claims are never integrity
-evidence. An index-only/absent/mismatched package, a corrupt existing package, or
-an unreadable/malformed/unsupported catalog fails closed (diagnostic) and preserves
+Published export packages are immutable and self-verifying. The **complete
+required-asset inventory** is derived from the package's own bound evidence —
+`identity.assets` (else `readiness.assets`), cross-checked against the bound
+`narration_references`/`asset_references` and the declared authored-ASS hash — not
+from `index.assets`, which is only exported-copy evidence (deleting a copy record
+never removes the requirement). Every required identity
+`(kind, source_relative_path, expected_sha256)` must map to exactly one exported
+record — an unambiguous `exported_relative_path` kept separate from the source
+`relative_path` — whose bytes verify against the authoritative expected hash, the
+index record, and the manifest entry. Missing, conflicting, duplicate, unexpected,
+path-invalid, or `copied=false` records, a destination-name collision between
+distinct assets, and any inventory/reference disagreement all fail; a
+missing/incomplete legacy inventory stays diagnostic and an empty inventory is
+valid only when nothing is declared by any bound source. Every package path (the
+transformed MP4, the ASS, narration/supporting assets, the index, and every
+manifest-listed file) is validated by one shared primitive requiring a contained
+relative path, **no symlink in any component** (rejected before any read), a
+nonempty regular file, and hashes agreeing with every applicable expected/index/
+manifest value — so an external file with matching bytes is never accepted.
+`destination_verified` booleans and bare index claims are never integrity evidence.
+An index-only/absent/mismatched package, a corrupt existing package, or an
+unreadable/malformed/unsupported catalog fails closed (diagnostic) and preserves
 the previous reference and the valid staging evidence; the same verifier is applied
-to reuse and legacy migration.
+before publication, on reuse, and in legacy migration.
 
 ## Objective and ownership
 

@@ -6,6 +6,85 @@
 > provider key is present" is stale; the only missing external prerequisite is
 > authorized source media.
 
+## Stage 6: SOL b141 corrections — complete, self-contained export verification (2026-10-18, continuation)
+
+Status: **the two SOL-reproduced export-integrity defects at `b141097` are
+corrected with regressions. The package verifier now derives the complete required
+asset inventory from the package's own bound evidence and requires an exact,
+byte-verified mapping from every required identity to its exported copy; a
+requirement can no longer be dropped by deleting its exported copy record, and
+every package path (transformed MP4, ASS, narration/supporting assets, index,
+manifest-listed files) is validated through one shared primitive that rejects
+external symlinks in any component. No live hosted calls were made. Stage 6 remains
+NOT FROZEN; `publication_ready` stays false.**
+
+### Corrections (one root-cause group: complete, self-contained export verification)
+1. **Defect A — partial asset omission
+   (`backend/app/materialization/acceptance_export.py`).** `_required_asset_reasons`
+   no longer treats `index.assets` (exported-copy evidence) as the requirement set.
+   It derives the authoritative inventory from the bound snapshot — `identity.assets`
+   (else `readiness.assets`), cross-checked against the bound `narration_references`
+   / `asset_references` and the declared authored-ASS hash — validating the
+   inventory's structure and flagging `identity`/`readiness` disagreement
+   (`PACKAGE_INVENTORY_CONFLICT`) or a reference not covered by the inventory
+   (`PACKAGE_INVENTORY_REFERENCE_MISMATCH`). It then requires an exact mapping from
+   every required `(kind, source_relative_path, expected_sha256)` to a single
+   exported record and verified bytes, rejecting missing (`PACKAGE_ASSET_RECORD_MISSING`),
+   duplicate, unexpected, conflicting, or path-invalid records. Deleting a copy
+   record never removes the requirement. A missing/incomplete legacy inventory
+   (no `identity`/`readiness`/references but present copy records) stays diagnostic
+   (`PACKAGE_ASSET_INVENTORY_MISSING`); an empty inventory is valid only when nothing
+   is declared by any bound source.
+2. **Defect B — external MP4 symlink (and every package path).** One shared
+   primitive, `_package_file_outcome`, now validates every package path — the
+   transformed artifact, the authored ASS, narration/supporting assets, the index,
+   and every manifest-listed file. Each path must be relative and contained, no
+   component may be a symlink (checked before any read), the file must exist and be
+   nonempty, and its hash must match every applicable expected hash and the manifest
+   entry. A symlinked `final.mp4` (or asset) is rejected before its bytes are read
+   (`PACKAGE_FILE_SYMLINK`, `PACKAGE_ARTIFACT_SYMLINK`, `PACKAGE_ASSET_SYMLINK`), so
+   an external file with matching bytes is no longer accepted. Applied consistently
+   before publication, on reuse, and during legacy migration. Preserved: immutable
+   package directories, catalog locking/atomic replacement, diagnostic separation,
+   and existing valid-package preservation.
+
+### Verification (this session)
+- Docker `oac-stage6-test` (Python 3.12.14, real FFmpeg 7.1.5) + PostgreSQL
+  `oac-stage6-pg-v4`:
+  - `test_stage6_sol_b141_regressions.py` (new, 18): passed — complete narrated
+    package genuine; omitted narration record/file and supporting omission
+    (publication/reuse/legacy) refused; removing all copy records never empties the
+    requirement; inventory conflict/reference-mismatch/duplicate/unexpected
+    rejected; symlinked artifact, symlinked asset, symlinked parent directory and
+    escaping path rejected; legacy migration promotes a complete package and
+    rejects a partial one; and a **real persisted narrated export** (real FFmpeg
+    render + finalize) refuses a removed narration mapping with the retained ASS.
+  - `sol_8b6 + sol_451 + sol_p5` (47): passed (the `_asset_package` fixture now
+    carries the bound inventory).
+  - `adapter_regressions + rc_corrections + rc_v4_corrections + results_boundary +
+    cache_validation + api_cli_acceptance` (71, real FFmpeg, persisted positive
+    export/HTTP path): passed.
+  - `ruff check app tests`: clean.
+  - SOL's probes `/tmp/test_sol_b141_review.py` now both **fail** (they assert the
+    fixed defects), confirming the reproduction is closed.
+- **Zero live provider calls** this session. Preserved recovery evidence unchanged:
+  `storage/benchmarks/stage-6/tts-audition/{recovery,consumed-budget}.json`
+  (`consumed_attempts=9`, `probe_calls=1`) and the captured report
+  `/tmp/audition-out.json` (sha256 `2d39a09a…0038`).
+
+### Disposition (corrected)
+- **Fixed**: complete, self-contained export verification (bound-inventory coverage
+  + shared symlink-rejecting file primitive).
+- **Code blockers**: none remaining in export verification.
+- **Validation blockers**: lost acoustic evidence and exhausted audition
+  authorization remain — the consumed-budget floor blocks new synthesis and the
+  audio is irrecoverable.
+- **Unresolved product decision (not a code gap)**: the hosted TTS voice stays
+  **unset by an already-made architectural decision**; further generation needs a
+  separately agreed bounded recovery budget.
+- **Externally blocked**: genuine authorized-media acceptance remains outstanding
+  (no authorized source media; a hosted key is present).
+
 ## Stage 6: SOL 8b6 corrections — verified exported asset bytes, case-sensitive protected atoms, versioned history-prefix budget proof (2026-10-17, continuation)
 
 Status: **the three SOL-reproduced defects at `8b6c992` are corrected with
@@ -88,6 +167,11 @@ remains NOT FROZEN; `publication_ready` stays false.**
 ### Disposition (corrected)
 - **Fixed**: verified exported asset bytes; case-sensitive protected atoms;
   versioned history-prefix budget proof.
+- **Later corrected by the next section**: the SOL review of this revision
+  reproduced two further export-integrity defects — a required asset (declared by
+  the bound inventory/references) could be omitted from `index.assets`/the package
+  yet still published, and the transformed MP4 could be an external symlink with
+  matching bytes. So "fixed" above was **not** final for the revision as reviewed.
 - **Validation blockers**: lost acoustic evidence and exhausted audition
   authorization remain — the floor blocks new synthesis and the audio is
   irrecoverable.

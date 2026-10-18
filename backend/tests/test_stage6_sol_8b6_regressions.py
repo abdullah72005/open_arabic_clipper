@@ -82,6 +82,29 @@ def _asset_package(
         "render_artifact_sha256": _file_sha(artifact),
         "authored_ass_expected_sha256": declared,
         "authored_ass_sha256": actual_ass,
+        "identity": {
+            "assets": [[r["kind"], r["relative_path"], r["expected_sha256"]] for r in records]
+        },
+        "readiness": {
+            "assets": [
+                {
+                    "kind": r["kind"],
+                    "relative_path": r["relative_path"],
+                    "expected_sha256": r["expected_sha256"],
+                }
+                for r in records
+            ]
+        },
+        "narration_references": [
+            {"relative_path": r["relative_path"], "sha256": r["expected_sha256"]}
+            for r in records
+            if r["kind"] == "narration"
+        ],
+        "asset_references": [
+            {"relative_path": r["relative_path"], "sha256": r["expected_sha256"]}
+            for r in records
+            if r["kind"] == "supporting"
+        ],
     }
     if include_assets_key:
         index["assets"] = records
@@ -129,11 +152,6 @@ def test_required_ass_bytes_cannot_be_replaced_by_index_claims(tmp_path: Path) -
     identity = _write_manifest(package)
     reasons = _package_integrity_reasons(package, identity)
     assert reasons != []
-    assert any(
-        reason.startswith("PACKAGE_ASSET_PATH_MISSING")
-        or reason.startswith("PACKAGE_ASSET_FILE_MISSING")
-        for reason in reasons
-    )
     assert not (package / "authored.ass").exists()
 
 

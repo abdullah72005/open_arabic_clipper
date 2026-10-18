@@ -53,11 +53,11 @@ def _package_integrity_reasons(package_dir: Path, package_identity: str | None) 
     index must be the supported acceptance structure and mark the package genuine,
     a required nonempty artifact filename and its recorded SHA-256 must be present,
     the actual nonempty artifact must match the index/manifest identity, every
-    required bound referenced asset must declare an unambiguous exported relative
-    path resolving to an actual nonempty file whose hash matches its authoritative
-    expected hash, the index record, and the manifest entry, and every manifest path
-    must stay inside the package and hash exactly. The same verifier is applied to
-    package reuse and to legacy-catalog migration.
+    required bound referenced asset must map to an exported copy whose bytes verify,
+    and every manifest path must stay inside the package and hash exactly. Every
+    package path is checked with the same primitive (:func:`_package_file_outcome`),
+    which rejects external symlinks. The same verifier is applied to package reuse
+    and to legacy-catalog migration.
     """
 
     reasons: list[str] = []
@@ -85,6 +85,7 @@ def _package_integrity_reasons(package_dir: Path, package_identity: str | None) 
     if index.get("genuine_acceptance") is not True:
         return ["PACKAGE_INDEX_NOT_GENUINE"]
     listed: dict[str, str] = {}
+    entries: list[tuple[str, str]] = []
     for line in manifest_lines:
         if not line.strip():
             continue
@@ -94,24 +95,25 @@ def _package_integrity_reasons(package_dir: Path, package_identity: str | None) 
             continue
         # Manifest paths must stay inside the package: an absolute or escaping
         # path is not a valid acceptance reference.
-        relative_path = Path(relative)
-        if relative_path.is_absolute() or ".." in relative_path.parts:
+        relative_path = _package_relative(relative)
+        if relative_path is None:
             reasons.append(f"PACKAGE_PATH_ESCAPES:{relative}")
             continue
-        listed[relative] = digest.lower()
-        target = package_dir / relative
-        if not target.is_file():
-            reasons.append(f"PACKAGE_FILE_MISSING:{relative}")
-            continue
-        try:
-            if _sha256_file(target) != digest.lower():
-                reasons.append(f"PACKAGE_FILE_MISMATCH:{relative}")
-        except OSError:
-            reasons.append(f"PACKAGE_FILE_UNREADABLE:{relative}")
+        key = relative_path.as_posix()
+        listed[key] = digest.lower()
+        entries.append((key, digest.lower()))
     if not listed:
         reasons.append("PACKAGE_MANIFEST_EMPTY")
     if "index.json" not in listed:
         reasons.append("PACKAGE_INDEX_UNLISTED")
+    # Every manifest-listed file must be a contained, nonempty regular file whose
+    # bytes match its declared digest (a symlink is rejected, never followed).
+    for key, digest in entries:
+        _actual, codes = _package_file_outcome(
+            package_dir, Path(key), expected_hashes=(digest,), listed=listed
+        )
+        for code in codes:
+            reasons.append(f"{_MANIFEST_FILE_REASONS[code]}:{key}")
     _artifact_reasons(package_dir, index, listed, reasons)
     _required_asset_reasons(package_dir, index, listed, reasons)
     return reasons
@@ -124,8 +126,9 @@ def _artifact_reasons(
 
     Explicit favorable booleans and a self-consistent manifest are insufficient: a
     genuine package must declare a required artifact filename and its recorded
-    SHA-256, that file must exist nonempty inside the package, and its actual hash
-    must match both the index record and the manifest entry.
+    SHA-256, and the file — validated through the shared primitive — must be a
+    contained nonempty regular file whose hash matches both the index record and the
+    manifest entry (a symlink is rejected).
     """
 
     artifact_file = index.get("artifact_file")
@@ -136,45 +139,76 @@ def _artifact_reasons(
     if not isinstance(recorded_sha, str) or not recorded_sha:
         reasons.append("PACKAGE_ARTIFACT_SHA_MISSING")
         return
-    recorded_sha = recorded_sha.lower()
-    artifact_path = package_dir / artifact_file
-    if not artifact_path.is_file():
-        reasons.append(f"PACKAGE_ARTIFACT_FILE_MISSING:{artifact_file}")
+    relative = _package_relative(artifact_file)
+    if relative is None:
+        reasons.append(f"PACKAGE_ARTIFACT_PATH_ESCAPES:{artifact_file}")
         return
-    try:
-        if artifact_path.stat().st_size <= 0:
-            reasons.append(f"PACKAGE_ARTIFACT_EMPTY:{artifact_file}")
-            return
-        actual_sha = _sha256_file(artifact_path)
-    except OSError:
-        reasons.append(f"PACKAGE_ARTIFACT_UNREADABLE:{artifact_file}")
-        return
-    if actual_sha != recorded_sha:
-        reasons.append(f"PACKAGE_ARTIFACT_SHA_MISMATCH:{artifact_file}")
-    manifest_sha = listed.get(artifact_file)
-    if manifest_sha is None:
-        reasons.append(f"PACKAGE_ARTIFACT_UNLISTED:{artifact_file}")
-    elif manifest_sha != actual_sha:
-        reasons.append(f"PACKAGE_ARTIFACT_MANIFEST_MISMATCH:{artifact_file}")
+    _actual, codes = _package_file_outcome(
+        package_dir, relative, expected_hashes=(recorded_sha,), listed=listed
+    )
+    for code in codes:
+        reasons.append(f"{_ARTIFACT_FILE_REASONS[code]}:{artifact_file}")
 
 
-def _exported_path(package_dir: Path, value: object) -> Path | None:
-    """Resolve one exported relative asset path inside the package, or ``None``.
+# --- Shared package-file validation -----------------------------------------
 
-    A required asset's exported path must be an unambiguous relative path that
-    stays inside the package: an absolute path or any ``..`` component is rejected.
-    """
+#: Generic failure codes from :func:`_package_file_outcome`.
+_PATH_ESCAPES = "PATH_ESCAPES"
+_SYMLINK = "SYMLINK"
+_FILE_MISSING = "FILE_MISSING"
+_FILE_EMPTY = "FILE_EMPTY"
+_FILE_UNREADABLE = "FILE_UNREADABLE"
+_HASH_MISMATCH = "HASH_MISMATCH"
+_UNLISTED = "UNLISTED"
+_MANIFEST_MISMATCH = "MANIFEST_MISMATCH"
+
+_ASSET_FILE_REASONS = {
+    _PATH_ESCAPES: "PACKAGE_ASSET_PATH_ESCAPES",
+    _SYMLINK: "PACKAGE_ASSET_SYMLINK",
+    _FILE_MISSING: "PACKAGE_ASSET_FILE_MISSING",
+    _FILE_EMPTY: "PACKAGE_ASSET_EMPTY",
+    _FILE_UNREADABLE: "PACKAGE_ASSET_UNREADABLE",
+    _HASH_MISMATCH: "PACKAGE_ASSET_HASH_MISMATCH",
+    _UNLISTED: "PACKAGE_ASSET_UNLISTED",
+    _MANIFEST_MISMATCH: "PACKAGE_ASSET_MANIFEST_MISMATCH",
+}
+
+_ARTIFACT_FILE_REASONS = {
+    _PATH_ESCAPES: "PACKAGE_ARTIFACT_PATH_ESCAPES",
+    _SYMLINK: "PACKAGE_ARTIFACT_SYMLINK",
+    _FILE_MISSING: "PACKAGE_ARTIFACT_FILE_MISSING",
+    _FILE_EMPTY: "PACKAGE_ARTIFACT_EMPTY",
+    _FILE_UNREADABLE: "PACKAGE_ARTIFACT_UNREADABLE",
+    _HASH_MISMATCH: "PACKAGE_ARTIFACT_SHA_MISMATCH",
+    _UNLISTED: "PACKAGE_ARTIFACT_UNLISTED",
+    _MANIFEST_MISMATCH: "PACKAGE_ARTIFACT_MANIFEST_MISMATCH",
+}
+
+_MANIFEST_FILE_REASONS = {
+    _PATH_ESCAPES: "PACKAGE_PATH_ESCAPES",
+    _SYMLINK: "PACKAGE_FILE_SYMLINK",
+    _FILE_MISSING: "PACKAGE_FILE_MISSING",
+    _FILE_EMPTY: "PACKAGE_FILE_EMPTY",
+    _FILE_UNREADABLE: "PACKAGE_FILE_UNREADABLE",
+    _HASH_MISMATCH: "PACKAGE_FILE_MISMATCH",
+    _UNLISTED: "PACKAGE_FILE_UNLISTED",
+    _MANIFEST_MISMATCH: "PACKAGE_FILE_MISMATCH",
+}
+
+
+def _package_relative(value: object) -> Path | None:
+    """A contained relative package path, or ``None`` (absolute/escaping/empty)."""
 
     if not isinstance(value, str) or not value:
         return None
     relative = Path(value)
     if relative.is_absolute() or not relative.parts or ".." in relative.parts:
         return None
-    return package_dir / relative
+    return relative
 
 
 def _symlink_component(package_dir: Path, relative: Path) -> bool:
-    """Whether any component of an exported relative path is a symlink."""
+    """Whether any component of a package-relative path is a symlink."""
 
     current = package_dir
     for part in relative.parts:
@@ -184,16 +218,117 @@ def _symlink_component(package_dir: Path, relative: Path) -> bool:
     return False
 
 
-def _declares_reference_requirements(index: Mapping[str, object]) -> bool:
-    """Whether the index declares any reference that requires an exported asset."""
+def _package_file_outcome(
+    package_dir: Path,
+    relative: Path,
+    *,
+    expected_hashes: Sequence[object],
+    listed: Mapping[str, str],
+) -> tuple[str | None, list[str]]:
+    """Validate one contained regular package file; return ``(sha256|None, codes)``.
 
-    for key in ("narration_references", "asset_references"):
-        value = index.get(key)
-        if isinstance(value, list) and any(
-            isinstance(item, Mapping) and item.get("relative_path") for item in value
-        ):
-            return True
-    return False
+    The single shared primitive for the transformed artifact, the authored ASS,
+    narration/supporting assets, the index, and every manifest-listed path. The path
+    must be relative and contained, no component may be a symlink (checked before any
+    read, so an external file with matching bytes is never accepted), the file must
+    exist and be nonempty, and its hash must match every applicable expected hash and
+    the manifest entry.
+    """
+
+    if _symlink_component(package_dir, relative):
+        return None, [_SYMLINK]
+    target = package_dir / relative
+    if not target.is_file():
+        return None, [_FILE_MISSING]
+    try:
+        if target.stat().st_size <= 0:
+            return None, [_FILE_EMPTY]
+        actual = _sha256_file(target)
+    except OSError:
+        return None, [_FILE_UNREADABLE]
+    codes: list[str] = []
+    for expected in expected_hashes:
+        if isinstance(expected, str) and expected and actual != expected.lower():
+            codes.append(_HASH_MISMATCH)
+            break
+    manifest_sha = listed.get(relative.as_posix())
+    if manifest_sha is None:
+        codes.append(_UNLISTED)
+    elif manifest_sha != actual:
+        codes.append(_MANIFEST_MISMATCH)
+    return actual, codes
+
+
+def _normalize_identity_entry(entry: object) -> tuple[str, str, str] | None:
+    """``(kind, source_relative_path, expected_sha256)`` for an inventory/record entry."""
+
+    if isinstance(entry, Mapping):
+        kind = entry.get("kind")
+        path = entry.get("relative_path")
+        sha = entry.get("expected_sha256")
+    elif isinstance(entry, (list, tuple)) and len(entry) == 3:
+        kind, path, sha = entry
+    else:
+        return None
+    if not isinstance(kind, str) or not kind:
+        return None
+    if not isinstance(path, str) or not isinstance(sha, str):
+        return None
+    return (kind, path, sha.lower())
+
+
+def _inventory_set(index: Mapping[str, object], key: str) -> tuple[bool, set, bool]:
+    """``(present, identities, valid)`` for an ``index[key]["assets"]`` snapshot.
+
+    ``present`` is false when the sub-container or its ``assets`` key is absent
+    (a legacy package); ``valid`` is false when present but malformed.
+    """
+
+    container = index.get(key)
+    if not isinstance(container, Mapping):
+        return False, set(), True
+    assets = container.get("assets")
+    if assets is None:
+        return False, set(), True
+    if not isinstance(assets, list):
+        return True, set(), False
+    result: set = set()
+    for entry in assets:
+        normalized = _normalize_identity_entry(entry)
+        if normalized is None:
+            return True, set(), False
+        result.add(normalized)
+    return True, result, True
+
+
+def _reference_set(index: Mapping[str, object]) -> tuple[set, bool]:
+    """The required identities declared by the bound narration/supporting references."""
+
+    result: set = set()
+    valid = True
+    for ref_key, kind in (
+        ("narration_references", "narration"),
+        ("asset_references", "supporting"),
+    ):
+        refs = index.get(ref_key)
+        if refs is None:
+            continue
+        if not isinstance(refs, list):
+            valid = False
+            continue
+        for ref in refs:
+            if not isinstance(ref, Mapping):
+                valid = False
+                continue
+            path = ref.get("relative_path")
+            if not path:
+                continue
+            sha = ref.get("sha256")
+            if not isinstance(path, str) or not isinstance(sha, str) or not sha:
+                valid = False
+                continue
+            result.add((kind, path, sha.lower()))
+    return result, valid
 
 
 def _required_asset_reasons(
@@ -202,96 +337,125 @@ def _required_asset_reasons(
     listed: Mapping[str, str],
     reasons: list[str],
 ) -> None:
-    """Require every bound referenced asset to resolve to verified exported bytes.
+    """Require a complete, byte-verified mapping from the bound inventory to exports.
 
-    The required asset set is the package's own bound reference records
-    (``assets``), with the authoritative expected authored-ASS hash cross-checked
-    against them. Favorable booleans (``destination_verified``) or self-consistent
-    index claims are never integrity evidence: each required asset must declare an
-    unambiguous exported relative path that resolves to an actual nonempty file
-    whose hash matches its authoritative expected hash, the index record, and the
-    manifest entry. A missing/malformed requirement set never implies an empty one.
+    The complete required-asset inventory is the package's own bound snapshot
+    (``identity.assets``, else ``readiness.assets``), cross-checked against the bound
+    narration/supporting references. ``index.assets`` is only exported-copy evidence:
+    deleting a copy record never removes the requirement. Every required identity
+    ``(kind, source_relative_path, expected_sha256)`` must map to exactly one exported
+    record whose bytes verify (through the shared primitive) against the authoritative
+    expected hash, the index record, and the manifest entry. Missing, conflicting,
+    duplicate, unexpected, or path-invalid records fail; a missing/incomplete legacy
+    inventory stays diagnostic; an empty inventory is valid only when nothing is
+    declared by any bound source.
     """
 
-    expected_ass = index.get("authored_ass_expected_sha256")
-    declared_ass = expected_ass if isinstance(expected_ass, str) and expected_ass else ""
+    declared_raw = index.get("authored_ass_expected_sha256")
+    declared_ass = declared_raw if isinstance(declared_raw, str) and declared_raw else ""
+
+    id_present, id_set, id_valid = _inventory_set(index, "identity")
+    rd_present, rd_set, rd_valid = _inventory_set(index, "readiness")
+    ref_set, ref_valid = _reference_set(index)
+
+    if not id_valid:
+        reasons.append("PACKAGE_INVENTORY_INVALID:identity")
+    if not rd_valid:
+        reasons.append("PACKAGE_INVENTORY_INVALID:readiness")
+    if not ref_valid:
+        reasons.append("PACKAGE_INVENTORY_INVALID:references")
+    if id_present and rd_present and id_valid and rd_valid and id_set != rd_set:
+        reasons.append("PACKAGE_INVENTORY_CONFLICT")
+
+    required: set | None
+    if id_present and id_valid:
+        required = set(id_set)
+    elif rd_present and rd_valid:
+        required = set(rd_set)
+    else:
+        required = None
+
+    if ref_set:
+        if required is None:
+            reasons.append("PACKAGE_ASSET_INVENTORY_MISSING")
+            required = set()
+        elif not ref_set <= required:
+            reasons.append("PACKAGE_INVENTORY_REFERENCE_MISMATCH")
+            required |= set(ref_set)
+
     raw_assets = index.get("assets")
     if raw_assets is None:
         entries: list[object] = []
+        if declared_ass or ref_set or (required is not None and bool(required)):
+            reasons.append("PACKAGE_ASSET_METADATA_MISSING")
     elif isinstance(raw_assets, list):
         entries = raw_assets
     else:
         reasons.append("PACKAGE_ASSET_METADATA_INVALID")
         return
-    if not entries and (declared_ass or _declares_reference_requirements(index)):
-        reasons.append("PACKAGE_ASSET_METADATA_MISSING")
 
-    records: list[Mapping[str, object]] = []
+    records: dict[tuple[str, str, str], Mapping[str, object]] = {}
     for raw in entries:
         if not isinstance(raw, Mapping):
             reasons.append("PACKAGE_ASSET_RECORD_INVALID")
             continue
-        records.append(raw)
+        identity = _normalize_identity_entry(raw)
+        if identity is None:
+            reasons.append("PACKAGE_ASSET_RECORD_INVALID")
+            continue
+        if identity in records:
+            reasons.append(f"PACKAGE_ASSET_RECORD_DUPLICATE:{identity[0]}")
+            continue
+        records[identity] = raw
 
-    authored_records = [record for record in records if record.get("kind") == "authored_ass"]
-    if declared_ass:
-        if not authored_records:
-            reasons.append("PACKAGE_AUTHORED_ASS_RECORD_MISSING")
-        for record in authored_records:
-            expected = record.get("expected_sha256")
-            if not isinstance(expected, str) or expected.lower() != declared_ass.lower():
-                reasons.append("PACKAGE_AUTHORED_ASS_EXPECTED_MISMATCH")
+    if required is None:
+        # No authoritative inventory: exported copies alone are not a completeness
+        # proof, so an incomplete legacy inventory stays diagnostic.
+        if records:
+            reasons.append("PACKAGE_ASSET_INVENTORY_MISSING")
+        return
 
-    seen: dict[str, tuple[str, str, str]] = {}
-    for record in records:
-        kind = str(record.get("kind") or "")
+    if declared_ass and not any(identity[0] == "authored_ass" for identity in required):
+        reasons.append("PACKAGE_INVENTORY_ASS_MISSING")
+
+    for identity in sorted(required):
+        if identity not in records:
+            reasons.append(f"PACKAGE_ASSET_RECORD_MISSING:{identity[0]}")
+    for identity in sorted(records):
+        if identity not in required:
+            reasons.append(f"PACKAGE_ASSET_RECORD_UNEXPECTED:{identity[0]}")
+
+    seen_paths: dict[str, tuple[str, str, str]] = {}
+    for identity in sorted(records):
+        record = records[identity]
+        kind = identity[0]
         exported = record.get("exported_relative_path")
         if not isinstance(exported, str) or not exported:
             reasons.append(f"PACKAGE_ASSET_PATH_MISSING:{kind}")
             continue
-        relative = Path(exported)
+        relative = _package_relative(exported)
+        if relative is None:
+            reasons.append(f"PACKAGE_ASSET_PATH_ESCAPES:{exported}")
+            continue
         key = relative.as_posix()
-        identity = (
-            kind,
-            str(record.get("relative_path") or ""),
-            str(record.get("expected_sha256") or ""),
-        )
-        previous = seen.get(key)
+        previous = seen_paths.get(key)
         if previous is not None and previous != identity:
             reasons.append(f"PACKAGE_ASSET_PATH_COLLISION:{key}")
             continue
-        seen[key] = identity
-        target = _exported_path(package_dir, exported)
-        if target is None:
-            reasons.append(f"PACKAGE_ASSET_PATH_ESCAPES:{exported}")
-            continue
-        if _symlink_component(package_dir, relative):
-            reasons.append(f"PACKAGE_ASSET_SYMLINK:{exported}")
-            continue
-        if not target.is_file():
-            reasons.append(f"PACKAGE_ASSET_FILE_MISSING:{exported}")
-            continue
-        try:
-            if target.stat().st_size <= 0:
-                reasons.append(f"PACKAGE_ASSET_EMPTY:{exported}")
-                continue
-            actual = _sha256_file(target)
-        except OSError:
-            reasons.append(f"PACKAGE_ASSET_UNREADABLE:{exported}")
-            continue
+        seen_paths[key] = identity
+        if kind == "authored_ass" and declared_ass and identity[2] != declared_ass.lower():
+            reasons.append("PACKAGE_AUTHORED_ASS_EXPECTED_MISMATCH")
         expected = record.get("expected_sha256")
         if not isinstance(expected, str) or not expected:
             reasons.append(f"PACKAGE_ASSET_EXPECTED_MISSING:{kind}")
-        elif actual != expected.lower():
-            reasons.append(f"PACKAGE_ASSET_HASH_MISMATCH:{exported}")
-        recorded = record.get("destination_sha256")
-        if isinstance(recorded, str) and recorded and actual != recorded.lower():
-            reasons.append(f"PACKAGE_ASSET_INDEX_MISMATCH:{exported}")
-        manifest_sha = listed.get(key)
-        if manifest_sha is None:
-            reasons.append(f"PACKAGE_ASSET_UNLISTED:{exported}")
-        elif manifest_sha != actual:
-            reasons.append(f"PACKAGE_ASSET_MANIFEST_MISMATCH:{exported}")
+        _actual, codes = _package_file_outcome(
+            package_dir,
+            relative,
+            expected_hashes=(expected, record.get("destination_sha256")),
+            listed=listed,
+        )
+        for code in codes:
+            reasons.append(f"{_ASSET_FILE_REASONS[code]}:{exported}")
 
 
 def _integrity_failure(
