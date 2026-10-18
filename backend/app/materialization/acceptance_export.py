@@ -260,7 +260,12 @@ def _package_file_outcome(
 
 
 def _normalize_identity_entry(entry: object) -> tuple[str, str, str] | None:
-    """``(kind, source_relative_path, expected_sha256)`` for an inventory/record entry."""
+    """``(kind, source_relative_path, expected_sha256)`` for an inventory/record entry.
+
+    A malformed entry (wrong type, or a missing/empty/non-string required field)
+    returns ``None`` so the caller records an explicit invalid refusal; it is never
+    treated as absent or skipped.
+    """
 
     if isinstance(entry, Mapping):
         kind = entry.get("kind")
@@ -272,7 +277,9 @@ def _normalize_identity_entry(entry: object) -> tuple[str, str, str] | None:
         return None
     if not isinstance(kind, str) or not kind:
         return None
-    if not isinstance(path, str) or not isinstance(sha, str):
+    if not isinstance(path, str) or not path:
+        return None
+    if not isinstance(sha, str) or not sha:
         return None
     return (kind, path, sha.lower())
 
@@ -280,10 +287,13 @@ def _normalize_identity_entry(entry: object) -> tuple[str, str, str] | None:
 def _inventory_set(index: Mapping[str, object], key: str) -> tuple[bool, set, bool]:
     """``(present, identities, valid)`` for an ``index[key]["assets"]`` snapshot.
 
-    ``present`` is false only when the sub-container or its ``assets`` key is
-    genuinely absent; a present-but-malformed sub-container is reported invalid and
-    is never silently treated as absence. ``valid`` is false when present but
-    malformed.
+    The three states are distinguished consistently:
+
+    * ABSENT (``present=False, valid=True``) — the sub-container or its ``assets``
+      key genuinely does not exist, so ``readiness`` fallback remains available;
+    * INVALID (``valid=False``) — a supplied non-object sub-container, a supplied
+      null/non-list ``assets``, or any malformed list entry;
+    * VALID — a structurally valid list whose entries all normalize.
     """
 
     if key not in index:
@@ -291,9 +301,9 @@ def _inventory_set(index: Mapping[str, object], key: str) -> tuple[bool, set, bo
     container = index[key]
     if not isinstance(container, Mapping):
         return True, set(), False
-    assets = container.get("assets")
-    if assets is None:
+    if "assets" not in container:
         return False, set(), True
+    assets = container["assets"]
     if not isinstance(assets, list):
         return True, set(), False
     result: set = set()
@@ -306,7 +316,15 @@ def _inventory_set(index: Mapping[str, object], key: str) -> tuple[bool, set, bo
 
 
 def _reference_set(index: Mapping[str, object]) -> tuple[set, bool]:
-    """The required identities declared by the bound narration/supporting references."""
+    """The required identities declared by the bound narration/supporting references.
+
+    Every supplied reference must be a mapping with a valid nonempty string
+    ``relative_path`` and ``sha256``. A supplied null/non-list container, a
+    non-object entry, or a missing/empty/non-string required field makes the whole
+    reference metadata INVALID (``valid=False``); malformed entries are never
+    silently skipped, so they can never shrink the requirement set to a favorable
+    empty remainder.
+    """
 
     result: set = set()
     valid = True
@@ -314,9 +332,9 @@ def _reference_set(index: Mapping[str, object]) -> tuple[set, bool]:
         ("narration_references", "narration"),
         ("asset_references", "supporting"),
     ):
-        refs = index.get(ref_key)
-        if refs is None:
+        if ref_key not in index:
             continue
+        refs = index[ref_key]
         if not isinstance(refs, list):
             valid = False
             continue
@@ -325,10 +343,8 @@ def _reference_set(index: Mapping[str, object]) -> tuple[set, bool]:
                 valid = False
                 continue
             path = ref.get("relative_path")
-            if not path:
-                continue
             sha = ref.get("sha256")
-            if not isinstance(path, str) or not isinstance(sha, str) or not sha:
+            if not isinstance(path, str) or not path or not isinstance(sha, str) or not sha:
                 valid = False
                 continue
             result.add((kind, path, sha.lower()))
@@ -350,11 +366,18 @@ def _required_asset_reasons(
     ``(kind, source_relative_path, expected_sha256)`` must map to exactly one exported
     record whose bytes verify (through the shared primitive) against the authoritative
     expected hash, the index record, and the manifest entry. Missing, conflicting,
-    duplicate, unexpected, or path-invalid records fail. An absent authoritative
-    inventory (no ``identity.assets`` and no ``readiness.assets``) is always
-    diagnostic, so exported-copy evidence alone can never prove zero requirements; an
-    explicitly empty inventory is valid only when structurally valid and consistent
-    with every bound reference and ASS declaration.
+    duplicate, unexpected, or path-invalid records fail. The metadata parsers
+    distinguish ABSENT, INVALID and VALID consistently: a supplied null/wrong-typed
+    container, a malformed list entry, or a missing/empty/non-string required field
+    is INVALID (``PACKAGE_INVENTORY_INVALID`` / ``PACKAGE_ASSET_METADATA_INVALID`` /
+    ``PACKAGE_ASSET_RECORD_INVALID``) and always prevents genuine publication; it can
+    never disappear through fallback or shrink the requirement set to a favorable
+    empty remainder. Only a genuinely absent ``identity.assets`` may fall back to
+    ``readiness.assets``; malformed identity evidence stays an explicit refusal. An
+    absent authoritative inventory (no ``identity.assets`` and no
+    ``readiness.assets``) is always diagnostic, so exported-copy evidence alone can
+    never prove zero requirements; an explicitly empty inventory is valid only when
+    structurally valid and consistent with every bound reference and ASS declaration.
     """
 
     declared_raw = index.get("authored_ass_expected_sha256")
@@ -376,6 +399,10 @@ def _required_asset_reasons(
     required: set | None
     if id_present and id_valid:
         required = set(id_set)
+    elif id_present:
+        # Malformed identity evidence is an explicit refusal: it must never fall
+        # back to readiness or vanish into a favorable empty remainder.
+        required = None
     elif rd_present and rd_valid:
         required = set(rd_set)
     else:
@@ -389,14 +416,15 @@ def _required_asset_reasons(
             reasons.append("PACKAGE_INVENTORY_REFERENCE_MISMATCH")
             required |= set(ref_set)
 
-    raw_assets = index.get("assets")
-    if raw_assets is None:
+    if "assets" not in index:
         entries: list[object] = []
         if declared_ass or ref_set or (required is not None and bool(required)):
             reasons.append("PACKAGE_ASSET_METADATA_MISSING")
-    elif isinstance(raw_assets, list):
-        entries = raw_assets
+    elif isinstance(index["assets"], list):
+        entries = index["assets"]
     else:
+        # A supplied null or wrong-typed ``index.assets`` is invalid evidence, not
+        # an absent key.
         reasons.append("PACKAGE_ASSET_METADATA_INVALID")
         return
 

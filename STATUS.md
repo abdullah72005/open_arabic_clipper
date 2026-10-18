@@ -6,6 +6,68 @@
 > provider key is present" is stale; the only missing external prerequisite is
 > authorized source media.
 
+## Stage 6: SOL 5a1de46 correction — consistent ABSENT/INVALID/VALID metadata parsing (2026-10-18, continuation from p5 @ `5a1de46`)
+
+Status: **the one remaining export metadata-validation root cause is fixed with a
+parameterized malformed-metadata matrix. Stage 6 remains NOT FROZEN;
+`publication_ready` stays false. No hosted/provider calls were made.**
+
+### Correction (one root cause: ABSENT vs INVALID vs VALID)
+- **`backend/app/materialization/acceptance_export.py`.** The metadata parsers now
+  distinguish the three states consistently instead of collapsing invalid evidence
+  into absence or skipping it:
+  - `_inventory_set` treats only a genuinely missing `identity`/`readiness` key (or
+    a missing `assets` key) as ABSENT; a supplied null, wrong-typed container, or
+    malformed list entry is INVALID (`PACKAGE_INVENTORY_INVALID`). A present null
+    `identity.assets` is INVALID, never absent, so it can no longer fall back to
+    `readiness.assets` and be accepted (reproduction B).
+  - `_reference_set` requires every supplied narration/supporting reference to be a
+    mapping with a valid nonempty string `relative_path` and `sha256`; a supplied
+    null/non-list container, a non-object entry, or a missing/empty/non-string
+    required field marks the references INVALID
+    (`PACKAGE_INVENTORY_INVALID:references`) instead of being skipped
+    (reproduction A).
+  - `_normalize_identity_entry` requires nonempty string `kind`/`relative_path`/
+    `expected_sha256`, so malformed inventory/record entries are invalid rather than
+    silently dropped.
+  - A supplied null or wrong-typed `index.assets` is INVALID
+    (`PACKAGE_ASSET_METADATA_INVALID`), not an absent key.
+  - Fallback to `readiness.assets` remains available only when `identity.assets` is
+    genuinely absent; malformed identity evidence stays an explicit refusal. No new
+    persistence, competing authority, or package-schema redesign; formats and
+    authority order are unchanged.
+
+### Verification (this session)
+- Docker `oac-stage6-test` (Python 3.12.14, real FFmpeg 7.1.5):
+  - `test_stage6_sol_b141_regressions.py` (now 57): passed — including a
+    **parameterized malformed-metadata matrix** (27 cases: null containers/assets,
+    wrong types, non-object references, missing/empty/non-string required fields)
+    exercising the verifier **and** publication/legacy-migration refusal with
+    specific reasons; both reproductions (malformed references, null authority);
+    positive controls for complete inventory, legitimate readiness fallback
+    (empty and nonempty), explicitly empty consistent inventory; and the **real
+    narrated execution/export** refusal.
+  - `test_stage6_sol_451_regressions.py` + `test_stage6_sol_p5_regressions.py` +
+    `test_stage6_sol_8b6_regressions.py` (47): passed.
+  - `test_stage6_adapter_regressions.py` + `test_stage6_rc_corrections.py` +
+    `test_stage6_rc_v4_corrections.py` + `test_stage6_results_boundary.py` (52) and
+    `test_stage6_api_cli_acceptance.py` + `test_stage6_cache_validation.py` (19,
+    real FFmpeg persisted positive export/HTTP path): passed.
+  - `ruff check app tests`: clean. (`ruff format --check` reports only the
+    pre-existing drift in `acceptance_export.py` at lines unrelated to this change;
+    `test_stage6_sol_b141_regressions.py` is format-clean.)
+- **Zero live provider calls** this session.
+
+### Disposition (corrected)
+- **Fixed**: consistent ABSENT/INVALID/VALID metadata parsing at the parsing
+  boundary (fail-closed on null/wrong-typed/malformed inventory, assets and
+  references).
+- **Code blockers**: none remaining in export verification.
+- **Validation blockers**: lost acoustic evidence and exhausted audition
+  authorization remain.
+- **Externally blocked**: genuine authorized-media acceptance remains outstanding
+  (no authorized source media; a hosted key is present).
+
 ## Stage 6: SOL 7057 corrections — fail-closed inventory, real narrated export harness (2026-10-18, continuation from p5 @ `7057c11`)
 
 Status: **the three remaining corrections that blocked closure at `7057c11` are

@@ -553,6 +553,166 @@ def test_legacy_migration_promotes_explicitly_empty_inventory(tmp_path: Path) ->
     assert published is not None and published["genuine_acceptance"] is True
 
 
+# --- ABSENT / INVALID / VALID metadata parsing matrix -----------------------
+
+
+def _mutation_package(base: Path, mutation: dict[str, object]) -> tuple[Path, str]:
+    """A valid explicit-empty package with ``mutation`` applied to its index."""
+
+    base.mkdir(parents=True, exist_ok=True)
+    (base / "final.mp4").write_bytes(b"transformed-media-bytes")
+    index: dict[str, object] = {
+        "genuine_acceptance": True,
+        "artifact_file": "final.mp4",
+        "render_artifact_sha256": _file_sha(base / "final.mp4"),
+        "authored_ass_expected_sha256": "",
+        "identity": {"assets": []},
+        "readiness": {"assets": []},
+        "assets": [],
+    }
+    index.update(mutation)
+    _write_index(base, index)
+    return base, _write_manifest(base)
+
+
+_MALFORMED_METADATA: list[tuple[dict[str, object], str]] = [
+    # Null / wrong-typed / malformed authoritative inventory containers and assets.
+    ({"identity": {"assets": None}}, "PACKAGE_INVENTORY_INVALID:identity"),
+    ({"identity": {"assets": "not-a-list"}}, "PACKAGE_INVENTORY_INVALID:identity"),
+    ({"identity": {"assets": {}}}, "PACKAGE_INVENTORY_INVALID:identity"),
+    ({"identity": {"assets": [None]}}, "PACKAGE_INVENTORY_INVALID:identity"),
+    ({"identity": "oops"}, "PACKAGE_INVENTORY_INVALID:identity"),
+    ({"identity": {"assets": [{"kind": "authored_ass"}]}}, "PACKAGE_INVENTORY_INVALID:identity"),
+    (
+        {"identity": {"assets": [{"kind": "", "relative_path": "p", "expected_sha256": "h"}]}},
+        "PACKAGE_INVENTORY_INVALID:identity",
+    ),
+    (
+        {
+            "identity": {
+                "assets": [{"kind": "authored_ass", "relative_path": "", "expected_sha256": "h"}]
+            }
+        },
+        "PACKAGE_INVENTORY_INVALID:identity",
+    ),
+    (
+        {
+            "identity": {
+                "assets": [{"kind": "authored_ass", "relative_path": "p", "expected_sha256": ""}]
+            }
+        },
+        "PACKAGE_INVENTORY_INVALID:identity",
+    ),
+    (
+        {"identity": {"assets": [{"kind": 5, "relative_path": "p", "expected_sha256": "h"}]}},
+        "PACKAGE_INVENTORY_INVALID:identity",
+    ),
+    ({"identity": {"assets": [["authored_ass", "p"]]}}, "PACKAGE_INVENTORY_INVALID:identity"),
+    ({"readiness": [1, 2]}, "PACKAGE_INVENTORY_INVALID:readiness"),
+    ({"readiness": {"assets": None}}, "PACKAGE_INVENTORY_INVALID:readiness"),
+    ({"readiness": {"assets": "x"}}, "PACKAGE_INVENTORY_INVALID:readiness"),
+    ({"readiness": {"assets": [["narration", "", "h"]]}}, "PACKAGE_INVENTORY_INVALID:readiness"),
+    # Null / wrong-typed / malformed narration and supporting references.
+    ({"narration_references": None}, "PACKAGE_INVENTORY_INVALID:references"),
+    ({"narration_references": {}}, "PACKAGE_INVENTORY_INVALID:references"),
+    ({"narration_references": [None]}, "PACKAGE_INVENTORY_INVALID:references"),
+    ({"narration_references": [{"sha256": "a" * 64}]}, "PACKAGE_INVENTORY_INVALID:references"),
+    ({"narration_references": [{"relative_path": "p"}]}, "PACKAGE_INVENTORY_INVALID:references"),
+    (
+        {"narration_references": [{"relative_path": "", "sha256": "a" * 64}]},
+        "PACKAGE_INVENTORY_INVALID:references",
+    ),
+    (
+        {"narration_references": [{"relative_path": "p", "sha256": ""}]},
+        "PACKAGE_INVENTORY_INVALID:references",
+    ),
+    (
+        {"narration_references": [{"relative_path": 5, "sha256": "a" * 64}]},
+        "PACKAGE_INVENTORY_INVALID:references",
+    ),
+    ({"asset_references": [{"sha256": "b" * 64}]}, "PACKAGE_INVENTORY_INVALID:references"),
+    ({"asset_references": "not-a-list"}, "PACKAGE_INVENTORY_INVALID:references"),
+    # Null / wrong-typed exported-copy evidence.
+    ({"assets": None}, "PACKAGE_ASSET_METADATA_INVALID"),
+    ({"assets": {"kind": "authored_ass"}}, "PACKAGE_ASSET_METADATA_INVALID"),
+]
+
+
+@pytest.mark.parametrize(("mutation", "expected"), _MALFORMED_METADATA)
+def test_malformed_metadata_is_refused_and_not_promoted(
+    tmp_path: Path, mutation: dict[str, object], expected: str
+) -> None:
+    base, identity = _mutation_package(tmp_path / "malformed", mutation)
+    reasons = _package_integrity_reasons(base, identity)
+    assert expected in reasons, reasons
+    result = _publish_result(tmp_path / "out", base, identity)
+    assert result["published"] is False
+    assert expected in result["integrity_failure"]
+    catalog = tmp_path / "catalog.json"
+    catalog.write_text(
+        json.dumps(
+            {
+                "cases": [
+                    {
+                        "case": "malformed",
+                        "directory": "malformed",
+                        "package_identity": identity,
+                        "published": True,
+                        "genuine_acceptance": True,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    entry = _read_catalog(catalog)["cases"]["malformed"]
+    assert entry["published"] is None
+    assert entry["diagnostic_attempts"][0]["genuine_acceptance"] is False
+
+
+def test_malformed_references_do_not_become_no_requirements(tmp_path: Path) -> None:
+    # Reproduction A: references with a valid hash but no relative_path must be
+    # INVALID (never silently skipped into a favorable empty requirement set).
+    base, _identity = _inventory_package(
+        tmp_path / "malformed-refs", identity={"assets": []}, readiness={"assets": []}
+    )
+    index = json.loads((base / "index.json").read_text(encoding="utf-8"))
+    index["narration_references"] = [{"sha256": "a" * 64}]
+    index["asset_references"] = [{"sha256": "b" * 64}]
+    identity = _rewrite(base, index)
+    reasons = _package_integrity_reasons(base, identity)
+    assert "PACKAGE_INVENTORY_INVALID:references" in reasons
+    assert _publish_result(tmp_path / "out", base, identity)["published"] is False
+
+
+def test_null_identity_authority_is_invalid_not_absent(tmp_path: Path) -> None:
+    # Reproduction B: a present null authority is INVALID; it must never be
+    # classified as absent and silently fall back to readiness.
+    package, _identity, index, _exported = _narrated_package(tmp_path / "null-authority")
+    index["identity"]["assets"] = None
+    identity = _rewrite(package, index)
+    reasons = _package_integrity_reasons(package, identity)
+    assert "PACKAGE_INVENTORY_INVALID:identity" in reasons
+    result = _publish_result(tmp_path / "out", package, identity)
+    assert result["published"] is False
+    assert "PACKAGE_INVENTORY_INVALID:identity" in result["integrity_failure"]
+
+
+def test_readiness_fallback_when_identity_absent_is_genuine(tmp_path: Path) -> None:
+    # A genuinely absent identity.assets may still fall back to readiness.assets.
+    base, identity = _inventory_package(tmp_path / "fallback", readiness={"assets": []})
+    assert _package_integrity_reasons(base, identity) == []
+    assert _publish_result(tmp_path / "out", base, identity)["published"] is True
+
+
+def test_readiness_fallback_with_nonempty_inventory_is_genuine(tmp_path: Path) -> None:
+    package, _identity, index, _exported = _narrated_package(tmp_path / "fallback-full")
+    index.pop("identity")
+    identity = _rewrite(package, index)
+    assert _package_integrity_reasons(package, identity) == []
+    assert _publish_result(tmp_path / "out", package, identity)["published"] is True
+
+
 # --- Real persisted narrated export -----------------------------------------
 
 

@@ -85,14 +85,23 @@ record — an unambiguous `exported_relative_path` kept separate from the source
 `relative_path` — whose bytes verify against the authoritative expected hash, the
 index record, and the manifest entry. Missing, conflicting, duplicate, unexpected,
 path-invalid, or `copied=false` records, a destination-name collision between
-distinct assets, and any inventory/reference disagreement all fail. An absent
-authoritative inventory (no `identity.assets` and no `readiness.assets`) is **always**
-diagnostic (`PACKAGE_ASSET_INVENTORY_MISSING`) — exported-copy evidence alone never
-proves zero requirements — and a present-but-malformed inventory sub-container is
-`PACKAGE_INVENTORY_INVALID`, never silently treated as absence. An explicitly empty
-inventory is valid only when structurally valid and consistent with every bound
-reference and ASS declaration (otherwise `PACKAGE_INVENTORY_ASS_MISSING` /
-`PACKAGE_INVENTORY_REFERENCE_MISMATCH`). Every package path (the
+distinct assets, and any inventory/reference disagreement all fail. The metadata
+parsers distinguish **ABSENT / INVALID / VALID** consistently: only a genuinely
+absent `identity.assets`/`readiness.assets` key is ABSENT (and only a genuinely
+absent `identity.assets` may fall back to `readiness.assets`); a supplied null,
+wrong-typed container, malformed list entry, or missing/empty/non-string required
+field is INVALID (`PACKAGE_INVENTORY_INVALID`,
+`PACKAGE_ASSET_METADATA_INVALID` for `index.assets`, or `PACKAGE_ASSET_RECORD_INVALID`)
+and always prevents genuine publication — it can never disappear through fallback or
+shrink the requirement set to a favorable empty remainder. Every supplied
+narration/supporting reference must carry a valid nonempty `relative_path` and
+`sha256`; malformed entries are never skipped. An absent authoritative inventory (no
+`identity.assets` and no `readiness.assets`) is **always** diagnostic
+(`PACKAGE_ASSET_INVENTORY_MISSING`) — exported-copy evidence alone never proves zero
+requirements. An explicitly empty inventory is valid only when structurally valid and
+consistent with every bound reference and ASS declaration (otherwise
+`PACKAGE_INVENTORY_ASS_MISSING` / `PACKAGE_INVENTORY_REFERENCE_MISMATCH`). Every
+package path (the
 transformed MP4, the ASS, narration/supporting assets, the index, and every
 manifest-listed file) is validated by one shared primitive requiring a contained
 relative path, **no symlink in any component** (rejected before any read), a
