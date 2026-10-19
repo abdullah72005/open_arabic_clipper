@@ -51,12 +51,8 @@ from app.transformation.governance.types import (
     ProviderCritique,
 )
 from app.transformation.grounding import (
-    INVALID,
-    QUOTE,
-    SOURCE_EXCERPT,
-    SOURCE_SPAN,
-    WORD_RANGE,
-    parse_reference,
+    resolve_reference,
+    validate_source_grounding,
 )
 from app.transformation.hook_payoff import (
     MandatoryEvidence,
@@ -361,6 +357,9 @@ def revalidate_integrity(
             dependencies = target.get("dependency_ids")
             if not isinstance(dependencies, list) or claim not in dependencies:
                 reasons.append("VERIFICATION_UNLINKED")
+
+    grounding_failures = validate_source_grounding(blocks)
+    reasons.extend(failure.reason() for failure in grounding_failures)
 
     for kind in plan.original_value_kinds:
         try:
@@ -981,6 +980,7 @@ class _SourceEvidence:
     all_text: str
     refined_start: float
     refined_end: float
+    source_blocks: tuple[Mapping[str, object], ...]
 
 
 def _build_source_evidence(plan: PlanEvidence, inputs: GovernanceInputs) -> _SourceEvidence:
@@ -990,9 +990,11 @@ def _build_source_evidence(plan: PlanEvidence, inputs: GovernanceInputs) -> _Sou
     spans: list[tuple[float, float, str]] = []
     words: list[tuple[int, int, str]] = []
     texts: list[str] = []
+    source_blocks: list[Mapping[str, object]] = []
     for block in _blocks(plan):
         if _block_type(block) != PlanBlockType.SOURCE_EXCERPT.value:
             continue
+        source_blocks.append(block)
         index = _int(block.get("index"))
         text = block.get("source_text")
         text_value = text if isinstance(text, str) else ""
@@ -1025,77 +1027,15 @@ def _build_source_evidence(plan: PlanEvidence, inputs: GovernanceInputs) -> _Sou
         all_text=" ".join(texts),
         refined_start=inputs.refined_start,
         refined_end=inputs.refined_end,
+        source_blocks=tuple(source_blocks),
     )
 
 
 def _resolve_ref(ref: object, evidence: _SourceEvidence) -> str | None:
-    """Resolve one grounding declaration against real plan source evidence.
+    """Resolve one declaration through the shared authoritative resolver."""
 
-    The shared strict grammar is used so malformed declarations never become a
-    convenient numeric substring. A citation must be completely in scope; partial
-    overlap is never accepted as resolution. Provider-declared labels and
-    provider-supplied proof text are never evidence.
-    """
-
-    parsed = parse_reference(ref)
-    if parsed.kind is INVALID:
-        return None
-    if parsed.kind is SOURCE_EXCERPT:
-        if parsed.block_index is None:
-            return None
-        return evidence.blocks.get(parsed.block_index)
-    if parsed.kind is WORD_RANGE:
-        start = parsed.word_start_index
-        end = parsed.word_end_index
-        if start is None or end is None or start < 0 or end < start:
-            return None
-        intervals = sorted(evidence.words, key=lambda item: item[0])
-        cursor = start
-        texts: list[str] = []
-        for word_start, word_end, text in intervals:
-            if word_end < cursor:
-                continue
-            if word_start > cursor:
-                return None
-            texts.append(text)
-            cursor = max(cursor, word_end)
-            if cursor >= end:
-                break
-        if cursor < end or not texts:
-            return None
-        return " ".join(texts)
-    if parsed.kind is SOURCE_SPAN:
-        start = parsed.source_start
-        end = parsed.source_end
-        if start is None or end is None:
-            return None
-        intervals = sorted((a, b, text) for a, b, text in evidence.spans)
-        cursor = float(start)
-        texts = []
-        for span_start, span_end, text in intervals:
-            if span_end < cursor:
-                continue
-            if span_start > cursor:
-                return None
-            texts.append(text)
-            cursor = max(cursor, span_end)
-            if cursor >= float(end):
-                break
-        if cursor < float(end) or not texts:
-            return None
-        return " ".join(texts)
-    if parsed.kind is QUOTE:
-        quote = (parsed.quote or "").strip().casefold()
-        if not quote:
-            return None
-        for text in evidence.blocks.values():
-            if text.strip().casefold() == quote:
-                return text
-        for _start, _end, text in evidence.spans:
-            if text.strip().casefold() == quote:
-                return text
-        return None
-    return None
+    text, _reason = resolve_reference(ref, evidence.source_blocks)
+    return text
 
 
 def _support_tokens(text: str) -> list[str]:
@@ -2247,7 +2187,9 @@ def apply_semantic_review(
     # Stage 4.3 correctly refuses the internally inconsistent evidence forever
     # (``INCONSISTENT_GOVERNANCE_EVIDENCE``).
     if (
-        evaluation.verification.get("claim_state") == ClaimGroundingState.SUPPORT_UNVERIFIED.value
+        evaluation.integrity_ok
+        and evaluation.verification.get("claim_state")
+        == ClaimGroundingState.SUPPORT_UNVERIFIED.value
         and critique.unsupported_claim == UnsupportedClaimFinding.NONE
         and critique.fidelity != SemanticFidelityFinding.FAIL
     ):

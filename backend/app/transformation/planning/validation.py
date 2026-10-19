@@ -23,6 +23,10 @@ from app.core.enums import (
     TransformationIntensity,
     TransformationStrategyType,
 )
+from app.transformation.grounding import (
+    GROUNDING_DECLARATION_MALFORMED,
+    validate_source_grounding,
+)
 from app.transformation.hook_payoff import (
     HOOK_EVIDENCE_MALFORMED,
     HOOK_EVIDENCE_MISSING,
@@ -494,6 +498,9 @@ def _resolve_block(
     inputs: PlanningInputs,
     config: Stage41Config,
 ) -> tuple[PlanBlock | None, str | None]:
+    if raw.grounding_refs_invalid:
+        detail = "; ".join(raw.grounding_refs_errors) or "invalid_reference_declaration"
+        return None, f"{GROUNDING_DECLARATION_MALFORMED}[block={index}]: {detail}"
     # Malformed provider block references are rejected, never silently dropped.
     if raw.dependent_block_ids_invalid:
         return None, REJECT_VERIFICATION_BLOCK_REFERENCE
@@ -895,6 +902,13 @@ def validate_provider_plan(
         if not (block_link or narration_link):
             return ValidationResult(plan=None, reasons=(REJECT_VERIFICATION_UNLINKED,))
 
+    grounding_failures = validate_source_grounding([block.as_dict() for block in blocks])
+    if grounding_failures:
+        return ValidationResult(
+            plan=None,
+            reasons=tuple(failure.reason() for failure in grounding_failures),
+        )
+
     status = (
         PlanStatus.PLAN_GENERATED_WITH_VERIFICATION_REQUIRED
         if verification_blocks or requires_verification
@@ -1014,11 +1028,11 @@ def deterministic_provider_plan(
     inputs: PlanningInputs,
     config: Stage41Config,
 ) -> PlanProviderPlan | None:
-    """Conservative deterministic structuring of an already-concrete intent.
+    """Decline deterministic structuring when no real source reference exists.
 
-    Only obvious, grounded Stage 4.0 strategies qualify. It structures existing
-    approved intent and never invents research, claims, names, numbers, context,
-    or generic commentary.
+    A strategy label is not source evidence, and the deterministic path must not
+    invent a block or word citation for an authored claim. A qualified strategy is
+    therefore left to an explicit provider; without one the run defers truthfully.
     """
 
     from app.transformation.planning.policy import DETERMINISTIC_FALLBACK_STRATEGIES
@@ -1029,38 +1043,10 @@ def deterministic_provider_plan(
         return None
     if strategy_type not in DETERMINISTIC_FALLBACK_STRATEGIES:
         return None
-    focus = str(strategy.get("added_value_focus", "")).strip()
-    if not focus:
+    if not str(strategy.get("added_value_focus", "")).strip():
         return None
-    kind_raw = str(strategy.get("substantive_value_kind", ""))
     try:
-        kind = SubstantiveValueKind(kind_raw)
+        SubstantiveValueKind(str(strategy.get("substantive_value_kind", "")))
     except ValueError:
         return None
-    source = PlanProviderBlock(
-        block_type=PlanBlockType.SOURCE_EXCERPT,
-        purpose="Hero source moment",
-        use_full_window=True,
-        source_role=SourceExcerptRole.HERO,
-        preservation_constraints=tuple(strategy.get("preservation_requirements") or []),
-    )
-    value = PlanProviderBlock(
-        block_type=PlanBlockType.ORIGINAL_VALUE,
-        purpose="Substantive value after the source",
-        estimated_duration=4.0,
-        interrupts_source=False,
-        substantive_value_kind=kind,
-        semantic_intent=focus,
-        why_unavailable=(
-            "The source excerpt alone does not provide this specific added dimension."
-        ),
-        grounding_refs=(str(strategy.get("strategy_key", "")),),
-        delivery_intent=None,
-    )
-    return PlanProviderPlan(
-        strategy_id=str(strategy.get("id", "")),
-        strategy_key=str(strategy.get("strategy_key", strategy_type.value)),
-        confidence=0.5,
-        blocks=(source, value),
-        narration=NarrationRequirement(need=NarrationNeed.NONE),
-    )
+    return None

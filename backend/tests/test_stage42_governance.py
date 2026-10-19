@@ -123,6 +123,7 @@ def test_twelve_second_generic_preamble_fails():
                 intent="This is interesting and important to note",
                 kind="SYNTHESIS",
                 duration=12.0,
+                grounding=("block:1",),
             ),
             source_block(1),
         ],
@@ -261,7 +262,8 @@ def test_fabricated_numeric_claim_is_rejected():
     )
     governance = _governance(plan)
     assert governance.status is GovernancePlanStatus.REJECTED_BY_GOVERNOR
-    assert "UNSUPPORTED_CRITICAL_CLAIM" in governance.reason_codes
+    assert "PLAN_INTEGRITY_INVALID" in governance.reason_codes
+    assert "GROUNDING_REQUIRED_MISSING" in str(governance.hard_gates)
 
 
 def test_high_source_ratio_with_source_as_evidence_not_auto_rejected():
@@ -489,11 +491,11 @@ def test_ungrounded_non_numeric_external_claim_cannot_be_approved():
         original_value_kinds=("EXPLANATION",),
     )
     governance = _governance(plan)
-    assert governance.status is GovernancePlanStatus.BLOCKED_PENDING_VERIFICATION
+    assert governance.status is GovernancePlanStatus.REJECTED_BY_GOVERNOR
     assert governance.status is not GovernancePlanStatus.APPROVED_FOR_SELECTION
     assert governance.eligible_for_stage4_3 is False
-    assert governance.verification["claim_state"] == "EXTERNAL_REQUIRED_UNRESOLVED"
-    assert "EXTERNAL_VERIFICATION_REQUIRED" in governance.reason_codes
+    assert "PLAN_INTEGRITY_INVALID" in governance.reason_codes
+    assert "GROUNDING_REQUIRED_MISSING" in str(governance.hard_gates)
 
 
 def test_structural_citation_to_unrelated_evidence_is_not_grounded():
@@ -761,6 +763,7 @@ def test_hard_failure_plan_is_never_sent_for_semantic_review():
                 intent="This is interesting and important to note",
                 kind="SYNTHESIS",
                 duration=12.0,
+                grounding=("block:1",),
             ),
             source_block(1),
         ],
@@ -792,8 +795,9 @@ def test_arbitrary_grounding_labels_do_not_approve_external_claim():
             original_value_kinds=("EXPLANATION",),
         )
         governance = _governance(plan)
-        assert governance.status is GovernancePlanStatus.BLOCKED_PENDING_VERIFICATION
+        assert governance.status is GovernancePlanStatus.REJECTED_BY_GOVERNOR
         assert governance.eligible_for_stage4_3 is False
+        assert "PLAN_INTEGRITY_INVALID" in governance.reason_codes
 
 
 def test_external_claim_with_unresolvable_grounding_remains_ineligible():
@@ -810,9 +814,9 @@ def test_external_claim_with_unresolvable_grounding_remains_ineligible():
         original_value_kinds=("EXPLANATION",),
     )
     governance = _governance(plan)
-    assert governance.status is GovernancePlanStatus.BLOCKED_PENDING_VERIFICATION
+    assert governance.status is GovernancePlanStatus.REJECTED_BY_GOVERNOR
     assert governance.eligible_for_stage4_3 is False
-    assert governance.verification["claim_state"] == "EXTERNAL_REQUIRED_UNRESOLVED"
+    assert "PLAN_INTEGRITY_INVALID" in governance.reason_codes
 
 
 def test_strict_hero_thresholds_are_config_governed():
@@ -1090,7 +1094,10 @@ def test_high_template_feel_confirms_template_revision() -> None:
 
 def test_measured_payoff_interruption_is_never_cleared_by_review() -> None:
     plan = make_plan(
-        blocks=[original_block(0, interrupts=True), source_block(1)],
+        blocks=[
+            original_block(0, interrupts=True, grounding=("block:1",)),
+            source_block(1),
+        ],
         hero_index=1,
     )
     inputs = make_inputs([plan], source_moment_structure="JOKE")
@@ -1123,6 +1130,7 @@ def test_hard_failure_is_never_cleared_by_review() -> None:
                 intent="This is interesting and important to note",
                 kind="SYNTHESIS",
                 duration=12.0,
+                grounding=("block:1",),
             ),
             source_block(1),
         ],

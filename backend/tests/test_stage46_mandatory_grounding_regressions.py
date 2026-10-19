@@ -206,6 +206,7 @@ def _provider_plan() -> PlanProviderPlan:
                 substantive_value_kind=SubstantiveValueKind.SYNTHESIS,
                 semantic_intent="Explain the relational negotiation underneath the dish swap.",
                 why_unavailable="The raw exchange states the swap but not its negotiation dynamic.",
+                grounding_refs=("words:8-18",),
             ),
         ),
         narration=NarrationRequirement(need=NarrationNeed.NONE),

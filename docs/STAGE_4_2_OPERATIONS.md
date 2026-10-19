@@ -198,14 +198,28 @@ end the clip. Closed findings: appropriate, excessive, redundant,
 position-damaging, not needed, unknown. No TTS provider, model, voice ID, speaker
 identity, or channel voice is ever selected or mentioned.
 
-## Mandatory hook/payoff integrity
+## Mandatory hook/payoff and grounding integrity
 
 Stage 4.2 revalidates mandatory hook/payoff coverage against the authoritative
 resolved source-segment evidence before applying any semantic review. Missing,
 malformed, unresolved, or uncovered evidence is a deterministic hard failure
 (`PLAN_INTEGRITY_INVALID` with the specific hook/payoff reason); a favorable
-provider critique can never clear it. An old approval produced before this
-validation version is stale and cannot be selected.
+provider critique can never clear it.
+
+It independently revalidates source grounding on the persisted plan. Every
+`ORIGINAL_VALUE`/`TEXTUAL_ANNOTATION` block requires at least one declaration that
+resolves against the plan's own selected source excerpts (block index, planning
+word range, source time span, or exact quote), unless a genuine
+`FACT_VERIFICATION_PLACEHOLDER` links the claim back to that block. Missing
+required grounding, malformed declarations/containers, and unresolved,
+out-of-scope, partial-overlap, non-source, or nonexistent-word references are
+deterministic integrity failures with the block index and offending declaration
+persisted in bounded detail. Declaration validity is not entailment: semantic
+support, fidelity, and substantive value are still evaluated separately. The
+integrity gate runs before semantic review, and a favorable critique can never
+clear it (`apply_semantic_review` reconciles verification only for an
+integrity-valid plan). An old approval produced before this validation version is
+stale and cannot be selected.
 
 ## Verification
 
@@ -217,11 +231,13 @@ Claim state is explicit:
   for the claim (shared claim-specific content tokens, a contiguous shared phrase,
   or direct-quote/reference framing); may proceed;
 - `EXTERNAL_REQUIRED_UNRESOLVED` — an essential correctly linked external
-  dependency, an unresolvable grounding reference (including provider-declared
-  labels such as `strategy` or `source_excerpt`), or an unsupported factual claim
-  whose citation is real but unrelated (e.g. "The merger closes next Monday"
-  citing a source that contains no merger information); →
-  `BLOCKED_PENDING_VERIFICATION` when the rest is sound;
+  dependency, or an unsupported factual claim whose citation is real but
+  unrelated (e.g. "The merger closes next Monday" citing a source that contains
+  no merger information); → `BLOCKED_PENDING_VERIFICATION` when the rest is
+  sound. Missing, malformed, or unresolvable required grounding never reaches
+  this classification: it is a deterministic `PLAN_INTEGRITY_INVALID` hard
+  failure before semantic review; provider-declared labels such as `strategy` or
+  `source_excerpt` are malformed declarations, not citations;
 - `SUPPORT_UNVERIFIED` — the citation resolves but the deterministic lexical
   check cannot confirm claim support; requires semantic review (defer or block,
   never a silent approval);
@@ -291,9 +307,9 @@ not change its truthful state.
 
 Immutable, code-defined profile (never a dynamic engine, never runtime scraping):
 
-- governor policy: `stage4.2-v8`
+- governor policy: `stage4.2-v9`
 - schema: `stage4.2-schema-v1`
-- validation: `stage4.2-validation-v8`
+- validation: `stage4.2-validation-v10`
 - platform profile: `stage4.2-platform-policy-2026-09-17-v1`
 - checked date: `2026-09-17`
 
@@ -695,3 +711,13 @@ regime.
   failures and blocking conditions are never sent for review and are never
   cleared by a review. Without a provider the deterministic revisions stand as
   before. Versions advanced to `stage4.2-v8`/`stage4.2-validation-v8`.
+13. **Required-source-grounding integrity (P1).** Persisted plans are
+    deterministically revalidated against authoritative selected source
+    evidence. Missing required grounding, malformed containers/declarations,
+    unresolved or partial-overlap references, and non-source/nonexistent-word
+    citations are `PLAN_INTEGRITY_INVALID` hard failures before any semantic
+    review; a favorable critique can never clear them. Only a genuine linked
+    external-verification placeholder waives grounding for a substantive block.
+    Declaration resolution never substitutes for claim-to-evidence support or
+    substantive-value review. Validation advanced to
+    `stage4.2-validation-v10` so old approvals cannot bypass the rule.

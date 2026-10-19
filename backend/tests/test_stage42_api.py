@@ -11,7 +11,12 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
-from stage41_support import run_planning, seed_stage41
+from stage41_support import (
+    FakePlanningProvider,
+    make_source_value_plan,
+    run_planning,
+    seed_stage41,
+)
 from stage42_support import (
     FakeGovernanceSettings,
     install_stage42_settings,
@@ -65,7 +70,13 @@ def _seed_planned(factory: sessionmaker[Session], settings: FakeGovernanceSettin
         session.commit()
         candidate_id = seed[1].id
     with factory() as session:
-        run_planning(session, settings, seed)
+        strategy = seed[4][0]
+        run_planning(
+            session,
+            settings,
+            seed,
+            FakePlanningProvider([make_source_value_plan(str(strategy.id), strategy.strategy_key)]),
+        )
         session.commit()
     return candidate_id
 

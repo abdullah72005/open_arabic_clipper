@@ -36,6 +36,7 @@ from app.transformation.governance.handoff import (
     FRESHNESS_UNVERIFIABLE,
     build_stage4_3_handoff,
 )
+from app.transformation.grounding import validate_source_grounding
 from app.transformation.hook_payoff import (
     coverage_reasons,
     resolve_mandatory_evidence,
@@ -363,7 +364,7 @@ def _evaluate(
 def _mandatory_failures(
     session: Session, candidate: ClipCandidate, plan_rows: Sequence[Any]
 ) -> dict[str, tuple[str, ...]]:
-    """Live revalidation guard: no cached approval may bypass coverage."""
+    """Live integrity guard: no cached approval may bypass coverage or grounding."""
 
     analysis = session.scalar(
         select(TransformationEligibilityAnalysis).where(
@@ -385,10 +386,9 @@ def _mandatory_failures(
     )
     failures: dict[str, tuple[str, ...]] = {}
     for row in plan_rows:
+        blocks = [dict(block) for block in (row.blocks or []) if isinstance(block, Mapping)]
         spans: list[tuple[float, float]] = []
-        for block in row.blocks or []:
-            if not isinstance(block, Mapping):
-                continue
+        for block in blocks:
             if str(block.get("block_type", "")) != "SOURCE_EXCERPT":
                 continue
             start = block.get("source_start")
@@ -401,14 +401,17 @@ def _mandatory_failures(
             ):
                 spans.append((float(start), float(end)))
         hook_payoff = dict(row.hook_payoff_evidence or {})
-        reasons = coverage_reasons(
-            hook_payoff.get("hook_index"),
-            hook_payoff.get("payoff_index"),
-            evidence,
-            spans,
+        reasons = list(
+            coverage_reasons(
+                hook_payoff.get("hook_index"),
+                hook_payoff.get("payoff_index"),
+                evidence,
+                spans,
+            )
         )
+        reasons.extend(failure.reason() for failure in validate_source_grounding(blocks))
         if reasons:
-            failures[str(row.id)] = reasons
+            failures[str(row.id)] = tuple(reasons)
     return failures
 
 
@@ -463,6 +466,12 @@ def _build_alternatives(
             )
             continue
         failures = tuple(mandatory_failures.get(plan_id, ()))
+        failure_codes: list[str] = []
+        if any(not reason.startswith("GROUNDING_") for reason in failures):
+            failure_codes.append(policy.MANDATORY_EVIDENCE_NOT_COVERED)
+        if any(reason.startswith("GROUNDING_") for reason in failures):
+            failure_codes.append(policy.SOURCE_GROUNDING_INVALID)
+        failure_codes.extend(failures)
         alternatives.append(
             PlanAlternative(
                 plan_id=plan_id,
@@ -485,9 +494,7 @@ def _build_alternatives(
                 provider_evidence=dict(governance.get("provider_evidence") or {}),
                 governance_input_fingerprint=str(governance.get("input_fingerprint") or ""),
                 inclusion=TIER_EXCLUDED,
-                exclusion_codes=(
-                    (policy.MANDATORY_EVIDENCE_NOT_COVERED, *failures) if failures else ()
-                ),
+                exclusion_codes=tuple(failure_codes),
                 snapshot=dict(governance),
             )
         )

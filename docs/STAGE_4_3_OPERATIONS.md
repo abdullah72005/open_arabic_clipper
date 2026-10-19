@@ -11,16 +11,25 @@ researches, refines transcripts, or renders, and it adds **no** Celery task,
   (`policy.py`, `types.py`, `fingerprints.py`, `service.py`, `handoff.py`).
 - Migration: `20260918_0019_stage_4_3_plan_selection`.
 - Persistence: `transformation_plan_selections`.
-- Versions: policy `stage4.3-v1`, schema `stage4.3-schema-v1`, fingerprint `1`.
+- Versions: policy `stage4.3-v3`, schema `stage4.3-schema-v1`, fingerprint `2`.
 
-## Mandatory hook/payoff selection guard
+## Mandatory hook/payoff and grounding selection guard
 
 Stage 4.3 revalidates the selected plan's mandatory hook/payoff coverage against
 the authoritative resolved source segments before arbitration. A plan that fails
 is excluded with `MANDATORY_EVIDENCE_NOT_COVERED` even if a legacy Stage 4.2 row
-says `APPROVED_FOR_SELECTION`. The selection policy/fingerprint version and the
-Stage 4.2 validation version were bumped so an old approval or cached selection
-cannot bypass the corrected contract.
+says `APPROVED_FOR_SELECTION`.
+
+It also revalidates source grounding live on the persisted plan blocks. A
+legacy/cached approval whose substantive block is missing required grounding, has
+a malformed declaration, or cites unresolved/out-of-scope/partial/non-source
+evidence is excluded with `SOURCE_GROUNDING_INVALID` plus the actionable
+block/declaration reason. The same genuine external-verification linkage
+exception applies: an arbitrary dependency ID never waives grounding. This guard
+runs on every evaluation, independently of the persisted Stage 4.2 verdict.
+
+The selection policy version and the Stage 4.2 validation version were bumped so
+an old approval or cached selection cannot bypass the corrected contract.
 
 
 ## Authoritative input

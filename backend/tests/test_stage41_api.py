@@ -12,8 +12,10 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 from stage41_support import (
+    FakePlanningProvider,
     FakeStage41Settings,
     install_stage41_settings,
+    make_source_value_plan,
     run_planning,
     seed_stage41,
 )
@@ -106,11 +108,25 @@ def test_queue_endpoint_requires_ready_stage40(api: ApiFixture) -> None:
     assert response.status_code == 409
 
 
+def _run_with_plan(
+    session: Session, settings: FakeStage41Settings, seed: tuple[object, ...]
+) -> None:
+    strategy = seed[4][0]  # type: ignore[index]
+    run_planning(
+        session,
+        settings,
+        seed,
+        FakePlanningProvider(
+            [make_source_value_plan(str(strategy.id), strategy.strategy_key)]  # type: ignore[attr-defined]
+        ),
+    )
+
+
 def test_queue_and_read_plan_set(api: ApiFixture) -> None:
     client, factory, settings = api
     candidate_id, seed = _seed_ready(factory, settings)
     with factory() as session:
-        run_planning(session, settings, seed)
+        _run_with_plan(session, settings, seed)
         session.commit()
     response = client.get(f"/api/candidates/{candidate_id}/transformation-plans")
     assert response.status_code == 200
@@ -132,7 +148,7 @@ def test_stage42_handoff_reports_not_implemented(api: ApiFixture) -> None:
     client, factory, settings = api
     candidate_id, seed = _seed_ready(factory, settings)
     with factory() as session:
-        run_planning(session, settings, seed)
+        _run_with_plan(session, settings, seed)
         session.commit()
     response = client.get(f"/api/candidates/{candidate_id}/stage4-2-handoff")
     assert response.status_code == 200
@@ -152,7 +168,7 @@ def test_cli_planning_commands(api: ApiFixture, monkeypatch: pytest.MonkeyPatch)
     client, factory, settings = api
     candidate_id, seed = _seed_ready(factory, settings)
     with factory() as session:
-        run_planning(session, settings, seed)
+        _run_with_plan(session, settings, seed)
         session.commit()
 
     from typer.testing import CliRunner

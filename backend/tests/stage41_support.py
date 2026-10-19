@@ -202,7 +202,7 @@ def make_source_value_plan(
     hero_role: SourceExcerptRole = SourceExcerptRole.HERO,
     narration_need: str = "NONE",
     confidence: float = 0.7,
-    grounding: Sequence[str] = ("strategy",),
+    grounding: Sequence[str] = ("block:0",),
 ) -> PlanProviderPlan:
     from app.core.enums import NarrationNeed
     from app.transformation.planning.types import NarrationRequirement

@@ -104,6 +104,7 @@ def _value_block(
         "substantive_value_kind": kind,
         "semantic_intent": intent,
         "why_unavailable": why,
+        "grounding_refs": ("block:0",),
     }
     base.update(overrides)
     return PlanProviderBlock(**base)
@@ -114,7 +115,13 @@ def test_eligible_source_as_evidence_produces_source_plus_value_plan(
 ) -> None:
     settings = FakeStage41Settings()
     seed = _seed(session, settings)
-    plan_set = _run(session, settings, seed)
+    strategy = seed[4][0]
+    plan_set = _run(
+        session,
+        settings,
+        seed,
+        FakePlanningProvider([make_source_value_plan(str(strategy.id), strategy.strategy_key)]),
+    )
     assert plan_set.planning_outcome is PlanSemanticOutcome.PLANS_GENERATED
     rows = list_plans(session, plan_set.id)
     assert len(rows) == 1
@@ -147,6 +154,7 @@ def test_analysis_preserves_hero_block_one_and_rejects_long_preamble(
                 SubstantiveValueKind.AUTHORED_THESIS,
                 "Frame the remote-work productivity claim before the source",
                 estimated_duration=2.0,
+                grounding_refs=("block:1",),
             ),
             _source_block(),
         ),
@@ -172,6 +180,7 @@ def test_analysis_preserves_hero_block_one_and_rejects_long_preamble(
                 SubstantiveValueKind.AUTHORED_THESIS,
                 "Set up the topic with a long generic introduction",
                 estimated_duration=15.0,
+                grounding_refs=("block:1",),
             ),
             _source_block(),
         ),
@@ -232,7 +241,22 @@ def test_funny_source_led_does_not_force_narration(session: Session) -> None:
         value_kind=SubstantiveValueKind.INFERENCE,
         added_value_focus="State the inference behind the joke setup",
     )
-    plan_set = _run(session, settings, seed, None)
+    strategy = seed[4][0]
+    plan_set = _run(
+        session,
+        settings,
+        seed,
+        FakePlanningProvider(
+            [
+                make_source_value_plan(
+                    str(strategy.id),
+                    strategy.strategy_key,
+                    kind=SubstantiveValueKind.INFERENCE,
+                    intent="State the inference behind the joke setup",
+                )
+            ]
+        ),
+    )
     rows = list_plans(session, plan_set.id)
     assert rows
     assert rows[0].narration_need == NarrationNeed.NONE.value
@@ -333,6 +357,7 @@ def test_multiple_valid_strategies_produce_distinct_plans(session: Session) -> N
                     substantive_value_kind=SubstantiveValueKind.AUTHORED_THESIS,
                     semantic_intent="Analyze the causal mechanism behind the drop",
                     why_unavailable="The excerpt states the drop without the causal chain",
+                    grounding_refs=("block:0",),
                 ),
             ),
         ),
@@ -424,7 +449,13 @@ def test_optional_narration_that_is_sole_contribution_is_rejected(
 def test_plan_never_selects_tts_provider_model_or_voice(session: Session) -> None:
     settings = FakeStage41Settings()
     seed = _seed(session, settings)
-    plan_set = _run(session, settings, seed)
+    strategy = seed[4][0]
+    plan_set = _run(
+        session,
+        settings,
+        seed,
+        FakePlanningProvider([make_source_value_plan(str(strategy.id), strategy.strategy_key)]),
+    )
     rows = list_plans(session, plan_set.id)
     serialized = str(rows[0].narration_requirements) + str(rows[0].blocks)
     for forbidden in ("voice", "tts", "provider", "model", "gemini"):

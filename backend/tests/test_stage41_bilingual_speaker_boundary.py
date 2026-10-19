@@ -137,6 +137,7 @@ def _validate_intent(session: Session, intent: str):
                 substantive_value_kind=SubstantiveValueKind.AUTHORED_THESIS,
                 semantic_intent=intent,
                 why_unavailable="The excerpt alone does not provide this added dimension",
+                grounding_refs=("block:0",),
             ),
         ),
         narration=NarrationRequirement(need=NarrationNeed.NONE),

@@ -82,11 +82,15 @@ def _executor(
 def test_repeated_execution_is_idempotent_with_stable_plan_uuid(session: Session) -> None:
     settings = FakeStage41Settings()
     seed = _seed(session, settings)
-    plan_set = run_planning(session, settings, seed)
+    strategy = seed[4][0]
+    provider = FakePlanningProvider(
+        [make_source_value_plan(str(strategy.id), strategy.strategy_key)]
+    )
+    plan_set = run_planning(session, settings, seed, provider)
     first = list_plans(session, plan_set.id)
     assert len(first) == 1
     plan_id = first[0].id
-    run_planning(session, settings, seed)
+    run_planning(session, settings, seed, provider)
     second = list_plans(session, plan_set.id)
     assert len(second) == 1
     assert second[0].id == plan_id
@@ -351,7 +355,13 @@ def test_no_plan_outcome_is_success_not_pipeline_failure(session: Session) -> No
 def test_only_plan_sets_created_and_no_automatic_next_stage(session: Session) -> None:
     settings = FakeStage41Settings()
     seed = _seed(session, settings)
-    run_planning(session, settings, seed)
+    strategy = seed[4][0]
+    run_planning(
+        session,
+        settings,
+        seed,
+        FakePlanningProvider([make_source_value_plan(str(strategy.id), strategy.strategy_key)]),
+    )
     jobs = list(
         session.scalars(
             select(ProcessingJob).where(ProcessingJob.kind == JobKind.TRANSFORMATION_PLANNING)

@@ -134,10 +134,10 @@ fields required for its type.
   source text derived from Stage 3.5 evidence (never trusted from provider text),
   and a continuity rationale.
 - `ORIGINAL_VALUE`: a `SubstantiveValueKind`, a specific semantic intent, why the
-  block adds information unavailable from the raw excerpt, grounding references
-  to Stage 4.0 strategy/context/evidence, delivery intent (on-screen text /
-  narration / flexible), and an optional short evaluation-only draft line
-  (`draft_only=true` when present).
+  block adds information unavailable from the raw excerpt, source-grounding
+  declarations that resolve against the resolved source excerpts, delivery intent
+  (on-screen text / narration / flexible), and an optional short evaluation-only
+  draft line (`draft_only=true` when present).
 - `TEXTUAL_ANNOTATION`: substantive explanatory/analytical text only. Captions,
   labels repeating speech, emojis, borders, crops, and B-roll are not
   substantive annotations.
@@ -166,6 +166,41 @@ existing endpoint tolerance. Absent indexes are optional evidence; declared but
 malformed, out-of-range, or conflicting indexes are unresolved and never
 satisfied. Rejection reasons are distinct (`HOOK_NOT_COVERED`,
 `PAYOFF_NOT_COVERED`, and the corresponding malformed/unresolved/missing codes).
+
+## Required source grounding
+
+`ORIGINAL_VALUE` and `TEXTUAL_ANNOTATION` are substantive authored blocks and
+require at least one valid grounding declaration. `SOURCE_EXCERPT`, `TRANSITION`,
+and `FACT_VERIFICATION_PLACEHOLDER` do not require a source citation. A
+substantive block may omit grounding only when a real
+`FACT_VERIFICATION_PLACEHOLDER` links the claim back to that block
+(`dependent_block_ids` plus the block's `dependency_ids`, with
+`must_verify_before_execution=true`); an arbitrary dependency ID never waives the
+requirement.
+
+Declarations use the shared strict grammar (`transformation/grounding.py`):
+source block index, planning word range, source time span, or exact source quote.
+Resolution happens only after source excerpts are resolved, against the exact
+selected planning-word/block evidence and selected source bounds. The complete
+cited range must be covered; partial overlap, out-of-scope indexes, nonexistent
+words, unknown/non-source blocks, reversed ranges, and quotes absent from the
+selected excerpt are rejected. Malformed containers, blank declarations, and
+non-string items are preserved at the provider parser boundary as explicit
+malformed-declaration failures; they are never dropped, truncated into validity,
+or treated as an empty list. Mixed valid and invalid declarations fail on the
+invalid declaration.
+
+Rejection diagnostics persist the block index, the offending declaration where
+present, and an actionable reason (`GROUNDING_REQUIRED_MISSING`,
+`GROUNDING_DECLARATION_MALFORMED`, or `GROUNDING_EVIDENCE_UNRESOLVED`).
+Declaration validity proves only that evidence was cited; it never proves
+entailment, fidelity, or substantive value. Stage 4.2 still evaluates
+claim-to-evidence support and semantic quality independently.
+
+The deterministic fallback never substitutes a strategy label, `block:0`, or
+other invented reference for real source evidence. When it cannot ground an
+authored claim truthfully it declines, and the strategy is left to an explicit
+provider or recorded as a truthful deferred/no-valid outcome.
 
 ## Source hero and span rules
 
@@ -571,13 +606,15 @@ ruff format app tests alembic && ruff check app tests alembic
 
 All Stage 4.1 tests are deterministic and hermetic: providers are mocked and no
 test makes a live Gemini, Qwen, web, TTS, or rendering call even when a key is
-present. The Arabic multi-token closure remediation advanced planning
-versions to `stage4.1-v8` / `stage4.1-schema-v8` / `stage4.1-validation-v8`
-(bounded Arabic selection grammar now covers multi-token identities such as
-`اختر محمد رمضان راوياً`, in addition to single- and multi-token English and
-single-token Arabic selection, with ordinary prose preserved), so prior plans
-and checkpoints invalidate
-through the input fingerprint. Known
+present. The required-source-grounding correction advanced the validation
+version to `stage4.1-validation-v10` (authoritative declaration resolution and a
+required-grounding policy for substantive authored blocks), so prior plans and
+checkpoints invalidate through the input fingerprint. The earlier Arabic
+multi-token closure advanced planning versions to `stage4.1-v8` /
+`stage4.1-schema-v8` / `stage4.1-validation-v8` (bounded Arabic selection grammar
+covers multi-token identities such as `اختر محمد رمضان راوياً`, in addition to
+single- and multi-token English and single-token Arabic selection, with ordinary
+prose preserved). Known
 limitation: the repository's strict `mypy` configuration already reports the
 same class of `no-any-return`/`untyped-decorator` findings in the frozen Stage
 4.0 provider modules and the FastAPI app; Stage 4.1 matches that existing

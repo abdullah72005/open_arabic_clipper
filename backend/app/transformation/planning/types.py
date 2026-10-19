@@ -259,6 +259,8 @@ class PlanProviderBlock:
     semantic_intent: str | None = None
     why_unavailable: str | None = None
     grounding_refs: tuple[str, ...] = ()
+    grounding_refs_invalid: bool = False
+    grounding_refs_errors: tuple[str, ...] = ()
     delivery_intent: DeliveryIntent | None = None
     draft_line: str | None = None
     claim_dependency: str | None = None
