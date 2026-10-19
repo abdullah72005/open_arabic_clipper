@@ -113,6 +113,7 @@ def build_plan_set_input_payload(
             "dialect_confidence": inputs.dialect_confidence,
             "code_switch": dict(inputs.code_switch),
         },
+        "mandatory_evidence": dict(inputs.mandatory_evidence),
         "context": list(inputs.context_segments),
         "provenance": {
             "rights_status": inputs.rights_status,

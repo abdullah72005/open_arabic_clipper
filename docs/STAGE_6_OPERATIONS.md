@@ -113,6 +113,22 @@ unreadable/malformed/unsupported catalog fails closed (diagnostic) and preserves
 the previous reference and the valid staging evidence; the same verifier is applied
 before publication, on reuse, and in legacy migration.
 
+## Grounding-reference integrity
+
+Stage 4 grounding declarations are parsed with the strict shared grammar
+(`block:N`, `word:N`, `words:A-B`, `source:START-END`, exact quotes, and
+validated object forms). Stage 4.1 word indexes are the filtered, bounded
+planning sequence and are never interpreted as FINAL_CLIP indexes. The plan
+retains its planning-word evidence; Stage 6 maps the cited planning range to
+source time and then reads the exact current evidence from the authoritative
+Stage 5 binding / FINAL_CLIP words. Malformed containers, unsupported labels or
+kinds, missing fields, invalid numeric types, reversed ranges, non-finite times,
+nonexistent or non-source blocks, partial overlap, and out-of-scope evidence
+produce an explicit `INVALID_GROUNDING_REFERENCE` finding with the block
+identity, offending declaration, and concrete reason. Valid grounding proves an
+evidence address only; all deterministic and semantic claim/fidelity/
+substantive-value/verification gates still apply.
+
 ## Objective and ownership
 
 Stage 6 builds one genuine transformed Short from one explicitly selected

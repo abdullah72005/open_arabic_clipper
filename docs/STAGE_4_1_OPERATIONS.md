@@ -154,6 +154,19 @@ fields required for its type.
 One giant script, finished voiceover, shot list, frame timeline, FFmpeg
 operation, or publication-ready copy is never persisted.
 
+## Mandatory hook/payoff preservation
+
+`hook_index` and `payoff_index` in the Stage 4.0 source moment are positions in
+the authoritative, ordered source transcript segments. They are never word
+indexes and never positions in the filtered planning-word window. Stage 4.1
+resolves the declared indexes against the source segments, records the resolved
+segment evidence on the plan, and rejects the plan when the resolved
+`SOURCE_EXCERPT` spans do not cover a declared hook or payoff segment under the
+existing endpoint tolerance. Absent indexes are optional evidence; declared but
+malformed, out-of-range, or conflicting indexes are unresolved and never
+satisfied. Rejection reasons are distinct (`HOOK_NOT_COVERED`,
+`PAYOFF_NOT_COVERED`, and the corresponding malformed/unresolved/missing codes).
+
 ## Source hero and span rules
 
 The provider never invents source timestamps or quotes. It selects source spans

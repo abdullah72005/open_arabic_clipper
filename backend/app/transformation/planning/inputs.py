@@ -11,15 +11,19 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 
+from sqlalchemy import select
+
 from app.core.enums import SourceMomentStructure, StrategyDisposition
 from app.core.settings import Settings
 from app.models import (
     CandidateRefinement,
     ClipCandidate,
+    Transcript,
     TransformationEligibilityAnalysis,
     TransformationStrategyCandidate,
 )
 from app.transformation.handoff import build_stage4_1_handoff
+from app.transformation.hook_payoff import resolve_mandatory_evidence
 from app.transformation.inputs import build_transformation_inputs
 from app.transformation.planning.policy import Stage41Config
 from app.transformation.planning.types import (
@@ -135,12 +139,24 @@ def build_planning_inputs(
         settings.stage40_config(),  # type: ignore[arg-type]
     )
 
+    transcript_row = session.scalar(
+        select(Transcript).where(Transcript.source_video_id == candidate.source_video_id)
+    )
+    source_segments: tuple[Mapping[str, object], ...] = ()
+    if transcript_row is not None and isinstance(transcript_row.segments, list):
+        source_segments = tuple(
+            item for item in transcript_row.segments if isinstance(item, Mapping)
+        )
+    mandatory = resolve_mandatory_evidence(
+        str(candidate.source_video_id),
+        analysis.source_moment or {},
+        source_segments,
+    )
+
     raw_words = tuple(
         item for item in (refinement.word_timestamps or []) if isinstance(item, Mapping)
     )
-    raw_words = _selectable_window_words(
-        raw_words, stage40.effective_start, stage40.effective_end
-    )
+    raw_words = _selectable_window_words(raw_words, stage40.effective_start, stage40.effective_end)
     words, _has_words = _bounded_words(raw_words, config)
     coverage = _coverage_sufficient(words, stage40.effective_start, stage40.effective_end)
 
@@ -217,6 +233,7 @@ def build_planning_inputs(
         refinement_quality_level=refinement.quality_level,
         refinement_status=refinement.status.value,
         refinement_output_fingerprint=refinement.output_fingerprint or "",
+        mandatory_evidence=mandatory.as_dict(),
     )
 
 

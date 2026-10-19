@@ -45,7 +45,6 @@ from app.render.policy import (
     NON_MATERIAL_DRIFT_SECONDS,
     NUMBER_OR_DATE_CHANGED,
     PAYOFF_COVERAGE_TOLERANCE_SECONDS,
-    PAYOFF_NOT_COVERED,
     PLANNING_BOUNDS_TOLERANCE_SECONDS,
     PROTECTED_SEMANTIC_OPERATORS,
     RECOVERED_CODE_SWITCH_TOKEN,
@@ -58,6 +57,7 @@ from app.render.policy import (
     most_blocking_outcome,
 )
 from app.render.types import BlockCompatibility, ClipWord, CompatibilityResult, FinalClipEvidence
+from app.transformation.hook_payoff import coverage_reasons, resolve_mandatory_evidence
 
 _SUBSTANTIVE_TYPES = {"ORIGINAL_VALUE", "TEXTUAL_ANNOTATION"}
 _GROUNDING_ENTITY_TYPES = {"PERSON", "PRODUCT", "PLACE", "ABBREVIATION", "TECHNICAL"}
@@ -140,13 +140,14 @@ def evaluate_compatibility(
         if verdict.rebound_start is not None and verdict.rebound_end is not None
     ]
 
-    if _payoff_not_covered(
+    mandatory_reasons = _mandatory_evidence_reasons(
         hook_payoff_evidence,
         source_segments=source_segments,
         spans=rebound_spans,
-    ):
+    )
+    if mandatory_reasons:
         outcome = _escalate(outcome, MATERIAL_TIMING_CHANGE)
-        overall_reasons.append(PAYOFF_NOT_COVERED)
+        overall_reasons.extend(mandatory_reasons)
 
     if _meaning_critical_unresolved(final, spans=rebound_spans):
         outcome = _escalate(outcome, UNRESOLVED_COMPATIBILITY)
@@ -553,27 +554,32 @@ def _escalate(current: str, candidate: str) -> str:
     return winner if winner is not None else current
 
 
-def _payoff_not_covered(
+def _mandatory_evidence_reasons(
     hook_payoff_evidence: Mapping[str, object],
     *,
     source_segments: Sequence[Mapping[str, object]],
     spans: Sequence[tuple[float, float]],
-) -> bool:
-    for key in ("payoff_index", "hook_index"):
-        index = hook_payoff_evidence.get(key)
-        if isinstance(index, bool) or not isinstance(index, int):
-            continue
-        if index < 0 or index >= len(source_segments):
-            # Does not resolve: NOT_EVALUABLE, never a failure.
-            continue
-        segment = source_segments[index]
-        start = segment.get("start")
-        end = segment.get("end")
-        if not isinstance(start, (int, float)) or not isinstance(end, (int, float)):
-            continue
-        if not _spans_cover(spans, float(start), float(end)):
-            return True
-    return False
+) -> tuple[str, ...]:
+    """Independent Stage 5 check against actual FINAL_CLIP rebound spans.
+
+    Hook and payoff failures are distinct; a null payoff never becomes a payoff
+    failure. An unresolved declared requirement is never silently satisfied.
+    """
+
+    evidence = resolve_mandatory_evidence(
+        "",
+        {
+            "hook_index": hook_payoff_evidence.get("hook_index"),
+            "payoff_index": hook_payoff_evidence.get("payoff_index"),
+        },
+        source_segments,
+    )
+    return coverage_reasons(
+        hook_payoff_evidence.get("hook_index"),
+        hook_payoff_evidence.get("payoff_index"),
+        evidence,
+        spans,
+    )
 
 
 def _spans_cover(spans: Sequence[tuple[float, float]], start: float, end: float) -> bool:

@@ -13,6 +13,7 @@ uniqueness recovery, and post-lock freshness revalidation.
 from __future__ import annotations
 
 import uuid
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -24,6 +25,8 @@ from app.core.enums import TransformationSelectionStatus
 from app.models import (
     CandidateRefinement,
     ClipCandidate,
+    Transcript,
+    TransformationEligibilityAnalysis,
     TransformationGovernanceSet,
     TransformationPlanSelection,
 )
@@ -32,6 +35,10 @@ from app.transformation.governance.handoff import (
     FRESHNESS_STALE,
     FRESHNESS_UNVERIFIABLE,
     build_stage4_3_handoff,
+)
+from app.transformation.hook_payoff import (
+    coverage_reasons,
+    resolve_mandatory_evidence,
 )
 from app.transformation.planning.queue import get_plan_set_for_candidate, list_plans
 from app.transformation.selection import policy
@@ -177,6 +184,7 @@ def _build_decision(
     plan_rows = [row for row in plan_rows if row.is_current]
     governance_set = _governance_set(session, handoff)
     refinement = _refinement(session, handoff)
+    mandatory_failures = _mandatory_failures(session, candidate, plan_rows)
 
     input_fp = selection_input_fingerprint(
         build_selection_input_payload(
@@ -200,6 +208,7 @@ def _build_decision(
         governance_set=governance_set,
         refinement=refinement,
         input_fp=input_fp,
+        mandatory_failures=mandatory_failures,
     )
     return handoff, decision
 
@@ -240,7 +249,9 @@ def _evaluate(
     governance_set: TransformationGovernanceSet | None,
     refinement: CandidateRefinement | None,
     input_fp: str,
+    mandatory_failures: Mapping[str, tuple[str, ...]] | None = None,
 ) -> SelectionDecision:
+    mandatory_failures = mandatory_failures or {}
     gov = handoff.get("governance_set")
     freshness = _freshness(gov)
     identity = _identity(handoff, governance_set, refinement)
@@ -262,7 +273,7 @@ def _evaluate(
             freshness=freshness,
             identity=identity,
             input_fp=input_fp,
-            alternatives=_build_alternatives(handoff, rows_by_id),
+            alternatives=_build_alternatives(handoff, rows_by_id, mandatory_failures),
         )
     if freshness == FRESHNESS_NOT_CURRENT:
         return _no_selection_decision(
@@ -271,7 +282,7 @@ def _evaluate(
             freshness=freshness,
             identity=identity,
             input_fp=input_fp,
-            alternatives=_build_alternatives(handoff, rows_by_id),
+            alternatives=_build_alternatives(handoff, rows_by_id, mandatory_failures),
         )
     if freshness == FRESHNESS_UNVERIFIABLE:
         return _no_selection_decision(
@@ -280,10 +291,10 @@ def _evaluate(
             freshness=freshness,
             identity=identity,
             input_fp=input_fp,
-            alternatives=_build_alternatives(handoff, rows_by_id),
+            alternatives=_build_alternatives(handoff, rows_by_id, mandatory_failures),
         )
 
-    alternatives = _build_alternatives(handoff, rows_by_id)
+    alternatives = _build_alternatives(handoff, rows_by_id, mandatory_failures)
     if any(alt.governance_result_id is None for alt in alternatives):
         return _no_selection_decision(
             status=TransformationSelectionStatus.SELECTION_DEFERRED,
@@ -349,9 +360,64 @@ def _evaluate(
     )
 
 
+def _mandatory_failures(
+    session: Session, candidate: ClipCandidate, plan_rows: Sequence[Any]
+) -> dict[str, tuple[str, ...]]:
+    """Live revalidation guard: no cached approval may bypass coverage."""
+
+    analysis = session.scalar(
+        select(TransformationEligibilityAnalysis).where(
+            TransformationEligibilityAnalysis.clip_candidate_id == candidate.id
+        )
+    )
+    if analysis is None:
+        return {}
+    transcript = session.scalar(
+        select(Transcript).where(Transcript.source_video_id == candidate.source_video_id)
+    )
+    segments = (
+        [item for item in (transcript.segments or []) if isinstance(item, Mapping)]
+        if transcript is not None
+        else []
+    )
+    evidence = resolve_mandatory_evidence(
+        str(candidate.source_video_id), analysis.source_moment or {}, segments
+    )
+    failures: dict[str, tuple[str, ...]] = {}
+    for row in plan_rows:
+        spans: list[tuple[float, float]] = []
+        for block in row.blocks or []:
+            if not isinstance(block, Mapping):
+                continue
+            if str(block.get("block_type", "")) != "SOURCE_EXCERPT":
+                continue
+            start = block.get("source_start")
+            end = block.get("source_end")
+            if (
+                isinstance(start, (int, float))
+                and not isinstance(start, bool)
+                and isinstance(end, (int, float))
+                and not isinstance(end, bool)
+            ):
+                spans.append((float(start), float(end)))
+        hook_payoff = dict(row.hook_payoff_evidence or {})
+        reasons = coverage_reasons(
+            hook_payoff.get("hook_index"),
+            hook_payoff.get("payoff_index"),
+            evidence,
+            spans,
+        )
+        if reasons:
+            failures[str(row.id)] = reasons
+    return failures
+
+
 def _build_alternatives(
-    handoff: dict[str, Any], rows_by_id: dict[str, Any]
+    handoff: dict[str, Any],
+    rows_by_id: dict[str, Any],
+    mandatory_failures: Mapping[str, tuple[str, ...]] | None = None,
 ) -> list[PlanAlternative]:
+    mandatory_failures = mandatory_failures or {}
     alternatives: list[PlanAlternative] = []
     plans = handoff.get("plans")
     if not isinstance(plans, list):
@@ -396,6 +462,7 @@ def _build_alternatives(
                 )
             )
             continue
+        failures = tuple(mandatory_failures.get(plan_id, ()))
         alternatives.append(
             PlanAlternative(
                 plan_id=plan_id,
@@ -403,7 +470,7 @@ def _build_alternatives(
                 governance_result_id=str(governance.get("result_id") or "") or None,
                 governance_output_fingerprint=str(governance.get("output_fingerprint") or ""),
                 status=str(governance.get("status") or ""),
-                eligible=bool(governance.get("eligible_for_stage4_3")),
+                eligible=bool(governance.get("eligible_for_stage4_3")) and not failures,
                 generation_rank=int(getattr(row, "generation_rank", 0) or 0),
                 planner_confidence=float(getattr(row, "planner_confidence", 0.0) or 0.0),
                 strategy_type=str(entry.get("strategy", {}).get("type", "")),
@@ -417,6 +484,10 @@ def _build_alternatives(
                 remediation=tuple(governance.get("remediation") or ()),
                 provider_evidence=dict(governance.get("provider_evidence") or {}),
                 governance_input_fingerprint=str(governance.get("input_fingerprint") or ""),
+                inclusion=TIER_EXCLUDED,
+                exclusion_codes=(
+                    (policy.MANDATORY_EVIDENCE_NOT_COVERED, *failures) if failures else ()
+                ),
                 snapshot=dict(governance),
             )
         )
@@ -426,7 +497,9 @@ def _build_alternatives(
 def _classify(alternatives: list[PlanAlternative]) -> list[PlanAlternative]:
     classified: list[PlanAlternative] = []
     for alt in alternatives:
-        if alt.status == CLEAN_STATUS:
+        if policy.MANDATORY_EVIDENCE_NOT_COVERED in alt.exclusion_codes:
+            classified.append(_with_inclusion(alt, TIER_EXCLUDED, alt.exclusion_codes))
+        elif alt.status == CLEAN_STATUS:
             ok, codes = policy.clean_selectability(alt.result_view, alt.plan_output_fingerprint)
             if ok:
                 classified.append(_with_inclusion(alt, TIER_CLEAN, ()))

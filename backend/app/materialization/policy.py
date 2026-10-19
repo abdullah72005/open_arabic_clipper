@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 
 STAGE6_POLICY_VERSION = "stage6-v1"
 STAGE6_SCHEMA_VERSION = "stage6-schema-v1"
-STAGE6_VALIDATION_VERSION = "stage6-validation-v1"
+STAGE6_VALIDATION_VERSION = "stage6-validation-v2"
 STAGE6_TIMELINE_SCHEMA_VERSION = "stage6-timeline-v1"
 STAGE6_QUALITY_POLICY_VERSION = "stage6-quality-v1"
 STAGE6_NATURALNESS_POLICY_VERSION = "stage6-naturalness-v1"

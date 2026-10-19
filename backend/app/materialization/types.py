@@ -17,13 +17,23 @@ from fractions import Fraction
 
 @dataclass(frozen=True)
 class GroundingRef:
-    """One resolvable grounding reference for authored copy."""
+    """One resolvable grounding reference for authored copy.
+
+    ``raw`` preserves the exact declaration a Stage 4 provider emitted even when
+    it is invalid. Index fields for ``WORD_RANGE`` are Stage 4.1 *planning* word
+    indexes; they are never FINAL_CLIP word indexes.
+    """
 
     kind: str
     block_index: int | None = None
     source_start: float | None = None
     source_end: float | None = None
     claim_id: str | None = None
+    word_start_index: int | None = None
+    word_end_index: int | None = None
+    quote: str | None = None
+    raw: str | None = None
+    invalid_reason: str | None = None
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -32,6 +42,11 @@ class GroundingRef:
             "source_start": self.source_start,
             "source_end": self.source_end,
             "claim_id": self.claim_id,
+            "word_start_index": self.word_start_index,
+            "word_end_index": self.word_end_index,
+            "quote": self.quote,
+            "raw": self.raw,
+            "invalid_reason": self.invalid_reason,
         }
 
 

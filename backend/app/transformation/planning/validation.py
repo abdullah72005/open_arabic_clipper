@@ -23,6 +23,18 @@ from app.core.enums import (
     TransformationIntensity,
     TransformationStrategyType,
 )
+from app.transformation.hook_payoff import (
+    HOOK_EVIDENCE_MALFORMED,
+    HOOK_EVIDENCE_MISSING,
+    HOOK_EVIDENCE_UNRESOLVED,
+    HOOK_NOT_COVERED,
+    PAYOFF_EVIDENCE_MALFORMED,
+    PAYOFF_EVIDENCE_MISSING,
+    PAYOFF_EVIDENCE_UNRESOLVED,
+    PAYOFF_NOT_COVERED,
+    MandatoryEvidence,
+    coverage_reasons,
+)
 from app.transformation.planning.fingerprints import (
     build_plan_output_payload,
     plan_fingerprint,
@@ -85,6 +97,14 @@ REJECT_SPEAKER_SELECTION = "SPEAKER_SELECTION_FORBIDDEN"
 REJECT_RENDERING_INSTRUCTION = "RENDERING_INSTRUCTION_FORBIDDEN"
 REJECT_EVASION = "PLATFORM_EVASION_FORBIDDEN"
 REJECT_COSMETIC_CLAIM = "COSMETIC_CLAIM_FORBIDDEN"
+REJECT_HOOK_NOT_COVERED = HOOK_NOT_COVERED
+REJECT_PAYOFF_NOT_COVERED = PAYOFF_NOT_COVERED
+REJECT_HOOK_EVIDENCE_MALFORMED = HOOK_EVIDENCE_MALFORMED
+REJECT_PAYOFF_EVIDENCE_MALFORMED = PAYOFF_EVIDENCE_MALFORMED
+REJECT_HOOK_EVIDENCE_UNRESOLVED = HOOK_EVIDENCE_UNRESOLVED
+REJECT_PAYOFF_EVIDENCE_UNRESOLVED = PAYOFF_EVIDENCE_UNRESOLVED
+REJECT_HOOK_EVIDENCE_MISSING = HOOK_EVIDENCE_MISSING
+REJECT_PAYOFF_EVIDENCE_MISSING = PAYOFF_EVIDENCE_MISSING
 
 _VERIFICATION_BLOCK_TYPES = {PlanBlockType.FACT_VERIFICATION_PLACEHOLDER}
 _SUBSTANTIVE_TYPES = {PlanBlockType.ORIGINAL_VALUE, PlanBlockType.TEXTUAL_ANNOTATION}
@@ -483,6 +503,12 @@ def _resolve_block(
             return None, error or REJECT_INVALID_SPAN
         role = raw.source_role or SourceExcerptRole.SUPPORT
         duration = max(0.0, span.end - span.start)
+        planning_words = ()
+        if span.word_start_index is not None and span.word_end_index is not None:
+            planning_words = tuple(
+                word.as_dict()
+                for word in inputs.words[span.word_start_index : span.word_end_index + 1]
+            )
         if duration < config.min_source_excerpt_seconds:
             return None, REJECT_SHORT_EXCERPT
         return (
@@ -501,6 +527,7 @@ def _resolve_block(
                 source_end=span.end,
                 source_text=span.text,
                 continuity_rationale=raw.continuity_rationale,
+                planning_words=planning_words,
             ),
             None,
         )
@@ -779,6 +806,24 @@ def validate_provider_plan(
                 and right.source_start < left.source_end - 0.05
             ):
                 return ValidationResult(plan=None, reasons=(REJECT_OVERLAPPING_EXCERPT,))
+
+    # Mandatory hook/payoff evidence is resolved from the authoritative ordered
+    # source segments at input assembly. A declared requirement that is not
+    # preserved by the resolved source excerpts rejects the plan here, before any
+    # plan can reach governance or selection.
+    mandatory = MandatoryEvidence.from_dict(inputs.mandatory_evidence)
+    mandatory_reasons = coverage_reasons(
+        inputs.source_moment.get("hook_index"),
+        inputs.source_moment.get("payoff_index"),
+        mandatory,
+        [
+            (float(block.source_start), float(block.source_end))
+            for block in source_blocks
+            if block.source_start is not None and block.source_end is not None
+        ],
+    )
+    if mandatory_reasons:
+        return ValidationResult(plan=None, reasons=mandatory_reasons)
 
     substantive = [b for b in blocks if b.is_substantive]
     for block in substantive:

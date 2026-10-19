@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
 from app.core.enums import ClaimClass
+from app.materialization.grounding import parse_grounding_refs
 from app.materialization.inputs import MaterializationInputs
 from app.materialization.policy import (
     SEMANTIC_ROUTINE_TIER,
@@ -128,9 +129,7 @@ class BlockCritique:
         levels = self.levels()
         return levels.get(dimension)
 
-    def levels(
-        self, requested: Sequence[str] = CRITIQUE_DIMENSIONS
-    ) -> dict[str, str]:
+    def levels(self, requested: Sequence[str] = CRITIQUE_DIMENSIONS) -> dict[str, str]:
         """Return the known level per dimension, dropping duplicates/non-requested.
 
         A duplicate or out-of-vocabulary finding for a requested dimension is
@@ -150,9 +149,7 @@ class BlockCritique:
             levels[finding.dimension] = finding.level
         return levels
 
-    def structural_issues(
-        self, requested: Sequence[str] = CRITIQUE_DIMENSIONS
-    ) -> list[str]:
+    def structural_issues(self, requested: Sequence[str] = CRITIQUE_DIMENSIONS) -> list[str]:
         """Malformed/duplicate/missing findings that cannot imply approval."""
 
         allowed = set(requested)
@@ -852,23 +849,9 @@ def _run_critique(
 
 
 def _refs(value: object) -> tuple[GroundingRef, ...]:
-    if not isinstance(value, (list, tuple)):
-        return ()
-    refs: list[GroundingRef] = []
-    for item in value:
-        if isinstance(item, Mapping):
-            refs.append(
-                GroundingRef(
-                    kind=str(item.get("kind", "")),
-                    block_index=_optional_int(item.get("block_index")),
-                    source_start=_optional_float(item.get("source_start")),
-                    source_end=_optional_float(item.get("source_end")),
-                    claim_id=_optional_str(item.get("claim_id")),
-                )
-            )
-        elif isinstance(item, str) and item.startswith("block:"):
-            refs.append(GroundingRef(kind="SOURCE_EXCERPT", block_index=int(item.split(":", 1)[1])))
-    return tuple(refs)
+    """Preserve every declared reference; invalid declarations stay explicit."""
+
+    return parse_grounding_refs(value)
 
 
 def _first_dependency(block: Mapping[str, object], inputs: MaterializationInputs) -> str | None:

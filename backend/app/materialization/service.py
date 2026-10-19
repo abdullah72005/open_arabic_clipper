@@ -396,6 +396,12 @@ def _merge_blocks(
                 "grounding_refs": plan_block.get("grounding_refs", ()),
                 "dependency_ids": plan_block.get("dependency_ids", ()),
                 "source_text": source_text,
+                "planning_source_text": plan_block.get("source_text", ""),
+                "planning_source_start": plan_block.get("source_start"),
+                "planning_source_end": plan_block.get("source_end"),
+                "planning_word_start_index": plan_block.get("word_start_index"),
+                "planning_word_end_index": plan_block.get("word_end_index"),
+                "planning_words": plan_block.get("planning_words", ()),
                 "estimated_duration": plan_block.get(
                     "estimated_duration", contract_block.get("estimated_duration_seconds", 0.0)
                 ),

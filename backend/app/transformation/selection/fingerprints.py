@@ -15,6 +15,7 @@ from collections.abc import Mapping, Sequence
 from typing import Protocol
 
 from app.pipeline.fingerprints import canonical_fingerprint
+from app.transformation.hook_payoff import MANDATORY_EVIDENCE_CONTRACT_VERSION
 from app.transformation.selection.policy import (
     CAUTION_ALLOWLIST,
     SELECTION_FINGERPRINT_VERSION,
@@ -129,6 +130,7 @@ def build_selection_input_payload(
             "selection_policy_version": SELECTION_POLICY_VERSION,
             "schema_version": SELECTION_SCHEMA_VERSION,
             "caution_allowlist": sorted(CAUTION_ALLOWLIST),
+            "mandatory_evidence_contract_version": MANDATORY_EVIDENCE_CONTRACT_VERSION,
         },
     }
 

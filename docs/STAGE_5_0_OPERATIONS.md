@@ -6,6 +6,16 @@ All Stage 3/3.5/3.7 and Stage 4.0–4.3 behavior is frozen; Stage 5.0 only adds 
 `app/render` package, one enum group, one table, one migration, API/CLI
 endpoints, and configuration.
 
+## Mandatory hook/payoff compatibility
+
+Stage 5.0 independently rechecks the selected plan's hook and payoff segment
+evidence against the actual FINAL_CLIP rebound spans. Hook and payoff failures
+are reported separately (`HOOK_NOT_COVERED`, `PAYOFF_NOT_COVERED`); both are
+emitted when both fail. A null payoff index never produces a payoff failure for a
+missing hook. This check is independent of earlier Stage 4 approval, so later
+transcript or boundary changes still block the render contract.
+
+
 ## Boundaries
 
 Stage 5.0 must never:

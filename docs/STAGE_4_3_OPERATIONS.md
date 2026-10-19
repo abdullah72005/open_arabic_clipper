@@ -13,6 +13,16 @@ researches, refines transcripts, or renders, and it adds **no** Celery task,
 - Persistence: `transformation_plan_selections`.
 - Versions: policy `stage4.3-v1`, schema `stage4.3-schema-v1`, fingerprint `1`.
 
+## Mandatory hook/payoff selection guard
+
+Stage 4.3 revalidates the selected plan's mandatory hook/payoff coverage against
+the authoritative resolved source segments before arbitration. A plan that fails
+is excluded with `MANDATORY_EVIDENCE_NOT_COVERED` even if a legacy Stage 4.2 row
+says `APPROVED_FOR_SELECTION`. The selection policy/fingerprint version and the
+Stage 4.2 validation version were bumped so an old approval or cached selection
+cannot bypass the corrected contract.
+
+
 ## Authoritative input
 
 `build_stage4_3_handoff()` in `app/transformation/governance/handoff.py` is the

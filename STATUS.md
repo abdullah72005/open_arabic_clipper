@@ -6,6 +6,32 @@
 > provider key is present" is stale; the only missing external prerequisite is
 > authorized source media.
 
+## Stage 4.1/5.0/6 mandatory hook-payoff and grounding corrections (2026-10-19)
+
+Status: **two confirmed integration defects are repaired; Stage 6 remains NOT
+FROZEN and `publication_ready` stays false.** No new TTS calls were made as part
+of the repair.
+
+- **Stage 4 mandatory hook/payoff preservation.** `hook_index`/`payoff_index`
+  are authoritative *source transcript segment* indexes. A new pure
+  `transformation/hook_payoff.py` resolves them against the ordered source
+  segments and enforces the existing endpoint coverage tolerance at Stage 4.1,
+  revalidates it as a deterministic Stage 4.2 integrity failure (never clearable
+  by semantic critique), and guards Stage 4.3 selection. Stage 5.0 keeps its
+  independent FINAL_CLIP rebound-span check and now reports distinct
+  `HOOK_NOT_COVERED` / `PAYOFF_NOT_COVERED` reasons; a null payoff no longer
+  turns a hook failure into a payoff failure.
+- **Stage 6 grounding references.** Stage 4 strings such as `words:3-7` and
+  `words:8-26` are parsed with a strict shared grammar, preserved through
+  authored-block and claim-ledger serialization, and resolved through the plan's
+  planning-word identity to the authoritative Stage 5 binding / FINAL_CLIP
+  words. Planning and FINAL_CLIP index spaces are never mixed. Invalid
+  containers, malformed labels, unsupported kinds, reversed ranges, missing
+  fields, non-finite times, nonexistent/non-source blocks, partial overlap, and
+  out-of-scope references produce explicit `INVALID_GROUNDING_REFERENCE`
+  findings. Policy/validation versions were bumped so stale plans, approvals,
+  selections, contracts, and Stage 6 checkpoints cannot bypass the repairs.
+
 ## Stage 6: SOL 5a1de46 correction — consistent ABSENT/INVALID/VALID metadata parsing (2026-10-18, continuation from p5 @ `5a1de46`)
 
 Status: **the one remaining export metadata-validation root cause is fixed with a

@@ -9,6 +9,7 @@ governor status or a platform-risk classification.
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 from app.core.enums import (
@@ -48,6 +49,18 @@ from app.transformation.governance.types import (
     PlanEvidence,
     PlanGovernance,
     ProviderCritique,
+)
+from app.transformation.grounding import (
+    INVALID,
+    QUOTE,
+    SOURCE_EXCERPT,
+    SOURCE_SPAN,
+    WORD_RANGE,
+    parse_reference,
+)
+from app.transformation.hook_payoff import (
+    MandatoryEvidence,
+    coverage_reasons,
 )
 from app.transformation.planning.policy import (
     DISTORTION_MARKERS,
@@ -238,7 +251,12 @@ def _as_text_list(value: object) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def revalidate_integrity(plan: PlanEvidence, config: Stage42Config) -> tuple[bool, tuple[str, ...]]:
+def revalidate_integrity(
+    plan: PlanEvidence,
+    config: Stage42Config,
+    *,
+    mandatory_evidence: Mapping[str, object] | None = None,
+) -> tuple[bool, tuple[str, ...]]:
     reasons: list[str] = []
     try:
         TransformationStrategyType(plan.strategy_type)
@@ -306,6 +324,17 @@ def revalidate_integrity(plan: PlanEvidence, config: Stage42Config) -> tuple[boo
             reasons.append("SOURCE_SPAN_NON_CHRONOLOGICAL")
         if next_start < prev_end - 1e-6:
             reasons.append("SOURCE_SPAN_OVERLAP")
+
+    # Mandatory hook/payoff preservation is a deterministic integrity
+    # requirement. It is evaluated against the authoritative resolved segment
+    # evidence, and a favorable semantic critique can never clear it.
+    coverage = coverage_reasons(
+        plan.hook_payoff_evidence.get("hook_index"),
+        plan.hook_payoff_evidence.get("payoff_index"),
+        MandatoryEvidence.from_dict(mandatory_evidence),
+        spans,
+    )
+    reasons.extend(coverage)
 
     for block in blocks:
         if _block_type(block) != PlanBlockType.FACT_VERIFICATION_PLACEHOLDER.value:
@@ -999,87 +1028,73 @@ def _build_source_evidence(plan: PlanEvidence, inputs: GovernanceInputs) -> _Sou
     )
 
 
-def _first_int(value: str) -> int | None:
-    match = _INT_RE.search(value)
-    return int(match.group(0)) if match else None
-
-
-def _float_range(value: str) -> tuple[float, float] | None:
-    match = _RANGE_RE.search(value)
-    if match is None:
-        return None
-    return float(match.group(1)), float(match.group(2))
-
-
 def _resolve_ref(ref: object, evidence: _SourceEvidence) -> str | None:
-    """Resolve one grounding reference and return its cited source text.
+    """Resolve one grounding declaration against real plan source evidence.
 
-    Provider-declared labels such as ``strategy`` or ``source_excerpt`` are
-    never proof: only a reference that addresses an existing source-excerpt
-    block/word/time span or quotes real source excerpt text resolves. A
-    structural citation alone is necessary but not sufficient for grounding.
+    The shared strict grammar is used so malformed declarations never become a
+    convenient numeric substring. A citation must be completely in scope; partial
+    overlap is never accepted as resolution. Provider-declared labels and
+    provider-supplied proof text are never evidence.
     """
 
-    if not isinstance(ref, str):
+    parsed = parse_reference(ref)
+    if parsed.kind is INVALID:
         return None
-    value = ref.strip()
-    if not value:
+    if parsed.kind is SOURCE_EXCERPT:
+        if parsed.block_index is None:
+            return None
+        return evidence.blocks.get(parsed.block_index)
+    if parsed.kind is WORD_RANGE:
+        start = parsed.word_start_index
+        end = parsed.word_end_index
+        if start is None or end is None or start < 0 or end < start:
+            return None
+        intervals = sorted(evidence.words, key=lambda item: item[0])
+        cursor = start
+        texts: list[str] = []
+        for word_start, word_end, text in intervals:
+            if word_end < cursor:
+                continue
+            if word_start > cursor:
+                return None
+            texts.append(text)
+            cursor = max(cursor, word_end)
+            if cursor >= end:
+                break
+        if cursor < end or not texts:
+            return None
+        return " ".join(texts)
+    if parsed.kind is SOURCE_SPAN:
+        start = parsed.source_start
+        end = parsed.source_end
+        if start is None or end is None:
+            return None
+        intervals = sorted((a, b, text) for a, b, text in evidence.spans)
+        cursor = float(start)
+        texts = []
+        for span_start, span_end, text in intervals:
+            if span_end < cursor:
+                continue
+            if span_start > cursor:
+                return None
+            texts.append(text)
+            cursor = max(cursor, span_end)
+            if cursor >= float(end):
+                break
+        if cursor < float(end) or not texts:
+            return None
+        return " ".join(texts)
+    if parsed.kind is QUOTE:
+        quote = (parsed.quote or "").strip().casefold()
+        if not quote:
+            return None
+        for text in evidence.blocks.values():
+            if text.strip().casefold() == quote:
+                return text
+        for _start, _end, text in evidence.spans:
+            if text.strip().casefold() == quote:
+                return text
         return None
-    lowered = value.casefold()
-
-    for prefix in _BLOCK_REF_PREFIXES:
-        if lowered.startswith(prefix):
-            index = _first_int(lowered[len(prefix) :])
-            if index is not None and index in evidence.blocks:
-                return evidence.blocks[index]
-            return None
-
-    for prefix in _WORD_REF_PREFIXES:
-        if lowered.startswith(prefix):
-            body = lowered[len(prefix) :]
-            span = _float_range(body)
-            if span is not None:
-                low, high = span
-                for start, end, text in evidence.words:
-                    if not (high < start or low > end):
-                        return text
-                return None
-            index = _first_int(body)
-            if index is None:
-                return None
-            for start, end, text in evidence.words:
-                if start <= index <= end:
-                    return text
-            return None
-
-    for prefix in _SPAN_REF_PREFIXES:
-        if lowered.startswith(prefix):
-            body = lowered[len(prefix) :]
-            span = _float_range(body)
-            if span is not None:
-                low, high = span
-                for span_start, span_end, span_text in evidence.spans:
-                    if not (high < span_start or low > span_end):
-                        return span_text
-                if low >= evidence.refined_start and high <= evidence.refined_end:
-                    return evidence.all_text
-                return None
-            point = _FLOAT_RE.search(body)
-            if point is not None:
-                value_f = float(point.group(0))
-                for span_start, span_end, span_text in evidence.spans:
-                    if span_start <= value_f <= span_end:
-                        return span_text
-                if evidence.refined_start <= value_f <= evidence.refined_end:
-                    return evidence.all_text
-            return None
-
-    if value.isdigit():
-        number = int(value)
-        return evidence.blocks.get(number)
-
-    if len(lowered) >= _MIN_QUOTE_CHARS and lowered in evidence.all_text.casefold():
-        return value
     return None
 
 
@@ -1998,7 +2013,9 @@ def evaluate_plan(
     provider_mode_deterministic: bool,
 ) -> PlanEvaluation:
     evaluation = PlanEvaluation(plan=plan)
-    integrity_ok, reasons = revalidate_integrity(plan, config)
+    integrity_ok, reasons = revalidate_integrity(
+        plan, config, mandatory_evidence=inputs.mandatory_evidence
+    )
     evaluation.integrity_ok = integrity_ok
     evaluation.integrity_reasons = reasons
     evidence = derive_evidence(plan, inputs, config)

@@ -198,6 +198,15 @@ end the clip. Closed findings: appropriate, excessive, redundant,
 position-damaging, not needed, unknown. No TTS provider, model, voice ID, speaker
 identity, or channel voice is ever selected or mentioned.
 
+## Mandatory hook/payoff integrity
+
+Stage 4.2 revalidates mandatory hook/payoff coverage against the authoritative
+resolved source-segment evidence before applying any semantic review. Missing,
+malformed, unresolved, or uncovered evidence is a deterministic hard failure
+(`PLAN_INTEGRITY_INVALID` with the specific hook/payoff reason); a favorable
+provider critique can never clear it. An old approval produced before this
+validation version is stale and cannot be selected.
+
 ## Verification
 
 Claim state is explicit:

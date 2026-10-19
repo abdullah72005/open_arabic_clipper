@@ -16,6 +16,11 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 from app.core.enums import ClaimClass, QualityLevel, SubstantiveValueKind
+from app.materialization.grounding import (
+    grounding_source_text,
+    parse_grounding_refs,
+    resolve_grounding,
+)
 from app.materialization.inputs import MaterializationInputs
 from app.materialization.policy import (
     REASON_GENERIC_FILLER,
@@ -31,7 +36,6 @@ from app.materialization.policy import (
 from app.materialization.types import (
     AuthoredBlock,
     ClaimLedgerEntry,
-    GroundingRef,
     QualityFinding,
     SlotResolution,
 )
@@ -138,53 +142,6 @@ def _numbers(text: str) -> set[str]:
     return {match.group(0) for match in _NUMBER_RE.finditer(text)}
 
 
-def resolve_grounding(
-    inputs: MaterializationInputs, refs: Sequence[GroundingRef]
-) -> GroundingResolution:
-    """Resolve the exact source text a grounding reference points at.
-
-    An unresolvable reference is reported as unresolved and contributes no text.
-    The whole transcript is never used as a fallback: unrelated authored copy must
-    never look grounded because its reference was invalid.
-    """
-
-    chunks: list[str] = []
-    unresolved: list[str] = []
-    for ref in refs:
-        if ref.kind == "FINAL_CLIP":
-            if inputs.final_clip.text.strip():
-                chunks.append(inputs.final_clip.text)
-            else:
-                unresolved.append("empty_final_clip")
-            continue
-        if ref.block_index is None:
-            unresolved.append("missing_block_index")
-            continue
-        block = inputs.plan_block(ref.block_index)
-        if block is None:
-            unresolved.append(f"missing_block:{ref.block_index}")
-            continue
-        if str(block.get("block_type", "")) != "SOURCE_EXCERPT":
-            unresolved.append(f"non_source_block:{ref.block_index}")
-            continue
-        text = str(block.get("source_text", "") or "").strip()
-        if not text:
-            unresolved.append(f"empty_source_block:{ref.block_index}")
-            continue
-        chunks.append(text)
-    return GroundingResolution(
-        text=" ".join(chunks).strip(),
-        declared=bool(refs),
-        unresolved=tuple(unresolved),
-    )
-
-
-def grounding_source_text(inputs: MaterializationInputs, refs: Sequence[GroundingRef]) -> str:
-    """Resolved grounding text (never a whole-transcript fallback)."""
-
-    return resolve_grounding(inputs, refs).text
-
-
 _NEGATION_TOKENS = frozenset(
     {
         "not",
@@ -275,7 +232,7 @@ def validate_authored_block(
     copy = str(block.get("copy", "") or "").strip()
     kind = str(block.get("substantive_value_kind", ""))
     block_type = str(block.get("block_type", ""))
-    refs = _grounding_refs(block.get("grounding_refs"))
+    refs = parse_grounding_refs(block.get("grounding_refs"))
     dependency_id = _optional_str(block.get("verification_dependency_id"))
     resolution = resolve_grounding(inputs, refs)
     grounding_text = resolution.text
@@ -297,7 +254,11 @@ def validate_authored_block(
                 dimension="GROUNDING_VERIFICATION",
                 level=QualityLevel.UNMET.value,
                 reason_codes=(REASON_INVALID_GROUNDING_REFERENCE,),
-                evidence={"block_index": index, "unresolved": list(resolution.unresolved)},
+                evidence={
+                    "block_index": index,
+                    "unresolved": list(resolution.unresolved),
+                    "errors": [dict(item) for item in resolution.errors],
+                },
             )
         )
 
@@ -481,26 +442,6 @@ def _finding(dimension: str, reason: str, index: int) -> QualityFinding:
         reason_codes=(reason,),
         evidence={"block_index": index},
     )
-
-
-def _grounding_refs(value: object) -> tuple[GroundingRef, ...]:
-    if not isinstance(value, (list, tuple)):
-        return ()
-    refs: list[GroundingRef] = []
-    for item in value:
-        if isinstance(item, GroundingRef):
-            refs.append(item)
-        elif isinstance(item, Mapping):
-            refs.append(
-                GroundingRef(
-                    kind=str(item.get("kind", "")),
-                    block_index=_optional_int(item.get("block_index")),
-                    source_start=_optional_float(item.get("source_start")),
-                    source_end=_optional_float(item.get("source_end")),
-                    claim_id=_optional_str(item.get("claim_id")),
-                )
-            )
-    return tuple(refs)
 
 
 def _optional_int(value: object) -> int | None:
