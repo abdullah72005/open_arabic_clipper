@@ -12,8 +12,13 @@ acceptance.
 
 from __future__ import annotations
 
+import atexit
+import hashlib
 import os
+import shutil
 import subprocess
+import tempfile
+import threading
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
@@ -50,40 +55,87 @@ _ANNOTATION_COPY = (
 _TERMINAL = {JobStatus.SUCCEEDED, JobStatus.FAILED, JobStatus.CANCELLED}
 
 
-def _write_source(path: Path) -> None:
-    """Narrow test-fixture media factory: real 1080p30/AAC source >= source bounds."""
+_SOURCE_ARGS = (
+    "-v",
+    "error",
+    "-y",
+    "-f",
+    "lavfi",
+    "-i",
+    "testsrc2=size=1920x1080:rate=30:duration=50",
+    "-f",
+    "lavfi",
+    "-i",
+    "sine=frequency=440:sample_rate=48000:duration=50",
+    "-vf",
+    "hue=H=2*PI*t:s=1",
+    "-c:v",
+    "libx264",
+    "-preset",
+    "ultrafast",
+    "-pix_fmt",
+    "yuv420p",
+    "-c:a",
+    "aac",
+    "-shortest",
+)
+_SOURCE_TIMEOUT_SECONDS = 120
+_SOURCE_CACHE_LOCK = threading.Lock()
+_SOURCE_CACHE_DIR = Path(tempfile.mkdtemp(prefix="clipfactory-stage6-source-"))
+atexit.register(shutil.rmtree, _SOURCE_CACHE_DIR, ignore_errors=True)
 
-    settings = get_settings()
-    subprocess.run(  # noqa: S603
-        [
-            settings.ffmpeg_binary,
-            "-v",
-            "error",
-            "-y",
-            "-f",
-            "lavfi",
-            "-i",
-            "testsrc2=size=1920x1080:rate=30:duration=50",
-            "-f",
-            "lavfi",
-            "-i",
-            "sine=frequency=440:sample_rate=48000:duration=50",
-            "-vf",
-            "hue=H=2*PI*t:s=1",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "ultrafast",
-            "-pix_fmt",
-            "yuv420p",
-            "-c:a",
-            "aac",
-            "-shortest",
-            str(path),
-        ],
-        check=True,
-        capture_output=True,
-    )
+
+def _source_command(ffmpeg_binary: str, path: Path) -> list[str]:
+    return [ffmpeg_binary, *_SOURCE_ARGS, str(path)]
+
+
+def _cached_source_path() -> Path:
+    binary = get_settings().ffmpeg_binary
+    digest = hashlib.sha256(repr((binary, _SOURCE_ARGS)).encode("utf-8")).hexdigest()[:20]
+    return _SOURCE_CACHE_DIR / f"source-{digest}.mp4"
+
+
+def _subprocess_stderr(error: subprocess.SubprocessError) -> str:
+    stderr = getattr(error, "stderr", b"") or b""
+    if isinstance(stderr, bytes):
+        stderr = stderr.decode("utf-8", "replace")
+    return str(stderr)[-1000:]
+
+
+def _write_source(path: Path) -> None:
+    """Narrow test-fixture media factory: real 1080p30/AAC source >= source bounds.
+
+    The expensive source is generated once per test run and copied into each
+    isolated source location before fingerprints are established. Fixture
+    subprocess execution remains bounded and keeps failure diagnostics.
+    """
+
+    cached = _cached_source_path()
+    with _SOURCE_CACHE_LOCK:
+        if not cached.is_file() or cached.stat().st_size == 0:
+            binary = get_settings().ffmpeg_binary
+            temporary = cached.with_suffix(".tmp.mp4")
+            try:
+                subprocess.run(  # noqa: S603
+                    _source_command(binary, temporary),
+                    check=True,
+                    capture_output=True,
+                    timeout=_SOURCE_TIMEOUT_SECONDS,
+                )
+            except subprocess.TimeoutExpired as error:
+                temporary.unlink(missing_ok=True)
+                raise RuntimeError(
+                    f"fixture source generation timed out after {_SOURCE_TIMEOUT_SECONDS}s: "
+                    f"{_subprocess_stderr(error)}"
+                ) from error
+            except subprocess.CalledProcessError as error:
+                temporary.unlink(missing_ok=True)
+                raise RuntimeError(
+                    f"fixture source generation failed ({error.returncode}): "
+                    f"{_subprocess_stderr(error)}"
+                ) from error
+            temporary.replace(cached)
+        shutil.copyfile(cached, path)
 
 
 class _RenderCapture:
@@ -183,9 +235,7 @@ def _export_synthetic_package(
             "error_code": job.error_code,
         }
         for job in session.scalars(
-            select(ProcessingJob).where(
-                ProcessingJob.materialization_id == envelope.id
-            )
+            select(ProcessingJob).where(ProcessingJob.materialization_id == envelope.id)
         ).all()
     ]
     jobs.extend(
@@ -410,9 +460,7 @@ def test_real_persisted_executor_end_to_end(engine: Engine, monkeypatch: Any) ->
         assert envelope.human_review_required is True
         # Every job is terminal.
         jobs = session.scalars(
-            select(ProcessingJob).where(
-                ProcessingJob.materialization_id == materialization_id
-            )
+            select(ProcessingJob).where(ProcessingJob.materialization_id == materialization_id)
         ).all()
         for job in jobs:
             assert job.status in _TERMINAL
@@ -455,9 +503,7 @@ def test_real_persisted_executor_end_to_end(engine: Engine, monkeypatch: Any) ->
         assert owner is not None
         from app.materialization.finalization import finalize_materialization
 
-        result = finalize_materialization(
-            session, owner, settings=settings, storage=storage
-        )
+        result = finalize_materialization(session, owner, settings=settings, storage=storage)
         session.commit()
         assert result.reused is True
         assert result.assessment_fingerprint == first_fingerprint
