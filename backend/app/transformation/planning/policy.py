@@ -23,7 +23,7 @@ from app.core.enums import (
 # multi-token identities (for example "اختر محمد رمضان راوياً").
 POLICY_VERSION = "stage4.1-v9"
 SCHEMA_VERSION = "stage4.1-schema-v9"
-VALIDATION_VERSION = "stage4.1-validation-v10"
+VALIDATION_VERSION = "stage4.1-validation-v11"
 INPUT_FINGERPRINT_VERSION = "2"
 OUTPUT_FINGERPRINT_VERSION = "2"
 PLAN_FINGERPRINT_VERSION = "2"

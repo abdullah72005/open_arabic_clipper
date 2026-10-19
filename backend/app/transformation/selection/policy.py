@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 
-SELECTION_POLICY_VERSION = "stage4.3-v3"
+SELECTION_POLICY_VERSION = "stage4.3-v4"
 SELECTION_SCHEMA_VERSION = "stage4.3-schema-v1"
 SELECTION_FINGERPRINT_VERSION = "2"
 

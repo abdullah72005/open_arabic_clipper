@@ -184,7 +184,14 @@ Resolution happens only after source excerpts are resolved, against the exact
 selected planning-word/block evidence and selected source bounds. The complete
 cited range must be covered; partial overlap, out-of-scope indexes, nonexistent
 words, unknown/non-source blocks, reversed ranges, and quotes absent from the
-selected excerpt are rejected. Malformed containers, blank declarations, and
+selected excerpt are rejected. A word range is validated against the actual
+selected evidence size before any provider-controlled index is iterated, so huge
+declarations fail explicitly without unbounded allocation. A time span must be
+covered by authoritative word evidence at both endpoints; a single-point time
+citation resolves only words containing that point. When no word evidence exists,
+only a declaration that exactly covers one selected whole excerpt resolves to
+that excerpt's exact text. A narrow or partially covered time citation never
+expands into the whole excerpt. Malformed containers, blank declarations, and
 non-string items are preserved at the provider parser boundary as explicit
 malformed-declaration failures; they are never dropped, truncated into validity,
 or treated as an empty list. Mixed valid and invalid declarations fail on the
@@ -607,8 +614,9 @@ ruff format app tests alembic && ruff check app tests alembic
 All Stage 4.1 tests are deterministic and hermetic: providers are mocked and no
 test makes a live Gemini, Qwen, web, TTS, or rendering call even when a key is
 present. The required-source-grounding correction advanced the validation
-version to `stage4.1-validation-v10` (authoritative declaration resolution and a
-required-grounding policy for substantive authored blocks), so prior plans and
+version to `stage4.1-validation-v11` (authoritative declaration resolution, a
+required-grounding policy for substantive authored blocks, bounded word-range
+work, and Stage 6-parity time-point/range coverage), so prior plans and
 checkpoints invalidate through the input fingerprint. The earlier Arabic
 multi-token closure advanced planning versions to `stage4.1-v8` /
 `stage4.1-schema-v8` / `stage4.1-validation-v8` (bounded Arabic selection grammar

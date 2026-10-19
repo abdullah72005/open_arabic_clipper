@@ -11,7 +11,7 @@ researches, refines transcripts, or renders, and it adds **no** Celery task,
   (`policy.py`, `types.py`, `fingerprints.py`, `service.py`, `handoff.py`).
 - Migration: `20260918_0019_stage_4_3_plan_selection`.
 - Persistence: `transformation_plan_selections`.
-- Versions: policy `stage4.3-v3`, schema `stage4.3-schema-v1`, fingerprint `2`.
+- Versions: policy `stage4.3-v4`, schema `stage4.3-schema-v1`, fingerprint `2`.
 
 ## Mandatory hook/payoff and grounding selection guard
 

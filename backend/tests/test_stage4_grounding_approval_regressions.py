@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -31,6 +32,9 @@ from app.core.enums import (
     TransformationSelectionStatus,
 )
 from app.db.base import Base
+from app.materialization.grounding import parse_grounding_refs, resolve_grounding
+from app.materialization.inputs import FinalClipEvidence
+from app.materialization.inputs import WordEvidence as FinalWordEvidence
 from app.transformation.governance.policy import DEFAULT_CONFIG as STAGE42_CONFIG
 from app.transformation.governance.validation import (
     SEMANTIC_AVAILABLE,
@@ -478,6 +482,383 @@ def test_stage43_live_guard_excludes_legacy_ungrounded_approval(
         failures = _mandatory_failures(session, fixture.candidate, [row])
         assert any(
             reason.startswith(GROUNDING_REQUIRED_MISSING) for reason in failures[str(row.id)]
+        )
+        decision, _freshness = evaluate_without_persisting(session, fixture.candidate.id)
+        assert decision.status is not TransformationSelectionStatus.PLAN_SELECTED
+        assert decision.status is not TransformationSelectionStatus.PLAN_SELECTED_WITH_CAUTION
+
+
+def _span_words() -> tuple[dict[str, object], ...]:
+    return tuple(
+        {
+            "index": index,
+            "text": f"w{index}",
+            "start": 100.0 + index,
+            "end": 101.0 + index,
+        }
+        for index in range(2, 7)
+    )
+
+
+def _span_source_block(
+    *,
+    index: int = 0,
+    start: float = 102.0,
+    duration: float = 5.0,
+    words: tuple[dict[str, object], ...] | None = None,
+    text: str = "w2 w3 w4 w5 w6",
+) -> dict[str, object]:
+    chosen = _span_words() if words is None else words
+    first = chosen[0]["index"]
+    last = chosen[-1]["index"]
+    return {
+        "index": index,
+        "block_type": "SOURCE_EXCERPT",
+        "source_role": "HERO",
+        "source_start": start,
+        "source_end": start + duration,
+        "source_text": text,
+        "planning_source_text": text,
+        "planning_source_start": start,
+        "planning_source_end": start + duration,
+        "word_start_index": first,
+        "word_end_index": last,
+        "planning_word_start_index": first,
+        "planning_word_end_index": last,
+        "planning_words": list(chosen),
+    }
+
+
+def _stage6_inputs(
+    *,
+    blocks: tuple[dict[str, object], ...] | None = None,
+    final_words: tuple[dict[str, object], ...] | None = None,
+    final_start: float = 102.0,
+    final_end: float = 107.0,
+) -> SimpleNamespace:
+    words = _span_words() if final_words is None else final_words
+    final = FinalClipEvidence(
+        refinement_id="ref",
+        priority="FINAL_CLIP",
+        quality_level="FINAL_CLIP",
+        status="FINAL_TRANSCRIPT_READY",
+        output_fingerprint="final-fp",
+        text=" ".join(str(word["text"]) for word in words),
+        words=tuple(
+            FinalWordEvidence(
+                index=int(word["index"]),
+                text=str(word["text"]),
+                start=float(word["start"]),
+                end=float(word["end"]),
+            )
+            for word in words
+        ),
+        start=final_start,
+        end=final_end,
+    )
+    return SimpleNamespace(blocks=blocks or (_span_source_block(),), final_clip=final)
+
+
+def _stage6_resolution(declaration: str, **kwargs: Any) -> Any:
+    return resolve_grounding(_stage6_inputs(**kwargs), parse_grounding_refs([declaration]))
+
+
+@pytest.mark.parametrize(
+    "declaration",
+    [
+        "words:0-100000000",
+        "words:100000000-200000000",
+        {
+            "kind": "WORD_RANGE",
+            "word_start_index": 0,
+            "word_end_index": 100000000,
+        },
+        "words:100000000-100000004",
+    ],
+)
+def test_huge_word_ranges_fail_before_allocation(declaration: object) -> None:
+    text, reason = resolve_reference(declaration, (_span_source_block(),))
+    assert text is None
+    assert reason == "word_range_not_fully_covered_by_selected_evidence"
+
+
+@pytest.mark.parametrize(
+    "declaration",
+    ["words:0-100000000", "words:100000000-100000004"],
+)
+def test_huge_word_ranges_fail_at_stage41(declaration: str) -> None:
+    result = _validate(_plan(grounding=(declaration,)))
+    assert result.plan is None
+    assert any(reason.startswith(GROUNDING_EVIDENCE_UNRESOLVED) for reason in result.reasons)
+
+
+@pytest.mark.parametrize(
+    ("declaration", "expected"),
+    [
+        ("word:3", "w3"),
+        ("words:3-5", "w3 w4 w5"),
+        ("words:2-6", "w2 w3 w4 w5 w6"),
+    ],
+)
+def test_valid_word_ranges_resolve_exactly(declaration: str, expected: str) -> None:
+    text, reason = resolve_reference(declaration, (_span_source_block(),))
+    assert reason is None
+    assert text == expected
+
+
+@pytest.mark.parametrize(
+    "declaration",
+    [
+        "words:1-3",
+        "words:2-7",
+        "words:99",
+        "words:0-2",
+    ],
+)
+def test_missing_or_partial_word_ranges_do_not_expand_evidence(
+    declaration: str,
+) -> None:
+    text, reason = resolve_reference(declaration, (_span_source_block(),))
+    assert text is None
+    assert reason == "word_range_not_fully_covered_by_selected_evidence"
+
+
+def test_valid_word_range_spans_supported_selected_excerpts() -> None:
+    first = _span_source_block(
+        words=_span_words()[:2],
+        start=102.0,
+        duration=2.0,
+        text="w2 w3",
+    )
+    second = _span_source_block(
+        index=1,
+        words=_span_words()[2:],
+        start=104.0,
+        duration=3.0,
+        text="w4 w5 w6",
+    )
+    text, reason = resolve_reference("words:2-6", (first, second))
+    assert reason is None
+    assert text == "w2 w3 w4 w5 w6"
+
+
+def test_sparse_word_indexes_do_not_fill_gaps() -> None:
+    first = _span_source_block(
+        words=(_span_words()[0], _span_words()[1]),
+        start=102.0,
+        duration=2.0,
+        text="w2 w3",
+    )
+    trailing = {
+        "index": 7,
+        "text": "w7",
+        "start": 107.0,
+        "end": 108.0,
+    }
+    second = _span_source_block(
+        index=1,
+        words=(*_span_words()[3:], trailing),
+        start=104.0,
+        duration=4.0,
+        text="w5 w6 w7",
+    )
+    text, reason = resolve_reference("words:2-6", (first, second))
+    assert text is None
+    assert reason == "word_range_not_fully_covered_by_selected_evidence"
+
+
+@pytest.mark.parametrize(
+    "declaration",
+    [
+        "source:102.2-102.3",
+        "source:102.2-106.7",
+    ],
+)
+def test_historical_time_references_rejected_at_stage41(declaration: str) -> None:
+    result = _validate(_plan(grounding=(declaration,)))
+    assert result.plan is None
+    assert any(reason.startswith(GROUNDING_EVIDENCE_UNRESOLVED) for reason in result.reasons)
+
+
+@pytest.mark.parametrize(
+    "declaration",
+    [
+        "source:102.2-102.3",
+        "source:102.2-106.7",
+        "source:102-106",
+        "source:102-107",
+        "source:103.5",
+        "source:99.5",
+        "source:102.5-106.5",
+    ],
+)
+def test_stage4_and_stage6_time_reference_parity(declaration: str) -> None:
+    stage4_text, stage4_reason = resolve_reference(declaration, (_span_source_block(),))
+    stage6 = _stage6_resolution(declaration)
+    assert (stage4_reason is None) == (not stage6.unresolved)
+    if stage4_reason is None:
+        assert stage4_text == stage6.text
+
+
+def test_stage4_and_stage6_agree_on_point_in_word_gap() -> None:
+    words = list(_span_words())
+    words[2] = {**words[2], "start": 104.5, "end": 105.5}
+    blocks = (_span_source_block(words=tuple(words)),)
+    stage4_text, stage4_reason = resolve_reference("source:104.2", blocks)
+    stage6 = _stage6_resolution("source:104.2", blocks=blocks, final_words=tuple(words))
+    assert stage4_text is None
+    assert stage4_reason is not None
+    assert stage6.unresolved
+
+
+def test_time_reference_across_uncovered_selected_scope_gap_is_rejected() -> None:
+    first = _span_source_block(
+        words=(_span_words()[0], _span_words()[1]),
+        start=102.0,
+        duration=2.0,
+        text="w2 w3",
+    )
+    second = _span_source_block(
+        index=1,
+        words=_span_words()[3:],
+        start=106.0,
+        duration=2.0,
+        text="w5 w6",
+    )
+    blocks = (first, second)
+    stage4_text, stage4_reason = resolve_reference("source:103-107", blocks)
+    stage6 = _stage6_resolution("source:103-107", blocks=blocks)
+    assert stage4_text is None
+    assert stage4_reason == "source_span_out_of_selected_scope"
+    assert stage6.unresolved
+
+
+def test_missing_word_evidence_rejects_narrow_time_references() -> None:
+    block = {
+        key: value
+        for key, value in _span_source_block().items()
+        if key
+        not in {
+            "word_start_index",
+            "word_end_index",
+            "planning_word_start_index",
+            "planning_word_end_index",
+            "planning_words",
+        }
+    }
+    for declaration in ("source:102-103", "source:103.5", "source:102.2-106.7"):
+        text, reason = resolve_reference(declaration, (block,))
+        assert text is None
+        assert reason is not None
+
+
+def test_valid_whole_block_reference_survives_without_word_evidence() -> None:
+    block = {
+        key: value
+        for key, value in _span_source_block().items()
+        if key
+        not in {
+            "word_start_index",
+            "word_end_index",
+            "planning_word_start_index",
+            "planning_word_end_index",
+            "planning_words",
+        }
+    }
+    text, reason = resolve_reference("source:102-107", (block,))
+    assert reason is None
+    assert text == "w2 w3 w4 w5 w6"
+    block_text, block_reason = resolve_reference("block:0", (block,))
+    assert block_reason is None
+    assert block_text == text
+
+
+def test_later_final_clip_changes_are_a_legitimate_downstream_rejection() -> None:
+    blocks = (_span_source_block(),)
+    stage4_text, stage4_reason = resolve_reference("source:102-106", blocks)
+    stage6 = _stage6_resolution("source:102-106", final_words=_span_words()[:3])
+    assert stage4_reason is None
+    assert stage4_text == "w2 w3 w4 w5"
+    assert stage6.unresolved
+    assert "final_clip_range_not_covered" in " ".join(stage6.unresolved)
+
+
+@pytest.mark.parametrize(
+    "declaration",
+    [
+        "source:102.2-102.3",
+        "source:102.2-106.7",
+    ],
+)
+def test_stage42_invalid_time_reference_fails_integrity(declaration: str) -> None:
+    source = source_block(0, start=102.0, duration=5.0)
+    source.update(
+        {
+            "source_text": "w2 w3 w4 w5 w6",
+            "word_start_index": 2,
+            "word_end_index": 6,
+            "planning_word_start_index": 2,
+            "planning_word_end_index": 6,
+            "planning_words": list(_span_words()),
+        }
+    )
+    plan = make_plan(
+        blocks=[source, original_block(1, grounding=(declaration,))],
+        original_value_kinds=("SOURCE_AS_EVIDENCE",),
+    )
+    ok, reasons = revalidate_integrity(plan, STAGE42_CONFIG)
+    assert not ok
+    assert any(reason.startswith(GROUNDING_EVIDENCE_UNRESOLVED) for reason in reasons)
+
+
+def test_stage42_favorable_critique_never_clears_invalid_time_reference() -> None:
+    source = source_block(0, start=102.0, duration=5.0)
+    source.update(
+        {
+            "source_text": "w2 w3 w4 w5 w6",
+            "word_start_index": 2,
+            "word_end_index": 6,
+            "planning_word_start_index": 2,
+            "planning_word_end_index": 6,
+            "planning_words": list(_span_words()),
+        }
+    )
+    plan = make_plan(
+        blocks=[source, original_block(1, grounding=("source:102.2-106.7",))],
+        original_value_kinds=("SOURCE_AS_EVIDENCE",),
+    )
+    inputs = make_inputs([plan])
+    evaluation = evaluate_plan(plan, inputs, STAGE42_CONFIG, provider_mode_deterministic=False)
+    apply_semantic_review(evaluation, make_critique(plan), SEMANTIC_AVAILABLE)
+    assert evaluation.integrity_ok is False
+    assert evaluation.hard_failures
+    assert evaluation.verification.get("claim_state") != "GROUNDED_IN_SOURCE"
+    governance = build_plan_governance(evaluation, input_fingerprint="in", output_fingerprint="out")
+    assert governance.status.value == "REJECTED_BY_GOVERNOR"
+    assert governance.eligible_for_stage4_3 is False
+
+
+def test_stage43_live_guard_excludes_persisted_invalid_time_reference(
+    sqlite_engine: Engine, monkeypatch: Any
+) -> None:
+    Base.metadata.create_all(sqlite_engine)
+    with Session(sqlite_engine) as session:
+        settings = FakeGovernanceSettings()
+        install_selection_settings(monkeypatch, settings)
+        fixture = seed_selection_fixture(
+            session, settings=settings, result_specs=[make_result_spec()]
+        )
+        row = fixture.plans[0]
+        row.blocks = [
+            {**dict(block), "grounding_refs": ["source:20.6-44.4"]}
+            if dict(block).get("block_type") == "ORIGINAL_VALUE"
+            else dict(block)
+            for block in (row.blocks or [])
+        ]
+        session.flush()
+        failures = _mandatory_failures(session, fixture.candidate, [row])
+        assert any(
+            reason.startswith(GROUNDING_EVIDENCE_UNRESOLVED) for reason in failures[str(row.id)]
         )
         decision, _freshness = evaluate_without_persisting(session, fixture.candidate.id)
         assert decision.status is not TransformationSelectionStatus.PLAN_SELECTED

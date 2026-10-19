@@ -309,7 +309,7 @@ Immutable, code-defined profile (never a dynamic engine, never runtime scraping)
 
 - governor policy: `stage4.2-v9`
 - schema: `stage4.2-schema-v1`
-- validation: `stage4.2-validation-v10`
+- validation: `stage4.2-validation-v11`
 - platform profile: `stage4.2-platform-policy-2026-09-17-v1`
 - checked date: `2026-09-17`
 
@@ -718,6 +718,10 @@ regime.
     citations are `PLAN_INTEGRITY_INVALID` hard failures before any semantic
     review; a favorable critique can never clear them. Only a genuine linked
     external-verification placeholder waives grounding for a substantive block.
-    Declaration resolution never substitutes for claim-to-evidence support or
-    substantive-value review. Validation advanced to
-    `stage4.2-validation-v10` so old approvals cannot bypass the rule.
+    The shared resolver bounds word-range work by actual selected evidence and
+    requires complete word endpoint coverage for time ranges (or exact
+    whole-excerpt coverage when no word evidence exists); partial or narrow time
+    citations are never expanded into the whole excerpt. Declaration resolution
+    never substitutes for claim-to-evidence support or substantive-value review.
+    Validation advanced to `stage4.2-validation-v11` so old approvals cannot
+    bypass the rule.

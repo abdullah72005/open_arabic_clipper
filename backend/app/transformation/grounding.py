@@ -420,10 +420,18 @@ def _resolve_word_range(
     words: dict[int, str] = {}
     for block in source_blocks:
         words.update(_word_map(block))
-    selected = [words.get(index) for index in range(start, end + 1)]
-    if any(text is None for text in selected):
+    if end < start or not words:
         return None, "word_range_not_fully_covered_by_selected_evidence"
-    return " ".join(text for text in selected if text), None
+    count = end - start + 1
+    # Validate declared scope against the actual selected evidence before
+    # iterating provider-controlled indexes. This also rejects huge declarations
+    # without allocating or iterating across an unbounded range.
+    if count > len(words):
+        return None, "word_range_not_fully_covered_by_selected_evidence"
+    for index in range(start, end + 1):
+        if index not in words:
+            return None, "word_range_not_fully_covered_by_selected_evidence"
+    return " ".join(words[index] for index in range(start, end + 1)), None
 
 
 def _range_covered(spans: Sequence[tuple[float, float]], start: float, end: float) -> bool:
@@ -437,6 +445,23 @@ def _range_covered(spans: Sequence[tuple[float, float]], start: float, end: floa
         if cursor + _RANGE_TOLERANCE_SECONDS >= end:
             return True
     return cursor + _RANGE_TOLERANCE_SECONDS >= end
+
+
+def _exact_whole_block_text(
+    start: float, end: float, source_blocks: Sequence[Mapping[str, object]]
+) -> str | None:
+    """The exact selected excerpt when the declaration covers exactly one block."""
+
+    matches = [
+        block
+        for block in source_blocks
+        if (span := _block_span(block))
+        and abs(span[0] - start) <= _RANGE_TOLERANCE_SECONDS
+        and abs(span[1] - end) <= _RANGE_TOLERANCE_SECONDS
+    ]
+    if len(matches) != 1:
+        return None
+    return _block_text(matches[0]) or None
 
 
 def _resolve_source_span(
@@ -453,23 +478,37 @@ def _resolve_source_span(
             if not math.isfinite(word_start) or not math.isfinite(word_end):
                 continue
             words.append((word_start, word_end, text))
+    words.sort()
+    if not words:
+        # A declaration that exactly names one selected excerpt is already the
+        # whole cited evidence; no word expansion is needed or fabricated.
+        whole = _exact_whole_block_text(start, end, source_blocks)
+        if whole is not None:
+            return whole, None
+        return None, "source_span_evidence_unavailable"
+    if start == end:
+        point = [
+            text
+            for word_start, word_end, text in words
+            if word_start - _RANGE_TOLERANCE_SECONDS <= start <= word_end + _RANGE_TOLERANCE_SECONDS
+        ]
+        if not point:
+            return None, "source_point_evidence_unavailable"
+        return " ".join(point), None
     inside = [
-        text
-        for word_start, word_end, text in sorted(words)
+        (word_start, word_end, text)
+        for word_start, word_end, text in words
         if word_start >= start - _RANGE_TOLERANCE_SECONDS
         and word_end <= end + _RANGE_TOLERANCE_SECONDS
     ]
-    if inside:
-        return " ".join(inside), None
-    chunks = [
-        _block_text(block)
-        for block in source_blocks
-        if (span := _block_span(block))
-        and span[0] < end - _RANGE_TOLERANCE_SECONDS
-        and span[1] > start + _RANGE_TOLERANCE_SECONDS
-    ]
-    text = " ".join(chunk for chunk in chunks if chunk)
-    return (text, None) if text else (None, "selected_source_text_unavailable")
+    if not inside:
+        return None, "source_span_evidence_unavailable"
+    if (
+        inside[0][0] > start + _RANGE_TOLERANCE_SECONDS
+        or inside[-1][1] < end - _RANGE_TOLERANCE_SECONDS
+    ):
+        return None, "source_span_range_not_covered"
+    return " ".join(text for _word_start, _word_end, text in inside), None
 
 
 def _resolve_quote(
