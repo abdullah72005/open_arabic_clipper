@@ -49,10 +49,12 @@ CANDIDATES = (
     "64e7807c-3b58-4ea7-9b80-d2ec3e543572",
     "a725e62d-bec3-445d-93b4-76815febfde4",
 )
-# The analytic representative case: hook segment 71 is inside the strict
-# refined window and the first planning words are in-window.
-REPRESENTATIVE = "a725e62d-bec3-445d-93b4-76815febfde4"
-REPRESENTATIVE_STRATEGY = TransformationStrategyType.ANALYSIS
+# The representative case uses an authentic CONTEXT_HOOK strategy whose source
+# excerpt spans the hook segment and the following demand phrase. That lets the
+# authored explanation state a grounded relationship between two authentic
+# phrases instead of merely quoting and attributing one phrase.
+REPRESENTATIVE = "1827c524-e893-4769-8b22-31411c10b6e8"
+REPRESENTATIVE_STRATEGY = TransformationStrategyType.CONTEXT_HOOK
 
 
 def load_case(candidate_id: str) -> dict[str, Any]:
@@ -276,14 +278,12 @@ class AuthoredProvider:
         return self.runtime_identity()
 
 
-def planning_word_range_for_segment(
-    refinement: Mapping[str, object], segment: tuple[float, float]
-) -> tuple[int, int] | None:
-    """Map authentic segment bounds to offered planning-word indexes read-only."""
+def selectable_planning_words(refinement: Mapping[str, object]) -> list[Mapping[str, object]]:
+    """Return the authentic selectable words in the offered planning order."""
 
     refined_start = float(refinement["refined_start"])
     refined_end = float(refinement["refined_end"])
-    selectable = []
+    selectable: list[Mapping[str, object]] = []
     for item in refinement.get("word_timestamps") or []:
         if not isinstance(item, Mapping):
             continue
@@ -294,28 +294,65 @@ def planning_word_range_for_segment(
         if not isinstance(end, (int, float)) or isinstance(end, bool):
             continue
         if float(start) >= refined_start - 0.75 and float(end) <= refined_end + 0.75:
-            selectable.append(item)
+            # Match WordEvidence.as_dict rounding so the helper sees exactly the
+            # planning bounds the production request exposes.
+            selectable.append(
+                {**item, "start": round(float(start), 4), "end": round(float(end), 4)}
+            )
+    return selectable
+
+
+def planning_word_range_for_span(
+    refinement: Mapping[str, object], span: tuple[float, float]
+) -> tuple[int, int] | None:
+    """Map authentic span bounds to offered planning-word indexes read-only."""
+
     indexes = [
         index
-        for index, item in enumerate(selectable)
-        if float(item["end"]) > segment[0] and float(item["start"]) < segment[1]
+        for index, item in enumerate(selectable_planning_words(refinement))
+        if float(item["end"]) > span[0] and float(item["start"]) < span[1]
     ]
     if not indexes:
         return None
     return indexes[0], indexes[-1]
 
 
+def planning_word_range_for_segment(
+    refinement: Mapping[str, object], segment: tuple[float, float]
+) -> tuple[int, int] | None:
+    """Map authentic segment bounds to offered planning-word indexes read-only."""
+
+    return planning_word_range_for_span(refinement, segment)
+
+
+def planning_word_texts(
+    refinement: Mapping[str, object], start_index: int, end_index: int
+) -> tuple[str, ...]:
+    words = selectable_planning_words(refinement)
+    return tuple(str(item.get("text", "")).strip() for item in words[start_index : end_index + 1])
+
+
 def representative_response(
-    *, strategy_id: str, strategy_key: str, word_start: int, word_end: int
+    *,
+    strategy_id: str,
+    strategy_key: str,
+    word_start: int,
+    word_end: int,
+    excerpt_quote: str,
+    demand_quote: str,
 ) -> dict[str, object]:
     """Authored offline provider-format response grounded in authentic evidence.
 
-    The semantic intent is a reference-framed whole-workspace quotation of the
-    selected authentic excerpt. It intentionally uses attribution wording that
-    is not part of the source so it is not a paraphrase-only restatement, while
-    every quoted token is present in the selected evidence.
+    The authored contribution is an explanatory claim about the relation between
+    two authentic phrases in the selected excerpt: the gold and diamonds are the
+    family's demands, not an unrelated list. The quoted phrases are the exact
+    saved planning-word text, and the only non-source tokens are the permitted
+    reference/framing words "source", "context", and "explains". Therefore the
+    claim adds no new factual predicate and inherits support from the cited
+    excerpt rather than laundering a quotation as substantive value.
     """
 
+    semantic_intent = f'The source context explains "{excerpt_quote}" as "{demand_quote}".'
     return {
         "plans": [
             {
@@ -324,7 +361,7 @@ def representative_response(
                 "confidence": 0.72,
                 "no_valid_plan": False,
                 "no_valid_reason": "",
-                "planner_notes": "offline authored contract fixture",
+                "planner_notes": "offline authored substantive-value fixture",
                 "preservation_constraints": ["Keep the source speakers and dialect unchanged."],
                 "narration": {
                     "need": "NONE",
@@ -338,8 +375,8 @@ def representative_response(
                 "blocks": [
                     {
                         "block_type": "SOURCE_EXCERPT",
-                        "purpose": "Authentic hero excerpt",
-                        "estimated_duration": 1.78,
+                        "purpose": "Authentic hook and demand excerpt",
+                        "estimated_duration": 3.36,
                         "source_role": "HERO",
                         "word_start_index": word_start,
                         "word_end_index": word_end,
@@ -354,13 +391,14 @@ def representative_response(
                     },
                     {
                         "block_type": "ORIGINAL_VALUE",
-                        "purpose": "Reference-framed source observation",
+                        "purpose": "Grounded explanation of the demand list",
                         "estimated_duration": 3.0,
                         "substantive_value_kind": "EXPLANATION",
-                        "semantic_intent": ('المصدر ذكر أن المتحدث يقول: "أوه نزلي أكي نزلك إيه؟"'),
+                        "semantic_intent": semantic_intent,
                         "why_unavailable": (
-                            "The raw excerpt states the repeated dish question but not the "
-                            "source attribution frame around it."
+                            "The selected excerpt states the diamonds, gold, and the family's "
+                            "demands as separate phrases; it does not itself state the "
+                            "explanatory relation that the diamonds and gold are those demands."
                         ),
                         "grounding_refs": [f"words:{word_start}-{word_end}"],
                         "delivery_intent": "ON_SCREEN_TEXT",
@@ -391,7 +429,10 @@ __all__ = [
     "AuthoredProvider",
     "load_case",
     "planning_word_range_for_segment",
+    "planning_word_range_for_span",
+    "planning_word_texts",
     "representative_response",
     "replace_strategy_id",
     "seed_authentic_case",
+    "selectable_planning_words",
 ]

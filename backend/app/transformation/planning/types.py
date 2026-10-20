@@ -299,6 +299,9 @@ class PlanProviderResult:
     # Bounded, non-executable response context for rejection diagnostics.
     # Never raw provider text or transcript content.
     response_evidence: Mapping[str, object] = field(default_factory=dict)
+    # Bounded parser rejections for this requested identity. These are recorded
+    # even when no plan was collected, and never make a rejected entry reusable.
+    rejections: tuple[Mapping[str, object], ...] = ()
 
 
 @dataclass(frozen=True)

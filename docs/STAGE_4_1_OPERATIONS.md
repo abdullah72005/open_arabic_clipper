@@ -205,6 +205,23 @@ or `PAYOFF` alone never prove coverage, and a null payoff never waives a hook.
 When the authoritative requirement is malformed or unresolved, no guessed span
 can satisfy it.
 
+Producer feasibility uses the same source-selection and mandatory-coverage
+semantics as validation; it is not an "endpoint lies inside one offered word"
+test. `planning_word_start_index`/`planning_word_end_index` and
+`covered_by_offered_words` are descriptive word mapping only. The authoritative
+`mandatory_coverage_feasible` flag is true when a supported contiguous
+planning-word selection, or the documented full-window fallback when word
+evidence is insufficient, covers both segment endpoints within the existing
+0.75-second tolerance and the resolved span stays inside the selectable window.
+`supported_selection` reports the method (`WORD_SELECTION`/`FULL_WINDOW`) and
+range. This matters when an endpoint falls in an inter-word gap: the authentic
+`ac0670c4` hook end does not lie inside any single word, yet the allowed excerpt
+covers it and validation accepts the plan. The instruction therefore tells the
+provider to decline only when `mandatory_coverage_feasible` is false, never
+merely because `covered_by_offered_words` is false. Truly uncoverable, malformed,
+and unresolved evidence remain infeasible and cannot pass validation through a
+word selection or the full-window fallback.
+
 ## Required source grounding
 
 `ORIGINAL_VALUE` and `TEXTUAL_ANNOTATION` are substantive authored blocks and
@@ -546,10 +563,21 @@ provider identity; it records the failure phase/codes/block, safely represented
 submitted selectors, resolved selected-source word/time identities, expected
 mandatory evidence, source-selection limits, and bounded response digest/size
 (never the raw response). Phases distinguish contract rejection, explicit
-decline, omission and transport failure. Quote declarations are retained only as
-digests, and diagnostics are never executable plan content, never reusable
-checkpoints, and never include transcript text or credentials. Earlier per-job
-diagnostics survive later runs (bounded to the most recent 20).
+decline, omission, parser rejection and transport failure. A returned plan whose
+requested `strategy_key` carries a mismatched/unknown identity, a duplicate
+identity, or malformed entries is not silently relabeled as `PROVIDER_OMITTED`:
+the parser retains bounded rejection codes (`STRATEGY_ID_MISMATCH`,
+`DUPLICATE_STRATEGY_KEY`, `UNKNOWN_STRATEGY_KEY`, `MALFORMED_ENTRY`,
+`MALFORMED_BLOCKS_CONTAINER`, `MALFORMED_BLOCK_ENTRY`, `UNKNOWN_BLOCK_TYPE`),
+the requested identity, returned-identity digests/lengths, response digest/size/
+returned count, and bounded unmatched-entry structure. Unmatched identities are
+digested rather than persisted verbatim. An accepted sibling remains accepted;
+its parser-sibling rejection evidence is recorded independently. A true omission
+has no parser rejection, and a transport failure has no response evidence.
+Quote declarations are retained only as digests, and diagnostics are never
+executable plan content, never reusable checkpoints, and never include
+transcript text or credentials. Earlier per-job diagnostics survive later runs
+(bounded to the most recent 20).
 
 Failed planning jobs retain bounded, sanitized operator diagnostics. A
 prerequisite (planning-input) failure records the repository-owned prerequisite
@@ -685,12 +713,25 @@ version to `stage4.1-validation-v11` (authoritative declaration resolution, a
 required-grounding policy for substantive authored blocks, bounded word-range
 work, and Stage 6-parity time-point/range coverage), so prior plans and
 checkpoints invalidate through the input fingerprint. The producer-contract V4
-correction advanced planning to `stage4.1-v10` / `stage4.1-schema-v10` and the
-provider-input fingerprint to version `2`: the request now exposes authoritative
+correction advanced planning to `stage4.1-v11` / `stage4.1-schema-v11` and kept
+the provider-input fingerprint at version `2`: the request exposes authoritative
 mandatory hook/payoff evidence and planning-word mappings, source-selection and
 strategy constraints; the hosted schema is generated from the same Pydantic model
-used by Gemini; and the effective instruction/schema participates in provider
-identity. Prior plans, checkpoints, and caches therefore invalidate normally.
+used by Gemini; producer feasibility follows validator endpoint/selection
+semantics; parser rejections retain bounded evidence; and the effective
+instruction/schema participates in provider identity. Prior plans, checkpoints,
+and caches therefore invalidate normally without resetting durable counters.
+Offline V4 evidence uses four authentic fixtures and a CONTEXT_HOOK response for
+`1827c524` whose authored block explains the relation between two authentic
+phrases (the quoted gold/diamonds are the quoted family demands), rather than
+merely quoting and attributing one phrase. It passes Stage 4.1 persistence/handoff,
+Stage 4.2 integrity and deterministic governance, Stage 4.3 live mandatory
+guards, Stage 5.0 compatibility/binding/contract assembly, and the production
+Stage 6 `_merge_blocks`/grounding resolver including partial ranges and negative
+mapping controls. Deterministic governance cannot supply the semantic-fidelity
+review dimension, so Stage 4.3 truthfully returns `NO_SELECTABLE_PLAN` offline;
+a persisted executable contract therefore requires an independently reviewed
+hosted semantic result. No approval or semantic-critique rows are fabricated.
 The earlier Arabic
 multi-token closure advanced planning versions to `stage4.1-v8` /
 `stage4.1-schema-v8` / `stage4.1-validation-v8` (bounded Arabic selection grammar

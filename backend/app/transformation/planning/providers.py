@@ -26,6 +26,10 @@ from app.core.enums import (
     SourceExcerptRole,
     SubstantiveValueKind,
 )
+from app.transformation.hook_payoff import (
+    MANDATORY_COVERAGE_TOLERANCE_SECONDS,
+    spans_cover_endpoints,
+)
 from app.transformation.planning.policy import (
     SCHEMA_VERSION,
     is_strict_hero_window,
@@ -295,9 +299,15 @@ PLANNING_SYSTEM_INSTRUCTION = (
     "bounds. If state is RESOLVED, the union of selected SOURCE_EXCERPT spans must cover "
     "both the segment start and end (within the stated tolerance). Role labels such as "
     "HERO, HOOK, PAYOFF, or SUPPORT do not prove coverage. A null payoff does not waive "
-    "a hook. If a declared hook or payoff is MALFORMED or UNRESOLVED, or a RESOLVED "
-    "segment reports covered_by_offered_words=false, decline with no_valid_plan "
-    "rather than guessing or citing unoffered evidence. "
+    "a hook. If a declared hook or payoff is MALFORMED or UNRESOLVED, decline with "
+    "no_valid_plan rather than guessing. For a RESOLVED segment, mandatory_coverage_feasible "
+    "states whether a supported source selection can preserve both endpoints; "
+    "supported_selection reports the method (WORD_SELECTION or FULL_WINDOW) and the "
+    "selectable planning-word range. When word evidence is insufficient, the supported "
+    "full-window fallback is a valid selection. Decline with no_valid_plan only when "
+    "mandatory_coverage_feasible is false. covered_by_offered_words is descriptive word "
+    "mapping only; a false value does not require declining when a supported selection "
+    "covers the segment. "
     "Every ORIGINAL_VALUE and TEXTUAL_ANNOTATION requires at least one grounding "
     "declaration in grounding_refs, except a genuine two-way external-verification "
     "linkage. Every supplied declaration must resolve against the selected "
@@ -520,7 +530,7 @@ def build_planning_request(
             str(hook.get("text", "")) for hook in inputs.hooks if isinstance(hook, Mapping)
         ),
         words=words,
-        mandatory_evidence=_mandatory_request_evidence(inputs, words),
+        mandatory_evidence=_mandatory_request_evidence(inputs, config, words),
         source_selection=_source_selection_payload(inputs, config, words, strict_hero, strict_cap),
         strategy_constraints=_strategy_constraints_payload(strategy),
         nonselectable_context={
@@ -540,28 +550,43 @@ def build_planning_request(
     )
 
 
+def _word_bounds(word: Mapping[str, object]) -> tuple[float, float] | None:
+    start = word.get("start")
+    end = word.get("end")
+    if isinstance(start, bool) or not isinstance(start, (int, float)):
+        return None
+    if isinstance(end, bool) or not isinstance(end, (int, float)):
+        return None
+    if float(end) < float(start):
+        return None
+    return float(start), float(end)
+
+
 def _planning_word_identity(
     words: Sequence[dict[str, object]], start: float, end: float
 ) -> dict[str, object]:
+    """Descriptive mapping of a mandatory segment onto offered planning words.
+
+    This is word overlap only. It is deliberately not the feasibility decision;
+    mandatory coverage may still be satisfiable by a supported word selection
+    when an endpoint falls in an inter-word gap, or by the supported full-window
+    fallback when word evidence is insufficient.
+    """
+
     overlapping = [
         word
         for word in words
-        if isinstance(word.get("start"), (int, float))
-        and not isinstance(word.get("start"), bool)
-        and isinstance(word.get("end"), (int, float))
-        and not isinstance(word.get("end"), bool)
-        and float(word["end"]) > start
-        and float(word["start"]) < end
+        if (bounds := _word_bounds(word)) is not None and bounds[1] > start and bounds[0] < end
     ]
-    start_covered = any(
-        float(word["start"]) <= start <= float(word["end"])
+    start_in_word = any(
+        bounds[0] <= start <= bounds[1]
         for word in words
-        if isinstance(word.get("start"), (int, float)) and isinstance(word.get("end"), (int, float))
+        if (bounds := _word_bounds(word)) is not None
     )
-    end_covered = any(
-        float(word["start"]) <= end <= float(word["end"])
+    end_in_word = any(
+        bounds[0] <= end <= bounds[1]
         for word in words
-        if isinstance(word.get("start"), (int, float)) and isinstance(word.get("end"), (int, float))
+        if (bounds := _word_bounds(word)) is not None
     )
     if not overlapping:
         return {
@@ -569,6 +594,8 @@ def _planning_word_identity(
             "planning_word_end_index": None,
             "planning_word_count": 0,
             "overlaps_offered_words": False,
+            "start_endpoint_in_word": bool(start_in_word),
+            "end_endpoint_in_word": bool(end_in_word),
             "covered_by_offered_words": False,
         }
     return {
@@ -576,12 +603,91 @@ def _planning_word_identity(
         "planning_word_end_index": int(overlapping[-1]["index"]),
         "planning_word_count": len(overlapping),
         "overlaps_offered_words": True,
-        "covered_by_offered_words": bool(start_covered and end_covered),
+        "start_endpoint_in_word": bool(start_in_word),
+        "end_endpoint_in_word": bool(end_in_word),
+        "covered_by_offered_words": bool(start_in_word and end_in_word),
     }
 
 
+def _supported_selection(
+    words: Sequence[dict[str, object]],
+    start: float,
+    end: float,
+    inputs: PlanningInputs,
+    config: object,
+) -> dict[str, object] | None:
+    """Whether an allowed source selection can preserve both mandatory endpoints.
+
+    Uses the same resolution and endpoint-coverage semantics as validation: a
+    contiguous planning-word range resolves to ``[first.start, last.end]`` and
+    both endpoints must fall within the authoritative coverage tolerance. Only
+    when word evidence is insufficient may the documented full-window fallback
+    be offered.
+    """
+
+    tolerance = MANDATORY_COVERAGE_TOLERANCE_SECONDS
+    indexes: list[int] = []
+    for index, word in enumerate(words):
+        bounds = _word_bounds(word)
+        if bounds is None:
+            continue
+        if bounds[1] >= start - tolerance and bounds[0] <= end + tolerance:
+            indexes.append(index)
+    if indexes:
+        low, high = indexes[0], indexes[-1]
+        minimum = max(0.0, float(getattr(config, "min_source_excerpt_seconds", 0.4)))
+        # Grow the range only when a minimum-duration excerpt is required.
+        while high - low + 1 < len(words):
+            low_bounds = _word_bounds(words[low])
+            high_bounds = _word_bounds(words[high])
+            if low_bounds is None or high_bounds is None:
+                break
+            if (high_bounds[1] - low_bounds[0]) + 1e-9 >= minimum:
+                break
+            if low > 0:
+                low -= 1
+            elif high + 1 < len(words):
+                high += 1
+            else:
+                break
+        low_bounds = _word_bounds(words[low])
+        high_bounds = _word_bounds(words[high])
+        if low_bounds is not None and high_bounds is not None:
+            span = (low_bounds[0], high_bounds[1])
+            if (
+                span[1] > span[0]
+                and span[0] >= inputs.refined_start - tolerance
+                and span[1] <= inputs.refined_end + tolerance
+                and spans_cover_endpoints([span], start, end, tolerance=tolerance)
+            ):
+                return {
+                    "method": "WORD_SELECTION",
+                    "planning_word_start_index": low,
+                    "planning_word_end_index": high,
+                    "planning_word_count": high - low + 1,
+                    "source_start": round(span[0], 6),
+                    "source_end": round(span[1], 6),
+                }
+    if not inputs.word_coverage_sufficient:
+        full = (inputs.refined_start, inputs.refined_end)
+        if full[1] > full[0] and spans_cover_endpoints([full], start, end, tolerance=tolerance):
+            return {
+                "method": "FULL_WINDOW",
+                "planning_word_start_index": None,
+                "planning_word_end_index": None,
+                "planning_word_count": 0,
+                "source_start": round(full[0], 6),
+                "source_end": round(full[1], 6),
+            }
+    return None
+
+
 def _mandatory_side(
-    data: Mapping[str, object], key: str, words: Sequence[dict[str, object]]
+    data: Mapping[str, object],
+    key: str,
+    words: Sequence[dict[str, object]],
+    inputs: PlanningInputs,
+    config: object,
 ) -> dict[str, object]:
     declared = bool(data.get(f"{key}_declared"))
     segment = data.get(f"{key}_segment")
@@ -603,7 +709,13 @@ def _mandatory_side(
         "source_end": None,
         "planning_word_start_index": None,
         "planning_word_end_index": None,
+        "planning_word_count": 0,
+        "overlaps_offered_words": False,
+        "start_endpoint_in_word": False,
+        "end_endpoint_in_word": False,
         "covered_by_offered_words": False,
+        "mandatory_coverage_feasible": False,
+        "supported_selection": {"method": "NONE"},
     }
     if isinstance(segment, Mapping):
         start = segment.get("start")
@@ -625,25 +737,31 @@ def _mandatory_side(
                     **_planning_word_identity(words, float(start), float(end)),
                 }
             )
+            selection = _supported_selection(words, float(start), float(end), inputs, config)
+            payload["mandatory_coverage_feasible"] = selection is not None
+            payload["supported_selection"] = selection or {"method": "NONE"}
     return payload
 
 
 def _mandatory_request_evidence(
-    inputs: PlanningInputs, words: Sequence[dict[str, object]]
+    inputs: PlanningInputs, config: object, words: Sequence[dict[str, object]]
 ) -> dict[str, object]:
     source = dict(inputs.mandatory_evidence)
-    hook = _mandatory_side(source, "hook", words)
-    payoff = _mandatory_side(source, "payoff", words)
+    hook = _mandatory_side(source, "hook", words, inputs, config)
+    payoff = _mandatory_side(source, "payoff", words, inputs, config)
     return {
         "contract_version": source.get("contract_version"),
         "source_id": source.get("source_id") or inputs.source_id,
         "hook": hook,
         "payoff": payoff,
-        "coverage_tolerance_seconds": 0.75,
+        "coverage_tolerance_seconds": MANDATORY_COVERAGE_TOLERANCE_SECONDS,
         "coverage_requirement": (
             "A resolved hook/payoff segment is satisfied only when the union of selected "
-            "SOURCE_EXCERPT spans covers both its start and end. Role labels do not "
-            "satisfy it, and a null payoff never waives a hook."
+            "SOURCE_EXCERPT spans covers both its start and end within the stated tolerance. "
+            "Role labels do not satisfy it, and a null payoff never waives a hook. "
+            "mandatory_coverage_feasible reports whether a supported word selection or the "
+            "supported full-window fallback can preserve both endpoints; "
+            "covered_by_offered_words is descriptive mapping only."
         ),
     }
 
@@ -903,16 +1021,63 @@ def _parse_narration(value: object) -> NarrationRequirement:
     )
 
 
+def _bounded_identity(value: object) -> tuple[str | None, int | None, str]:
+    """Safe structural identity evidence: digest, length, and type name."""
+
+    if not isinstance(value, str):
+        return None, None, type(value).__name__
+    return hashlib.sha256(value.encode("utf-8")).hexdigest(), len(value), "str"
+
+
+def _rejection(
+    code: str,
+    *,
+    entry_index: int | None = None,
+    block_index: int | None = None,
+    **extra: object,
+) -> dict[str, object]:
+    payload: dict[str, object] = {"code": code}
+    if entry_index is not None:
+        payload["entry_index"] = entry_index
+    if block_index is not None:
+        payload["block_index"] = block_index
+    payload.update(extra)
+    return payload
+
+
+def _response_evidence_with_parser_context(
+    content: Mapping[str, object],
+    supplied: Mapping[str, object] | None,
+    unmatched: Sequence[Mapping[str, object]],
+) -> dict[str, object]:
+    evidence = dict(supplied or {})
+    if "content_digest" not in evidence or "content_bytes" not in evidence:
+        encoded = json.dumps(content, ensure_ascii=False, sort_keys=True, default=str).encode(
+            "utf-8"
+        )
+        evidence.setdefault("content_digest", hashlib.sha256(encoded).hexdigest())
+        evidence.setdefault("content_bytes", len(encoded))
+    entries = content.get("plans")
+    evidence.setdefault("returned_plan_count", len(entries) if isinstance(entries, list) else 0)
+    evidence.setdefault("truncated", False)
+    evidence["unmatched_entry_count"] = len(unmatched)
+    evidence["unmatched_entries"] = [dict(item) for item in list(unmatched)[:8]]
+    return evidence
+
+
 def parse_plan_results(
     content: Mapping[str, object],
     requests: Sequence[PlanningRequest],
     *,
     response_evidence: Mapping[str, object] | None = None,
 ) -> dict[str, PlanProviderResult]:
-    """Strictly parse provider plans, isolating malformed items.
+    """Strictly parse provider plans and retain bounded rejection evidence.
 
-    Unknown, duplicate, stale, or mismatched strategy identities are dropped.
-    One malformed item never invalidates accepted siblings.
+    Unknown, duplicate, stale, or mismatched strategy identities are dropped
+    from executable results. Their bounded parser evidence is retained even when
+    no plan was collected, so a caller can distinguish a true omission from a
+    mismatched, unknown, duplicate, or malformed entry. One malformed item never
+    invalidates an accepted sibling.
     """
 
     entries = content.get("plans")
@@ -920,28 +1085,109 @@ def parse_plan_results(
         raise PlanningProviderError(ProviderErrorCategory.MALFORMED_OUTPUT.value)
     requested = {request.strategy_key: request for request in requests}
     collected: dict[str, list[PlanProviderPlan]] = {}
+    rejections: dict[str, list[dict[str, object]]] = {key: [] for key in requested}
+    unmatched: list[dict[str, object]] = []
     seen: set[str] = set()
-    for entry in entries:
+    recognized_requested_entry = False
+    for entry_index, entry in enumerate(entries[:256]):
         if not isinstance(entry, Mapping):
+            unmatched.append(
+                _rejection(
+                    "MALFORMED_ENTRY",
+                    entry_index=entry_index,
+                    actual_type=type(entry).__name__,
+                )
+            )
             continue
         key = entry.get("strategy_key")
         if not isinstance(key, str) or key not in requested:
+            key_digest, key_characters, _key_type = _bounded_identity(key)
+            id_digest, id_characters, _id_type = _bounded_identity(entry.get("strategy_id"))
+            unmatched.append(
+                _rejection(
+                    "UNKNOWN_STRATEGY_KEY" if isinstance(key, str) else "MALFORMED_STRATEGY_KEY",
+                    entry_index=entry_index,
+                    strategy_key_digest=key_digest,
+                    strategy_key_characters=key_characters,
+                    strategy_id_digest=id_digest,
+                    strategy_id_characters=id_characters,
+                )
+            )
             continue
+        recognized_requested_entry = True
         request = requested[key]
         if entry.get("strategy_id") != request.strategy_id:
+            id_digest, id_characters, _id_type = _bounded_identity(entry.get("strategy_id"))
+            rejections[key].append(
+                _rejection(
+                    "STRATEGY_ID_MISMATCH",
+                    entry_index=entry_index,
+                    requested_strategy_id=request.strategy_id,
+                    requested_strategy_key=request.strategy_key,
+                    returned_strategy_id_digest=id_digest,
+                    returned_strategy_id_characters=id_characters,
+                )
+            )
             continue
         if key in seen:
+            rejections[key].append(
+                _rejection(
+                    "DUPLICATE_STRATEGY_KEY",
+                    entry_index=entry_index,
+                    requested_strategy_id=request.strategy_id,
+                    requested_strategy_key=request.strategy_key,
+                )
+            )
             continue
         seen.add(key)
         blocks: list[PlanProviderBlock] = []
         raw_blocks = entry.get("blocks")
         if isinstance(raw_blocks, list):
-            for item in raw_blocks:
+            for block_index, item in enumerate(raw_blocks[:256]):
                 if not isinstance(item, Mapping):
+                    rejections[key].append(
+                        _rejection(
+                            "MALFORMED_BLOCK_ENTRY",
+                            entry_index=entry_index,
+                            block_index=block_index,
+                            actual_type=type(item).__name__,
+                        )
+                    )
+                    continue
+                if _enum(item.get("block_type"), PlanBlockType) is None:
+                    type_digest, type_characters, _type_name = _bounded_identity(
+                        item.get("block_type")
+                    )
+                    rejections[key].append(
+                        _rejection(
+                            "UNKNOWN_BLOCK_TYPE",
+                            entry_index=entry_index,
+                            block_index=block_index,
+                            block_type_digest=type_digest,
+                            block_type_characters=type_characters,
+                        )
+                    )
                     continue
                 parsed = _parse_block(item)
-                if parsed is not None:
-                    blocks.append(parsed)
+                if parsed is None:
+                    rejections[key].append(
+                        _rejection(
+                            "MALFORMED_BLOCK_ENTRY",
+                            entry_index=entry_index,
+                            block_index=block_index,
+                        )
+                    )
+                    continue
+                blocks.append(parsed)
+        else:
+            rejections[key].append(
+                _rejection(
+                    "MALFORMED_BLOCKS_CONTAINER",
+                    entry_index=entry_index,
+                    requested_strategy_id=request.strategy_id,
+                    requested_strategy_key=request.strategy_key,
+                )
+            )
         plan = PlanProviderPlan(
             strategy_id=request.strategy_id,
             strategy_key=key,
@@ -954,14 +1200,35 @@ def parse_plan_results(
             planner_notes=_bounded_text(entry.get("planner_notes"), _BOUNDED_NOTES),
         )
         collected.setdefault(key, []).append(plan)
-    return {
-        key: PlanProviderResult(
-            plans=tuple(plans),
-            confidence=plans[0].confidence,
-            response_evidence=dict(response_evidence or {}),
+    if not recognized_requested_entry and unmatched and requested:
+        # The response contained no requested identity at all. Keep this
+        # response-level rejection visible for every requested strategy without
+        # inventing a placeholder plan or attaching it as a key-specific match.
+        unmatched_codes = {str(item.get("code")) for item in unmatched}
+        shared_code = (
+            "MALFORMED_ENTRY" if unmatched_codes <= {"MALFORMED_ENTRY"} else "UNKNOWN_STRATEGY_KEY"
         )
-        for key, plans in collected.items()
-    }
+        shared = _rejection(
+            shared_code,
+            scope="RESPONSE",
+            unmatched_entry_count=len(unmatched),
+        )
+        for key in requested:
+            rejections[key].append(dict(shared))
+    evidence = _response_evidence_with_parser_context(content, response_evidence, unmatched)
+    parsed_results: dict[str, PlanProviderResult] = {}
+    for key in requested:
+        plans = tuple(collected.get(key, ()))
+        candidate_rejections = tuple(rejections.get(key, ()))
+        if not plans and not candidate_rejections:
+            continue
+        parsed_results[key] = PlanProviderResult(
+            plans=plans,
+            confidence=plans[0].confidence if plans else 0.0,
+            response_evidence=dict(evidence),
+            rejections=candidate_rejections,
+        )
+    return parsed_results
 
 
 def serialize_provider_result(result: PlanProviderResult) -> dict[str, object]:

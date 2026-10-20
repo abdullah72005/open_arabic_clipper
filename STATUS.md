@@ -1,18 +1,26 @@
 ## Stage 4.1 producer-contract V4 (2026-10-20)
 
 Status: **the Stage 4.1 producer contract is aligned with the preserved
-validators and proven offline satisfiable on authentic saved evidence. No real
-provider, TTS, Ollama, rendering, acceptance, worker, or Stage 7 work was
+validators and proven offline satisfiable on authentic saved evidence through
+Stage 5.0 compatibility/binding/contract assembly and the Stage 6 merge/grounding
+path. Deterministic Stage 4.3 still declines automatic selection because the
+offline governance result has no semantic-fidelity review; a persisted executable
+contract therefore remains blocked pending independent hosted semantic review. No
+real provider, TTS, Ollama, rendering, acceptance, worker, or Stage 7 work was
 performed. Stage 6 remains NOT FROZEN; Stage 7 remains unstarted.**
 
 - **Authoritative request evidence.** `build_planning_request` now exposes
   `mandatory_evidence` (truthful `ABSENT`/`RESOLVED`/`MALFORMED`/`UNRESOLVED`
-  hook/payoff state, source segment identity/bounds, offered planning-word
-  mapping), `source_selection` (planning-index scope, offered words, coverage,
-  selectable window, excerpt/block/duration/hero caps), `strategy_constraints`
-  (allowed value kinds and verification requirement), and
+  hook/payoff state, source segment identity/bounds, descriptive offered
+  planning-word mapping, validator-aligned `mandatory_coverage_feasible`, and
+  `supported_selection`), `source_selection` (planning-index scope, offered
+  words, coverage, selectable window, excerpt/block/duration/hero caps),
+  `strategy_constraints` (allowed value kinds and verification requirement), and
   `nonselectable_context` (context, suggested hook copy, summaries) separated
-  from authoritative evidence.
+  from authoritative evidence. Feasibility follows the validator's endpoint
+  tolerance and supported word-selection/full-window semantics, so an endpoint
+  in an inter-word gap or a wordless full-window case is not falsely declined;
+  only truly uncoverable, malformed, or unresolved evidence requires declining.
 - **One authoritative schema.** `PlanningOutputSchema` is the Pydantic model
   Google receives, and `PLANNING_OUTPUT_SCHEMA` is generated from it. Required
   plan/block/narration/declaration fields and descriptions now state hero,
@@ -29,26 +37,39 @@ performed. Stage 6 remains NOT FROZEN; Stage 7 remains unstarted.**
   job/strategy/route/fingerprint/contract identity, phase, failure codes/block,
   structural selectors, resolved selected-source identities, expected mandatory
   evidence and response digest/size, separated from executable plans and reusable
-  checkpoints. Quote declarations are digests only; no raw provider/transcript
-  text or credential is persisted. Prior per-job diagnostics survive later runs.
-- **Versions.** Planning `stage4.1-v10`, schema `stage4.1-schema-v10`,
+  checkpoints. Parser rejections are retained independently of collected plans:
+  mismatched/unknown/duplicate identities and malformed entries keep bounded
+  codes, requested identity, returned-identity digests/counts and unmatched-entry
+  structure, so they are not misreported as true `PROVIDER_OMITTED`; accepted
+  siblings remain isolated and transport failures keep no response evidence.
+  Quote declarations are digests only; no raw provider/transcript text or
+  credential is persisted. Prior per-job diagnostics survive later runs.
+- **Versions.** Planning `stage4.1-v11`, schema `stage4.1-schema-v11`,
   validation `stage4.1-validation-v11`, provider-input fingerprint `2`; prior
-  plans/checkpoints invalidate normally. The effective instruction/schema
-  participates in provider runtime/prompt identity.
+  plans/checkpoints invalidate normally without resetting counters. The effective
+  instruction/schema participates in provider runtime/prompt identity.
 
 Offline evidence: four deliberate fixtures under
 `backend/tests/fixtures/stage41_contract_v4/` extracted from the read-only
 `clipfactory_stage6_acceptance` snapshot (SHA-256
 `259d3128301b130da8573676211a84e1c7fc92de6039d28577210ec4998d92da`), plus
-`test_stage41_contract_v4.py`. One authored provider-format response grounded in
-the authentic `a725e62d` hero passes the actual schema/parser, Stage 4.1,
-Stage 4.2 integrity and deterministic governance, Stage 4.3 mandatory guards,
-Stage 5.0 FINAL_CLIP compatibility and materialization partial-range resolution.
-Negative controls still reject missing hooks, declared missing payoff, empty/
-malformed/mixed/invalid grounding, bare decimals, substring-only quotes,
-unknown blocks, partial/out-of-scope/huge/reversed ranges, malformed mandatory
-identity and unsupported claims. No approval rows or semantic critiques were
-fabricated.
+`test_stage41_contract_v4.py`. The request/schema/instruction are captured through
+the real adapter for all four fixtures. One authored provider-format response
+grounded in the authentic `1827c524` CONTEXT_HOOK evidence states a concrete
+explanatory relation between two authentic phrases (the quoted gold/diamonds are
+the quoted family demands), and passes the actual schema/parser, Stage 4.1,
+Stage 4.2 integrity and deterministic governance, Stage 4.3 live mandatory
+guards, Stage 5.0 FINAL_CLIP compatibility/binding/contract assembly, and the
+production Stage 6 `_merge_blocks`/grounding resolver with nonzero planning
+indexes, partial-range citations, corrupted-mapping failures and
+tolerance-admitted out-of-scope rejection. Deterministic governance cannot
+provide the semantic-fidelity review dimension, so Stage 4.3 truthfully reports
+`NO_SELECTABLE_PLAN` offline and a persisted executable contract remains blocked
+pending independent hosted semantic review. Negative controls still reject
+missing hooks, declared missing payoff, empty/malformed/mixed/invalid grounding,
+bare decimals, substring-only quotes, unknown blocks, partial/out-of-scope/huge/
+reversed ranges, malformed mandatory identity and unsupported claims. No
+approval rows or semantic critiques were fabricated.
 
 # Runtime status
 

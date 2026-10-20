@@ -12,17 +12,23 @@ import json
 from collections.abc import Iterator
 from dataclasses import replace
 from fractions import Fraction
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import Engine
 from sqlalchemy.orm import Session
 from stage41_contract_v4_support import (
     CANDIDATES,
+    REPRESENTATIVE,
+    REPRESENTATIVE_STRATEGY,
     AuthoredProvider,
     load_case,
     planning_word_range_for_segment,
+    planning_word_range_for_span,
+    planning_word_texts,
     representative_response,
     seed_authentic_case,
+    selectable_planning_words,
 )
 from stage41_support import (
     FakeStage41Settings,
@@ -31,6 +37,7 @@ from stage41_support import (
 
 from app.core.enums import (
     ContentType,
+    DeliveryIntent,
     JobKind,
     NarrationNeed,
     PlanBlockType,
@@ -41,21 +48,27 @@ from app.core.enums import (
     SubstantiveValueKind,
     TransformationStrategyType,
 )
+from app.core.settings import get_settings
 from app.db.base import Base
 from app.materialization.grounding import parse_grounding_refs, resolve_grounding
 from app.materialization.inputs import (
-    FinalClipEvidence,
     MaterializationInputs,
     ProfileContext,
     SourceMediaEvidence,
     VisualPlanEvidence,
 )
-from app.materialization.inputs import (
-    WordEvidence as FinalWordEvidence,
-)
+from app.materialization.service import _final_clip_evidence, _merge_blocks
 from app.models import ProcessingJob
+from app.render.binding import build_bound_spans
+from app.render.compatibility import evaluate_compatibility
+from app.render.policy import render_profile_for
+from app.render.service import _assemble_contract, _final_evidence
+from app.transformation.governance.executor import (
+    build_transformation_governance_executor,
+)
 from app.transformation.governance.inputs import build_governance_inputs
 from app.transformation.governance.policy import DEFAULT_CONFIG as STAGE42_CONFIG
+from app.transformation.governance.queue import get_or_create_governance_set
 from app.transformation.governance.validation import (
     evaluate_plan,
     finalize,
@@ -63,6 +76,10 @@ from app.transformation.governance.validation import (
 )
 from app.transformation.hook_payoff import resolve_mandatory_evidence
 from app.transformation.planning.executor import TransformationPlanningExecutor
+from app.transformation.planning.fingerprints import (
+    build_provider_input_payload,
+    provider_input_fingerprint,
+)
 from app.transformation.planning.inputs import build_planning_inputs
 from app.transformation.planning.policy import (
     DEFAULT_CONFIG as STAGE41_CONFIG,
@@ -87,7 +104,10 @@ from app.transformation.planning.types import (
     PlanProviderPlan,
 )
 from app.transformation.planning.validation import validate_provider_plan
-from app.transformation.selection.service import _mandatory_failures
+from app.transformation.selection.service import (
+    _mandatory_failures,
+    select_transformation_plan,
+)
 
 
 @pytest.fixture  # type: ignore[untyped-decorator]
@@ -102,7 +122,7 @@ def _authentic_inputs(
 ) -> tuple[PlanningInputs, tuple[object, ...], dict[str, object]]:
     source, candidate, refinement, analysis, strategies = seed_authentic_case(
         session,
-        strategy_type=TransformationStrategyType.ANALYSIS,
+        strategy_type=REPRESENTATIVE_STRATEGY,
         settings=settings,
     )
     inputs = build_planning_inputs(
@@ -116,11 +136,7 @@ def _authentic_inputs(
 
 
 def _strategy(inputs: PlanningInputs) -> dict[str, object]:
-    return next(
-        item
-        for item in inputs.stage40_strategies
-        if item.get("strategy_type") == TransformationStrategyType.ANALYSIS.value
-    )
+    return dict(inputs.stage40_strategies[0])
 
 
 def test_fixtures_are_deliberate_authentic_extractions() -> None:
@@ -152,7 +168,7 @@ def test_request_exposes_authoritative_mandatory_evidence_and_limits(
 
     hook = case["analysis"]["source_moment"]["hook_index"]
     segment = case["source_segments"][hook]
-    assert payload["source_selection"]["words_offered"] == 117
+    assert payload["source_selection"]["words_offered"] == _EXPECTED_PLANNING_WORDS[REPRESENTATIVE]
     assert payload["source_selection"]["word_index_scope"].startswith("Inclusive")
     assert payload["mandatory_evidence"]["hook"]["state"] == "RESOLVED"
     assert payload["mandatory_evidence"]["hook"]["segment_index"] == hook
@@ -164,7 +180,8 @@ def test_request_exposes_authoritative_mandatory_evidence_and_limits(
     assert payload["mandatory_evidence"]["hook"]["covered_by_offered_words"] is True
     assert payload["mandatory_evidence"]["payoff"]["state"] == "ABSENT"
     assert set(payload["strategy_constraints"]["allowed_value_kinds"]) == {
-        item.value for item in strategy_value_kinds(TransformationStrategyType.ANALYSIS)
+        item.value
+        for item in strategy_value_kinds(TransformationStrategyType(str(strategy["strategy_type"])))
     }
     assert payload["source_selection"]["min_source_excerpt_seconds"] > 0
     assert payload["source_selection"]["strict_hero_cap_seconds"] > 0
@@ -262,18 +279,323 @@ def test_actual_provider_schema_and_instruction_are_the_authoritative_contract(
     assert provider.runtime_identity()["schema_version"] == SCHEMA_VERSION
 
 
+_EXPECTED_PLANNING_WORDS = {
+    "1827c524-e893-4769-8b22-31411c10b6e8": 113,
+    "ac0670c4-dfd4-4609-b9b8-b2736b96b095": 114,
+    "64e7807c-3b58-4ea7-9b80-d2ec3e543572": 127,
+    "a725e62d-bec3-445d-93b4-76815febfde4": 117,
+}
+
+
+def _capture_gemini_request(request: object) -> dict[str, object]:
+    captured: dict[str, object] = {}
+
+    class _Models:
+        def generate_content(self, **kwargs: object) -> object:
+            captured.update(kwargs)
+            return type(
+                "_Response",
+                (),
+                {
+                    "parsed": None,
+                    "text": json.dumps({"plans": []}),
+                    "usage_metadata": None,
+                    "prompt_feedback": None,
+                    "candidates": [type("_C", (), {"finish_reason": None})()],
+                },
+            )()
+
+    class _Client:
+        def __init__(self) -> None:
+            self.models = _Models()
+
+        def close(self) -> None:
+            return None
+
+    from app.transformation.planning.gemini import GeminiPlanningProvider
+
+    provider = GeminiPlanningProvider(api_key="offline", client_factory=lambda: _Client())
+    provider.plan([request], "ROUTINE")  # type: ignore[list-item]
+    provider.release()
+    return captured
+
+
+def _coverage_plan(strategy: dict[str, object], selection: dict[str, object]) -> PlanProviderPlan:
+    kind = strategy_value_kinds(TransformationStrategyType(str(strategy["strategy_type"])))[0]
+    method = str(selection.get("method"))
+    hero = PlanProviderBlock(
+        block_type=PlanBlockType.SOURCE_EXCERPT,
+        purpose="Hero source moment",
+        source_role=SourceExcerptRole.HERO,
+        use_full_window=method == "FULL_WINDOW",
+        word_start_index=selection.get("planning_word_start_index"),
+        word_end_index=selection.get("planning_word_end_index"),
+    )
+    value = PlanProviderBlock(
+        block_type=PlanBlockType.ORIGINAL_VALUE,
+        purpose="Grounded substantive value",
+        estimated_duration=2.0,
+        substantive_value_kind=kind,
+        semantic_intent="Synthesize the source evidence for the viewer",
+        why_unavailable="The excerpt states the moment but not the synthesis",
+        grounding_refs=("block:0",),
+        delivery_intent=DeliveryIntent.ON_SCREEN_TEXT,
+    )
+    return PlanProviderPlan(
+        strategy_id=str(strategy["id"]),
+        strategy_key=str(strategy["strategy_key"]),
+        blocks=(hero, value),
+        narration=NarrationRequirement(need=NarrationNeed.NONE),
+    )
+
+
+@pytest.mark.parametrize("candidate_id", CANDIDATES)  # type: ignore[untyped-decorator]
+def test_actual_request_feasibility_and_gemini_boundary_agree_for_every_fixture(
+    session: Session, monkeypatch: pytest.MonkeyPatch, candidate_id: str
+) -> None:
+    settings = FakeStage41Settings()
+    install_stage41_settings(monkeypatch, settings)
+    case = load_case(candidate_id)
+    _source, candidate, refinement, analysis, _strategies = seed_authentic_case(
+        session,
+        candidate_id=candidate_id,
+        strategy_type=None,
+        settings=settings,
+    )
+    inputs = build_planning_inputs(
+        session, candidate, analysis, refinement, settings, settings.stage41_config()
+    )
+    assert len(inputs.words) == _EXPECTED_PLANNING_WORDS[candidate_id]
+    hook_index = case["analysis"]["source_moment"]["hook_index"]
+    hook_segment = case["source_segments"][hook_index]
+    expected_word_range = planning_word_range_for_segment(
+        case["refinement"], (hook_segment["start"], hook_segment["end"])
+    )
+    assert inputs.stage40_strategies
+    for strategy in inputs.stage40_strategies:
+        request = build_planning_request(strategy, inputs, settings.stage41_config())
+        payload = request.to_payload()
+        hook = payload["mandatory_evidence"]["hook"]
+        assert hook["state"] == "RESOLVED"
+        assert hook["segment_index"] == hook_index
+        assert hook["source_start"] == hook_segment["start"]
+        assert hook["source_end"] == hook_segment["end"]
+        assert (
+            hook["planning_word_start_index"],
+            hook["planning_word_end_index"],
+        ) == expected_word_range
+        assert hook["mandatory_coverage_feasible"] is True
+        assert hook["supported_selection"]["method"] in {"WORD_SELECTION", "FULL_WINDOW"}
+        assert (
+            payload["source_selection"]["words_offered"] == _EXPECTED_PLANNING_WORDS[candidate_id]
+        )
+        assert set(payload["strategy_constraints"]["allowed_value_kinds"]) == {
+            item.value
+            for item in strategy_value_kinds(
+                TransformationStrategyType(str(strategy["strategy_type"]))
+            )
+        }
+        assert payload["nonselectable_context"]["suggested_hook_copy"]
+        assert "context_text" in payload["nonselectable_context"]
+
+        identity = settings.transformation_planning_provider_identity()
+        fingerprint = provider_input_fingerprint(
+            build_provider_input_payload(
+                request=payload, provider_identity=identity, route="ROUTINE"
+            )
+        )
+        altered = json.loads(json.dumps(payload))
+        altered["mandatory_evidence"]["hook"]["mandatory_coverage_feasible"] = False
+        assert (
+            provider_input_fingerprint(
+                build_provider_input_payload(
+                    request=altered, provider_identity=identity, route="ROUTINE"
+                )
+            )
+            != fingerprint
+        )
+
+        captured = _capture_gemini_request(request)
+        config = captured["config"]
+        assert config.system_instruction == PLANNING_SYSTEM_INSTRUCTION
+        assert config.response_schema is PlanningOutputSchema
+        contents = json.loads(captured["contents"])
+        assert contents["plans_requested"] == [payload]
+        assert (
+            contents["plans_requested"][0]["mandatory_evidence"]["hook"][
+                "mandatory_coverage_feasible"
+            ]
+            is True
+        )
+
+        validation = validate_provider_plan(
+            _coverage_plan(dict(strategy), hook["supported_selection"]),
+            strategy,
+            inputs,
+            settings.stage41_config(),
+            provider_evidence={},
+            provider_input_fingerprint="offline-fixture",
+        )
+        assert validation.plan is not None, validation.reasons
+        assert not any("HOOK_NOT_COVERED" in reason for reason in validation.reasons)
+
+
+def test_ac0670c4_inter_word_endpoint_is_feasible_without_false_decline(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    candidate_id = "ac0670c4-dfd4-4609-b9b8-b2736b96b095"
+    settings = FakeStage41Settings()
+    install_stage41_settings(monkeypatch, settings)
+    _source, candidate, refinement, analysis, _strategies = seed_authentic_case(
+        session, candidate_id=candidate_id, strategy_type=None, settings=settings
+    )
+    inputs = build_planning_inputs(
+        session, candidate, analysis, refinement, settings, settings.stage41_config()
+    )
+    strategy = dict(inputs.stage40_strategies[0])
+    payload = build_planning_request(strategy, inputs, settings.stage41_config()).to_payload()
+    hook = payload["mandatory_evidence"]["hook"]
+    # The hook end lies between word indexes 2 and 3; its word mapping alone is
+    # incomplete, but the allowed excerpt still covers the endpoint tolerance.
+    assert hook["end_endpoint_in_word"] is False
+    assert hook["covered_by_offered_words"] is False
+    assert hook["mandatory_coverage_feasible"] is True
+    assert hook["supported_selection"]["planning_word_start_index"] == 0
+    assert hook["supported_selection"]["planning_word_end_index"] >= 2
+    validation = validate_provider_plan(
+        _coverage_plan(strategy, hook["supported_selection"]),
+        strategy,
+        inputs,
+        settings.stage41_config(),
+        provider_evidence={},
+        provider_input_fingerprint="offline-fixture",
+    )
+    assert validation.plan is not None, validation.reasons
+
+
+def test_wordless_full_window_case_is_supported_and_declines_only_when_impossible(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = FakeStage41Settings()
+    install_stage41_settings(monkeypatch, settings)
+    case = load_case(REPRESENTATIVE)
+    _source, candidate, refinement, analysis, _strategies = seed_authentic_case(
+        session, strategy_type=REPRESENTATIVE_STRATEGY, settings=settings
+    )
+    inputs = build_planning_inputs(
+        session, candidate, analysis, refinement, settings, settings.stage41_config()
+    )
+    wordless = replace(inputs, words=(), word_coverage_sufficient=False)
+    strategy = dict(wordless.stage40_strategies[0])
+    payload = build_planning_request(strategy, wordless, settings.stage41_config()).to_payload()
+    hook = payload["mandatory_evidence"]["hook"]
+    assert hook["mandatory_coverage_feasible"] is True
+    assert hook["supported_selection"]["method"] == "FULL_WINDOW"
+    assert "full-window fallback" in PLANNING_SYSTEM_INSTRUCTION
+    validation = validate_provider_plan(
+        _coverage_plan(strategy, hook["supported_selection"]),
+        strategy,
+        wordless,
+        settings.stage41_config(),
+        provider_evidence={},
+        provider_input_fingerprint="offline-fixture",
+    )
+    assert validation.plan is not None, validation.reasons
+
+    # Truly uncoverable mandatory evidence is not feasible and cannot pass the
+    # validator through either a word selection or the full-window fallback.
+    far_index = next(
+        index
+        for index, segment in enumerate(case["source_segments"])
+        if float(segment["start"]) > float(refinement.refined_end) + 5.0
+    )
+    mandatory = resolve_mandatory_evidence(
+        str(candidate.source_video_id),
+        {"hook_index": far_index, "payoff_index": None},
+        case["source_segments"],
+    )
+    uncoverable = replace(
+        inputs,
+        source_moment={"hook_index": far_index, "payoff_index": None},
+        mandatory_evidence=mandatory.as_dict(),
+    )
+    payload = build_planning_request(strategy, uncoverable, settings.stage41_config()).to_payload()
+    hook = payload["mandatory_evidence"]["hook"]
+    assert hook["state"] == "RESOLVED"
+    assert hook["mandatory_coverage_feasible"] is False
+    assert hook["supported_selection"]["method"] == "NONE"
+    rejected = validate_provider_plan(
+        _coverage_plan(strategy, {"method": "FULL_WINDOW"}),
+        strategy,
+        uncoverable,
+        settings.stage41_config(),
+        provider_evidence={},
+        provider_input_fingerprint="offline-fixture",
+    )
+    assert rejected.plan is None
+    assert any("HOOK_NOT_COVERED" in reason for reason in rejected.reasons)
+
+
+def test_malformed_and_unresolved_mandatory_evidence_remain_distinct(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = FakeStage41Settings()
+    install_stage41_settings(monkeypatch, settings)
+    case = load_case(REPRESENTATIVE)
+    _source, candidate, refinement, analysis, _strategies = seed_authentic_case(
+        session, strategy_type=REPRESENTATIVE_STRATEGY, settings=settings
+    )
+    inputs = build_planning_inputs(
+        session, candidate, analysis, refinement, settings, settings.stage41_config()
+    )
+    strategy = dict(inputs.stage40_strategies[0])
+
+    malformed_evidence = resolve_mandatory_evidence(
+        str(candidate.source_video_id),
+        {"hook_index": "343", "payoff_index": None},
+        case["source_segments"],
+    )
+    malformed = replace(
+        inputs,
+        source_moment={"hook_index": "343", "payoff_index": None},
+        mandatory_evidence=malformed_evidence.as_dict(),
+    )
+    malformed_payload = build_planning_request(
+        strategy, malformed, settings.stage41_config()
+    ).to_payload()
+    assert malformed_payload["mandatory_evidence"]["hook"]["state"] == "MALFORMED"
+    assert malformed_payload["mandatory_evidence"]["hook"]["mandatory_coverage_feasible"] is False
+
+    unresolved_evidence = resolve_mandatory_evidence(
+        str(candidate.source_video_id),
+        {"hook_index": len(case["source_segments"]) + 5, "payoff_index": None},
+        case["source_segments"],
+    )
+    unresolved = replace(
+        inputs,
+        source_moment={"hook_index": len(case["source_segments"]) + 5, "payoff_index": None},
+        mandatory_evidence=unresolved_evidence.as_dict(),
+    )
+    unresolved_payload = build_planning_request(
+        strategy, unresolved, settings.stage41_config()
+    ).to_payload()
+    assert unresolved_payload["mandatory_evidence"]["hook"]["state"] == "UNRESOLVED"
+    assert unresolved_payload["mandatory_evidence"]["hook"]["mandatory_coverage_feasible"] is False
+
+
 def _run_authentic_planning(
     session: Session,
     settings: FakeStage41Settings,
     provider: object,
     *,
     job: ProcessingJob | None = None,
+    strategy_type: TransformationStrategyType | None = REPRESENTATIVE_STRATEGY,
 ) -> tuple[object, object, object, object]:
     from app.transformation.planning.queue import get_or_create_plan_set
 
     source, candidate, refinement, analysis, strategies = seed_authentic_case(
         session,
-        strategy_type=TransformationStrategyType.ANALYSIS,
+        strategy_type=strategy_type,
         settings=settings,
     )
     plan_set = get_or_create_plan_set(session, candidate, analysis)
@@ -296,31 +618,40 @@ def _run_authentic_planning(
 def test_representative_authentic_plan_passes_stage41_and_downstream(
     session: Session, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    settings = FakeStage41Settings()
-    install_stage41_settings(monkeypatch, settings)
-    case = load_case("a725e62d-bec3-445d-93b4-76815febfde4")
-    segment = case["source_segments"][case["analysis"]["source_moment"]["hook_index"]]
-    word_range = planning_word_range_for_segment(
-        case["refinement"], (segment["start"], segment["end"])
+    from stage43_support import FakeGovernanceSettings, install_selection_settings
+
+    settings = FakeGovernanceSettings(governance_mode="deterministic")
+    install_selection_settings(monkeypatch, settings)
+    case = load_case(REPRESENTATIVE)
+    hook_index = case["analysis"]["source_moment"]["hook_index"]
+    hook_segment = case["source_segments"][hook_index]
+    demand_segment = case["source_segments"][hook_index + 1]
+    word_range = planning_word_range_for_span(
+        case["refinement"], (hook_segment["start"], demand_segment["end"])
     )
     assert word_range is not None
-    word_start, word_end = word_range[0], min(word_range[1] + 2, 116)
+    word_start, word_end = word_range
     assert word_start > 0  # a nonzero planning index space, not an identity shortcut
-    response = representative_response(
-        strategy_id="",
-        strategy_key="",
-        word_start=word_start,
-        word_end=word_end,
-    )
-    PlanningOutputSchema.model_validate(response)
-    # The authored response must match the authentic strategy identity.
+    texts = planning_word_texts(case["refinement"], word_start, word_end)
+    assert len(texts) >= 6
+    excerpt_quote = " ".join(texts[:4])
+    demand_quote = " ".join(texts[4:])
     authentic_strategy = next(
         item
         for item in case["strategies"]
-        if item["strategy_type"] == "ANALYSIS" and item["is_current"]
+        if item["strategy_type"] == "CONTEXT_HOOK"
+        and item["is_current"]
+        and item["disposition"] == "RECOMMENDED"
     )
-    response["plans"][0]["strategy_id"] = authentic_strategy["id"]
-    response["plans"][0]["strategy_key"] = authentic_strategy["strategy_key"]
+    response = representative_response(
+        strategy_id=authentic_strategy["id"],
+        strategy_key=authentic_strategy["strategy_key"],
+        word_start=word_start,
+        word_end=word_end,
+        excerpt_quote=excerpt_quote,
+        demand_quote=demand_quote,
+    )
+    PlanningOutputSchema.model_validate(response)
 
     plan_set, candidate, refinement, analysis = _run_authentic_planning(
         session, settings, AuthoredProvider(response)
@@ -334,8 +665,8 @@ def test_representative_authentic_plan_passes_stage41_and_downstream(
     assert hero["block_type"] == "SOURCE_EXCERPT"
     assert hero["word_start_index"] == word_start
     assert hero["word_end_index"] == word_end
+    assert hero["source_text"] == " ".join(texts)
     assert len(hero["planning_words"]) == word_end - word_start + 1
-    assert hero["planning_words"][0]["start"] >= 0
     # Planning indexes are not FINAL_CLIP indexes: the first planning word maps
     # to an authentic refinement word at a different stored index.
     final_index = next(
@@ -345,6 +676,13 @@ def test_representative_authentic_plan_passes_stage41_and_downstream(
         and float(item["end"]) == float(hero["planning_words"][0]["end"])
     )
     assert final_index != hero["word_start_index"]
+
+    # Inspect the authored contribution directly. It states a relation between
+    # two authentic phrases: the quoted gold/diamonds are the quoted demands.
+    contribution = plan.blocks[1]["semantic_intent"]
+    assert contribution == f'The source context explains "{excerpt_quote}" as "{demand_quote}".'
+    assert excerpt_quote in hero["source_text"] and demand_quote in hero["source_text"]
+    assert plan.blocks[1]["substantive_value_kind"] == "EXPLANATION"
 
     governance = build_governance_inputs(
         session,
@@ -367,36 +705,31 @@ def test_representative_authentic_plan_passes_stage41_and_downstream(
     )
     assert not evaluation.hard_failures, evaluation.hard_failures
     assert not evaluation.blocking, evaluation.blocking
+    assert not evaluation.revisions, evaluation.revisions
+    assert evaluation.verification["claim_state"] == "GROUNDED_IN_SOURCE"
     status, _severity = finalize(evaluation)
     assert status.value in {"APPROVED_FOR_SELECTION", "APPROVED_WITH_CAUTION"}
 
     assert _mandatory_failures(session, candidate, [plan]) == {}
 
-    from app.render.compatibility import evaluate_compatibility
-    from app.render.types import ClipWord, FinalClipEvidence
+    # Persist the real deterministic Stage 4.2 result. No approval row is
+    # fabricated. Deterministic governance cannot supply the semantic review
+    # dimension, so Stage 4.3 correctly declines automatic selection; that is a
+    # truthful offline blocker for a persisted contract, not something this
+    # milestone may paper over with a manufactured favorable critique.
+    governance_set = get_or_create_governance_set(session, candidate, plan_set)
+    build_transformation_governance_executor(session, settings).execute(governance_set.id)
+    session.refresh(governance_set)
+    assert governance_set.execution_status.value == "COMPLETE"
+    assert governance_set.governance_outcome.value == "PLANS_ELIGIBLE_FOR_SELECTION"
+    selection_view = select_transformation_plan(session, candidate.id)
+    assert selection_view is not None and selection_view.effective
+    assert selection_view.row.status.value == "NO_SELECTABLE_PLAN"
+    assert "NO_SELECTABLE_PLAN" in list(selection_view.row.selection_reason_codes or [])
 
-    final_words = tuple(
-        ClipWord(
-            index=index,
-            text=item["text"].strip(),
-            start=float(item["start"]),
-            end=float(item["end"]),
-        )
-        for index, item in enumerate(refinement.word_timestamps)
-        if isinstance(item.get("text"), str) and item.get("text", "").strip()
-    )
-    final = FinalClipEvidence(
-        refinement_id=str(refinement.id),
-        priority=refinement.priority.value,
-        quality_level=refinement.quality_level,
-        status=refinement.status.value,
-        output_fingerprint=refinement.output_fingerprint or "",
-        final_transcript=refinement.final_transcript or "",
-        words=final_words,
-        refined_start=float(refinement.refined_start),
-        refined_end=float(refinement.refined_end),
-    )
-    result = evaluate_compatibility(
+    # Real Stage 5.0 compatibility, binding, and contract assembly primitives.
+    final = _final_evidence(refinement)
+    compatibility = evaluate_compatibility(
         blocks=[dict(block) for block in plan.blocks],
         hero_block_index=plan.hero_block_index,
         hook_payoff_evidence=dict(plan.hook_payoff_evidence),
@@ -408,108 +741,145 @@ def test_representative_authentic_plan_passes_stage41_and_downstream(
         planning_refined_start=float(refinement.refined_start),
         planning_refined_end=float(refinement.refined_end),
         exact_identity_match=True,
-        caption_source_fingerprint="caption",
+        caption_source_fingerprint="offline-caption",
         planning_refinement_id=str(refinement.id),
         planning_refinement_priority=refinement.priority.value,
         planning_refinement_quality_level=refinement.quality_level,
         planning_output_fingerprint=plan.plan_output_fingerprint,
     )
-    assert result.outcome == "EXACT_MATCH", result.reason_codes
-    assert "HOOK_NOT_COVERED" not in result.reason_codes
-
-    materialization = _materialization_inputs(plan, refinement, final_words)
-    refs = parse_grounding_refs([f"words:{word_start + 1}-{word_end - 1}"])
-    resolution = resolve_grounding(materialization, refs)
-    assert resolution.unresolved == ()
-    assert resolution.text == " ".join(
-        item["text"].strip() for item in hero["planning_words"][1:-1]
+    assert compatibility.outcome == "EXACT_MATCH", compatibility.reason_codes
+    bound_spans = build_bound_spans(
+        [dict(block) for block in plan.blocks],
+        {verdict.block_index: verdict for verdict in compatibility.per_block},
+        hero_block_index=plan.hero_block_index,
+        words=final.words,
     )
-
-
-def _materialization_inputs(
-    plan: object, refinement: object, final_words: tuple[object, ...]
-) -> MaterializationInputs:
-    blocks = tuple(dict(block) for block in plan.blocks)  # type: ignore[attr-defined]
-    final_text = " ".join(word.text for word in final_words)
-    bindings = tuple(
-        {
-            "block_index": block["index"],
-            "final_clip_start": block.get("source_start"),
-            "final_clip_end": block.get("source_end"),
-            "final_clip_word_start": None,
-            "final_clip_word_end": None,
-            "final_clip_text": block.get("source_text") or "",
-        }
-        for block in blocks
-        if block.get("block_type") == "SOURCE_EXCERPT"
+    contract_config = get_settings().stage50_config()
+    profile = render_profile_for(contract_config.profile_key)
+    facts = SimpleNamespace(
+        duration_seconds=90.0,
+        width=1920,
+        height=1080,
+        frames_per_second=30.0,
+        audio_sample_rate=48000,
+        audio_channels=2,
+        as_dict=lambda: {
+            "duration_seconds": 90.0,
+            "width": 1920,
+            "height": 1080,
+            "frames_per_second": 30.0,
+            "audio_sample_rate": 48000,
+            "audio_channels": 2,
+        },
     )
-    return MaterializationInputs(
-        candidate_id="candidate",
-        candidate_key="candidate",
-        source_id="source",
+    gathered = SimpleNamespace(
+        candidate=candidate,
+        handoff={},
+        selection=selection_view.row,
+        selection_view=selection_view,
+        selected_plan=plan,
+        planning_refinement=refinement,
+        final_refinement=refinement,
+        source_segments=[dict(item) for item in case["source_segments"]],
+        governance_snapshot={},
+    )
+    assembly = _assemble_contract(
+        candidate=candidate,
+        gathered=gathered,
+        final_row=refinement,
+        compatibility=compatibility,
+        bound_spans=bound_spans,
+        facts=facts,
+        media_identity={
+            "relative_path": "offline/source.mp4",
+            "content_hash": "offline-hash",
+            "size_bytes": 1,
+            "mtime_ns": 1,
+        },
+        caption_fingerprint="offline-caption",
+        profile=profile,
+        config=contract_config,
+    )
+    contract = SimpleNamespace(contract_payload=assembly.payload)
+    contract_source = next(
+        item for item in assembly.payload["blocks"] if item.get("block_type") == "SOURCE_EXCERPT"
+    )
+    binding = contract_source["source_binding"]
+    assert binding["final_clip_word_start"] is not None
+    assert binding["final_clip_word_start"] != word_start
+    assert binding["final_clip_text"] == " ".join(texts)
+
+    # Production contract-to-materialization merge (_merge_blocks) and the real
+    # grounding resolver. The merged blocks and bindings are not hand-authored;
+    # only unrelated media/profile scaffolding is synthetic.
+    merged_blocks, bindings = _merge_blocks(contract, plan)
+    merged = next(item for item in merged_blocks if item.get("block_type") == "SOURCE_EXCERPT")
+    assert merged["planning_word_start_index"] == word_start
+    assert merged["planning_word_end_index"] == word_end
+    assert [item["text"] for item in merged["planning_words"]] == list(texts)
+    assert merged["word_start_index"] == binding["final_clip_word_start"]
+    assert merged["word_end_index"] == binding["final_clip_word_end"]
+    assert merged["word_start_index"] != merged["planning_word_start_index"]
+    assert bindings[0]["final_clip_word_start"] == binding["final_clip_word_start"]
+    final_clip = _final_clip_evidence(refinement)
+    assert final_clip.start == float(refinement.refined_start)
+    materialization = MaterializationInputs(
+        candidate_id=str(candidate.id),
+        candidate_key=candidate.candidate_key,
+        source_id=str(candidate.source_video_id),
         priority="CANDIDATE",
-        selection_id="selection",
-        selection_output_fingerprint="selection-fp",
-        selected_plan_fingerprint="plan-fp",
-        plan_id="plan",
-        plan_output_fingerprint=str(plan.plan_output_fingerprint),  # type: ignore[attr-defined]
-        strategy_type=str(plan.strategy_type.value),  # type: ignore[attr-defined]
-        intensity=str(plan.intensity.value),  # type: ignore[attr-defined]
-        blocks=blocks,
-        hero_block_index=int(plan.hero_block_index),  # type: ignore[attr-defined]
-        narration={"need": "NONE", "requirements": {}},
+        selection_id=str(selection_view.row.id),
+        selection_output_fingerprint=selection_view.row.output_fingerprint,
+        selected_plan_fingerprint=plan.plan_output_fingerprint,
+        plan_id=str(plan.id),
+        plan_output_fingerprint=plan.plan_output_fingerprint,
+        strategy_type=plan.strategy_type.value,
+        intensity=plan.intensity.value,
+        blocks=merged_blocks,
+        hero_block_index=int(plan.hero_block_index),
+        narration={
+            "need": plan.narration_need,
+            "requirements": dict(plan.narration_requirements or {}),
+        },
         verification_dependencies=(),
-        original_value_kinds=("EXPLANATION",),
-        required_context=(),
-        preservation_constraints=(),
+        original_value_kinds=tuple(plan.original_value_kinds or []),
+        required_context=tuple(plan.required_context or []),
+        preservation_constraints=tuple(plan.preservation_constraints or []),
         plan_target_context={},
-        contract_id="contract",
+        contract_id="offline-contract",
         contract_status="MATERIALIZATION_REQUIRED",
-        contract_input_fingerprint="contract-in",
-        contract_output_fingerprint="contract-out",
+        contract_input_fingerprint="offline-contract-input",
+        contract_output_fingerprint="offline-contract-output",
         execution_slots=(),
         contract_source_bindings=bindings,
-        final_clip=FinalClipEvidence(
-            refinement_id=str(refinement.id),  # type: ignore[attr-defined]
-            priority=refinement.priority.value,  # type: ignore[attr-defined]
-            quality_level=refinement.quality_level,  # type: ignore[attr-defined]
-            status=refinement.status.value,  # type: ignore[attr-defined]
-            output_fingerprint=refinement.output_fingerprint or "",  # type: ignore[attr-defined]
-            text=final_text,
-            words=tuple(
-                FinalWordEvidence(index=index, text=word.text, start=word.start, end=word.end)
-                for index, word in enumerate(final_words)
-            ),
-            start=float(refinement.refined_start),  # type: ignore[attr-defined]
-            end=float(refinement.refined_end),  # type: ignore[attr-defined]
-        ),
+        final_clip=final_clip,
         visual_plan=VisualPlanEvidence(
-            visual_plan_id="vis",
-            output_fingerprint="vis-out",
+            visual_plan_id="offline-visual",
+            output_fingerprint="offline-visual-output",
             plan_ready=True,
-            ass_relative_path="captions.ass",
+            ass_relative_path="offline/captions.ass",
             ass_sha256="a" * 64,
-            ass_policy_version="v1",
-            caption_source_fingerprint="caption",
-            framing_fingerprint="framing",
-            source_media_fingerprint="media",
+            ass_policy_version="offline",
+            caption_source_fingerprint="offline-caption",
+            framing_fingerprint="offline-framing",
+            source_media_fingerprint="offline-media",
         ),
         source_media=SourceMediaEvidence(
-            relative_path="source.webm",
-            content_hash="hash",
+            relative_path="offline/source.mp4",
+            content_hash="offline-hash",
             size_bytes=1,
             mtime_ns=1,
-            duration=900.0,
-            frame_rate=Fraction(25, 1),
-            display_width=1920,
-            display_height=1080,
-            encoded_width=1920,
-            encoded_height=1080,
-            sample_rate=48000,
+            duration=facts.duration_seconds,
+            frame_rate=Fraction(str(facts.frames_per_second)).limit_denominator(1001),
+            display_width=facts.width,
+            display_height=facts.height,
+            encoded_width=facts.width,
+            encoded_height=facts.height,
+            sample_rate=facts.audio_sample_rate,
             channels=2,
         ),
         profile=ProfileContext(
-            profile_id="profile",
+            profile_id="offline-profile",
             profile_key="offline-contract",
             target_market="UNSPECIFIED",
             output_language_policy="SOURCE_LANGUAGE",
@@ -518,33 +888,93 @@ def _materialization_inputs(
         ),
     )
 
+    refs = parse_grounding_refs([f"words:{word_start + 1}-{word_end - 1}"])
+    resolution = resolve_grounding(materialization, refs)
+    assert resolution.unresolved == ()
+    assert resolution.text == " ".join(texts[1:-1])
+
+    # Removing the preserved planning-word mapping makes a partial citation
+    # unresolvable; the accepted full-block citation still works.
+    without_words = replace(
+        materialization,
+        blocks=tuple(
+            {**item, "planning_words": []} if item.get("block_type") == "SOURCE_EXCERPT" else item
+            for item in materialization.blocks
+        ),
+    )
+    broken = resolve_grounding(without_words, refs)
+    assert broken.unresolved
+    assert "exact_word_evidence_unavailable" in broken.unresolved[0]
+    assert resolve_grounding(without_words, parse_grounding_refs(["block:0"])).unresolved == ()
+
+    # Corrupting the bound source span fails closed.
+    corrupt_binding = replace(
+        materialization,
+        blocks=tuple(
+            {**item, "source_start": 0.0, "source_end": 1.0}
+            if item.get("block_type") == "SOURCE_EXCERPT"
+            else item
+            for item in materialization.blocks
+        ),
+    )
+    corrupt = resolve_grounding(corrupt_binding, parse_grounding_refs(["block:0"]))
+    assert corrupt.unresolved
+    assert "out_of_scope_block" in corrupt.unresolved[0]
+
+    # A planning word admitted by the 0.75-second selection tolerance can lie
+    # outside the strict FINAL_CLIP scope. It remains rejected as final evidence.
+    tolerance_word = selectable_planning_words(case["refinement"])[0]
+    assert float(tolerance_word["start"]) >= float(refinement.refined_start) - 0.75
+    assert float(tolerance_word["start"]) < float(refinement.refined_start)
+    out_of_scope = replace(
+        materialization,
+        blocks=tuple(
+            {
+                **item,
+                "source_start": float(tolerance_word["start"]),
+                "source_end": float(tolerance_word["end"]),
+            }
+            if item.get("block_type") == "SOURCE_EXCERPT"
+            else item
+            for item in materialization.blocks
+        ),
+    )
+    rejected = resolve_grounding(out_of_scope, parse_grounding_refs(["block:0"]))
+    assert rejected.unresolved
+    assert "out_of_scope_block" in rejected.unresolved[0]
+
 
 def test_rejection_diagnostics_are_bounded_and_survive_a_later_run(
     session: Session, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     settings = FakeStage41Settings()
     install_stage41_settings(monkeypatch, settings)
-    case = load_case("a725e62d-bec3-445d-93b4-76815febfde4")
-    segment = case["source_segments"][71]
-    word_range = planning_word_range_for_segment(
-        case["refinement"], (segment["start"], segment["end"])
+    case = load_case(REPRESENTATIVE)
+    hook_index = case["analysis"]["source_moment"]["hook_index"]
+    segment = case["source_segments"][hook_index]
+    next_segment = case["source_segments"][hook_index + 1]
+    word_range = planning_word_range_for_span(
+        case["refinement"], (segment["start"], next_segment["end"])
     )
     assert word_range is not None
     strategy = next(
         item
         for item in case["strategies"]
-        if item["strategy_type"] == "ANALYSIS" and item["is_current"]
+        if item["strategy_type"] == "CONTEXT_HOOK" and item["is_current"]
     )
+    texts = planning_word_texts(case["refinement"], word_range[0], word_range[1])
     invalid = representative_response(
         strategy_id=strategy["id"],
         strategy_key=strategy["strategy_key"],
         word_start=word_range[0],
-        word_end=word_range[1] + 2,
+        word_end=word_range[1],
+        excerpt_quote=" ".join(texts[:4]),
+        demand_quote=" ".join(texts[4:]),
     )
     invalid["plans"][0]["blocks"][1]["grounding_refs"] = ["793.32", "block:0"]
 
     source, candidate, refinement, analysis, _strategies = seed_authentic_case(
-        session, strategy_type=TransformationStrategyType.ANALYSIS, settings=settings
+        session, strategy_type=REPRESENTATIVE_STRATEGY, settings=settings
     )
     plan_set = get_or_create_plan_set(session, candidate, analysis)
     job = ProcessingJob(
@@ -576,7 +1006,7 @@ def test_rejection_diagnostics_are_bounded_and_survive_a_later_run(
     assert entry["phase"] == "CONTRACT_REJECTION"
     assert any("GROUNDING_EVIDENCE_UNRESOLVED" in code for code in entry["failure_codes"])
     assert entry["strategy_key"] == strategy["strategy_key"]
-    assert entry["route"] == "STRONG"
+    assert entry["route"] == "ROUTINE"
     assert entry["provider_input_fingerprint"]
     assert entry["mandatory_evidence"]["hook"]["state"] == "RESOLVED"
     selectors = entry["selectors"]
@@ -591,6 +1021,8 @@ def test_rejection_diagnostics_are_bounded_and_survive_a_later_run(
         strategy_key=strategy["strategy_key"],
         word_start=word_range[0],
         word_end=word_range[1],
+        excerpt_quote=" ".join(texts[:4]),
+        demand_quote=" ".join(texts[4:]),
     )
     second_job = ProcessingJob(
         source_video_id=source.id,
@@ -619,6 +1051,285 @@ def test_rejection_diagnostics_are_bounded_and_survive_a_later_run(
     assert str(second_job.id) not in {item["job_id"] for item in entries}
     assert any(item["outcome"] == "INVALID" for item in entries)
     assert list_plans(session, plan_set.id)
+
+
+def _representative_content(
+    case: dict[str, object],
+    strategy: dict[str, object],
+    *,
+    wrong_id: bool = False,
+) -> dict[str, object]:
+    hook_index = case["analysis"]["source_moment"]["hook_index"]  # type: ignore[index]
+    hook = case["source_segments"][hook_index]  # type: ignore[index]
+    following = case["source_segments"][hook_index + 1]  # type: ignore[index]
+    word_range = planning_word_range_for_span(
+        case["refinement"],
+        (hook["start"], following["end"]),  # type: ignore[index]
+    )
+    assert word_range is not None
+    texts = planning_word_texts(case["refinement"], word_range[0], word_range[1])  # type: ignore[arg-type]
+    content = representative_response(
+        strategy_id="not-the-requested-id" if wrong_id else str(strategy["id"]),
+        strategy_key=str(strategy["strategy_key"]),
+        word_start=word_range[0],
+        word_end=word_range[1],
+        excerpt_quote=" ".join(texts[:4]),
+        demand_quote=" ".join(texts[4:]),
+    )
+    return content
+
+
+def _seed_planning_job(
+    session: Session,
+    settings: FakeStage41Settings,
+    *,
+    candidate_id: str = REPRESENTATIVE,
+    strategy_type: TransformationStrategyType | None = REPRESENTATIVE_STRATEGY,
+) -> tuple[object, object, object, ProcessingJob]:
+    source, candidate, refinement, analysis, _strategies = seed_authentic_case(
+        session, candidate_id=candidate_id, strategy_type=strategy_type, settings=settings
+    )
+    plan_set = get_or_create_plan_set(session, candidate, analysis)
+    job = ProcessingJob(
+        source_video_id=source.id,
+        transformation_plan_set_id=plan_set.id,
+        kind=JobKind.TRANSFORMATION_PLANNING,
+    )
+    session.add(job)
+    session.commit()
+    return source, candidate, plan_set, job
+
+
+def _execute_with_content(
+    session: Session,
+    settings: FakeStage41Settings,
+    plan_set: object,
+    job: ProcessingJob,
+    provider: object,
+    *,
+    force: bool = False,
+) -> None:
+    executor = TransformationPlanningExecutor(
+        session=session,
+        settings=settings,
+        provider=provider,  # type: ignore[arg-type]
+        provider_identity=settings.transformation_planning_provider_identity(),
+        mode=SemanticProviderMode.ADAPTIVE,
+        config=STAGE41_CONFIG,
+        lease_factory=settings.heavy_model_lease_factory(),  # type: ignore[arg-type]
+    )
+    executor.set_active_job(job.id)
+    executor.execute(plan_set.id, force=force)  # type: ignore[attr-defined]
+    session.refresh(plan_set)
+
+
+def test_identity_rejection_is_diagnosed_not_treated_as_omission_and_not_reused(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = FakeStage41Settings()
+    install_stage41_settings(monkeypatch, settings)
+    case = load_case(REPRESENTATIVE)
+    strategy = next(
+        item
+        for item in case["strategies"]
+        if item["strategy_type"] == "CONTEXT_HOOK" and item["is_current"]
+    )
+    source, candidate, plan_set, first_job = _seed_planning_job(session, settings)
+    invalid = _representative_content(case, strategy, wrong_id=True)
+    _execute_with_content(session, settings, plan_set, first_job, AuthoredProvider(invalid))
+
+    assert list_plans(session, plan_set.id) == []  # type: ignore[attr-defined]
+    assert plan_set.planning_outcome.value == "PLANNING_DEFERRED"  # type: ignore[attr-defined]
+    entries = dict(plan_set.provider_evidence or {}).get("attempt_diagnostics")  # type: ignore[attr-defined]
+    assert isinstance(entries, list) and entries
+    entry = entries[-1]
+    assert entry["phase"] == "PARSER_REJECTION"
+    assert "STRATEGY_ID_MISMATCH" in entry["failure_codes"]
+    assert entry["parser_rejections"][0]["code"] == "STRATEGY_ID_MISMATCH"
+    assert entry["parser_rejections"][0]["requested_strategy_key"] == strategy["strategy_key"]
+    assert entry["response_evidence"]["returned_plan_count"] == 1
+    assert entry["response_evidence"]["content_digest"]
+    assert entry["response_evidence"]["content_bytes"] > 0
+    # The returned identity is never persisted verbatim.
+    assert "not-the-requested-id" not in json.dumps(entry, ensure_ascii=False)
+    attempts = [dict(item) for item in plan_set.strategy_attempts or []]  # type: ignore[attr-defined]
+    assert attempts and attempts[0]["checkpoint"] is None
+
+    # A later valid run adds a plan, keeps the earlier diagnostic, and never
+    # reuses the rejected attempt as a checkpoint.
+    valid = _representative_content(case, strategy)
+    second_job = ProcessingJob(
+        source_video_id=source.id,
+        transformation_plan_set_id=plan_set.id,  # type: ignore[attr-defined]
+        kind=JobKind.TRANSFORMATION_PLANNING,
+    )
+    session.add(second_job)
+    session.commit()
+    _execute_with_content(
+        session,
+        settings,
+        plan_set,
+        second_job,
+        AuthoredProvider(valid),
+        force=True,
+    )
+    plans = list_plans(session, plan_set.id)  # type: ignore[attr-defined]
+    assert len(plans) == 1
+    entries = dict(plan_set.provider_evidence or {}).get("attempt_diagnostics")  # type: ignore[attr-defined]
+    assert isinstance(entries, list)
+    assert str(first_job.id) in {item["job_id"] for item in entries}
+    assert str(second_job.id) not in {item["job_id"] for item in entries}
+    assert any(item["phase"] == "PARSER_REJECTION" for item in entries)
+
+
+def test_mixed_accepted_and_identity_rejected_siblings_are_isolated(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = FakeStage41Settings()
+    install_stage41_settings(monkeypatch, settings)
+    case = load_case(REPRESENTATIVE)
+    recommended = {
+        item["strategy_type"]: item
+        for item in case["strategies"]
+        if item["is_current"] and item["disposition"] == "RECOMMENDED"
+    }
+    hook_strategy = recommended["CONTEXT_HOOK"]
+    minimal_strategy = recommended["SOURCE_LED_MINIMAL"]
+    content = _representative_content(case, hook_strategy)
+    rejected_plan = _representative_content(case, minimal_strategy, wrong_id=True)["plans"][0]
+    content["plans"].append(rejected_plan)
+
+    _source, _candidate, plan_set, job = _seed_planning_job(session, settings, strategy_type=None)
+    _execute_with_content(session, settings, plan_set, job, AuthoredProvider(content))
+
+    plans = list_plans(session, plan_set.id)  # type: ignore[attr-defined]
+    assert len(plans) == 1
+    assert plans[0].strategy_type.value == "CONTEXT_HOOK"
+    attempts = {
+        item["strategy_key"]: dict(item)
+        for item in plan_set.strategy_attempts or []  # type: ignore[attr-defined]
+    }
+    assert attempts[hook_strategy["strategy_key"]]["status"] == "GENERATED"
+    rejected = attempts[minimal_strategy["strategy_key"]]
+    assert rejected["status"] == "DEFERRED"
+    assert rejected["diagnostics"]["phase"] == "PARSER_REJECTION"
+    assert rejected["diagnostics"]["parser_rejections"][0]["code"] == "STRATEGY_ID_MISMATCH"
+    assert rejected["checkpoint"] is None
+    assert plan_set.planning_outcome.value == "PLANS_GENERATED"  # type: ignore[attr-defined]
+
+
+def test_true_omission_and_transport_failure_remain_distinct(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = FakeStage41Settings()
+    install_stage41_settings(monkeypatch, settings)
+    _source, _candidate, plan_set, omission_job = _seed_planning_job(session, settings)
+    _execute_with_content(
+        session, settings, plan_set, omission_job, AuthoredProvider({"plans": []})
+    )
+    entries = dict(plan_set.provider_evidence or {}).get("attempt_diagnostics")  # type: ignore[attr-defined]
+    omission = entries[-1]
+    assert omission["phase"] == "OMISSION"
+    assert omission["failure_codes"] == ["PROVIDER_OMITTED"]
+    assert omission["response_evidence"] == {}
+    assert omission["parser_rejections"] == []
+
+    class _TransportFailure:
+        hosted_provider = True
+
+        def plan(self, requests: object, tier: str = "ROUTINE") -> object:
+            from app.transformation.planning.providers import PlanningProviderError
+
+            raise PlanningProviderError("TIMEOUT")
+
+        def release(self) -> None:
+            return None
+
+        def runtime_identity(self) -> dict[str, object]:
+            return {"provider": "offline-transport-failure"}
+
+        def refresh_runtime_identity(self) -> dict[str, object]:
+            return self.runtime_identity()
+
+        def raw_call_count(self) -> int:
+            return 0
+
+    transport_job = ProcessingJob(
+        source_video_id=omission_job.source_video_id,
+        transformation_plan_set_id=plan_set.id,  # type: ignore[attr-defined]
+        kind=JobKind.TRANSFORMATION_PLANNING,
+    )
+    session.add(transport_job)
+    session.commit()
+    _execute_with_content(
+        session,
+        settings,
+        plan_set,
+        transport_job,
+        _TransportFailure(),
+        force=True,
+    )
+    entries = dict(plan_set.provider_evidence or {}).get("attempt_diagnostics")  # type: ignore[attr-defined]
+    transport = entries[-1]
+    assert transport["phase"] == "TRANSPORT"
+    assert transport["failure_codes"] == ["TIMEOUT"]
+    assert transport["response_evidence"] == {}
+    assert transport["parser_rejections"] == []
+
+
+def test_parser_retains_malformed_and_unknown_entry_evidence(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.transformation.planning.providers import parse_plan_results
+
+    settings = FakeStage41Settings()
+    install_stage41_settings(monkeypatch, settings)
+    inputs, _, _case = _authentic_inputs(session, settings)
+    strategy = _strategy(inputs)
+    request = build_planning_request(strategy, inputs, settings.stage41_config())
+    key = request.strategy_key
+    valid_plan = {
+        "strategy_id": request.strategy_id,
+        "strategy_key": key,
+        "blocks": [
+            {
+                "block_type": "SOURCE_EXCERPT",
+                "source_role": "HERO",
+                "use_full_window": True,
+            },
+            {
+                "block_type": "ORIGINAL_VALUE",
+                "substantive_value_kind": "EXPLANATION",
+                "semantic_intent": "Synthesize the source evidence for the viewer",
+                "why_unavailable": "The excerpt states the moment but not the synthesis",
+                "grounding_refs": ["block:0"],
+                "estimated_duration": 2.0,
+            },
+        ],
+    }
+    duplicate = json.loads(json.dumps({"plans": [valid_plan, valid_plan]}))
+    results = parse_plan_results(duplicate, [request])
+    assert len(results[key].plans) == 1
+    assert any(item["code"] == "DUPLICATE_STRATEGY_KEY" for item in results[key].rejections)
+
+    malformed_container = {
+        "plans": [{"strategy_id": request.strategy_id, "strategy_key": key, "blocks": "nope"}]
+    }
+    results = parse_plan_results(malformed_container, [request])
+    assert results[key].plans[0].blocks == ()
+    assert any(item["code"] == "MALFORMED_BLOCKS_CONTAINER" for item in results[key].rejections)
+
+    unknown = {"plans": [{"strategy_id": "other", "strategy_key": "unknown-key", "blocks": []}]}
+    results = parse_plan_results(unknown, [request])
+    assert key in results and results[key].plans == ()
+    assert results[key].rejections[0]["code"] == "UNKNOWN_STRATEGY_KEY"
+    assert results[key].response_evidence["unmatched_entry_count"] == 1
+    assert "unknown-key" not in json.dumps(dict(results[key].response_evidence))
+
+    non_mapping = {"plans": ["not-a-mapping"]}
+    results = parse_plan_results(non_mapping, [request])
+    assert results[key].plans == ()
+    assert results[key].rejections[0]["code"] == "MALFORMED_ENTRY"
 
 
 def _authentic_planning_inputs(session: Session) -> PlanningInputs:

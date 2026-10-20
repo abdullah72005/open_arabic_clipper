@@ -271,7 +271,7 @@ class PlanningService:
             return None
         raw = stored.get("result")
         result = deserialize_provider_result(raw, request)  # type: ignore[arg-type]
-        if result is None:
+        if result is None or not result.plans:
             return None
         return result, fingerprint
 
@@ -350,16 +350,28 @@ class PlanningService:
         accepted: list[ValidatedPlan],
         attempts: list[StrategyAttempt],
     ) -> None:
+        from dataclasses import replace as _replace
+
         for strategy, fingerprint, route, key, request in group:
             result = results.get(key)
             if result is None or not result.plans:
-                # Omission is not an explicit no-plan result: retryable.
+                # A true omission is distinct from a returned response whose
+                # requested identity was rejected by the parser. Both are
+                # retryable, but only recorded parser evidence can explain the
+                # latter without treating it as an absent plan.
                 self._unfinished = True
+                parser_rejections = tuple(result.rejections) if result is not None else ()
+                if parser_rejections:
+                    reason = str(parser_rejections[0].get("code") or "PARSER_REJECTION")
+                    phase = "PARSER_REJECTION"
+                else:
+                    reason = "PROVIDER_OMITTED"
+                    phase = "OMISSION"
                 attempts.append(
                     _attempt(
                         strategy,
                         _ATTEMPT_DEFERRED,
-                        ("PROVIDER_OMITTED",),
+                        (reason,),
                         None,
                         fingerprint,
                         diagnostics=self._diagnostics(
@@ -368,8 +380,12 @@ class PlanningService:
                             fingerprint,
                             route,
                             outcome="DEFERRED",
-                            phase="OMISSION",
-                            reasons=("PROVIDER_OMITTED",),
+                            phase=phase,
+                            reasons=(reason,),
+                            response_evidence=(
+                                result.response_evidence if result is not None else None
+                            ),
+                            parser_rejections=parser_rejections,
                         ),
                     )
                 )
@@ -384,6 +400,32 @@ class PlanningService:
                 request=request,
                 route=route,
             )
+            if result.rejections:
+                # Accepted-sibling isolation: the accepted plan remains valid,
+                # while bounded evidence about a rejected sibling/duplicate is
+                # retained independently of the executable result.
+                rejection_codes = tuple(
+                    str(item.get("code") or "PARSER_REJECTION") for item in result.rejections
+                )
+                if attempt.diagnostics:
+                    diagnostics = dict(attempt.diagnostics)
+                    diagnostics.setdefault(
+                        "parser_rejections", [dict(item) for item in result.rejections[:8]]
+                    )
+                    diagnostics.setdefault("response_evidence", dict(result.response_evidence))
+                else:
+                    diagnostics = self._diagnostics(
+                        strategy,
+                        request,
+                        fingerprint,
+                        route,
+                        outcome="ACCEPTED",
+                        phase="PARSER_SIBLING_REJECTION",
+                        reasons=rejection_codes,
+                        response_evidence=result.response_evidence,
+                        parser_rejections=result.rejections,
+                    )
+                attempt = _replace(attempt, diagnostics=diagnostics)
             if plan is not None:
                 accepted.append(plan)
             attempts.append(attempt)
@@ -502,6 +544,7 @@ class PlanningService:
         phase: str,
         reasons: Sequence[str],
         response_evidence: Mapping[str, object] | None = None,
+        parser_rejections: Sequence[Mapping[str, object]] = (),
         provider_plan: object | None = None,
         inputs: PlanningInputs | None = None,
     ) -> dict[str, object]:
@@ -527,6 +570,9 @@ class PlanningService:
             "mandatory_evidence": dict(request.mandatory_evidence),
             "source_selection": dict(request.source_selection),
             "response_evidence": dict(response_evidence or {}),
+            "parser_rejections": [
+                dict(item) for item in list(parser_rejections)[:8] if isinstance(item, Mapping)
+            ],
         }
 
     def _raw_hosted_calls(self) -> int:
