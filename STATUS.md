@@ -1,3 +1,59 @@
+## Stage 6 V4 offline remediation after FAILED human acceptance (2026-10-20)
+
+Status: **offline remediation implemented and locally verified; the 2026-10-20
+genuine MP4 remains FAILED human acceptance. Stage 6 remains UNFROZEN, Stage 7
+UNSTARTED, `publication_ready=false`. No hosted/provider/TTS/Qwen call, new
+genuine candidate, production submission, acceptance retry, publication, or
+worker was run. Stage 5.2 is untouched.**
+
+All four acceptance failures were addressed behind existing owning contracts:
+
+1. **Arabic caption order (Stage 5.1).** The derived ASS now carries logical
+   Unicode text; libass owns BiDi. The manual visual permutation (double-applied
+   by libass) is removed from the deployed asset. Per-token active emphasis is
+   allowed only for single-direction LTR scripts; RTL/mixed scripts degrade to
+   the static phrase state with `ACTIVE_EMPHASIS_UNSAFE_BIDI` and are not claimed
+   repaired. `stage5.1-ass-v6`, `stage5.1-caption-bidi-v3`.
+2. **Tracking/framing (Stage 5.1).** Internal boxes now use one `(x1,y1,x2,y2)`
+   convention, so self-IoU is 1 and the recorded two-shot→close-up jump is
+   0.20467 (rejected) instead of 0.08137 (falsely accepted). The final smoothed,
+   rate-limited, simplified and interpolated path is validated against
+   contemporaneous subject boxes; an unsafe path degrades the scene to
+   `BACKGROUND_FILL` (`CROP_LOSES_SUBJECT`). `stage5.1-framing-v2`. Saved source
+   evidence renders the actual subject instead of hand/curtain in the former
+   failure window.
+3. **Stage 6 delivery/cards/assessment.** Standalone authored copy is an explicit
+   measured delivery: safe-area-centred `Noto Sans Arabic` 88 px card, at most
+   three lines, no truncation, complete copy, measured reading budget/layout/
+   silence/fraction evidence persisted, absent judgments not defaulted to
+   SATISFIED, and dominant silent endings without assessed `LENGTH_NECESSITY`
+   defer. `stage6-authored-ass-v2`, `stage6-timeline-v2`.
+4. **Stage 4 promise / Stage 6 value.** Planning and governance requests separate
+   rendered selected evidence from nonrendered context and require content
+   sufficiency. The Stage 6 critique adds critical `INTENT_FULFILLMENT` with
+   exact copy-quote/offered-grounding/added-relation evidence; structural anchors
+   are deterministically validated, missing/invalid evidence cannot PASS,
+   `REDUNDANCY` is consequential for substantive blocks, and
+   `adds_beyond_source` is the reviewed relation rather than an echoed promise.
+   Planning `stage4.1-v13`/validation `v13`; governance `stage4.2-v10`/validation
+   `v12`; Gemini schema `stage6-gemini-schema-v2`.
+
+**Verification (offline, Docker Python 3.12, network disabled, `PYTHONPATH=/app`):**
+Stage 5.1 ASS/BiDi/tracking/framing/analysis/planner/fingerprints/types plus the
+new V4 regressions pass; Stage 6 provider/schema/delivery/intent/finalization/
+cache/results/acceptance suites pass; `ruff check app tests` is clean. Exact
+commands/results are in the final V4 report and the remediation note. No offline
+result is genuine acceptance.
+
+**Open blocker (unresolved provenance).** Production detection boxes repeat
+identically through 585.16 s and fresh replay already shows the close-up at
+584.16 s. A bounded replay confirms the `fps`-filter sample digest at 584.16 s
+differs from the exact input-seek frame, so the `start + index/fps` label is not
+proof of the selected input frame near a cut. The original run retained no
+per-sample frame digest, so detector/cache/decoder/sampling attribution cannot be
+made from surviving evidence. Full genuine framing/sampling correction is not
+claimed; see the V4 remediation note.
+
 ## Stage 4.1 producer-contract V4 (2026-10-20)
 
 Status: **the Stage 4.1 producer contract is aligned with the preserved
@@ -2606,11 +2662,11 @@ emphasis off by default: captions render as plain static single-color phrase
 text. Setting `CLIPFACTORY_VISUAL_CAPTION_DYNAMIC_EMPHASIS=true` re-enables
 active-word emphasis, highlighting the word currently being spoken in a
 configurable accent color on a stationary block using the exact FINAL_CLIP word
-timings, degrading to static captions on unreliable timing. Because the deployed
-libass build does not reorder mixed-direction text (measured), the derived ASS
-asset carries a deterministic run-level visual order from the pure `bidi.py`
-transform while canonical transcript text stays in logical order; run-aware
-wrapping keeps a Latin phrase such as `content creator` together. `BACKGROUND_FILL`
+timings, degrading to static captions on unreliable timing. Historical (superseded by the top 2026-10-20 V4 entry): the older section below
+assumed libass did not reorder mixed-direction text and wrote a manual visual
+order into the derived ASS. That assumption failed human acceptance; the current
+serializer emits logical text and libass owns BiDi. Run-aware wrapping still
+keeps a Latin phrase such as `content creator` together. `BACKGROUND_FILL`
 uses a strong blur plus modest dim/desaturation so the background reads as
 background. Known limitations:
 `CLIPFACTORY_VISUAL_COMPOSITION_ENABLED` is enforced by both the queue and the
