@@ -67,6 +67,13 @@ lossy subset of the deterministic validators. `build_planning_request` exposes:
   requirement.
 - `nonselectable_context` with `context_text`, `suggested_hook_copy`, idea/topic
   summaries, and an explicit note that none of it is citable evidence.
+- `source_selection.evidence_scope` explicitly separates the **rendered** selected
+  evidence (only the selected `SOURCE_EXCERPT` spans reach the audience) from
+  **nonrendered** transcript/context/summaries, and states the content-sufficiency
+  requirement: the selected excerpt plus the authored value must convey the
+  promised idea. `required_context` is descriptive, never timestamp authority;
+  surrounding material must be selected through the authoritative word/source-span
+  contract.
 - `words` with the exact planning-word text and absolute times offered for
   selection.
 

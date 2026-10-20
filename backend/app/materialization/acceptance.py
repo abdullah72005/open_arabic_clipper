@@ -361,6 +361,17 @@ def assess_materialization(
 
     findings.extend(context.extra_findings)
 
+    # A dominant silent authored card without an assessed length necessity is
+    # missing presentation/continuity evidence: it defers rather than receiving
+    # an unqualified review-ready pass.
+    if any(
+        finding.level == QualityLevel.UNKNOWN.value
+        and finding.dimension == QualityDimension.PACING_CONTEXT_DENSITY.value
+        and "AUTHORED_PAUSE_NECESSITY_NOT_ASSESSED" in finding.reason_codes
+        for finding in findings
+    ):
+        critical_evidence_missing = True
+
     unmet = [finding for finding in findings if finding.level == QualityLevel.UNMET.value]
     concern = [finding for finding in findings if finding.level == QualityLevel.CONCERN.value]
     unknown = [finding for finding in findings if finding.level == QualityLevel.UNKNOWN.value]

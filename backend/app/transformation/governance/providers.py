@@ -73,14 +73,22 @@ GOVERNANCE_SYSTEM_INSTRUCTION = (
     "voice, or speaker identity, and never suggest detection evasion. Judge plan "
     "intent, not final script naturalness. Preserve the source speaker's meaning: "
     "flag distortion, decontextualization, sarcasm treated literally, speculation "
-    "presented as fact, false attribution, and fake hooks. Report substantive value "
-    "only for genuine context, explanation, inference, comparison, counterpoint, "
-    "synthesis, verification/correction, authored thesis, useful takeaway, or "
-    "source-as-evidence framing; presentation-only changes such as captions, crop, "
-    "zoom, borders, music, B-roll, filters, or speed receive zero credit. Narration "
-    'NONE is valid. Return strict JSON: {"critiques": [...]} with exactly one item '
-    "per requested plan, echoing its plan_id and plan_output_fingerprint, using only "
-    "the closed values defined by the schema."
+    "presented as fact, false attribution, and fake hooks. Each plan separates the "
+    "rendered selected evidence (the SOURCE_EXCERPT text the audience actually "
+    "receives) from nonrendered context (refined transcript, surrounding context, "
+    "summaries). Judge whether the rendered selected evidence plus the plan's "
+    "authored value actually conveys the promised idea. A minimum duration or a "
+    "hook match is NOT context sufficiency: if the promised explanation needs "
+    "material that is only in nonrendered context, report fidelity/retention as "
+    "inadequate even when the selected words are accurate. Do not treat a copied "
+    "required_context string as evidence that it appears in the output. Report "
+    "substantive value only for genuine context, explanation, inference, comparison, "
+    "counterpoint, synthesis, verification/correction, authored thesis, useful "
+    "takeaway, or source-as-evidence framing; presentation-only changes such as "
+    "captions, crop, zoom, borders, music, B-roll, filters, or speed receive zero "
+    'credit. Narration NONE is valid. Return strict JSON: {"critiques": [...]} with '
+    "exactly one item per requested plan, echoing its plan_id and "
+    "plan_output_fingerprint, using only the closed values defined by the schema."
 )
 
 GOVERNANCE_OUTPUT_SCHEMA: dict[str, object] = {
@@ -222,10 +230,30 @@ class GovernanceRequest:
             "originality_risk": self.originality_risk,
             "plans": [dict(plan) for plan in self.plans],
             "priority": self.priority,
+            "evidence_scope": {
+                "rendered": ("Only each plan's SOURCE_EXCERPT spans are rendered to the audience."),
+                "nonrendered": [
+                    "refined_transcript",
+                    "context_text",
+                    "idea_summary",
+                    "topic_summary",
+                ],
+                "content_sufficiency_requirement": (
+                    "Judge whether the rendered selected evidence plus the authored "
+                    "value conveys the promised idea. Nonrendered context may explain "
+                    "what is missing but never proves the audience receives it."
+                ),
+            },
         }
 
 
 def _plan_payload(plan: PlanEvidence) -> dict[str, object]:
+    rendered = [
+        str(block.get("source_text", "") or "")
+        for block in plan.blocks
+        if str(block.get("block_type", "")) == "SOURCE_EXCERPT"
+        and str(block.get("source_text", "") or "").strip()
+    ]
     return {
         "plan_id": plan.plan_id,
         "plan_output_fingerprint": plan.plan_output_fingerprint,
@@ -238,6 +266,10 @@ def _plan_payload(plan: PlanEvidence) -> dict[str, object]:
         "stage40_risk": dict(plan.stage40_risk),
         "preservation_constraints": list(plan.preservation_constraints),
         "original_value_kinds": list(plan.original_value_kinds),
+        # Rendered evidence the audience actually receives, distinct from the
+        # nonrendered transcript/context below.
+        "selected_evidence": rendered,
+        "required_context_is_not_rendered_evidence": True,
     }
 
 

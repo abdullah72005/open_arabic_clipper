@@ -21,8 +21,13 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
+from app.composition.policy import safe_zone_for
 from app.core.settings import Settings
-from app.materialization.overlays import build_authored_ass
+from app.materialization.overlays import (
+    DEFAULT_AUTHORED_FONT_FAMILY,
+    DEFAULT_AUTHORED_FONT_SIZE,
+    build_authored_ass,
+)
 from app.render.execution.authored import (
     ASSET_ROLE_NARRATION,
     ASSET_ROLE_SOURCE_VIDEO,
@@ -489,6 +494,13 @@ def _build_and_store_authored_ass(
             output_start=_float(segment.get("output_start")),
             output_end=_float(segment.get("output_end")),
             text=str(segment.get("text") or ""),
+            narration_chunk_id=(
+                str(segment.get("narration_chunk_id"))
+                if segment.get("narration_chunk_id")
+                else None
+            ),
+            delivery=str(segment.get("delivery") or ""),
+            delivery_rationale=str(segment.get("delivery_rationale") or ""),
         )
         for segment in _segments(timeline_payload)
     )
@@ -505,8 +517,15 @@ def _build_and_store_authored_ass(
         timeline,
         play_res_x=base.output_width,
         play_res_y=base.output_height,
-        font_family="DejaVu Sans",
+        safe_zone=safe_zone_for("SHORTS_VERTICAL_SAFE_ZONE_V1"),
+        font_family=DEFAULT_AUTHORED_FONT_FAMILY,
+        font_size=DEFAULT_AUTHORED_FONT_SIZE,
     )
+    if result.failed:
+        # Measured layout/readability failure: refuse to burn an unreadable card.
+        # The semantic assessment already rejects it before dispatch; this is a
+        # fail-closed renderer handoff guard.
+        raise RenderExecutionError("AUTHORED_LAYOUT_UNREADABLE")
     directory = storage.source_directory(row.source_video_id) / "materializations" / str(row.id)
     directory.mkdir(parents=True, exist_ok=True)
     destination = directory / "authored.ass"

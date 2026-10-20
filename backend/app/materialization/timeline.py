@@ -171,6 +171,16 @@ def build_timeline(
             duration = _estimate_authored_seconds(block, copy, narration_seconds)
             output_start = _quantize(cursor, resolved_frame_rate)
             output_end = _quantize(cursor + duration, resolved_frame_rate)
+            if chunk is not None:
+                delivery = "NARRATION"
+                rationale = "Validated narration audio carries the authored value."
+            else:
+                delivery = "STANDALONE_CARD"
+                rationale = (
+                    "Authored text is delivered as a standalone reading card: the "
+                    "frozen Stage 5.2 vocabulary has no executable source-hosted "
+                    "overlay unit, and a card cannot obscure the hero."
+                )
             segments.append(
                 TimelineSegment(
                     segment_id=segment_id,
@@ -181,6 +191,8 @@ def build_timeline(
                     text=copy,
                     narration_chunk_id=chunk.chunk_id if chunk is not None else None,
                     asset_id=supporting_by_block.get(index),
+                    delivery=delivery,
+                    delivery_rationale=rationale,
                 )
             )
             cursor = output_end

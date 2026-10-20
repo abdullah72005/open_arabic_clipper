@@ -27,9 +27,9 @@ from app.core.enums import (
 # semantics and parser rejections are retained as bounded diagnostics), v10
 # producer-contract alignment, and v8 Arabic multi-token closure remain in
 # force.
-POLICY_VERSION = "stage4.1-v12"
+POLICY_VERSION = "stage4.1-v13"
 SCHEMA_VERSION = "stage4.1-schema-v12"
-VALIDATION_VERSION = "stage4.1-validation-v12"
+VALIDATION_VERSION = "stage4.1-validation-v13"
 INPUT_FINGERPRINT_VERSION = "2"
 OUTPUT_FINGERPRINT_VERSION = "2"
 PLAN_FINGERPRINT_VERSION = "2"

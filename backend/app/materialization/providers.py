@@ -17,7 +17,7 @@ changing callers.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Protocol, runtime_checkable
 
 from app.core.enums import ClaimClass
@@ -49,6 +49,7 @@ class MaterializationProviderError(Exception):
 CRITIQUE_DIMENSIONS = (
     "GROUNDING_ENTAILMENT",
     "SUBSTANTIVE_ADDED_VALUE",
+    "INTENT_FULFILLMENT",
     "SEMANTIC_FIDELITY",
     "UNSUPPORTED_FACTS",
     "CODE_SWITCH_PRESERVATION",
@@ -61,18 +62,28 @@ CRITIQUE_DIMENSIONS = (
 CRITIQUE_LEVELS = ("PASS", "CONCERN", "FAIL", "UNKNOWN")
 
 #: Dimensions whose CONCERN/FAIL is a critical failure: no approval is possible.
-#: GROUNDING_ENTAILMENT and SUBSTANTIVE_ADDED_VALUE additionally must be a *known
-#: positive* PASS (an UNKNOWN/absent verdict defers, never approves).
+#: GROUNDING_ENTAILMENT, SUBSTANTIVE_ADDED_VALUE and INTENT_FULFILLMENT
+#: additionally must be a *known positive* PASS (an UNKNOWN/absent verdict
+#: defers, never approves).
 CRITICAL_CRITIQUE_DIMENSIONS = frozenset(
     {
         "GROUNDING_ENTAILMENT",
         "SUBSTANTIVE_ADDED_VALUE",
+        "INTENT_FULFILLMENT",
         "SEMANTIC_FIDELITY",
         "UNSUPPORTED_FACTS",
         "CODE_SWITCH_PRESERVATION",
     }
 )
-_POSITIVE_REQUIRED_DIMENSIONS = ("GROUNDING_ENTAILMENT", "SUBSTANTIVE_ADDED_VALUE")
+_POSITIVE_REQUIRED_DIMENSIONS = (
+    "GROUNDING_ENTAILMENT",
+    "SUBSTANTIVE_ADDED_VALUE",
+    "INTENT_FULFILLMENT",
+)
+
+#: Dimensions that make a substantive block worthless when merely CONCERN.
+#: REDUNDANCY cannot be waved through by an otherwise favorable critique.
+_SUBSTANTIVE_CONCERN_CONSEQUENTIAL = frozenset({"REDUNDANCY"})
 
 #: A block verdict is a closed tri-state. ``ACCEPTED`` requires exactly one valid
 #: finding for every requested dimension and a known PASS for every critical
@@ -88,6 +99,7 @@ CRITIQUE_REJECTED = "REJECTED"
 CRITIQUE_TO_QUALITY_DIMENSION: dict[str, str] = {
     "GROUNDING_ENTAILMENT": "GROUNDING_VERIFICATION",
     "SUBSTANTIVE_ADDED_VALUE": "SUBSTANTIVE_VALUE",
+    "INTENT_FULFILLMENT": "SUBSTANTIVE_VALUE",
     "SEMANTIC_FIDELITY": "FIDELITY_ATTRIBUTION",
     "UNSUPPORTED_FACTS": "GROUNDING_VERIFICATION",
     "CODE_SWITCH_PRESERVATION": "LANGUAGE_REGISTER_NATURALNESS",
@@ -108,14 +120,30 @@ CRITIQUE_TO_QUALITY_LEVEL: dict[str, str] = {
 
 @dataclass(frozen=True)
 class CritiqueDimensionFinding:
-    """One categorical critique finding for a single dimension."""
+    """One categorical critique finding for a single dimension.
+
+    ``copy_quote``/``grounding_refs``/``added_relation`` are review evidence for
+    ``INTENT_FULFILLMENT`` only: an exact quote from the actual copy, references
+    drawn from the target's offered evidence, and the relationship that quote
+    expresses beyond restatement. They are never new authored copy or timestamps.
+    """
 
     dimension: str
     level: str
     evidence: str = ""
+    copy_quote: str = ""
+    grounding_refs: tuple[str, ...] = ()
+    added_relation: str = ""
 
     def as_dict(self) -> dict[str, object]:
-        return {"dimension": self.dimension, "level": self.level, "evidence": self.evidence}
+        return {
+            "dimension": self.dimension,
+            "level": self.level,
+            "evidence": self.evidence,
+            "copy_quote": self.copy_quote,
+            "grounding_refs": list(self.grounding_refs),
+            "added_relation": self.added_relation,
+        }
 
 
 @dataclass(frozen=True)
@@ -124,6 +152,8 @@ class BlockCritique:
 
     block_index: int
     findings: tuple[CritiqueDimensionFinding, ...] = ()
+    substantive: bool = False
+    require_length_necessity: bool = False
 
     def _level(self, dimension: str) -> str | None:
         levels = self.levels()
@@ -189,6 +219,22 @@ class BlockCritique:
                 return CRITIQUE_REJECTED
             if level != "PASS":
                 return CRITIQUE_DEFERRED
+        if self.substantive:
+            # Redundant substantive copy adds no value even if grounding and
+            # novelty are otherwise favorable; a missing judgment defers.
+            redundancy = levels.get("REDUNDANCY")
+            if redundancy in {"CONCERN", "FAIL"}:
+                return CRITIQUE_REJECTED
+            if redundancy != "PASS":
+                return CRITIQUE_DEFERRED
+        if self.require_length_necessity:
+            # Standalone authored delivery must have its actual interruption
+            # judged, not assumed. Missing evidence defers.
+            length = levels.get("LENGTH_NECESSITY")
+            if length in {"CONCERN", "FAIL"}:
+                return CRITIQUE_REJECTED
+            if length != "PASS":
+                return CRITIQUE_DEFERRED
         return CRITIQUE_ACCEPTED
 
     @property
@@ -200,6 +246,8 @@ class BlockCritique:
             "block_index": self.block_index,
             "accepted": self.accepted,
             "verdict": self.verdict(),
+            "substantive": self.substantive,
+            "require_length_necessity": self.require_length_necessity,
             "findings": [finding.as_dict() for finding in self.findings],
         }
 
@@ -210,16 +258,27 @@ class BlockCritique:
         if isinstance(raw, list):
             for item in raw:
                 if isinstance(item, Mapping):
+                    refs = item.get("grounding_refs")
                     findings.append(
                         CritiqueDimensionFinding(
                             dimension=str(item.get("dimension", "")),
                             level=str(item.get("level", "")),
                             evidence=str(item.get("evidence", "")),
+                            copy_quote=str(item.get("copy_quote", "") or ""),
+                            grounding_refs=(
+                                tuple(str(ref) for ref in refs) if isinstance(refs, list) else ()
+                            ),
+                            added_relation=str(item.get("added_relation", "") or ""),
                         )
                     )
         index = data.get("block_index")
         block_index = index if isinstance(index, int) and not isinstance(index, bool) else -1
-        return cls(block_index=block_index, findings=tuple(findings))
+        return cls(
+            block_index=block_index,
+            findings=tuple(findings),
+            substantive=bool(data.get("substantive", False)),
+            require_length_necessity=bool(data.get("require_length_necessity", False)),
+        )
 
 
 @dataclass(frozen=True)
@@ -234,6 +293,9 @@ class WritingTarget:
     grounding_refs: tuple[GroundingRef, ...]
     source_evidence: str = ""
     verification_dependency_id: str | None = None
+    why_unavailable: str = ""
+    delivery_intent: str = ""
+    proposed_delivery: Mapping[str, object] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -245,6 +307,9 @@ class WritingTarget:
             "grounding_refs": [ref.as_dict() for ref in self.grounding_refs],
             "source_evidence": self.source_evidence,
             "verification_dependency_id": self.verification_dependency_id,
+            "why_unavailable": self.why_unavailable,
+            "delivery_intent": self.delivery_intent,
+            "proposed_delivery": dict(self.proposed_delivery),
         }
 
 
@@ -258,6 +323,11 @@ class CritiqueTarget:
     semantic_intent: str
     claim_class: str
     source_evidence: str = ""
+    offered_grounding_refs: tuple[str, ...] = ()
+    delivery_intent: str = ""
+    proposed_delivery: Mapping[str, object] = field(default_factory=dict)
+    substantive: bool = True
+    require_length_necessity: bool = False
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -267,6 +337,9 @@ class CritiqueTarget:
             "semantic_intent": self.semantic_intent,
             "claim_class": self.claim_class,
             "source_evidence": self.source_evidence,
+            "offered_grounding_refs": list(self.offered_grounding_refs),
+            "delivery_intent": self.delivery_intent,
+            "proposed_delivery": dict(self.proposed_delivery),
         }
 
 
@@ -534,6 +607,9 @@ def build_writing_request(inputs: MaterializationInputs, *, config: Stage6Config
                 grounding_refs=refs,
                 source_evidence=evidence,
                 verification_dependency_id=_first_dependency(block, inputs),
+                why_unavailable=str(block.get("why_unavailable", "") or ""),
+                delivery_intent=str(block.get("delivery_intent", "") or ""),
+                proposed_delivery=_proposed_delivery(block, inputs),
             )
         )
     tier = SEMANTIC_STRONG_TIER if inputs.intensity == "STRONG" else SEMANTIC_ROUTINE_TIER
@@ -548,6 +624,41 @@ def build_writing_request(inputs: MaterializationInputs, *, config: Stage6Config
         tier=tier,
         source_context=_source_context(inputs),
     )
+
+
+def _proposed_delivery(
+    block: Mapping[str, object], inputs: MaterializationInputs
+) -> dict[str, object]:
+    """Bounded delivery/duration facts for the critique's LENGTH_NECESSITY.
+
+    These are the facts the current plan intends, not a rendered timeline. The
+    critique must judge the actual interruption, not assume it is justified.
+    """
+
+    delivery = str(block.get("delivery_intent", "") or "")
+    narration_need = str(inputs.narration.get("need", "NONE"))
+    estimated = block.get("estimated_duration")
+    duration = (
+        float(estimated)
+        if isinstance(estimated, (int, float)) and not isinstance(estimated, bool)
+        else 0.0
+    )
+    if narration_need in {"RECOMMENDED", "REQUIRED"}:
+        kind = "NARRATION"
+    elif delivery == "ON_SCREEN_TEXT":
+        kind = "STANDALONE_CARD"
+    else:
+        kind = "AUTHORED_TEXT"
+    return {
+        "delivery": kind,
+        "planned_duration_seconds": round(duration, 6),
+        "silent": kind == "STANDALONE_CARD",
+        "purpose": str(block.get("purpose", "") or ""),
+    }
+
+
+def _offered_refs(refs: Sequence[GroundingRef]) -> tuple[str, ...]:
+    return tuple(ref.raw for ref in refs if isinstance(ref.raw, str) and ref.raw.strip())
 
 
 def _source_context(inputs: MaterializationInputs) -> dict[str, object]:
@@ -650,6 +761,10 @@ def materialize_script(
         if validation.accepted:
             accepted_indexes[target.block_index] = True
         elif validation.requires_semantic_review and validation.claim is not None:
+            substantive = (
+                target.block_type in _SUBSTANTIVE_BLOCK_TYPES
+                and target.substantive_value_kind != "SOURCE_AS_EVIDENCE"
+            )
             review_targets.append(
                 CritiqueTarget(
                     block_index=target.block_index,
@@ -658,6 +773,19 @@ def materialize_script(
                     semantic_intent=target.semantic_intent,
                     claim_class=validation.claim.claim_class,
                     source_evidence=target.source_evidence,
+                    offered_grounding_refs=_offered_refs(target.grounding_refs),
+                    delivery_intent=target.delivery_intent,
+                    proposed_delivery={
+                        **dict(target.proposed_delivery),
+                        "copy_characters": len(copy),
+                        "reading_seconds": round(len(copy) / 14.0, 6),
+                    },
+                    substantive=substantive,
+                    require_length_necessity=(
+                        substantive
+                        and target.delivery_intent == "ON_SCREEN_TEXT"
+                        and str(inputs.narration.get("need", "NONE")) == "NONE"
+                    ),
                 )
             )
 
@@ -689,7 +817,17 @@ def materialize_script(
             if block is not None:
                 critique_by_block[index] = block
             verdict = evaluation.verdict(index)
-            if verdict == CRITIQUE_ACCEPTED:
+            intent_issue = _intent_fulfillment_issue(block, target)
+            if intent_issue is not None:
+                findings_by_block.setdefault(index, []).append(
+                    QualityFinding(
+                        dimension="SUBSTANTIVE_VALUE",
+                        level="UNKNOWN",
+                        reason_codes=(intent_issue,),
+                        evidence={"block_index": index},
+                    )
+                )
+            if verdict == CRITIQUE_ACCEPTED and intent_issue is None:
                 accepted_indexes[index] = True
             elif verdict == CRITIQUE_REJECTED:
                 accepted_indexes[index] = False
@@ -715,8 +853,19 @@ def materialize_script(
         copy = result.copies.get(target.block_index, "")
         evidence: dict[str, object] = {"accepted": True}
         block_critique = critique_by_block.get(target.block_index)
+        added_relation = ""
         if block_critique is not None:
             evidence["critique"] = block_critique.as_dict()
+            intent = next(
+                (
+                    item
+                    for item in block_critique.findings
+                    if item.dimension == "INTENT_FULFILLMENT"
+                ),
+                None,
+            )
+            if intent is not None and intent.level == "PASS":
+                added_relation = intent.added_relation.strip()
         authored.append(
             AuthoredBlock(
                 block_index=target.block_index,
@@ -724,7 +873,10 @@ def materialize_script(
                 slot_id=f"block-{target.block_index}",
                 substantive_value_kind=target.substantive_value_kind,
                 copy=copy,
-                adds_beyond_source=target.semantic_intent,
+                # Never echo the plan's promise as proof of added value. The
+                # concrete relation comes from reviewed intent-fulfillment
+                # evidence; without it the field stays empty.
+                adds_beyond_source=added_relation,
                 claim_class=ClaimClass.SOURCE_GROUNDED_INFERENCE.value,
                 grounding_refs=target.grounding_refs,
                 validation_evidence=evidence,
@@ -764,7 +916,26 @@ def _combined_findings(
         for finding in block.findings:
             dimension = CRITIQUE_TO_QUALITY_DIMENSION.get(finding.dimension)
             level = CRITIQUE_TO_QUALITY_LEVEL.get(finding.level)
-            if dimension is None or level is None or level == "SATISFIED":
+            if dimension is None or level is None:
+                continue
+            if level == "SATISFIED":
+                # Keep the positive evidence that actually authorizes a
+                # standalone delivery or an intent-fulfilled substantive block;
+                # drop other routine PASS noise.
+                if finding.dimension not in {"LENGTH_NECESSITY", "INTENT_FULFILLMENT"}:
+                    continue
+                combined.append(
+                    QualityFinding(
+                        dimension=dimension,
+                        level=level,
+                        reason_codes=(f"CRITIQUE_{finding.dimension}_PASS",),
+                        evidence={
+                            "critique_dimension": finding.dimension,
+                            "critique_level": finding.level,
+                            "evidence": finding.evidence,
+                        },
+                    )
+                )
                 continue
             combined.append(
                 QualityFinding(
@@ -781,11 +952,54 @@ def _combined_findings(
     return tuple(combined)
 
 
+def _intent_fulfillment_issue(block: BlockCritique | None, target: CritiqueTarget) -> str | None:
+    """Deterministically validate the INTENT_FULFILLMENT review evidence.
+
+    A PASS must carry an exact copy quote, nonempty offered-and-resolvable
+    grounding references, and a bounded added relation. Structure is validated
+    here; whether the relation actually fulfils the promised intent remains the
+    reviewer's categorical judgment.
+    """
+
+    if block is None:
+        return "MISSING_INTENT_FULFILLMENT_EVIDENCE"
+    finding = next(
+        (item for item in block.findings if item.dimension == "INTENT_FULFILLMENT"),
+        None,
+    )
+    if finding is None:
+        return "MISSING_INTENT_FULFILLMENT_EVIDENCE"
+    if finding.level in {"CONCERN", "FAIL", "UNKNOWN"}:
+        # The verdict already rejects/defers these levels.
+        return None
+    quote = finding.copy_quote.strip()
+    if not quote or quote not in target.copy:
+        return "INVALID_INTENT_FULFILLMENT_COPY_QUOTE"
+    refs = tuple(ref.strip() for ref in finding.grounding_refs if ref.strip())
+    if not refs:
+        return "MISSING_INTENT_FULFILLMENT_GROUNDING"
+    offered = {ref.strip() for ref in target.offered_grounding_refs if ref.strip()}
+    parsed = parse_grounding_refs(list(refs))
+    if any(ref.invalid_reason for ref in parsed) or len(parsed) != len(refs):
+        return "INVALID_INTENT_FULFILLMENT_GROUNDING"
+    if any(ref not in offered for ref in refs):
+        return "OUT_OF_SCOPE_INTENT_FULFILLMENT_GROUNDING"
+    relation = finding.added_relation.strip()
+    if not relation or len(relation) > 400:
+        return "MISSING_INTENT_FULFILLMENT_RELATION"
+    return None
+
+
 def _critique_reasons(block: BlockCritique | None) -> list[str]:
     if block is None:
         return []
+    dimensions = set(CRITICAL_CRITIQUE_DIMENSIONS)
+    if block.substantive:
+        dimensions.add("REDUNDANCY")
+    if block.require_length_necessity:
+        dimensions.add("LENGTH_NECESSITY")
     reasons: list[str] = []
-    for dimension in CRITICAL_CRITIQUE_DIMENSIONS:
+    for dimension in dimensions:
         level = block._level(dimension)
         if level in {"CONCERN", "FAIL"}:
             reasons.append(f"CRITIQUE_{dimension}_{level}")
@@ -830,7 +1044,11 @@ def _run_critique(
     for target in targets:
         block = result.blocks.get(target.block_index)
         if block is not None:
-            blocks[target.block_index] = block
+            blocks[target.block_index] = replace(
+                block,
+                substantive=target.substantive,
+                require_length_necessity=target.require_length_necessity,
+            )
         elif target.block_index in result.accepted:
             # Boolean-only legacy/fake result: synthesize a block that carries
             # the boolean as complete evidence only when it is a rejection.
@@ -839,9 +1057,25 @@ def _run_critique(
             blocks[target.block_index] = BlockCritique(
                 block_index=target.block_index,
                 findings=tuple(
-                    CritiqueDimensionFinding(dimension=dimension, level=level)
+                    CritiqueDimensionFinding(
+                        dimension=dimension,
+                        level=level,
+                        copy_quote=target.copy if dimension == "INTENT_FULFILLMENT" else "",
+                        grounding_refs=(
+                            target.offered_grounding_refs[:1]
+                            if dimension == "INTENT_FULFILLMENT"
+                            else ()
+                        ),
+                        added_relation=(
+                            "Fake critique accepted the supplied relation."
+                            if dimension == "INTENT_FULFILLMENT"
+                            else ""
+                        ),
+                    )
                     for dimension in CRITIQUE_DIMENSIONS
                 ),
+                substantive=target.substantive,
+                require_length_necessity=target.require_length_necessity,
             )
     if not blocks:
         return None

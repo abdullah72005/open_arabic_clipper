@@ -47,9 +47,7 @@ from app.materialization.queue import (
 from app.models import ClipMaterialization, ProcessingJob
 from app.models.render_execution import RenderExecution
 
-_ANNOTATION_COPY = (
-    "That drop looks milder once you control for which teams already promoted heavily."
-)
+_ANNOTATION_COPY = "The drop looks smaller with promotion."
 _TERMINAL = {JobStatus.SUCCEEDED, JobStatus.FAILED, JobStatus.CANCELLED}
 
 
@@ -130,9 +128,7 @@ def _prepare_to_awaiting_render(
 
     session = _session()
     try:
-        fixture = seed_stage51(
-            session, monkeypatch, narration="NONE", media_writer=media_writer
-        )
+        fixture = seed_stage51(session, monkeypatch, narration="NONE", media_writer=media_writer)
         candidate = fixture.stage50.selection.candidate
         candidate_id = candidate.id
         _ready_composition(session, fixture)
@@ -241,9 +237,7 @@ def _complete_materialization(
     return uuid.UUID(str(candidate_id)), materialization_id, render_id, storage
 
 
-def _post(
-    candidate_id: uuid.UUID, capture: _Capture
-) -> Any:
+def _post(candidate_id: uuid.UUID, capture: _Capture) -> Any:
     session = _session()
     try:
         outcome = queue_materialization(
@@ -320,9 +314,7 @@ def test_valid_completed_replay_is_cached_without_duplicated_work(
         session.close()
 
 
-def test_demoted_bound_render_is_recovered_not_cached(
-    engine: Engine, monkeypatch: Any
-) -> None:
+def test_demoted_bound_render_is_recovered_not_cached(engine: Engine, monkeypatch: Any) -> None:
     from test_stage6_real_executor import _write_source
 
     candidate_id, materialization_id, render_id, _storage = _complete_materialization(
@@ -427,9 +419,7 @@ def test_missing_or_corrupted_artifact_is_recovered_not_cached(
     assert response.semantic_outcome is None
 
 
-def test_stale_output_binding_is_recovered_not_cached(
-    engine: Engine, monkeypatch: Any
-) -> None:
+def test_stale_output_binding_is_recovered_not_cached(engine: Engine, monkeypatch: Any) -> None:
     from test_stage6_real_executor import _write_source
 
     candidate_id, materialization_id, render_id, _storage = _complete_materialization(
@@ -519,9 +509,7 @@ def _materialization_job_ids(materialization_id: uuid.UUID) -> set[str]:
         return {
             str(job.id)
             for job in session.scalars(
-                select(ProcessingJob).where(
-                    ProcessingJob.materialization_id == materialization_id
-                )
+                select(ProcessingJob).where(ProcessingJob.materialization_id == materialization_id)
             ).all()
         }
     finally:
@@ -673,9 +661,7 @@ def _tampering_copyfile(monkeypatch: Any) -> None:
     monkeypatch.setattr(_shutil, "copyfile", tamper)
 
 
-def test_export_verifies_copied_destination_bytes(
-    engine: Engine, monkeypatch: Any
-) -> None:
+def test_export_verifies_copied_destination_bytes(engine: Engine, monkeypatch: Any) -> None:
     """A genuine export verifies the COPIED destination bytes, not the source."""
 
     import json
@@ -733,9 +719,7 @@ def test_export_verifies_copied_destination_bytes(
     assert tampered_index["authored_ass_sha256"] != tampered_index["authored_ass_expected_sha256"]
 
 
-def test_diagnostic_export_preserves_last_valid_package(
-    engine: Engine, monkeypatch: Any
-) -> None:
+def test_diagnostic_export_preserves_last_valid_package(engine: Engine, monkeypatch: Any) -> None:
     """A diagnostic export never replaces a valid published package or its catalog reference."""
 
     import json
@@ -776,9 +760,7 @@ def test_diagnostic_export_preserves_last_valid_package(
     diagnostic_directory = Path(str(diagnostic_case["diagnostic_directory"]))
     assert diagnostic_directory.is_dir()
     assert diagnostic_directory != valid_directory
-    diagnostic_index = json.loads(
-        (diagnostic_directory / "index.json").read_text(encoding="utf-8")
-    )
+    diagnostic_index = json.loads((diagnostic_directory / "index.json").read_text(encoding="utf-8"))
     assert diagnostic_index["diagnostic"] is True
     # The last valid package is preserved untouched (immutable versioned directory).
     assert (valid_directory / "index.json").read_text(encoding="utf-8") == valid_index_before
@@ -792,14 +774,10 @@ def test_diagnostic_export_preserves_last_valid_package(
     entry = catalog["cases"][case]
     assert entry["published"]["identity"] == valid_identity
     assert entry["diagnostic_attempts"]
-    assert all(
-        attempt["genuine_acceptance"] is False for attempt in entry["diagnostic_attempts"]
-    )
+    assert all(attempt["genuine_acceptance"] is False for attempt in entry["diagnostic_attempts"])
 
 
-def test_export_catalog_merge_preserves_unrelated_cases(
-    engine: Engine, monkeypatch: Any
-) -> None:
+def test_export_catalog_merge_preserves_unrelated_cases(engine: Engine, monkeypatch: Any) -> None:
     """A later export merges into the catalog without dropping unrelated cases."""
 
     import json

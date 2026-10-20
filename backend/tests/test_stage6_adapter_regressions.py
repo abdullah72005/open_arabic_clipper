@@ -60,11 +60,22 @@ from app.services.storage import StorageService
 __all__ = ["engine"]
 
 
-def _findings(**overrides: str) -> list[dict[str, str]]:
-    return [
-        {"dimension": dimension, "level": overrides.get(dimension, "PASS"), "evidence": "bounded"}
-        for dimension in CRITIQUE_DIMENSIONS
-    ]
+def _findings(**overrides: str) -> list[dict[str, object]]:
+    findings: list[dict[str, object]] = []
+    for dimension in CRITIQUE_DIMENSIONS:
+        item: dict[str, object] = {
+            "dimension": dimension,
+            "level": overrides.get(dimension, "PASS"),
+            "evidence": "bounded",
+        }
+        if dimension == "INTENT_FULFILLMENT":
+            item["intent_fulfillment"] = {
+                "copy_quote": NOVEL_COPY,
+                "grounding_refs": ["block:0"],
+                "added_relation": "The copy states the mechanism behind the observed drop.",
+            }
+        findings.append(item)
+    return findings
 
 
 def _critique_provider_with(findings: list[dict[str, str]]) -> object:

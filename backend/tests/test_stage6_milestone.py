@@ -42,9 +42,7 @@ from app.materialization.providers import FakeCritiqueProvider, FakeWritingProvi
 from app.models import ClipMaterialization, ProcessingJob
 from app.models.render_execution import RenderExecution
 
-_ANNOTATION_COPY = (
-    "That drop looks milder once you control for which teams already promoted heavily."
-)
+_ANNOTATION_COPY = "The drop looks smaller with promotion."
 _TERMINAL = {JobStatus.SUCCEEDED, JobStatus.FAILED, JobStatus.CANCELLED}
 
 #: A deliberately hot source: a near-full-scale 1 kHz tone gated to 25 ms each
@@ -144,9 +142,7 @@ def _no_broker(monkeypatch: Any) -> None:
     monkeypatch.setattr(
         tasks_module.run_materialization_finalization, "delay", lambda *a, **k: None
     )
-    monkeypatch.setattr(
-        tasks_module.run_materialization_job, "delay", lambda *a, **k: None
-    )
+    monkeypatch.setattr(tasks_module.run_materialization_job, "delay", lambda *a, **k: None)
 
 
 def _inject_deterministic_providers(
@@ -177,9 +173,7 @@ def _inject_deterministic_providers(
         )
 
     monkeypatch.setattr(tasks_module, "build_materialization_executor", _builder, raising=False)
-    monkeypatch.setattr(
-        "app.materialization.executor.build_materialization_executor", _builder
-    )
+    monkeypatch.setattr("app.materialization.executor.build_materialization_executor", _builder)
 
 
 def test_real_repair_chain_end_to_end(engine: Engine, monkeypatch: Any) -> None:
@@ -281,12 +275,7 @@ def test_real_repair_chain_end_to_end(engine: Engine, monkeypatch: Any) -> None:
         # The pre-repair (historical) callback can no longer request finalization.
         from app.materialization.finalization import request_finalization_job
 
-        assert (
-            request_finalization_job(
-                session, first_render_id, settings=settings
-            )
-            is None
-        )
+        assert request_finalization_job(session, first_render_id, settings=settings) is None
         revised_job = session.scalars(
             select(ProcessingJob).where(ProcessingJob.render_execution_id == revised_render_id)
         ).first()
@@ -338,16 +327,12 @@ def test_real_repair_chain_end_to_end(engine: Engine, monkeypatch: Any) -> None:
         assert final_fingerprint
         # Every handled job is terminal.
         for job in session.scalars(
-            select(ProcessingJob).where(
-                ProcessingJob.materialization_id == materialization_id
-            )
+            select(ProcessingJob).where(ProcessingJob.materialization_id == materialization_id)
         ).all():
             assert job.status in _TERMINAL
         repaired_render = session.get(RenderExecution, revised_render_id)
         assert repaired_render is not None
-        fraction = (
-            repaired_render.artifact_reference or {}
-        ).get("relative_path")
+        fraction = (repaired_render.artifact_reference or {}).get("relative_path")
         _export_synthetic_package(
             session,
             storage,
@@ -427,9 +412,7 @@ def _force_replay(
             session, envelope.id, replay_job.id, expected_job_claim_version=1
         )
         assert owner is not None
-        result = finalize_materialization(
-            session, owner, settings=settings, storage=storage
-        )
+        result = finalize_materialization(session, owner, settings=settings, storage=storage)
         session.commit()
         assert result.reused is True
         assert envelope.repair_count == expected_repairs
@@ -646,13 +629,15 @@ def test_real_authored_card_with_synthetic_narration(engine: Engine, monkeypatch
         from app.render.execution.authored import ASSET_ROLE_NARRATION
 
         narration_assets = [
-            asset for asset in (authored.get("assets") or [])
+            asset
+            for asset in (authored.get("assets") or [])
             if asset.get("role") == ASSET_ROLE_NARRATION
         ]
         assert narration_assets
         narration_asset_ids = {asset.get("asset_id") for asset in narration_assets}
         narration_tracks = [
-            track for track in (authored.get("tracks") or [])
+            track
+            for track in (authored.get("tracks") or [])
             if track.get("asset_id") in narration_asset_ids
         ]
         assert narration_tracks
@@ -736,8 +721,11 @@ def test_real_authored_card_with_synthetic_narration(engine: Engine, monkeypatch
             "MATERIALIZED_WITH_CAUTION",
         }, (
             envelope.reason_codes,
-            [(f.get("dimension"), f.get("level"), f.get("reason_codes"))
-             for f in (envelope.quality_findings or []) if f.get("level") == "UNKNOWN"],
+            [
+                (f.get("dimension"), f.get("level"), f.get("reason_codes"))
+                for f in (envelope.quality_findings or [])
+                if f.get("level") == "UNKNOWN"
+            ],
         )
         assert envelope.human_review_required is True
         assert envelope.publication_ready is False
@@ -755,9 +743,7 @@ def test_real_authored_card_with_synthetic_narration(engine: Engine, monkeypatch
         final_fingerprint = (envelope.metrics or {}).get("assessment_fingerprint")
         # Every handled job is terminal.
         for job in session.scalars(
-            select(ProcessingJob).where(
-                ProcessingJob.materialization_id == materialization_id
-            )
+            select(ProcessingJob).where(ProcessingJob.materialization_id == materialization_id)
         ).all():
             assert job.status in _TERMINAL
         for job in session.scalars(
@@ -835,9 +821,7 @@ def _zcr(frames: list[tuple[int, int]], start_sample: int, end_sample: int) -> f
     return crossings / (end - start - 1)
 
 
-def test_narration_asset_hash_mismatch_fails_localization(
-    engine: Engine, monkeypatch: Any
-) -> None:
+def test_narration_asset_hash_mismatch_fails_localization(engine: Engine, monkeypatch: Any) -> None:
     """A tampered managed narration asset is refused by production localization."""
 
     from test_stage6_real_executor import _write_source
@@ -1128,9 +1112,7 @@ def test_real_core_artifact_coexists_with_transformed(engine: Engine, monkeypatc
 
     session = _session()
     try:
-        fixture = seed_stage51(
-            session, monkeypatch, narration="NONE", media_writer=_write_source
-        )
+        fixture = seed_stage51(session, monkeypatch, narration="NONE", media_writer=_write_source)
         candidate = fixture.stage50.selection.candidate
         candidate_id = candidate.id
         _ready_composition(session, fixture)

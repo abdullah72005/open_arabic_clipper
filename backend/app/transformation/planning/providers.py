@@ -324,10 +324,19 @@ PLANNING_SYSTEM_INSTRUCTION = (
     "Choose substantive_value_kind only from strategy_constraints.allowed_value_kinds. "
     "Use an additive value kind: state what the viewer learns that the selected excerpt "
     "alone did not provide in semantic_intent, and state why the excerpt alone does not "
-    "provide it in why_unavailable. No generic filler, no paraphrase-only restatement, no "
-    "fabricated facts, numbers, names, or quotes, no rewritten source speech, no source "
-    "dialect shifting, no publication-ready full scripts, no voice/provider/model "
-    "selection, no frame-level rendering instructions, no final-plan approval, and no "
+    "provide it in why_unavailable. The promised value must be conveyed by the selected "
+    "SOURCE_EXCERPT evidence together with the authored block: refined_transcript, "
+    "context_text, suggested_hook_copy and summaries are NONRENDERED context. They may "
+    "explain what is missing but cannot substantiate a promise the audience will not "
+    "receive. If fulfilling the idea requires surrounding material, either include that "
+    "material in a selected excerpt through the authoritative word/source-span contract "
+    "or decline the plan; do not promise an explanation the selected excerpt cannot "
+    "support, and never treat required_context as timestamp authority. No generic "
+    "filler, no paraphrase-only restatement, no dialect-to-standard rewording disguised "
+    "as explanation, no fabricated psychological mechanism or motive, no fabricated "
+    "facts, numbers, names, or quotes, no rewritten source speech, no source dialect "
+    "shifting, no publication-ready full scripts, no voice/provider/model selection, no "
+    "frame-level rendering instructions, no final-plan approval, and no "
     "platform-detection evasion. "
     "If a plan depends on an external fact, emit a FACT_VERIFICATION_PLACEHOLDER with "
     "claim_dependency and must_verify_before_execution=true; do not supply the supposed "
@@ -819,6 +828,23 @@ def _source_selection_payload(
         else float(getattr(config, "max_authored_before_hero_seconds", 3.0)),
         "elapsed_before_hero_cap_seconds": elapsed_cap,
         "authored_before_hero_cap_seconds": authored_cap,
+        "evidence_scope": {
+            "rendered_on_selection": (
+                "Only the selected SOURCE_EXCERPT spans are rendered to the audience."
+            ),
+            "nonrendered": [
+                "refined_transcript",
+                "context_text",
+                "suggested_hook_copy",
+                "idea_summary",
+                "topic_summary",
+            ],
+            "content_sufficiency_requirement": (
+                "The selected excerpt plus the authored value must convey the promised "
+                "idea; nonrendered context cannot prove the audience receives it. "
+                "required_context is descriptive, never timestamp authority."
+            ),
+        },
     }
 
 
