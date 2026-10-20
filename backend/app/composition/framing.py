@@ -1017,6 +1017,18 @@ def _path_preserves_subjects(
     )
     if not samples:
         return False
+    # Detection evidence must cover the scene (up to the permitted hold at each
+    # edge) and must not contain an interior gap longer than the hold. A longer
+    # gap leaves an interval with no contemporaneous subject observation, which
+    # recentering cannot prove safe.
+    hold = config.detection_hold_seconds()
+    if samples[0].source_time - scene_start > hold + _EDGE_EPSILON:
+        return False
+    if scene_end - samples[-1].source_time > hold + _EDGE_EPSILON:
+        return False
+    for earlier, later in zip(samples, samples[1:]):
+        if later.source_time - earlier.source_time > hold + _EDGE_EPSILON:
+            return False
     times: set[float] = {keyframe.source_time for keyframe in keyframes}
     for earlier, later in zip(keyframes, keyframes[1:]):
         times.add((earlier.source_time + later.source_time) / 2.0)
@@ -1024,7 +1036,6 @@ def _path_preserves_subjects(
         if scene_start - _EDGE_EPSILON <= sample.source_time <= scene_end + _EDGE_EPSILON:
             times.add(sample.source_time)
 
-    hold = config.detection_hold_seconds()
     for source_time in sorted(times):
         target = _interpolated_target(keyframes, source_time)
         if target is None:
@@ -1041,9 +1052,11 @@ def _path_preserves_subjects(
             if abs(nearest.source_time - source_time) <= hold + _EDGE_EPSILON:
                 observed.append(nearest)
         if not observed:
-            # No subject evidence near this sample; the tracked builder already
-            # holds/conservatively recenters here, so there is nothing to prove.
-            continue
+            # No subject evidence within the permitted hold: recentering is not
+            # proof that the speaker remains visible. An unobserved interval can
+            # never certify containment, so the scene must use the full-source
+            # fallback instead of a valid-looking crop.
+            return False
         if len(observed) < len(tracks):
             return False
         for nearest in observed:
