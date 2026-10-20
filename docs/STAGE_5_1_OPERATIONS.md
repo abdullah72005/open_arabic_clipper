@@ -174,7 +174,11 @@ Every emitted crop is a clamped 9:16 window represented by a compact normalized
   subject sample. If a preserved subject box is not inside the crop, or subject
   evidence is unreliable, the scene degrades to `BACKGROUND_FILL` with
   `CROP_LOSES_SUBJECT` and `SUBJECT_NOT_PRESERVED_IN_CROP`. An in-bounds crop is
-  not sufficient evidence that the face is still visible.
+  not sufficient evidence that the face is still visible. A leading, trailing
+  or interior interval without subject evidence within the configured detection
+  hold (default 1.0 s) also fails the proof; recentering is not evidence of
+  visibility. Only complete coverage, or a gap no longer than the hold at an
+  edge/between observations, can keep a crop.
 
 ## Caption architecture
 
@@ -543,7 +547,7 @@ constraints shown; see `.env.example` for the comments.
 - policy `stage5.1-v1`
 - schema `stage5.1-schema-v1`
 - fingerprint `1`
-- framing policy `stage5.1-framing-v2`
+- framing policy `stage5.1-framing-v3`
 - caption layout policy `stage5.1-caption-layout-v4`
 - ASS policy `stage5.1-ass-v6`
 - caption BiDi policy `stage5.1-caption-bidi-v3`

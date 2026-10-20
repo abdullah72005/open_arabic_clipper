@@ -94,6 +94,92 @@ Directory:
 - `provenance-probe.json`
   `ca18264de3328e72b99c48eac025e625936cc3c73ae27bb50bd4f940d854dfa8`.
 
+## Follow-up corrections after the independent SOL review (2026-10-20)
+
+Reviewed BASE: `39560e3b6c898d3bb60d4f132750ebc1821405a3`. Disposition was
+**CHANGES REQUESTED** for R1–R5 in
+`docs/superpowers/handoffs/2026-10-20-stage-6-v4-independent-sol-review.md`.
+The offline corrections below are implemented and locally verified. They do not
+rehabilitate the failed MP4 and are not acceptance evidence.
+
+| Finding | Before (reproduced) | After (offline correction) |
+| --- | --- | --- |
+| R1 substantive intent bypass | `...` in a required `ORIGINAL_VALUE/SYNTHESIS` block passed deterministic validation, skipped the critique, and reached `READY_FOR_HUMAN_REVIEW` with supplied QC. | Content-free copy (punctuation, whitespace, stopwords only) is a deterministic `CONTENT_FREE` hard failure. Every essential substantive block now requires the existing semantic intent/redundancy review even if lexical checks pass. Explicit `SOURCE_AS_EVIDENCE` handling remains. No critique means honest defer. |
+| R2 boolean-only positive replay | A checkpoint/provider response with `accepted:true`, empty `blocks` produced PASS for every dimension, an invented intent quote/reference and the relation `Fake critique accepted the supplied relation.` | Boolean-only entries are never promoted. Checkpoint parsing drops them and defers (`MALFORMED_CRITIQUE_EVIDENCE`); replay defers without a provider resend. Complete categorical evidence is required. Fake test adapters now supply complete evidence. |
+| R3 length necessity | A PASS for block 1 authorized block 2; `FLEXIBLE` delivery was labelled `AUTHORED_TEXT`/non-silent, so a real silent card was accepted with `LENGTH_NECESSITY UNKNOWN`. | Provisional delivery follows the executable policy (`NARRATION` only when narration will actually run; otherwise a silent `STANDALONE_CARD`). Its executable duration is derived from the actual copy. `LENGTH_NECESSITY` is required for silent/optional-narration delivery and is bound to its own block, reviewed copy, delivery and duration. Sibling/stale evidence cannot authorize a card; UNKNOWN/FAIL defers before rendering. |
+| R4 layout safety | A fixed `0.55 * font_size * characters` estimate declared 17 uppercase `W` readable; the encoded MP4 ink was `[0,814,995,859]` against the 54–918 safe area and clipped at the frame edge. | `build_authored_ass` rasterizes the emitted one-event ASS locally through FFmpeg/libass and measures actual glyph ink, including fontconfig fallback and outline padding. Unsafe/unbreakable/overwide copy records `AUTHORED_TEXT_EXCEEDS_SAFE_AREA`; unavailable measurement records `AUTHORED_LAYOUT_MEASUREMENT_UNAVAILABLE`. Complete copy is preserved, never truncated or shrunk. Findings reach `readable_copy`, render admission and final assessment. |
+| R5 subject absence | Detections only at 0, 0.5 and 1 s still produced `TRACKED_CROP` through a 6 s hero; five unobserved seconds were treated as contained. | `_path_preserves_subjects` now rejects leading/trailing/interior intervals without subject evidence beyond the detection hold. The scene uses the existing full-source `BACKGROUND_FILL` fallback with `CROP_LOSES_SUBJECT`; recentering is never containment proof. Detection/sampling policy was not changed. |
+
+Version changes: `stage5.1-framing-v3`, `stage6-authored-ass-v3`,
+`stage6-validation-v3`. Existing fingerprints invalidate affected checkpoints and
+assessments. Stage 5.2 (`backend/app/render/execution/`) was not modified.
+
+### Follow-up verification
+
+Docker Python 3.12, `PYTHONPATH=/app`, `PYTHONDONTWRITEBYTECODE=1`, network
+disabled (`--network none`) except an isolated internal bridge for Postgres-backed
+tests (no internet). Exact results:
+
+- `tests/test_stage6_v4_followup_regressions.py
+  tests/test_stage6_v4_intent_regressions.py
+  tests/test_stage6_v4_delivery_regressions.py tests/test_stage6_overlays.py
+  tests/test_stage6_providers.py tests/test_stage51_framing.py`: **87 passed**.
+- `tests/test_stage51_ass.py tests/test_stage51_bidi_render.py
+  tests/test_stage51_tracking.py tests/test_stage51_framing.py
+  tests/test_stage51_bidi_order.py tests/test_stage51_fingerprints.py
+  tests/test_stage51_analysis.py tests/test_stage51_planner.py
+  tests/test_stage51_captions.py tests/test_stage51_geometry.py`: **212 passed**.
+- `tests/test_stage6_providers.py tests/test_stage6_gemini_boundary.py
+  tests/test_stage6_adapter_regressions.py tests/test_stage6_materialization_core.py
+  tests/test_stage6_overlays.py tests/test_stage6_v4_delivery_regressions.py
+  tests/test_stage6_v4_intent_regressions.py
+  tests/test_stage6_v4_followup_regressions.py`: **99 passed**.
+- `tests/test_stage6_component_recovery.py tests/test_stage6_runtime_corrections.py
+  tests/test_stage6_service.py`: **19 passed**.
+- `tests/test_stage6_finalization_gates.py`: **10 passed**;
+  `tests/test_stage6_finalizer_evidence.py`: **24 passed**;
+  `tests/test_stage6_results_boundary.py`: **7 passed**;
+  `tests/test_stage6_cache_validation.py`: **13 passed** (Postgres on an isolated
+  internal network).
+- `tests/test_stage6_milestone.py tests/test_stage6_authored_render.py
+  tests/test_stage6_authored_spec.py`: **27 passed**;
+  `tests/test_stage6_real_executor.py tests/test_stage6_worker_pipeline.py`:
+  **3 passed**.
+- `ruff check app tests`: clean.
+
+### Follow-up diagnostic artifacts (diagnostic-only)
+
+Directory:
+`storage/benchmarks/stage-6/manual-acceptance/review-notes/2026-10-20-v4-followup-corrections/`
+(`README.md`, `manifest.json`, `before/`, `after/`). The probes are copied from
+the SOL review unchanged. `before/` reproduces the reviewed failures; `after/`
+shows the corrected contract outcomes. Hashes:
+
+- `manifest.json` `ca0588c693bf82f14f7508b4f7e3cf0272c2876f77d62612ed971f5d515137b4`
+  (19 files; `before/review-findings.json` is
+  `5caaf54221da9061ec2e19306184d72ed1ac3e44408f9bf5c4dffb8c88d41c55`, matching
+  the reviewed SOL evidence).
+- `after/review-findings.json`
+  `74ac6be279745ddd4e640b6e7181d0020cc08b648fa2c489b8e811e708c281b5`:
+  `boolean_replay` deferred/empty; `unrelated_length_pass` `UNKNOWN`;
+  wide-card `layout_failed=true`, measured ink `[0,814,996,859]`; unobserved gap
+  `BACKGROUND_FILL` + `CROP_LOSES_SUBJECT`.
+- `after/punctuation-probe.json`
+  `cd52f5a96bd8633041e1f090bf99e1ec6c2ec60fa7469c1e77d02943e1442179`:
+  `script_accepted=false`, `NO_OUTPUT`.
+- `after/flexible-delivery-probe.json`
+  `581e2faf6a9812ca7cb8d638f92a15eecf809d07ac99cb2e1d5518d8207036ac`:
+  `STANDALONE_CARD`, `silent=true`, `length_required=true`, deferred.
+- `after/wide-card.ass/mp4/png` are byte-identical to `before/` (same emitted
+  text); the correction is the refusal finding, not a different asset.
+
+These files are diagnostic reproductions only. They are not human acceptance,
+not genuine semantic evidence, and do not prove execution of the R5 fallback on
+the original media. The existing Stage 5.2 engine test
+(`test_stage52_engine.py::test_all_six_framing_modes_compile`) remains the
+frozen-renderer `BACKGROUND_FILL` execution check; no new media claim is made
+here.
+
 ## Unresolved repeated-face-box provenance (open blocker)
 
 The original run's saved right-hand two-shot detections repeat identically at

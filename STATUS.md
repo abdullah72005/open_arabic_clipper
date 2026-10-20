@@ -1,3 +1,50 @@
+## Stage 6 V4 follow-up corrections after independent SOL review (2026-10-20)
+
+Status: **offline follow-up corrections implemented and locally verified. The
+2026-10-20 genuine MP4 remains FAILED human acceptance. Stage 6 remains UNFROZEN,
+Stage 7 UNSTARTED, `publication_ready=false`. No hosted/Gemini/TTS/Qwen call,
+worker, production job, new candidate, acceptance retry, publication, or Stage 7
+activity was run. Stage 5.2 (`backend/app/render/execution/`) is untouched.**
+
+The independent SOL review at BASE `39560e3b6c898d3bb60d4f132750ebc1821405a3`
+requested changes (R1–R5). The bounded corrections are:
+
+1. **R1.** Content-free substantive copy (punctuation/whitespace/stopwords only)
+   is a deterministic `CONTENT_FREE` hard failure; every essential substantive
+   block still requires the semantic intent/redundancy review. `SOURCE_AS_EVIDENCE`
+   handling is preserved; no critique means honest defer.
+2. **R2.** Boolean-only positive critique results/checkpoints are never promoted
+   into quotes, references or relations. They defer without a provider resend;
+   complete categorical evidence is required. `stage6-validation-v3`.
+3. **R3.** Delivery facts follow executable policy: narration only when it will
+   actually run, otherwise a silent card whose duration comes from the actual
+   copy. `LENGTH_NECESSITY` is required for silent/optional-narration delivery and
+   bound to its own block, copy, delivery and duration; sibling/stale evidence
+   cannot authorize a card; UNKNOWN/FAIL defers.
+4. **R4.** Authored layout readability is decided by actual local FFmpeg/libass
+   glyph-ink measurement (fontconfig fallback, outline padding), not a
+   per-character estimate. Unsafe/unbreakable copy is refused, never truncated
+   or shrunk; findings reach render admission and final assessment.
+   `stage6-authored-ass-v3`.
+5. **R5.** Leading/trailing/interior subject gaps beyond the detection hold fail
+   containment proof and use the existing full-source `BACKGROUND_FILL` fallback
+   with `CROP_LOSES_SUBJECT`. Recentering is not visibility proof.
+   `stage5.1-framing-v3`.
+
+Verification (offline Docker Python 3.12, `PYTHONPATH=/app`; network disabled,
+with an isolated internal bridge only for Postgres-backed tests): 87 focused
+Stage 6/5.1 regressions, 212 Stage 5.1 suites, 99 provider/schema/V4 suites,
+19 recovery/service suites, 10 finalization-gate, 24 finalizer-evidence,
+7 results-boundary and 13 cache-validation tests, 27 milestone/authored suites,
+and 3 executor/worker-pipeline tests passed; `ruff check app tests` is clean.
+Exact commands are in the remediation note. Diagnostic before/after probes are
+under
+`storage/benchmarks/stage-6/manual-acceptance/review-notes/2026-10-20-v4-followup-corrections/`
+and are **diagnostic-only, never acceptance evidence**.
+
+The unresolved original repeated-box/sampling provenance remains open. No
+genuine acceptance attempt is authorized; human acceptance remains mandatory.
+
 ## Stage 6 V4 offline remediation after FAILED human acceptance (2026-10-20)
 
 Status: **offline remediation implemented and locally verified; the 2026-10-20

@@ -144,19 +144,35 @@ Standalone authored copy is a first-class, measured delivery decision.
   1080x1920). At most three lines. Complete tokens are never truncated or shrunk
   indefinitely: an overlong/missing/unsafe card records a `FAIL`
   (`AUTHORED_TEXT_REQUIRES_SHORTENING`, `AUTHORED_TEXT_EXCEEDS_SAFE_AREA`,
-  `AUTHORED_READING_BUDGET_INSUFFICIENT`, `MISSING_REQUIRED_VALUE`) and cannot
-  become review-ready. A card with narration is not forced to meet the silent
-  reading budget; the audio carries that delivery.
-- **Measured evidence.** Findings and per-card layout facts (font, safe-area
-  rectangle, character/line count, estimated width/height, duration, reading
-  seconds, delivery rationale) are persisted. `readable_copy` is derived from
-  the measured layout, never from a default.
+  `AUTHORED_LAYOUT_MEASUREMENT_UNAVAILABLE`, `AUTHORED_READING_BUDGET_INSUFFICIENT`,
+  `MISSING_REQUIRED_VALUE`) and cannot become review-ready. A card with narration
+  is not forced to meet the silent reading budget; the audio carries that
+  delivery.
+- **Measured evidence.** The emitted one-event ASS is rasterized locally through
+  FFmpeg/libass (and fontconfig fallback) and its actual glyph ink is measured;
+  a positive readability finding is never derived from a per-character estimate.
+  The measured ink must sit inside the safe area (including outline padding).
+  Per-card facts (font, safe-area rectangle, character/line count, estimate for
+  line-breaking only, measured ink bbox/measurement method, duration, reading
+  seconds, delivery rationale) are persisted. If local measurement is
+  unavailable, the card is refused. `readable_copy` is derived from these
+  measured findings, never from a default, and reaches render admission and final
+  assessment.
 - **Pacing/continuity.** Each silent card records duration, reading budget,
   fraction of the timeline, silence interval and delivery rationale under
-  `PACING_CONTEXT_DENSITY`. A dominant silent ending (>=40% and last) with no
-  assessed `LENGTH_NECESSITY` is `UNKNOWN` and defers; it never receives an
-  unqualified pacing/readability pass. A legitimate intentional silent reading
-  card remains allowed once value, layout and pause necessity are established.
+  `PACING_CONTEXT_DENSITY`. A `LENGTH_NECESSITY` PASS is bound to its own block,
+  reviewed copy, delivery and executable duration; a sibling PASS or stale
+  copy/duration cannot authorize another card. A dominant silent ending (>=40%
+  and last) with no matching assessment is `UNKNOWN` and defers; it never
+  receives an unqualified pacing/readability pass. A legitimate intentional
+  silent reading card remains allowed once value, layout and pause necessity are
+  established.
+- **Critique evidence integrity.** Required substantive copy that is
+  punctuation/stopword-only is a deterministic hard failure. A substantive block
+  never reaches acceptance through lexical validation alone: the required intent
+  and redundancy judgments still run. Legacy boolean-only positive critique
+  results/checkpoints are not promoted into quotes, references or relations; they
+  defer without a provider resend. Complete categorical evidence is required.
 - **Intent fulfillment.** The critique schema adds the critical
   `INTENT_FULFILLMENT` dimension. For substantive blocks a `PASS` must carry an
   `intent_fulfillment` object with an exact `copy_quote` substring of the actual
@@ -195,7 +211,7 @@ an intermediate prerequisite.
   `processing_jobs` and `render_executions`. No `PipelineStage`, `PipelineRun`,
   `_NEXT_STAGE` entry, or source-lifecycle change is introduced.
 - `backend/app/materialization/policy.py`: versioned policy (`stage6-v1`),
-  validation (`stage6-validation-v1`), timeline schema, quality policy, and the
+  validation (`stage6-validation-v3`), timeline schema, quality policy, and the
   hard budgets (≤4 raw semantic calls including ≤2 strong-tier, ≤3 narration
   chunks, ≤60 s narration, ≤6 raw synthesis calls, ≤180 s clip, one repair,
   conservative boundary-trim limits, `-16 LUFS` / `-1.5 dBTP` / 48 kHz mastering
