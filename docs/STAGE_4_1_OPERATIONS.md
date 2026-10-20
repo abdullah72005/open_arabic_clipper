@@ -214,7 +214,11 @@ planning-word selection, or the documented full-window fallback when word
 evidence is insufficient, covers both segment endpoints within the existing
 0.75-second tolerance and the resolved span stays inside the selectable window.
 `supported_selection` reports the method (`WORD_SELECTION`/`FULL_WINDOW`) and
-range. This matters when an endpoint falls in an inter-word gap: the authentic
+range. `WORD_SELECTION` is advertised only when the planning inputs report
+sufficient word coverage; with insufficient coverage (including nonempty partial
+word evidence), the producer advertises the existing `FULL_WINDOW` fallback
+instead of a word span that validation would reject. This matters when an
+endpoint falls in an inter-word gap: the authentic
 `ac0670c4` hook end does not lie inside any single word, yet the allowed excerpt
 covers it and validation accepts the plan. The instruction therefore tells the
 provider to decline only when `mandatory_coverage_feasible` is false, never
@@ -708,7 +712,14 @@ ruff format app tests alembic && ruff check app tests alembic
 
 All Stage 4.1 tests are deterministic and hermetic: providers are mocked and no
 test makes a live Gemini, Qwen, web, TTS, or rendering call even when a key is
-present. The required-source-grounding correction advanced the validation
+present. The producer/validator selection-agreement correction advanced planning
+to `stage4.1-v12` / `stage4.1-schema-v12` / `stage4.1-validation-v12` and kept
+the provider-input fingerprint at version `2`: `WORD_SELECTION` is advertised
+only with sufficient word coverage, while insufficient nonempty word evidence
+uses the existing validated `FULL_WINDOW` fallback; the regression uses an
+authentic nonempty word subset whose sufficiency is computed by the production
+helper and verifies both the advertised method and the real validator. The
+required-source-grounding correction advanced the validation
 version to `stage4.1-validation-v11` (authoritative declaration resolution, a
 required-grounding policy for substantive authored blocks, bounded word-range
 work, and Stage 6-parity time-point/range coverage), so prior plans and

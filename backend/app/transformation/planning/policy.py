@@ -19,16 +19,17 @@ from app.core.enums import (
     TransformationStrategyType,
 )
 
-# v11 producer feasibility/diagnostics correction: mandatory feasibility now
-# follows the same supported word-selection/full-window and endpoint-tolerance
-# semantics as validation instead of requiring endpoints inside individual
-# words, and parser rejections are retained as bounded diagnostics before
-# matches are discarded. v10 producer-contract alignment (authoritative
-# mandatory/source-selection evidence and one hosted schema shared with the
-# prompt hash) and v8 Arabic multi-token closure remain in force.
-POLICY_VERSION = "stage4.1-v11"
-SCHEMA_VERSION = "stage4.1-schema-v11"
-VALIDATION_VERSION = "stage4.1-validation-v11"
+# v12 producer/validator selection-agreement correction: WORD_SELECTION is
+# advertised only when word coverage is sufficient, and insufficient nonempty
+# word evidence uses the existing full-window fallback instead of advertising a
+# word span the validator rejects. v11 producer feasibility/diagnostics
+# alignment (mandatory feasibility follows validator selection/endpoint
+# semantics and parser rejections are retained as bounded diagnostics), v10
+# producer-contract alignment, and v8 Arabic multi-token closure remain in
+# force.
+POLICY_VERSION = "stage4.1-v12"
+SCHEMA_VERSION = "stage4.1-schema-v12"
+VALIDATION_VERSION = "stage4.1-validation-v12"
 INPUT_FINGERPRINT_VERSION = "2"
 OUTPUT_FINGERPRINT_VERSION = "2"
 PLAN_FINGERPRINT_VERSION = "2"

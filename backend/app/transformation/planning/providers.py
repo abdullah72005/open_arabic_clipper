@@ -626,48 +626,49 @@ def _supported_selection(
     """
 
     tolerance = MANDATORY_COVERAGE_TOLERANCE_SECONDS
-    indexes: list[int] = []
-    for index, word in enumerate(words):
-        bounds = _word_bounds(word)
-        if bounds is None:
-            continue
-        if bounds[1] >= start - tolerance and bounds[0] <= end + tolerance:
-            indexes.append(index)
-    if indexes:
-        low, high = indexes[0], indexes[-1]
-        minimum = max(0.0, float(getattr(config, "min_source_excerpt_seconds", 0.4)))
-        # Grow the range only when a minimum-duration excerpt is required.
-        while high - low + 1 < len(words):
+    if inputs.word_coverage_sufficient:
+        indexes: list[int] = []
+        for index, word in enumerate(words):
+            bounds = _word_bounds(word)
+            if bounds is None:
+                continue
+            if bounds[1] >= start - tolerance and bounds[0] <= end + tolerance:
+                indexes.append(index)
+        if indexes:
+            low, high = indexes[0], indexes[-1]
+            minimum = max(0.0, float(getattr(config, "min_source_excerpt_seconds", 0.4)))
+            # Grow the range only when a minimum-duration excerpt is required.
+            while high - low + 1 < len(words):
+                low_bounds = _word_bounds(words[low])
+                high_bounds = _word_bounds(words[high])
+                if low_bounds is None or high_bounds is None:
+                    break
+                if (high_bounds[1] - low_bounds[0]) + 1e-9 >= minimum:
+                    break
+                if low > 0:
+                    low -= 1
+                elif high + 1 < len(words):
+                    high += 1
+                else:
+                    break
             low_bounds = _word_bounds(words[low])
             high_bounds = _word_bounds(words[high])
-            if low_bounds is None or high_bounds is None:
-                break
-            if (high_bounds[1] - low_bounds[0]) + 1e-9 >= minimum:
-                break
-            if low > 0:
-                low -= 1
-            elif high + 1 < len(words):
-                high += 1
-            else:
-                break
-        low_bounds = _word_bounds(words[low])
-        high_bounds = _word_bounds(words[high])
-        if low_bounds is not None and high_bounds is not None:
-            span = (low_bounds[0], high_bounds[1])
-            if (
-                span[1] > span[0]
-                and span[0] >= inputs.refined_start - tolerance
-                and span[1] <= inputs.refined_end + tolerance
-                and spans_cover_endpoints([span], start, end, tolerance=tolerance)
-            ):
-                return {
-                    "method": "WORD_SELECTION",
-                    "planning_word_start_index": low,
-                    "planning_word_end_index": high,
-                    "planning_word_count": high - low + 1,
-                    "source_start": round(span[0], 6),
-                    "source_end": round(span[1], 6),
-                }
+            if low_bounds is not None and high_bounds is not None:
+                span = (low_bounds[0], high_bounds[1])
+                if (
+                    span[1] > span[0]
+                    and span[0] >= inputs.refined_start - tolerance
+                    and span[1] <= inputs.refined_end + tolerance
+                    and spans_cover_endpoints([span], start, end, tolerance=tolerance)
+                ):
+                    return {
+                        "method": "WORD_SELECTION",
+                        "planning_word_start_index": low,
+                        "planning_word_end_index": high,
+                        "planning_word_count": high - low + 1,
+                        "source_start": round(span[0], 6),
+                        "source_end": round(span[1], 6),
+                    }
     if not inputs.word_coverage_sufficient:
         full = (inputs.refined_start, inputs.refined_end)
         if full[1] > full[0] and spans_cover_endpoints([full], start, end, tolerance=tolerance):

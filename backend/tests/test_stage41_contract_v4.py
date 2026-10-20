@@ -80,7 +80,7 @@ from app.transformation.planning.fingerprints import (
     build_provider_input_payload,
     provider_input_fingerprint,
 )
-from app.transformation.planning.inputs import build_planning_inputs
+from app.transformation.planning.inputs import _coverage_sufficient, build_planning_inputs
 from app.transformation.planning.policy import (
     DEFAULT_CONFIG as STAGE41_CONFIG,
 )
@@ -453,6 +453,7 @@ def test_ac0670c4_inter_word_endpoint_is_feasible_without_false_decline(
         session, candidate, analysis, refinement, settings, settings.stage41_config()
     )
     strategy = dict(inputs.stage40_strategies[0])
+    assert inputs.word_coverage_sufficient is True
     payload = build_planning_request(strategy, inputs, settings.stage41_config()).to_payload()
     hook = payload["mandatory_evidence"]["hook"]
     # The hook end lies between word indexes 2 and 3; its word mapping alone is
@@ -460,12 +461,59 @@ def test_ac0670c4_inter_word_endpoint_is_feasible_without_false_decline(
     assert hook["end_endpoint_in_word"] is False
     assert hook["covered_by_offered_words"] is False
     assert hook["mandatory_coverage_feasible"] is True
+    assert hook["supported_selection"]["method"] == "WORD_SELECTION"
     assert hook["supported_selection"]["planning_word_start_index"] == 0
     assert hook["supported_selection"]["planning_word_end_index"] >= 2
     validation = validate_provider_plan(
         _coverage_plan(strategy, hook["supported_selection"]),
         strategy,
         inputs,
+        settings.stage41_config(),
+        provider_evidence={},
+        provider_input_fingerprint="offline-fixture",
+    )
+    assert validation.plan is not None, validation.reasons
+
+
+def test_insufficient_nonempty_authentic_words_advertise_full_window_selection(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = FakeStage41Settings()
+    install_stage41_settings(monkeypatch, settings)
+    case = load_case(REPRESENTATIVE)
+    _source, candidate, refinement, analysis, _strategies = seed_authentic_case(
+        session, strategy_type=REPRESENTATIVE_STRATEGY, settings=settings
+    )
+    inputs = build_planning_inputs(
+        session, candidate, analysis, refinement, settings, settings.stage41_config()
+    )
+    hook_index = case["analysis"]["source_moment"]["hook_index"]
+    hook_segment = case["source_segments"][hook_index]
+    hook_start = float(hook_segment["start"])
+    hook_end = float(hook_segment["end"])
+    hook_word_indexes = [
+        index
+        for index, word in enumerate(inputs.words)
+        if word.end > hook_start and word.start < hook_end
+    ]
+    assert hook_word_indexes
+    # A genuine nonempty subset of the authentic planning words: it covers the
+    # hook locally but not enough of the refined window to resolve word spans.
+    subset = inputs.words[hook_word_indexes[0] : hook_word_indexes[-1] + 1]
+    coverage = _coverage_sufficient(subset, inputs.refined_start, inputs.refined_end)
+    assert subset
+    assert coverage is False
+    bounded = replace(inputs, words=subset, word_coverage_sufficient=coverage)
+    strategy = dict(bounded.stage40_strategies[0])
+    payload = build_planning_request(strategy, bounded, settings.stage41_config()).to_payload()
+    hook = payload["mandatory_evidence"]["hook"]
+    assert hook["state"] == "RESOLVED"
+    assert hook["mandatory_coverage_feasible"] is True
+    assert hook["supported_selection"]["method"] == "FULL_WINDOW"
+    validation = validate_provider_plan(
+        _coverage_plan(strategy, hook["supported_selection"]),
+        strategy,
+        bounded,
         settings.stage41_config(),
         provider_evidence={},
         provider_input_fingerprint="offline-fixture",
