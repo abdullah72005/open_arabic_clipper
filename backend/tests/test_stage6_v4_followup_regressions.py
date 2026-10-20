@@ -523,3 +523,11 @@ def test_short_arabic_positive_card_remains_readable() -> None:
     assert any(
         finding.get("reason_codes") == ["AUTHORED_LAYOUT_READABLE"] for finding in result.findings
     )
+
+
+def test_non_dominant_card_without_its_own_assessment_also_defers() -> None:
+    pacing = _delivery_pacing_findings(_timeline(duration=2.0), ())
+    assert len(pacing) == 1
+    assert pacing[0].level == "UNKNOWN"
+    assert pacing[0].reason_codes == ("AUTHORED_PAUSE_NECESSITY_NOT_ASSESSED",)
+    assert pacing[0].evidence["dominant"] is False

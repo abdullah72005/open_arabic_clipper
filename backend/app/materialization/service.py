@@ -761,12 +761,11 @@ def _delivery_pacing_findings(
 ) -> tuple[QualityFinding, ...]:
     """Record explicit delivery/pacing facts for standalone authored cards.
 
-    A dominant silent card (at least 40% of the timeline and ending the output)
-    is only pacing-satisfied when its *own* block has an explicit length-
-    necessity PASS that was reviewed against the same copy, delivery and
-    duration actually assembled. A sibling PASS, an unreviewed duration or a
-    stale copy can never authorize the card. No matching evidence means UNKNOWN,
-    never a favorable default.
+    A silent card is only pacing-satisfied when its *own* block has an explicit
+    length-necessity PASS that was reviewed against the same copy, delivery and
+    duration actually assembled. A sibling PASS, an unreviewed duration, a stale
+    copy, or a merely non-dominant timeline fraction can never authorize the
+    card. No matching evidence means UNKNOWN, never a favorable default.
     """
 
     total = max(0.0, timeline.output_duration)
@@ -796,12 +795,11 @@ def _delivery_pacing_findings(
         if length_assessed:
             level = "SATISFIED"
             reason = "AUTHORED_PAUSE_NECESSITY_ASSESSED"
-        elif dominant:
+        else:
+            # A small fraction is not a substitute for the required judgment.
+            # Without its own matching review the card is unassessed and defers.
             level = "UNKNOWN"
             reason = "AUTHORED_PAUSE_NECESSITY_NOT_ASSESSED"
-        else:
-            level = "SATISFIED"
-            reason = "AUTHORED_CARD_NON_DOMINANT"
         findings.append(
             QualityFinding(
                 dimension="PACING_CONTEXT_DENSITY",

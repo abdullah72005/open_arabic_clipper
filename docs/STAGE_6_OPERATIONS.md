@@ -161,12 +161,12 @@ Standalone authored copy is a first-class, measured delivery decision.
 - **Pacing/continuity.** Each silent card records duration, reading budget,
   fraction of the timeline, silence interval and delivery rationale under
   `PACING_CONTEXT_DENSITY`. A `LENGTH_NECESSITY` PASS is bound to its own block,
-  reviewed copy, delivery and executable duration; a sibling PASS or stale
-  copy/duration cannot authorize another card. A dominant silent ending (>=40%
-  and last) with no matching assessment is `UNKNOWN` and defers; it never
-  receives an unqualified pacing/readability pass. A legitimate intentional
-  silent reading card remains allowed once value, layout and pause necessity are
-  established.
+  reviewed copy, delivery and executable duration; a sibling PASS, a stale
+  copy/duration or a merely non-dominant timeline fraction cannot authorize a
+  card. A silent card without its own matching assessment is `UNKNOWN` and
+  defers; the dominant flag is reported for context but is not a substitute for
+  the judgment. A legitimate intentional silent reading card remains allowed
+  once value, layout and pause necessity are established.
 - **Critique evidence integrity.** Required substantive copy that is
   punctuation/stopword-only is a deterministic hard failure. A substantive block
   never reaches acceptance through lexical validation alone: the required intent
