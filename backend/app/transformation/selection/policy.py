@@ -11,9 +11,9 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 
-SELECTION_POLICY_VERSION = "stage4.3-v1"
+SELECTION_POLICY_VERSION = "stage4.3-v4"
 SELECTION_SCHEMA_VERSION = "stage4.3-schema-v1"
-SELECTION_FINGERPRINT_VERSION = "1"
+SELECTION_FINGERPRINT_VERSION = "2"
 
 # Approved-for-selection is the clean tier; approved-with-caution is considered
 # only when no valid clean approval exists.
@@ -69,6 +69,8 @@ COHERENCE_NOT_ACCEPTABLE = "COHERENCE_NOT_ACCEPTABLE"
 LOST_IN_ARBITRATION = "LOST_IN_ARBITRATION"
 NOT_IN_ACTIVE_TIER = "NOT_IN_ACTIVE_TIER"
 MISSING_GOVERNANCE_RESULT = "MISSING_GOVERNANCE_RESULT"
+MANDATORY_EVIDENCE_NOT_COVERED = "MANDATORY_EVIDENCE_NOT_COVERED"
+SOURCE_GROUNDING_INVALID = "SOURCE_GROUNDING_INVALID"
 
 # Categorical order maps. Lower is always "better" so a plain tuple comparison
 # is the whole comparator.

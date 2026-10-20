@@ -17,7 +17,7 @@ def test_no_channel_or_tts_persistence_model_added() -> None:
     assert "ChannelTTSConfig" not in names
     assert "ChannelConfig" not in names
     assert "VoiceConfig" not in names
-    assert all("Channel" not in name for name in names)
+    assert {name for name in names if "Channel" in name} == {"ChannelProductionProfile"}
 
 
 def test_no_tts_or_rendering_modules_added() -> None:

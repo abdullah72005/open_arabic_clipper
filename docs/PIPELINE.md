@@ -300,6 +300,23 @@ touches the source lifecycle.
 The current purpose `CORE_SOURCE_VALIDATION` omits authored material and reports
 every omission; artifacts are never publication-final (`publication_ready=false`,
 `stage6_implemented=false`). There is no mandatory intermediate H.264 file and no
-Stage 6 mixing/narration semantics. Stage 6 remains unimplemented. See
-`docs/STAGE_5_2_OPERATIONS.md`.
+Stage 6 mixing/narration semantics. See `docs/STAGE_5_2_OPERATIONS.md`.
+
+## Stage 6 transformed-short materialization (in progress)
+
+Stage 6 owns authored content, timeline, and editing decisions for one explicitly
+selected candidate, and adds a `MATERIALIZATION` job kind plus the
+`TRANSFORMED_SHORT` render purpose (migration `20261014_0023`) without any
+`PipelineStage`, `PipelineRun`, `_NEXT_STAGE` entry, or source-lifecycle change.
+The durable persistence and the deterministic `app/materialization` core
+(policy/budgets, immutable types, DB-independent inputs, stable fingerprints,
+profile semantic-context matching, authored-copy validation with a claim ledger
+and slot resolution, authored timeline/audio-recipe construction with hero
+protection, a rights-gated supporting-visual library, a provider-neutral
+narration interface, and categorical assessment with `publication_ready=false`)
+are implemented and tested. The DB-assembly service/queue/executor, the
+semantic/TTS provider adapters, the authored renderer integration
+(authored cards/output overlays, mixed/mastered audio, final-purpose QC), the
+API/CLI/UI, and real manual acceptance remain. See
+`docs/STAGE_6_OPERATIONS.md`.
 

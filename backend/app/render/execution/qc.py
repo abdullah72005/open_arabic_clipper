@@ -19,6 +19,7 @@ from fractions import Fraction
 from pathlib import Path
 
 from app.render.execution.policy import (
+    QC_AUTHORED_CARD_UNDECODABLE,
     QC_AV_DURATION_TOLERANCE_SECONDS,
     QC_BLACK_FRAME_FRACTION_FAIL,
     QC_BLACK_FRAME_FRACTION_WARN,
@@ -27,13 +28,17 @@ from app.render.execution.policy import (
     QC_FROZEN_DIFF_THRESHOLD,
     QC_FROZEN_FRAME_FRACTION_FAIL,
     QC_FROZEN_FRAME_FRACTION_WARN,
+    QC_LOUDNESS_EVIDENCE_MISSING,
+    QC_LOUDNESS_MISMATCH,
     QC_PASS,
     QC_PEAK_DBFS,
     QC_POLICY_VERSION,
     QC_SILENCE_DBFS,
     QC_TIMING_AUDIO_TOLERANCE_SECONDS,
     QC_TIMING_BASE_TOLERANCE_SECONDS,
+    QC_TRUE_PEAK_EXCEEDED,
     QC_WARN,
+    TRANSFORMED_SHORT,
     Stage52Config,
 )
 from app.render.execution.types import QCCheck, RenderArtifacts, TechnicalQCResult
@@ -271,6 +276,52 @@ def _volume_metrics(
             except ValueError:
                 continue
     return metrics or None
+
+
+def _loudness_metrics(
+    binary: str,
+    path: Path,
+    *,
+    cancel_check: Callable[[], bool] | None = None,
+    deadline: float | None = None,
+) -> dict[str, float] | None:
+    """Measure decoded integrated loudness and true peak of the final artifact."""
+
+    from app.render.execution.audio import parse_loudnorm_output
+
+    _raise_if_cancelled(cancel_check)
+    command = [
+        binary,
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "info",
+        "-i",
+        str(path),
+        "-af",
+        "loudnorm=print_format=json",
+        "-f",
+        "null",
+        "-",
+    ]
+    try:
+        completed = subprocess.run(  # noqa: S603 - allow-listed argv
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=_remaining_seconds(deadline, 180, cancel_check=cancel_check),
+        )
+    except subprocess.TimeoutExpired:
+        _raise_if_stopped(deadline, cancel_check)
+        return None
+    except (OSError, subprocess.SubprocessError):
+        return None
+    _raise_if_stopped(deadline, cancel_check)
+    measurement = parse_loudnorm_output(completed.stderr or "")
+    if measurement is None:
+        return None
+    return {"input_i": measurement.input_i, "input_tp": measurement.input_tp}
 
 
 def _sample_times(manifest: Mapping[str, object], limit: int) -> list[tuple[float, float | None]]:
@@ -544,6 +595,18 @@ def check_render_artifact(
         deadline,
     )
 
+    if str(expected.get("artifact_purpose") or "") == TRANSFORMED_SHORT:
+        _authored_checks(
+            checks,
+            reasons,
+            measured,
+            artifacts,
+            manifest,
+            qc_policy,
+            cancel_check,
+            deadline,
+        )
+
     # Never return a verdict from an exhausted/stale budget: a mandatory-QC
     # deadline exhaustion is a hard failure, not a warning.
     _raise_if_stopped(deadline, cancel_check)
@@ -560,6 +623,111 @@ def check_render_artifact(
         measured=measured,
         policy_version=QC_POLICY_VERSION,
     )
+
+
+def _authored_checks(
+    checks: list[QCCheck],
+    reasons: list[str],
+    measured: dict[str, object],
+    artifacts: RenderArtifacts,
+    manifest: Mapping[str, object],
+    qc_policy: Stage52Config,
+    cancel_check: Callable[[], bool] | None,
+    deadline: float | None,
+) -> None:
+    """Purpose-aware QC for authored output: cards decode, final loudness measured."""
+
+    diagnostics = manifest.get("diagnostics")
+    diagnostics = diagnostics if isinstance(diagnostics, Mapping) else {}
+    cards = diagnostics.get("card_intervals")
+    if isinstance(cards, list) and cards:
+        decoded = 0
+        for interval in cards:
+            if not isinstance(interval, (list, tuple)) or len(interval) != 2:
+                continue
+            _raise_if_cancelled(cancel_check)
+            midpoint = (_as_float(interval[0]) + _as_float(interval[1])) / 2.0
+            luma = _extract_luma(
+                qc_policy.ffmpeg_binary,
+                artifacts.output_path,
+                midpoint,
+                deadline=deadline,
+                cancel_check=cancel_check,
+            )
+            if luma is not None:
+                decoded += 1
+        if decoded >= len(cards):
+            checks.append(
+                QCCheck(name="authored_cards_decode", status=QC_PASS, measured={"decoded": decoded})
+            )
+        else:
+            checks.append(
+                QCCheck(
+                    name="authored_cards_decode",
+                    status=QC_FAIL,
+                    reason_code=QC_AUTHORED_CARD_UNDECODABLE,
+                    measured={"decoded": decoded, "expected": len(cards)},
+                )
+            )
+            reasons.append(QC_AUTHORED_CARD_UNDECODABLE)
+
+    # Mandatory final decoded loudness/true-peak evidence: a missing measurement
+    # is a hard failure, never a warning success.
+    _raise_if_cancelled(cancel_check)
+    loudness = _loudness_metrics(
+        qc_policy.ffmpeg_binary,
+        artifacts.output_path,
+        cancel_check=cancel_check,
+        deadline=deadline,
+    )
+    if loudness is None:
+        checks.append(
+            QCCheck(
+                name="final_loudness",
+                status=QC_FAIL,
+                reason_code=QC_LOUDNESS_EVIDENCE_MISSING,
+            )
+        )
+        reasons.append(QC_LOUDNESS_EVIDENCE_MISSING)
+        return
+    input_i = loudness["input_i"]
+    input_tp = loudness["input_tp"]
+    measured["final_integrated_lufs"] = round(input_i, 4)
+    measured["final_true_peak_dbtp"] = round(input_tp, 4)
+    if -17.0 <= input_i <= -15.0:
+        checks.append(
+            QCCheck(
+                name="final_loudness_target",
+                status=QC_PASS,
+                measured={"input_i": round(input_i, 4)},
+            )
+        )
+    else:
+        checks.append(
+            QCCheck(
+                name="final_loudness_target",
+                status=QC_FAIL,
+                reason_code=QC_LOUDNESS_MISMATCH,
+                measured={"input_i": round(input_i, 4), "target_lufs": -16.0},
+            )
+        )
+        reasons.append(QC_LOUDNESS_MISMATCH)
+    if input_tp <= -1.5 + 0.05:
+        checks.append(
+            QCCheck(
+                name="final_true_peak", status=QC_PASS, measured={"input_tp": round(input_tp, 4)}
+            )
+        )
+    else:
+        checks.append(
+            QCCheck(
+                name="final_true_peak",
+                status=QC_FAIL,
+                reason_code=QC_TRUE_PEAK_EXCEEDED,
+                measured={"input_tp": round(input_tp, 4), "ceiling_dbtp": -1.5},
+            )
+        )
+        reasons.append(QC_TRUE_PEAK_EXCEEDED)
 
 
 def _appearance_checks(

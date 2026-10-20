@@ -242,4 +242,94 @@ describe("API client", () => {
       )
     ).resolves.toMatchObject({ final_transcript: "النص المؤكد" });
   });
+
+  it("queues and reads a Stage 6 materialization with exact identity and flags", async () => {
+    const fetcher = async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/materialization?priority=CANDIDATE&supporting_requested=OFF&force=false")) {
+        expect(init?.method).toBe("POST");
+        return new Response(
+          JSON.stringify({
+            job_id: "job-9",
+            status: "QUEUED",
+            queued: true,
+            cached: false,
+            active: false,
+            materialization_id: "mat-1",
+            render_execution_id: null,
+            phase: "PREPARE",
+            lifecycle: "QUEUED",
+            semantic_outcome: null,
+            human_review_required: false,
+            publication_ready: false,
+            review_ready: false,
+            reasons: ["LIFECYCLE_NOT_COMPLETE"],
+            skipped_reason: null
+          }),
+          { headers: { "content-type": "application/json" } }
+        );
+      }
+      expect(url).toBe("http://api.test/api/materializations/mat-1");
+      return new Response(
+        JSON.stringify({
+          id: "mat-1",
+          lifecycle: "COMPLETE",
+          semantic_outcome: "READY_FOR_HUMAN_REVIEW",
+          human_review_required: true,
+          publication_ready: false,
+          readiness: { review_ready: true, reasons: [] },
+          render_execution_id: "render-1",
+          output_fingerprint: "a".repeat(64),
+          artifact_available: true,
+          findings: [],
+          live_freshness: "CURRENT",
+          is_effective: true
+        }),
+        { headers: { "content-type": "application/json" } }
+      );
+    };
+
+    const client = createApiClient("http://api.test", fetcher);
+    await expect(client.queueMaterialization("candidate-1")).resolves.toMatchObject({
+      job_id: "job-9",
+      materialization_id: "mat-1",
+      phase: "PREPARE",
+      review_ready: false
+    });
+    await expect(client.getMaterialization("mat-1")).resolves.toMatchObject({
+      lifecycle: "COMPLETE",
+      readiness: { review_ready: true },
+      artifact_available: true
+    });
+    expect(client.materializationArtifactUrl("mat/1")).toBe(
+      "http://api.test/api/materializations/mat%2F1/artifact"
+    );
+  });
+
+  it("cancels and resumes materializations through the id-scoped endpoints", async () => {
+    const calls: string[] = [];
+    const fetcher = async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      calls.push(`${init?.method ?? "GET"} ${url}`);
+      if (url.endsWith("/cancel")) {
+        return new Response(JSON.stringify({ id: "mat-1", lifecycle: "CANCELLED" }), {
+          headers: { "content-type": "application/json" }
+        });
+      }
+      return new Response(
+        JSON.stringify({ materialization_id: "mat-1", job_id: "job-2", queued: true }),
+        { headers: { "content-type": "application/json" } }
+      );
+    };
+
+    const client = createApiClient("http://api.test", fetcher);
+    await expect(client.cancelMaterialization("mat-1")).resolves.toMatchObject({
+      lifecycle: "CANCELLED"
+    });
+    await expect(client.resumeMaterialization("mat-1")).resolves.toMatchObject({ queued: true });
+    expect(calls).toEqual([
+      "POST http://api.test/api/materializations/mat-1/cancel",
+      "POST http://api.test/api/materializations/mat-1/resume"
+    ]);
+  });
 });

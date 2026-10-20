@@ -13,7 +13,7 @@ from app.core.settings import get_settings
 from app.db.session import create_session_factory
 from app.media.audio import AudioExtractor
 from app.media.ffprobe import FFprobe
-from app.models import ProcessingJob
+from app.models import ClipMaterialization, ProcessingJob
 from app.pipeline.executor import StageCancelled, StageExecutor
 from app.pipeline.runner import PipelineRunner
 from app.pipeline.stages import (
@@ -500,6 +500,10 @@ def run_render_execution(
         except Exception as error:
             if parsed_job is not None and not getattr(executor, "skipped_duplicate", False):
                 executor.record_failure(error)
+            # A terminal technical failure still requests the honest Stage 6
+            # finalizer so a justified bounded repair can be allocated.
+            if not getattr(error, "retryable", False):
+                _request_finalization_after_render(parsed_execution)
             if getattr(error, "retryable", False):
                 raise self.retry(
                     args=[render_execution_id, job_id, force],
@@ -507,8 +511,244 @@ def run_render_execution(
                     max_retries=MAX_RETRIES,
                 ) from error
             raise
+        _request_finalization_after_render(parsed_execution)
         return {
             "render_execution_id": str(parsed_execution),
+            "job_id": str(parsed_job) if parsed_job else None,
+            "skipped": bool(getattr(executor, "skipped_duplicate", False)),
+        }
+    finally:
+        session.close()
+
+
+def _request_finalization_after_render(render_execution_id: UUID | str) -> None:
+    """Request a Stage 6 finalizer job for a terminal transformed render.
+
+    Runs in a fresh session after the render's terminal state is committed.
+    Duplicate callbacks coalesce through envelope ownership; a lost callback is
+    recoverable through POST/resume. Failures are swallowed (never mask the
+    render result).
+    """
+
+    from app.materialization.finalization import request_finalization_job
+
+    session = create_session_factory()()
+    try:
+        settings = get_settings()
+        request_finalization_job(session, render_execution_id, settings=settings)
+    except Exception:
+        try:
+            session.rollback()
+        except Exception:
+            pass
+    finally:
+        session.close()
+
+
+@celery_app.task(  # type: ignore[untyped-decorator]
+    bind=True, autoretry_for=(), name="clipfactory.run_materialization_job"
+)
+def run_materialization_job(
+    self: Task,
+    candidate_id: str,
+    job_id: str | None = None,
+    priority: str = "CANDIDATE",
+    profile_key: str | None = None,
+    supporting_requested: str = "OFF",
+    force: bool = False,
+) -> dict[str, str | bool | None]:
+    """Run one explicit candidate-scoped Stage 6 materialization.
+
+    This extends the existing job system, not the pipeline: it creates no
+    ``PipelineRun``, schedules no next stage, and never touches the whole-source
+    stage chain. The durable phase (prepare vs finalize) is resolved from the
+    job's bound envelope, never from this task name or its transient arguments.
+    """
+
+    from uuid import UUID as _UUID
+
+    from app.materialization.executor import build_materialization_executor
+
+    parsed_job = _UUID(job_id) if job_id else None
+    session = create_session_factory()()
+    try:
+        settings = get_settings()
+        storage = StorageService(settings.storage_root)
+        if parsed_job is not None:
+            job = session.get(ProcessingJob, parsed_job)
+            if job is not None and job.status is JobStatus.CANCELLED:
+                return {"candidate_id": candidate_id, "cancelled": True}
+        executor = build_materialization_executor(session, storage, settings)
+        executor.set_active_job(parsed_job)
+        # Production: deliver the render handoff through the real broker.
+        executor.set_render_dispatcher(None)
+        try:
+            _run_materialization_phase(
+                session,
+                executor,
+                parsed_job,
+                candidate_id,
+                priority=priority,
+                profile_key=profile_key,
+                supporting_requested=supporting_requested,
+                force=force,
+            )
+        except StageCancelled:
+            return {"candidate_id": candidate_id, "cancelled": True}
+        except Exception as error:
+            if parsed_job is not None and not getattr(executor, "skipped_duplicate", False):
+                executor.record_failure(error)
+            if getattr(error, "retryable", False):
+                raise self.retry(
+                    args=[
+                        candidate_id,
+                        job_id,
+                        priority,
+                        profile_key,
+                        supporting_requested,
+                        force,
+                    ],
+                    exc=error,
+                    max_retries=MAX_RETRIES,
+                ) from error
+            raise
+        return {
+            "candidate_id": candidate_id,
+            "job_id": str(parsed_job) if parsed_job else None,
+            "skipped": bool(getattr(executor, "skipped_duplicate", False)),
+        }
+    finally:
+        session.close()
+
+
+def _run_materialization_phase(
+    session: Session,
+    executor: object,
+    parsed_job: UUID | None,
+    candidate_id: str,
+    *,
+    priority: str,
+    profile_key: str | None,
+    supporting_requested: str,
+    force: bool,
+) -> None:
+    """Resolve and execute the job's durable phase from its bound envelope."""
+
+    from app.materialization.queue import (
+        PHASE_FINALIZE,
+        resolve_job_options,
+        resolve_job_phase,
+    )
+
+    if parsed_job is None:
+        executor.execute(  # type: ignore[attr-defined]
+            candidate_id,
+            priority=priority,
+            profile_key=profile_key,
+            supporting_requested=supporting_requested,
+            force=force,
+        )
+        return
+    job = session.get(ProcessingJob, parsed_job)
+    envelope = (
+        session.get(ClipMaterialization, job.materialization_id)
+        if job is not None and job.materialization_id is not None
+        else None
+    )
+    _validate_task_binding(job, envelope, candidate_id)
+    if resolve_job_phase(session, job, envelope) == PHASE_FINALIZE:
+        executor.finalize(candidate_id)  # type: ignore[attr-defined]
+        return
+    options = resolve_job_options(session, job, envelope)
+    resolved_candidate = options.get("candidate_id") or candidate_id
+    executor.execute(  # type: ignore[attr-defined]
+        str(resolved_candidate),
+        priority=str(options.get("priority") or priority),
+        profile_key=options.get("profile_key") or profile_key,
+        supporting_requested=str(options.get("supporting_requested") or supporting_requested),
+        force=force,
+    )
+
+
+def _validate_task_binding(
+    job: ProcessingJob | None,
+    envelope: ClipMaterialization | None,
+    candidate_id: str,
+) -> None:
+    """Reject a task whose transient arguments disagree with the durable envelope.
+
+    The durable envelope is authoritative: a mismatched/missing candidate, source,
+    kind, or refinement is refused rather than executed with caller-supplied
+    options.
+    """
+
+    from app.materialization.queue import MaterializationQueueError
+
+    if job is None or job.kind is not JobKind.MATERIALIZATION:
+        raise MaterializationQueueError("materialization job is missing or the wrong kind")
+    if envelope is None or job.materialization_id != envelope.id:
+        raise MaterializationQueueError("job is not bound to its durable envelope")
+    if str(envelope.clip_candidate_id) != str(candidate_id):
+        raise MaterializationQueueError("task candidate does not match the durable envelope")
+    if job.source_video_id != envelope.source_video_id:
+        raise MaterializationQueueError("job source does not match the durable envelope")
+    if (
+        job.candidate_refinement_id is not None
+        and envelope.refinement_id is not None
+        and job.candidate_refinement_id != envelope.refinement_id
+    ):
+        raise MaterializationQueueError("job refinement does not match the durable envelope")
+
+
+@celery_app.task(  # type: ignore[untyped-decorator]
+    bind=True, autoretry_for=(), name="clipfactory.run_materialization_finalization"
+)
+def run_materialization_finalization(
+    self: Task,
+    candidate_id: str,
+    job_id: str | None = None,
+) -> dict[str, str | bool | None]:
+    """Finalize one AWAITING_RENDER Stage 6 materialization.
+
+    Extends the existing job system with the same MATERIALIZATION job kind; it
+    adds no ``PipelineStage``/``PipelineRun``/``_NEXT_STAGE`` entry. Delegates to
+    the same verified durable phase resolution as the materialization task.
+    """
+
+    from uuid import UUID as _UUID
+
+    from app.materialization.executor import build_materialization_executor
+
+    parsed_job = _UUID(job_id) if job_id else None
+    session = create_session_factory()()
+    try:
+        settings = get_settings()
+        storage = StorageService(settings.storage_root)
+        if parsed_job is not None:
+            job = session.get(ProcessingJob, parsed_job)
+            if job is not None and job.status is JobStatus.CANCELLED:
+                return {"candidate_id": candidate_id, "cancelled": True}
+        executor = build_materialization_executor(session, storage, settings)
+        executor.set_active_job(parsed_job)
+        try:
+            _run_materialization_phase(
+                session,
+                executor,
+                parsed_job,
+                candidate_id,
+                priority="CANDIDATE",
+                profile_key=None,
+                supporting_requested="OFF",
+                force=False,
+            )
+        except StageCancelled:
+            return {"candidate_id": candidate_id, "cancelled": True}
+        except Exception as error:
+            if parsed_job is not None and not getattr(executor, "skipped_duplicate", False):
+                executor.record_failure(error)
+            raise
+        return {
+            "candidate_id": candidate_id,
             "job_id": str(parsed_job) if parsed_job else None,
             "skipped": bool(getattr(executor, "skipped_duplicate", False)),
         }

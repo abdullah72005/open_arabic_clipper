@@ -116,6 +116,7 @@ def build_governance_input_payload(
             "topic_summary": inputs.topic_summary,
             "hooks": [dict(item) for item in inputs.hooks],
             "stage3_risk": dict(inputs.stage3_risk),
+            "mandatory_evidence": dict(inputs.mandatory_evidence),
         },
         "provenance": {
             "rights_status": inputs.rights_status,

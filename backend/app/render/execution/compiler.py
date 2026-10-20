@@ -346,6 +346,24 @@ def _audio_layout(channels: int) -> str:
 def compile_render(spec: RenderSpec, runtime_identity: RuntimeIdentity) -> CompiledRender:
     """Compile a validated render spec into a deterministic FFmpeg command."""
 
+    from app.render.execution.authored import compile_authored_render
+    from app.render.execution.policy import (
+        AUTHORED_PAYLOAD_REQUIRED,
+        AUTHORED_PAYLOAD_UNEXPECTED,
+        TRANSFORMED_SHORT,
+    )
+
+    if spec.artifact_purpose == TRANSFORMED_SHORT:
+        # Never fall through to the source-only core compiler for this purpose.
+        # ``compile_authored_render`` raises ``AuthoredPayloadError`` when no
+        # authored payload is present, so a transformed request can never emit
+        # source-only content.
+        if spec.authored is None:
+            raise CompileError(AUTHORED_PAYLOAD_REQUIRED)
+        return compile_authored_render(spec, runtime_identity)
+    if spec.authored is not None:
+        raise CompileError(AUTHORED_PAYLOAD_UNEXPECTED)
+
     profile = delivery_profile_for(spec.delivery_profile_key)
     if profile is None:
         raise CompileError("UNSUPPORTED_DELIVERY_PROFILE")

@@ -202,7 +202,7 @@ def make_source_value_plan(
     hero_role: SourceExcerptRole = SourceExcerptRole.HERO,
     narration_need: str = "NONE",
     confidence: float = 0.7,
-    grounding: Sequence[str] = ("strategy",),
+    grounding: Sequence[str] = ("block:0",),
 ) -> PlanProviderPlan:
     from app.core.enums import NarrationNeed
     from app.transformation.planning.types import NarrationRequirement
@@ -397,7 +397,7 @@ def seed_stage41(
         },
         source_moment={
             "structure": "CLAIM",
-            "hook_index": 1,
+            "hook_index": None,
             "payoff_index": None,
             "duration": refined[1] - refined[0],
             "moment_density": 0.65,

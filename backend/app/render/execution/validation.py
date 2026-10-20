@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import NoReturn
 
 from app.composition.policy import FramingMode
 from app.render.execution.policy import (
@@ -19,6 +20,9 @@ from app.render.execution.policy import (
     ASS_MALFORMED,
     ASS_METADATA_MISMATCH,
     ASS_MISSING,
+    AUTHORED_MATERIALIZATION_BINDING_INVALID,
+    AUTHORED_PAYLOAD_REQUIRED,
+    AUTHORED_PAYLOAD_UNEXPECTED,
     CONTRADICTORY_FRAMING_EVIDENCE,
     EXOTIC_PIXEL_ASPECT,
     KEYFRAME_GEOMETRY_INVALID,
@@ -35,6 +39,7 @@ from app.render.execution.policy import (
     SCENE_COVERAGE_GAP,
     SCENE_OVERLAP,
     SUPPORTED_ARTIFACT_PURPOSES,
+    TRANSFORMED_SHORT,
     UNSUPPORTED_ARTIFACT_PURPOSE,
     UNSUPPORTED_DELIVERY_PROFILE,
     UNSUPPORTED_FRAMING_MODE,
@@ -83,7 +88,7 @@ class AssFileFacts:
     has_canonical_header: bool
 
 
-def _fail(reason_code: str) -> None:
+def _fail(reason_code: str) -> NoReturn:
     raise RenderValidationError(reason_code)
 
 
@@ -91,11 +96,33 @@ def _is_finite(value: object) -> bool:
     return not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(value)
 
 
+def _validate_purpose_payload(spec: RenderSpec) -> None:
+    """Fail closed on contradictory or missing purpose/payload combinations.
+
+    A ``TRANSFORMED_SHORT`` request is only executable with an authored payload
+    that is exactly materialization-bound; it must never silently fall through to
+    the source-only core compiler. Conversely a core request must never carry an
+    authored payload. This is enforced in validation, the compiler, and the
+    service/queue boundaries so no path can emit source-only content labelled
+    ``TRANSFORMED_SHORT``.
+    """
+
+    if spec.artifact_purpose == TRANSFORMED_SHORT:
+        payload = spec.authored
+        if payload is None:
+            _fail(AUTHORED_PAYLOAD_REQUIRED)
+        if not payload.materialization_id or not payload.materialization_output_fingerprint:
+            _fail(AUTHORED_MATERIALIZATION_BINDING_INVALID)
+    elif spec.authored is not None:
+        _fail(AUTHORED_PAYLOAD_UNEXPECTED)
+
+
 def validate_spec(spec: RenderSpec) -> None:
     """Run every strict structural validation over a render spec."""
 
     if spec.artifact_purpose not in SUPPORTED_ARTIFACT_PURPOSES:
         _fail(UNSUPPORTED_ARTIFACT_PURPOSE)
+    _validate_purpose_payload(spec)
     if delivery_profile_for(spec.delivery_profile_key) is None:
         _fail(UNSUPPORTED_DELIVERY_PROFILE)
     if spec.output_width != OUTPUT_PROFILE_WIDTH or spec.output_height != OUTPUT_PROFILE_HEIGHT:
@@ -109,6 +136,11 @@ def validate_spec(spec: RenderSpec) -> None:
     if not spec.occurrences:
         _fail(NO_RENDERABLE_OCCURRENCES)
 
+    # Authored output legitimately interleaves CARD units between SOURCE
+    # occurrences, so source-only occurrence contiguity is not required there;
+    # the authored payload's contiguous complete VISUAL units are validated
+    # instead. Core source validation still requires contiguous occurrences.
+    authored = spec.artifact_purpose == TRANSFORMED_SHORT
     cursor = 0.0
     for occurrence in spec.occurrences:
         if occurrence.source_end <= occurrence.source_start:
@@ -117,14 +149,25 @@ def validate_spec(spec: RenderSpec) -> None:
             _fail(OCCURRENCE_BOUNDS_INVALID)
         if occurrence.source_end > spec.source_duration + 0.05:
             _fail(OCCURRENCE_BEYOND_MEDIA)
-        if abs(occurrence.output_start - cursor) > 1e-4:
-            _fail(OCCURRENCE_BOUNDS_INVALID)
+        if not authored:
+            if abs(occurrence.output_start - cursor) > 1e-4:
+                _fail(OCCURRENCE_BOUNDS_INVALID)
+            cursor = occurrence.output_end
         if occurrence.output_end <= occurrence.output_start:
             _fail(OCCURRENCE_BOUNDS_INVALID)
-        cursor = occurrence.output_end
         _validate_occurrence_scenes(spec, occurrence)
 
     validate_captions(spec)
+    if authored and spec.authored is not None:
+        from app.render.execution.authored import (
+            AuthoredPayloadError,
+            validate_authored_payload,
+        )
+
+        try:
+            validate_authored_payload(spec.authored)
+        except AuthoredPayloadError as error:
+            _fail(error.reason_code)
 
 
 def _validate_occurrence_scenes(spec: RenderSpec, occurrence: object) -> None:

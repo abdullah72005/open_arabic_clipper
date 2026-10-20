@@ -221,4 +221,5 @@ def build_governance_inputs(
         refinement_output_fingerprint=refinement.output_fingerprint or "",
         target_context=planning.planning_context,
         plans=plans,
+        mandatory_evidence=dict(planning.mandatory_evidence),
     )

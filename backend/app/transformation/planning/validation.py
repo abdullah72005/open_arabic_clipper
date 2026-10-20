@@ -23,6 +23,22 @@ from app.core.enums import (
     TransformationIntensity,
     TransformationStrategyType,
 )
+from app.transformation.grounding import (
+    GROUNDING_DECLARATION_MALFORMED,
+    validate_source_grounding,
+)
+from app.transformation.hook_payoff import (
+    HOOK_EVIDENCE_MALFORMED,
+    HOOK_EVIDENCE_MISSING,
+    HOOK_EVIDENCE_UNRESOLVED,
+    HOOK_NOT_COVERED,
+    PAYOFF_EVIDENCE_MALFORMED,
+    PAYOFF_EVIDENCE_MISSING,
+    PAYOFF_EVIDENCE_UNRESOLVED,
+    PAYOFF_NOT_COVERED,
+    MandatoryEvidence,
+    coverage_reasons,
+)
 from app.transformation.planning.fingerprints import (
     build_plan_output_payload,
     plan_fingerprint,
@@ -85,6 +101,14 @@ REJECT_SPEAKER_SELECTION = "SPEAKER_SELECTION_FORBIDDEN"
 REJECT_RENDERING_INSTRUCTION = "RENDERING_INSTRUCTION_FORBIDDEN"
 REJECT_EVASION = "PLATFORM_EVASION_FORBIDDEN"
 REJECT_COSMETIC_CLAIM = "COSMETIC_CLAIM_FORBIDDEN"
+REJECT_HOOK_NOT_COVERED = HOOK_NOT_COVERED
+REJECT_PAYOFF_NOT_COVERED = PAYOFF_NOT_COVERED
+REJECT_HOOK_EVIDENCE_MALFORMED = HOOK_EVIDENCE_MALFORMED
+REJECT_PAYOFF_EVIDENCE_MALFORMED = PAYOFF_EVIDENCE_MALFORMED
+REJECT_HOOK_EVIDENCE_UNRESOLVED = HOOK_EVIDENCE_UNRESOLVED
+REJECT_PAYOFF_EVIDENCE_UNRESOLVED = PAYOFF_EVIDENCE_UNRESOLVED
+REJECT_HOOK_EVIDENCE_MISSING = HOOK_EVIDENCE_MISSING
+REJECT_PAYOFF_EVIDENCE_MISSING = PAYOFF_EVIDENCE_MISSING
 
 _VERIFICATION_BLOCK_TYPES = {PlanBlockType.FACT_VERIFICATION_PLACEHOLDER}
 _SUBSTANTIVE_TYPES = {PlanBlockType.ORIGINAL_VALUE, PlanBlockType.TEXTUAL_ANNOTATION}
@@ -474,6 +498,9 @@ def _resolve_block(
     inputs: PlanningInputs,
     config: Stage41Config,
 ) -> tuple[PlanBlock | None, str | None]:
+    if raw.grounding_refs_invalid:
+        detail = "; ".join(raw.grounding_refs_errors) or "invalid_reference_declaration"
+        return None, f"{GROUNDING_DECLARATION_MALFORMED}[block={index}]: {detail}"
     # Malformed provider block references are rejected, never silently dropped.
     if raw.dependent_block_ids_invalid:
         return None, REJECT_VERIFICATION_BLOCK_REFERENCE
@@ -483,6 +510,12 @@ def _resolve_block(
             return None, error or REJECT_INVALID_SPAN
         role = raw.source_role or SourceExcerptRole.SUPPORT
         duration = max(0.0, span.end - span.start)
+        planning_words = ()
+        if span.word_start_index is not None and span.word_end_index is not None:
+            planning_words = tuple(
+                word.as_dict()
+                for word in inputs.words[span.word_start_index : span.word_end_index + 1]
+            )
         if duration < config.min_source_excerpt_seconds:
             return None, REJECT_SHORT_EXCERPT
         return (
@@ -501,6 +534,7 @@ def _resolve_block(
                 source_end=span.end,
                 source_text=span.text,
                 continuity_rationale=raw.continuity_rationale,
+                planning_words=planning_words,
             ),
             None,
         )
@@ -780,6 +814,24 @@ def validate_provider_plan(
             ):
                 return ValidationResult(plan=None, reasons=(REJECT_OVERLAPPING_EXCERPT,))
 
+    # Mandatory hook/payoff evidence is resolved from the authoritative ordered
+    # source segments at input assembly. A declared requirement that is not
+    # preserved by the resolved source excerpts rejects the plan here, before any
+    # plan can reach governance or selection.
+    mandatory = MandatoryEvidence.from_dict(inputs.mandatory_evidence)
+    mandatory_reasons = coverage_reasons(
+        inputs.source_moment.get("hook_index"),
+        inputs.source_moment.get("payoff_index"),
+        mandatory,
+        [
+            (float(block.source_start), float(block.source_end))
+            for block in source_blocks
+            if block.source_start is not None and block.source_end is not None
+        ],
+    )
+    if mandatory_reasons:
+        return ValidationResult(plan=None, reasons=mandatory_reasons)
+
     substantive = [b for b in blocks if b.is_substantive]
     for block in substantive:
         error = _validate_substantive_block(block, inputs, strategy_type, config)
@@ -849,6 +901,13 @@ def validate_provider_plan(
         narration_link = placeholder.claim_dependency in narration.verification_dependency_ids
         if not (block_link or narration_link):
             return ValidationResult(plan=None, reasons=(REJECT_VERIFICATION_UNLINKED,))
+
+    grounding_failures = validate_source_grounding([block.as_dict() for block in blocks])
+    if grounding_failures:
+        return ValidationResult(
+            plan=None,
+            reasons=tuple(failure.reason() for failure in grounding_failures),
+        )
 
     status = (
         PlanStatus.PLAN_GENERATED_WITH_VERIFICATION_REQUIRED
@@ -969,11 +1028,11 @@ def deterministic_provider_plan(
     inputs: PlanningInputs,
     config: Stage41Config,
 ) -> PlanProviderPlan | None:
-    """Conservative deterministic structuring of an already-concrete intent.
+    """Decline deterministic structuring when no real source reference exists.
 
-    Only obvious, grounded Stage 4.0 strategies qualify. It structures existing
-    approved intent and never invents research, claims, names, numbers, context,
-    or generic commentary.
+    A strategy label is not source evidence, and the deterministic path must not
+    invent a block or word citation for an authored claim. A qualified strategy is
+    therefore left to an explicit provider; without one the run defers truthfully.
     """
 
     from app.transformation.planning.policy import DETERMINISTIC_FALLBACK_STRATEGIES
@@ -984,38 +1043,10 @@ def deterministic_provider_plan(
         return None
     if strategy_type not in DETERMINISTIC_FALLBACK_STRATEGIES:
         return None
-    focus = str(strategy.get("added_value_focus", "")).strip()
-    if not focus:
+    if not str(strategy.get("added_value_focus", "")).strip():
         return None
-    kind_raw = str(strategy.get("substantive_value_kind", ""))
     try:
-        kind = SubstantiveValueKind(kind_raw)
+        SubstantiveValueKind(str(strategy.get("substantive_value_kind", "")))
     except ValueError:
         return None
-    source = PlanProviderBlock(
-        block_type=PlanBlockType.SOURCE_EXCERPT,
-        purpose="Hero source moment",
-        use_full_window=True,
-        source_role=SourceExcerptRole.HERO,
-        preservation_constraints=tuple(strategy.get("preservation_requirements") or []),
-    )
-    value = PlanProviderBlock(
-        block_type=PlanBlockType.ORIGINAL_VALUE,
-        purpose="Substantive value after the source",
-        estimated_duration=4.0,
-        interrupts_source=False,
-        substantive_value_kind=kind,
-        semantic_intent=focus,
-        why_unavailable=(
-            "The source excerpt alone does not provide this specific added dimension."
-        ),
-        grounding_refs=(str(strategy.get("strategy_key", "")),),
-        delivery_intent=None,
-    )
-    return PlanProviderPlan(
-        strategy_id=str(strategy.get("id", "")),
-        strategy_key=str(strategy.get("strategy_key", strategy_type.value)),
-        confidence=0.5,
-        blocks=(source, value),
-        narration=NarrationRequirement(need=NarrationNeed.NONE),
-    )
+    return None

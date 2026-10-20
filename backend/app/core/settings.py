@@ -11,6 +11,7 @@ from app.candidates.policy import Stage3Config
 from app.candidates.providers import SemanticProvider
 from app.composition.policy import Stage51Config, stage51_config_payload
 from app.core.enums import SemanticProviderMode
+from app.materialization.policy import Stage6Config
 from app.refinement.policy import AdmissionPolicy, Stage35Config
 from app.render.execution.policy import Stage52Config, stage52_config_payload
 from app.render.policy import Stage50Config
@@ -152,7 +153,11 @@ class Settings(BaseSettings):
     refinement_batch_default_limit: int = Field(default=5, gt=0, le=10)
     refinement_batch_max_limit: int = Field(default=10, gt=0, le=20)
     gemini_transcription_model: str = Field(default="gemini-3.5-transcribe", max_length=256)
-    gemini_transcription_api_version: str = Field(default="v1", min_length=1, max_length=32)
+    # The dedicated Gemini 3.5 Transcribe model is served from the Interactions
+    # API, which is published on the ``v1beta`` surface. This is independent of
+    # the stable ``v1`` generateContent surface used by adjudication and the
+    # Stage 2.7/Stage 4 providers; no global beta switch exists.
+    gemini_transcription_api_version: str = Field(default="v1beta", min_length=1, max_length=32)
     gemini_transcription_max_output_tokens: int = Field(default=2_048, gt=0, le=8_192)
     gemini_adjudication_max_output_tokens: int = Field(default=1_024, gt=0, le=4_096)
     gemini_admission_window_seconds: float = Field(default=60.0, gt=0, le=86_400)
@@ -193,6 +198,24 @@ class Settings(BaseSettings):
     transformation_governance_strong_model: str = Field(default="gemini-3.8-flash", max_length=256)
     transformation_governance_max_output_tokens: int = Field(default=3_072, gt=0, le=8_192)
     transformation_governance_strong_thinking_level: Literal["low", "medium", "high"] = "low"
+    # Stage 6 materialization semantic writing/critique. Explicitly configurable
+    # and decoupled from every other stage's provider mode. adaptive routes the
+    # necessary hosted writing/critique adapters through the shared HIGH admission
+    # gate when a key is configured; deterministic makes zero hosted calls and
+    # never falls back to Qwen. A missing key degrades adaptive to honest
+    # deterministic/deferred operation.
+    materialization_mode: Literal["deterministic", "adaptive"] = "adaptive"
+    materialization_routine_model: str = Field(default="gemini-3.5-flash-lite", max_length=256)
+    materialization_strong_model: str = Field(default="gemini-3.8-flash", max_length=256)
+    materialization_max_output_tokens: int = Field(default=2_048, gt=0, le=8_192)
+    materialization_strong_thinking_level: Literal["low", "medium", "high"] = "low"
+    # Stage 6 narration defaults. The channel profile owns the persistent voice
+    # (model/voice/style); these are fallbacks for a profile that omits them. The
+    # provisional auditioned voice is persisted in the profile, never a
+    # deployment-wide dialect/voice default.
+    materialization_tts_model: str = Field(default="gemini-3.8-flash-tts", max_length=256)
+    materialization_tts_api_version: str = Field(default="v1beta", min_length=1, max_length=32)
+    materialization_tts_default_voice: str = Field(default="Kore", max_length=64)
     # Stage 5.0 deterministic render-contract configuration. No TTS voice,
     # caption font, crop, or publishing setting participates.
     render_contract_profile: Literal["SHORTS_1080X1920"] = "SHORTS_1080X1920"
@@ -613,6 +636,93 @@ class Settings(BaseSettings):
             temperature=0.0,
         )
 
+    def materialization_semantic_mode(self) -> SemanticProviderMode:
+        return SemanticProviderMode(self.materialization_mode)
+
+    def materialization_writing_provider(self) -> object | None:
+        """Return the Stage 6 hosted writing provider for the configured mode, if any.
+
+        Deterministic mode never builds a provider (zero hosted calls). Adaptive
+        builds the Gemini writing adapter only when a key is configured; a missing
+        key returns ``None`` so the caller falls back to deterministic/deferred.
+        """
+
+        if self.materialization_semantic_mode() is SemanticProviderMode.DETERMINISTIC:
+            return None
+        return self.gemini_materialization_writing_instance()
+
+    def materialization_critique_provider(self) -> object | None:
+        """Return the Stage 6 hosted critique provider for the configured mode, if any."""
+
+        if self.materialization_semantic_mode() is SemanticProviderMode.DETERMINISTIC:
+            return None
+        return self.gemini_materialization_critique_instance()
+
+    def materialization_provider_identity(self) -> dict[str, object]:
+        """Stable configured Stage 6 provider identity, independent of availability."""
+
+        from app.materialization.providers import DeterministicWritingProvider
+
+        if self.materialization_semantic_mode() is SemanticProviderMode.ADAPTIVE:
+            from app.materialization.gemini import GeminiCritiqueProvider, GeminiWritingProvider
+
+            writing = GeminiWritingProvider(
+                api_key=None,
+                routine_model=self.materialization_routine_model,
+                strong_model=self.materialization_strong_model,
+                timeout_seconds=self.gemini_timeout_seconds,
+                max_output_tokens=self.materialization_max_output_tokens,
+                thinking_level=self.materialization_strong_thinking_level,
+                temperature=self.gemini_temperature,
+                api_version=self.gemini_api_version,
+            ).runtime_identity()
+            critique = GeminiCritiqueProvider(
+                api_key=None,
+                routine_model=self.materialization_routine_model,
+                strong_model=self.materialization_strong_model,
+                timeout_seconds=self.gemini_timeout_seconds,
+                max_output_tokens=self.materialization_max_output_tokens,
+                thinking_level=self.materialization_strong_thinking_level,
+                temperature=self.gemini_temperature,
+                api_version=self.gemini_api_version,
+            ).runtime_identity()
+            return {"writing": writing, "critique": critique}
+        return {"writing": DeterministicWritingProvider().runtime_identity(), "critique": {}}
+
+    def gemini_materialization_writing_instance(self) -> object | None:
+        key = self.gemini_api_key
+        if key is None or not key.get_secret_value():
+            return None
+        from app.materialization.gemini import GeminiWritingProvider
+
+        return GeminiWritingProvider(
+            api_key=key.get_secret_value(),
+            routine_model=self.materialization_routine_model,
+            strong_model=self.materialization_strong_model,
+            timeout_seconds=self.gemini_timeout_seconds,
+            max_output_tokens=self.materialization_max_output_tokens,
+            thinking_level=self.materialization_strong_thinking_level,
+            temperature=self.gemini_temperature,
+            api_version=self.gemini_api_version,
+        )
+
+    def gemini_materialization_critique_instance(self) -> object | None:
+        key = self.gemini_api_key
+        if key is None or not key.get_secret_value():
+            return None
+        from app.materialization.gemini import GeminiCritiqueProvider
+
+        return GeminiCritiqueProvider(
+            api_key=key.get_secret_value(),
+            routine_model=self.materialization_routine_model,
+            strong_model=self.materialization_strong_model,
+            timeout_seconds=self.gemini_timeout_seconds,
+            max_output_tokens=self.materialization_max_output_tokens,
+            thinking_level=self.materialization_strong_thinking_level,
+            temperature=self.gemini_temperature,
+            api_version=self.gemini_api_version,
+        )
+
     def stage42_config(self) -> Stage42Config:
         """Build bounded Stage 4.2 governance configuration."""
 
@@ -656,6 +766,11 @@ class Settings(BaseSettings):
 
         payload: dict[str, object] = stage51_config_payload(self.stage51_config())
         return payload
+
+    def stage6_config(self) -> Stage6Config:
+        """Build bounded Stage 6 materialization configuration (no providers)."""
+
+        return Stage6Config()
 
     def stage52_config(self) -> Stage52Config:
         """Build bounded Stage 5.2 render-execution configuration."""

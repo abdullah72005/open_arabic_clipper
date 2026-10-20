@@ -12,8 +12,13 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from fractions import Fraction
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from app.render.execution.policy import CORE_SOURCE_VALIDATION
+
+if TYPE_CHECKING:
+    from app.render.execution.audio import AudioPreparationPlan
+    from app.render.execution.authored import AuthoredRenderPayload
 
 
 @dataclass(frozen=True)
@@ -231,6 +236,9 @@ class RuntimeIdentity:
     filter_complex_threads: int = 1
     source_absolute_path: str = ""
     attempt_directory: str = ""
+    #: Execution-only localized asset names (asset_id -> filename inside the
+    #: attempt directory). Absolute paths are excluded from every fingerprint.
+    asset_localized_paths: Mapping[str, str] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -285,15 +293,20 @@ class RenderSpec:
     audio_channels: int = 2
     source_video_start_seconds: float = 0.0
     source_audio_start_seconds: float = 0.0
+    #: Optional typed Stage 6 authored payload. ``None`` keeps the frozen
+    #: source-core behavior and serialization byte-for-byte unchanged.
+    authored: "AuthoredRenderPayload | None" = None
 
     @property
     def output_duration(self) -> float:
+        if self.authored is not None:
+            return self.authored.frame_count / float(self.output_frame_rate)
         if not self.occurrences:
             return 0.0
         return self.occurrences[-1].output_end
 
     def as_dict(self) -> dict[str, object]:
-        return {
+        data: dict[str, object] = {
             "render_execution_id": self.render_execution_id,
             "candidate_id": self.candidate_id,
             "source_id": self.source_id,
@@ -332,6 +345,9 @@ class RenderSpec:
             "occurrences": [occurrence.as_dict() for occurrence in self.occurrences],
             "omitted": [item.as_dict() for item in self.omitted],
         }
+        if self.authored is not None:
+            data["authored"] = self.authored.as_dict()
+        return data
 
 
 @dataclass(frozen=True)
@@ -372,6 +388,12 @@ class CompiledRender:
     expected_sample_count: int
     expected: Mapping[str, object] = field(default_factory=dict)
     diagnostics: Mapping[str, object] = field(default_factory=dict)
+    authored_ass_localized_name: str = ""
+    input_relative_paths: tuple[str, ...] = ()
+    #: Optional typed Stage 6 lossless audio-preparation plan. When present the
+    #: runner executes the mix/measure/master phases before the final encode;
+    #: the core source path leaves this ``None`` and is byte-for-byte unchanged.
+    audio_preparation: "AudioPreparationPlan | None" = None
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -482,6 +504,7 @@ class AttemptContext:
     timeout_seconds: float = 0.0
     poll_seconds: float = 0.5
     ass_bytes: bytes = b""
+    authored_ass_bytes: bytes = b""
     #: Absolute monotonic deadline shared by the whole expensive attempt
     #: (encode, post-encode probing, and QC). ``None`` falls back to a per-phase
     #: ``timeout_seconds`` budget when set.

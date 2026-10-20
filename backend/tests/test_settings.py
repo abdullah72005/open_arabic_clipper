@@ -237,6 +237,19 @@ def test_gemini_temperature_defaults_to_zero_and_parses() -> None:
     assert overridden.gemini_api_version == "v1beta"
 
 
+def test_transcription_api_version_defaults_to_interactions_beta_surface() -> None:
+    """The dedicated transcription provider uses the v1beta Interactions surface.
+
+    The stable ``v1`` generateContent surface (adjudication, Stage 2.7, Stage 4)
+    is configured separately via ``gemini_api_version`` and is not affected.
+    """
+
+    settings = Settings(_env_file=None)
+
+    assert settings.gemini_transcription_api_version == "v1beta"
+    assert settings.gemini_api_version == "v1"
+
+
 def test_ollama_compose_hardware_safeguards_are_configured() -> None:
     """Compose pins Ollama parallelism, loaded models, queue, context, CPU, RAM,
     and swap to safe defaults for the documented ~10.7 GiB WSL environment."""

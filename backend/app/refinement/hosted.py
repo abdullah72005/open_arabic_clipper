@@ -4,23 +4,25 @@ Two providers, deliberately separate from the Stage 2.7 text-reconstruction
 provider:
 
 * :class:`GeminiAudioTranscriptionProvider` uses the documented Interactions API
-  with the dedicated ``gemini-3.5-transcribe`` model in **verbatim** mode. It
-  uploads exactly one bounded candidate WAV, requests word timestamps, never
-  enables smart transcription, and never combines custom vocabulary with
-  timestamps in the same pass.
-* :class:`GeminiAdjudicationProvider` uses ``gemini-3.8-flash`` with structured
-  output to choose one supplied reading or ``UNRESOLVED``. It never rewrites a
-  whole transcript and never recovers omitted English (that belongs to ASR).
+  (served from the ``v1beta`` surface) with the dedicated
+  ``gemini-3.5-transcribe`` model in **verbatim** mode. It uploads exactly one
+  bounded candidate WAV, requests word timestamps *inside* the verbatim
+  ``mode`` object, never enables smart transcription, and never combines custom
+  vocabulary with timestamps in the same pass.
+* :class:`GeminiAdjudicationProvider` uses ``gemini-3.8-flash`` over the stable
+  ``v1`` generateContent surface with structured output to choose one supplied
+  reading or ``UNRESOLVED``. It never rewrites a whole transcript and never
+  recovers omitted English (that belongs to ASR).
 
-Official documentation was checked on 2026-09-12 (Gemini API audio
-transcription, Gemini 3.5 Transcribe, Gemini 3.8 Flash, Files API, Interactions
-API). The installed SDK is ``google-genai`` 2.23.0; the Interactions API surface
-used here (``client.interactions.create`` with
-``generation_config.transcription_config``, ``VerbatimTranscriptionMode``,
-``WordInfo`` and ``client.files.upload``/``delete``) was verified against that
-installed package. Remote uploads are deleted in ``finally`` on every exit path
-and their URIs are never persisted or logged. API keys are unwrapped only at
-lazy client construction and never logged.
+Official documentation was checked on 2026-10-14 (Gemini API audio
+transcription, Interactions API, Gemini 3.5 Transcribe, Gemini 3.8 Flash, Files
+API). The Interactions API examples place ``timestamp_granularities`` inside
+``transcription_config.mode`` and pass audio content directly as ``input``.
+Each provider builds its own client with its own API version, so the beta
+Interactions surface never changes the stable generateContent consumers. Remote
+uploads are deleted in ``finally`` on every exit path and their URIs are never
+persisted or logged. API keys are unwrapped only at lazy client construction and
+never logged.
 """
 
 from __future__ import annotations
@@ -39,7 +41,13 @@ from app.refinement.policy import (
 )
 from app.refinement.types import AdjudicationRequest, AdjudicationResult, WordTimestamp
 
-_GEMINI_API_VERSION = "v1"
+# The Interactions API is served from the ``v1beta`` surface; the stable
+# ``v1`` surface is used by generateContent consumers (e.g. adjudication).
+# Each provider builds its own client so these versions never leak into one
+# another or into the Stage 2.7/Stage 4 generateContent providers.
+_INTERACTIONS_API_VERSION = "v1beta"
+_GENERATE_CONTENT_API_VERSION = "v1"
+_GEMINI_API_VERSION = _GENERATE_CONTENT_API_VERSION
 _TRANSCRIPTION_MODEL = "gemini-3.5-transcribe"
 _RETRYABLE_CATEGORIES = frozenset(
     {"CONNECTION", "TIMEOUT", "SERVICE_UNAVAILABLE", "PROVIDER_ERROR"}
@@ -253,6 +261,7 @@ class _LazyClientMixin:
     _owns_client: bool
     _client_factory: Callable[..., object] | None
     _timeout_seconds: float
+    _api_version: str
 
     def _client_instance(self) -> object | None:
         if self._client is not None:
@@ -271,7 +280,7 @@ class _LazyClientMixin:
         return genai.Client(
             api_key=self._api_key,
             http_options=types.HttpOptions(
-                api_version=_GEMINI_API_VERSION,
+                api_version=self._api_version,
                 timeout=int(self._timeout_seconds * 1000),
             ),
         )
@@ -319,7 +328,7 @@ class GeminiAudioTranscriptionProvider(_LazyClientMixin):
         *,
         api_key: object | None,
         model: str = _TRANSCRIPTION_MODEL,
-        api_version: str = _GEMINI_API_VERSION,
+        api_version: str = _INTERACTIONS_API_VERSION,
         timeout_seconds: float = 60.0,
         retry_attempts: int = 1,
         retry_backoff_seconds: float = 1.5,
@@ -446,22 +455,24 @@ class GeminiAudioTranscriptionProvider(_LazyClientMixin):
     ) -> object:
         # Word timestamps and custom vocabulary are never combined in one pass.
         vocabulary = [] if include_word_timestamps else list(custom_vocabulary)
-        transcription_config: dict[str, object] = {
-            "mode": {"type": "verbatim"},
-        }
+        # Current Interactions API examples nest the timestamp granularity
+        # *inside* the verbatim ``mode`` object; a sibling
+        # ``timestamp_granularities`` on ``transcription_config`` is not the
+        # documented shape.
+        mode: dict[str, object] = {"type": "verbatim"}
+        if include_word_timestamps:
+            mode["timestamp_granularities"] = ["word"]
+        transcription_config: dict[str, object] = {"mode": mode}
         if language_codes:
             transcription_config["language_codes"] = list(language_codes)
-        if include_word_timestamps:
-            transcription_config["timestamp_granularities"] = ["word"]
         if vocabulary:
             transcription_config["custom_vocabulary"] = vocabulary
+        # The published ``interactions.create`` accepts content parts directly
+        # (``[{"type": "audio", ...}]``), matching the documented examples.
         body = {
             "model": self.model,
             "input": [
-                {
-                    "type": "user_input",
-                    "content": [{"type": "audio", "uri": uploaded.uri, "mime_type": "audio/wav"}],
-                }
+                {"type": "audio", "uri": uploaded.uri, "mime_type": "audio/wav"}
             ],
             "generation_config": {"transcription_config": transcription_config},
         }

@@ -151,6 +151,9 @@ class PlanBlock:
     source_end: float | None = None
     source_text: str | None = None
     continuity_rationale: str | None = None
+    # Exact planning-word evidence for this excerpt. These are Stage 4.1
+    # planning word identities, never FINAL_CLIP word indexes.
+    planning_words: tuple[Mapping[str, object], ...] = ()
     # ORIGINAL_VALUE / TEXTUAL_ANNOTATION fields.
     substantive_value_kind: SubstantiveValueKind | None = None
     semantic_intent: str | None = None
@@ -187,6 +190,7 @@ class PlanBlock:
                     "source_end": _round_opt(self.source_end),
                     "source_text": self.source_text,
                     "continuity_rationale": self.continuity_rationale,
+                    "planning_words": [dict(item) for item in self.planning_words],
                 }
             )
         if self.block_type in {
@@ -255,6 +259,8 @@ class PlanProviderBlock:
     semantic_intent: str | None = None
     why_unavailable: str | None = None
     grounding_refs: tuple[str, ...] = ()
+    grounding_refs_invalid: bool = False
+    grounding_refs_errors: tuple[str, ...] = ()
     delivery_intent: DeliveryIntent | None = None
     draft_line: str | None = None
     claim_dependency: str | None = None
@@ -449,6 +455,7 @@ class PlanningInputs:
     refinement_quality_level: str
     refinement_status: str
     refinement_output_fingerprint: str
+    mandatory_evidence: Mapping[str, object] = field(default_factory=dict)
 
     @property
     def duration(self) -> float:

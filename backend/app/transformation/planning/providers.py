@@ -379,6 +379,31 @@ def _float(value: object) -> float:
     return max(0.0, number)
 
 
+def _parse_grounding_refs(
+    value: object,
+) -> tuple[tuple[str, ...], bool, tuple[str, ...]]:
+    """Preserve every string declaration and flag malformed containers/items."""
+
+    if value is None:
+        return (), False, ()
+    if not isinstance(value, (list, tuple)):
+        return (
+            (),
+            True,
+            (f"invalid_reference_container:{type(value).__name__}",),
+        )
+    refs: list[str] = []
+    errors: list[str] = []
+    for item in list(value)[:64]:
+        if isinstance(item, str):
+            refs.append(item)
+            continue
+        errors.append(f"unsupported_reference_type:{type(item).__name__}:{repr(item)[:120]}")
+    if len(value) > 64:
+        errors.append("too_many_reference_declarations")
+    return tuple(refs), bool(errors), tuple(errors)
+
+
 def _bounded_int_list(
     value: object, *, present: bool = False, limit: int = _BOUNDED_LIST
 ) -> tuple[tuple[int, ...], bool]:
@@ -423,6 +448,9 @@ def _parse_block(entry: Mapping[str, object]) -> PlanProviderBlock | None:
         entry.get("dependent_block_ids"),
         present="dependent_block_ids" in entry,
     )
+    grounding_refs, grounding_refs_invalid, grounding_refs_errors = _parse_grounding_refs(
+        entry.get("grounding_refs")
+    )
     return PlanProviderBlock(
         block_type=block_type,  # type: ignore[arg-type]
         purpose=_bounded_text(entry.get("purpose"), _BOUNDED_FIELD),
@@ -438,7 +466,9 @@ def _parse_block(entry: Mapping[str, object]) -> PlanProviderBlock | None:
         substantive_value_kind=_enum(entry.get("substantive_value_kind"), SubstantiveValueKind),  # type: ignore[arg-type]
         semantic_intent=_bounded_text(entry.get("semantic_intent"), _BOUNDED_FIELD),
         why_unavailable=_bounded_text(entry.get("why_unavailable"), _BOUNDED_FIELD),
-        grounding_refs=_bounded_list(entry.get("grounding_refs")),
+        grounding_refs=grounding_refs,
+        grounding_refs_invalid=grounding_refs_invalid,
+        grounding_refs_errors=grounding_refs_errors,
         delivery_intent=_enum(entry.get("delivery_intent"), DeliveryIntent),  # type: ignore[arg-type]
         draft_line=_bounded_text(entry.get("draft_line"), _BOUNDED_FIELD) or None,
         claim_dependency=_bounded_text(entry.get("claim_dependency"), _BOUNDED_FIELD) or None,

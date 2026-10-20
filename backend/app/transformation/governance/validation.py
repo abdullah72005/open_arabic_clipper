@@ -9,6 +9,7 @@ governor status or a platform-risk classification.
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 from app.core.enums import (
@@ -48,6 +49,14 @@ from app.transformation.governance.types import (
     PlanEvidence,
     PlanGovernance,
     ProviderCritique,
+)
+from app.transformation.grounding import (
+    resolve_reference,
+    validate_source_grounding,
+)
+from app.transformation.hook_payoff import (
+    MandatoryEvidence,
+    coverage_reasons,
 )
 from app.transformation.planning.policy import (
     DISTORTION_MARKERS,
@@ -135,6 +144,11 @@ class PlanEvaluation:
     semantic_state: str = SEMANTIC_NOT_ATTEMPTED
     critique: ProviderCritique | None = None
     provider_evidence: dict[str, object] = field(default_factory=dict)
+    # Heuristic deterministic revisions that a bounded semantic review
+    # adjudicated away, retained (with the adjudication reason) for audit. They
+    # are removed from ``revisions`` so they no longer block approval, but they
+    # are never silently discarded.
+    adjudicated_revisions: list[dict[str, object]] = field(default_factory=list)
 
 
 def _text(value: object) -> str:
@@ -233,7 +247,12 @@ def _as_text_list(value: object) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def revalidate_integrity(plan: PlanEvidence, config: Stage42Config) -> tuple[bool, tuple[str, ...]]:
+def revalidate_integrity(
+    plan: PlanEvidence,
+    config: Stage42Config,
+    *,
+    mandatory_evidence: Mapping[str, object] | None = None,
+) -> tuple[bool, tuple[str, ...]]:
     reasons: list[str] = []
     try:
         TransformationStrategyType(plan.strategy_type)
@@ -302,6 +321,17 @@ def revalidate_integrity(plan: PlanEvidence, config: Stage42Config) -> tuple[boo
         if next_start < prev_end - 1e-6:
             reasons.append("SOURCE_SPAN_OVERLAP")
 
+    # Mandatory hook/payoff preservation is a deterministic integrity
+    # requirement. It is evaluated against the authoritative resolved segment
+    # evidence, and a favorable semantic critique can never clear it.
+    coverage = coverage_reasons(
+        plan.hook_payoff_evidence.get("hook_index"),
+        plan.hook_payoff_evidence.get("payoff_index"),
+        MandatoryEvidence.from_dict(mandatory_evidence),
+        spans,
+    )
+    reasons.extend(coverage)
+
     for block in blocks:
         if _block_type(block) != PlanBlockType.FACT_VERIFICATION_PLACEHOLDER.value:
             continue
@@ -327,6 +357,9 @@ def revalidate_integrity(plan: PlanEvidence, config: Stage42Config) -> tuple[boo
             dependencies = target.get("dependency_ids")
             if not isinstance(dependencies, list) or claim not in dependencies:
                 reasons.append("VERIFICATION_UNLINKED")
+
+    grounding_failures = validate_source_grounding(blocks)
+    reasons.extend(failure.reason() for failure in grounding_failures)
 
     for kind in plan.original_value_kinds:
         try:
@@ -947,6 +980,7 @@ class _SourceEvidence:
     all_text: str
     refined_start: float
     refined_end: float
+    source_blocks: tuple[Mapping[str, object], ...]
 
 
 def _build_source_evidence(plan: PlanEvidence, inputs: GovernanceInputs) -> _SourceEvidence:
@@ -956,9 +990,11 @@ def _build_source_evidence(plan: PlanEvidence, inputs: GovernanceInputs) -> _Sou
     spans: list[tuple[float, float, str]] = []
     words: list[tuple[int, int, str]] = []
     texts: list[str] = []
+    source_blocks: list[Mapping[str, object]] = []
     for block in _blocks(plan):
         if _block_type(block) != PlanBlockType.SOURCE_EXCERPT.value:
             continue
+        source_blocks.append(block)
         index = _int(block.get("index"))
         text = block.get("source_text")
         text_value = text if isinstance(text, str) else ""
@@ -991,91 +1027,15 @@ def _build_source_evidence(plan: PlanEvidence, inputs: GovernanceInputs) -> _Sou
         all_text=" ".join(texts),
         refined_start=inputs.refined_start,
         refined_end=inputs.refined_end,
+        source_blocks=tuple(source_blocks),
     )
 
 
-def _first_int(value: str) -> int | None:
-    match = _INT_RE.search(value)
-    return int(match.group(0)) if match else None
-
-
-def _float_range(value: str) -> tuple[float, float] | None:
-    match = _RANGE_RE.search(value)
-    if match is None:
-        return None
-    return float(match.group(1)), float(match.group(2))
-
-
 def _resolve_ref(ref: object, evidence: _SourceEvidence) -> str | None:
-    """Resolve one grounding reference and return its cited source text.
+    """Resolve one declaration through the shared authoritative resolver."""
 
-    Provider-declared labels such as ``strategy`` or ``source_excerpt`` are
-    never proof: only a reference that addresses an existing source-excerpt
-    block/word/time span or quotes real source excerpt text resolves. A
-    structural citation alone is necessary but not sufficient for grounding.
-    """
-
-    if not isinstance(ref, str):
-        return None
-    value = ref.strip()
-    if not value:
-        return None
-    lowered = value.casefold()
-
-    for prefix in _BLOCK_REF_PREFIXES:
-        if lowered.startswith(prefix):
-            index = _first_int(lowered[len(prefix) :])
-            if index is not None and index in evidence.blocks:
-                return evidence.blocks[index]
-            return None
-
-    for prefix in _WORD_REF_PREFIXES:
-        if lowered.startswith(prefix):
-            body = lowered[len(prefix) :]
-            span = _float_range(body)
-            if span is not None:
-                low, high = span
-                for start, end, text in evidence.words:
-                    if not (high < start or low > end):
-                        return text
-                return None
-            index = _first_int(body)
-            if index is None:
-                return None
-            for start, end, text in evidence.words:
-                if start <= index <= end:
-                    return text
-            return None
-
-    for prefix in _SPAN_REF_PREFIXES:
-        if lowered.startswith(prefix):
-            body = lowered[len(prefix) :]
-            span = _float_range(body)
-            if span is not None:
-                low, high = span
-                for span_start, span_end, span_text in evidence.spans:
-                    if not (high < span_start or low > span_end):
-                        return span_text
-                if low >= evidence.refined_start and high <= evidence.refined_end:
-                    return evidence.all_text
-                return None
-            point = _FLOAT_RE.search(body)
-            if point is not None:
-                value_f = float(point.group(0))
-                for span_start, span_end, span_text in evidence.spans:
-                    if span_start <= value_f <= span_end:
-                        return span_text
-                if evidence.refined_start <= value_f <= evidence.refined_end:
-                    return evidence.all_text
-            return None
-
-    if value.isdigit():
-        number = int(value)
-        return evidence.blocks.get(number)
-
-    if len(lowered) >= _MIN_QUOTE_CHARS and lowered in evidence.all_text.casefold():
-        return value
-    return None
+    text, _reason = resolve_reference(ref, evidence.source_blocks)
+    return text
 
 
 def _support_tokens(text: str) -> list[str]:
@@ -1993,7 +1953,9 @@ def evaluate_plan(
     provider_mode_deterministic: bool,
 ) -> PlanEvaluation:
     evaluation = PlanEvaluation(plan=plan)
-    integrity_ok, reasons = revalidate_integrity(plan, config)
+    integrity_ok, reasons = revalidate_integrity(
+        plan, config, mandatory_evidence=inputs.mandatory_evidence
+    )
     evaluation.integrity_ok = integrity_ok
     evaluation.integrity_reasons = reasons
     evidence = derive_evidence(plan, inputs, config)
@@ -2114,6 +2076,83 @@ def _requires_semantic_review(
 # ---------------------------------------------------------------------------
 
 
+# Deterministic revision codes that encode a *heuristic opinion* (a lexical
+# paraphrase/filler/template reading) rather than a measured violation. Only
+# these may be adjudicated away by a bounded semantic review, and only when the
+# review is genuinely complete and favorable. Measured
+# retention/proportionality violations (hero delay, source-moment damage, payoff
+# interruption, duration, fragmentation, over-edit), hard failures, and essential
+# verification blocks are deterministic requirements and never appear here.
+_POSITIVE_SUBSTANTIVE_VALUE = frozenset(
+    {SubstantiveValueFinding.DISTINCT, SubstantiveValueFinding.ADEQUATE}
+)
+
+
+def narration_is_relevant(plan: PlanEvidence) -> bool:
+    """Whether a plan's narration requirement makes the narration dimension live.
+
+    Anything other than an explicit ``NONE`` need (including ``OPTIONAL``) keeps
+    the dimension relevant: an unknown narration assessment may not be silently
+    treated as favorable.
+    """
+
+    return _text(plan.narration.get("need", NarrationNeed.NONE.value)) != (NarrationNeed.NONE.value)
+
+
+def critique_is_complete_favorable(critique: ProviderCritique, *, narration_relevant: bool) -> bool:
+    """Whether a critique is a genuinely complete, favorable semantic review.
+
+    Every decision-critical dimension must carry a known positive finding. An
+    ``UNKNOWN`` or concerning dimension is never treated as positive, and an
+    irrelevant narration dimension still requires a known non-concern
+    (``APPROPRIATE`` or ``NOT_NEEDED``) rather than being inferred from an
+    unknown assessment.
+    """
+
+    if critique.fidelity != SemanticFidelityFinding.PASS:
+        return False
+    if critique.value not in _POSITIVE_SUBSTANTIVE_VALUE:
+        return False
+    if critique.retention != RetentionEffectFinding.PRESERVED:
+        return False
+    if critique.coherence != CoherenceFinding.COHERENT:
+        return False
+    if critique.unsupported_claim != UnsupportedClaimFinding.NONE:
+        return False
+    if critique.template_feel != GovernanceLevel.LOW:
+        return False
+    if narration_relevant:
+        return critique.narration == NarrationBurdenFinding.APPROPRIATE
+    return critique.narration in {
+        NarrationBurdenFinding.APPROPRIATE,
+        NarrationBurdenFinding.NOT_NEEDED,
+    }
+
+
+def clearable_heuristic_revisions(
+    critique: ProviderCritique, *, narration_relevant: bool = True
+) -> set[str]:
+    """Heuristic revision codes refuted by a complete, favorable review.
+
+    A dimension that is UNKNOWN, a concern, unavailable, or malformed never
+    contributes a clearable code, and no heuristic revision is cleared at all
+    unless the whole review is genuinely complete and favorable
+    (:func:`critique_is_complete_favorable`). Given that, paraphrase/filler
+    opinions additionally require a known positive substantive-value finding and
+    a template-feel opinion requires a known LOW template level.
+    """
+
+    if not critique_is_complete_favorable(critique, narration_relevant=narration_relevant):
+        return set()
+    clearable: set[str] = {
+        _R.REDUNDANT_PARAPHRASE_ONLY.value,
+        _R.GENERIC_FILLER_ONLY.value,
+    }
+    if critique.template_feel == GovernanceLevel.LOW:
+        clearable.add(_R.TEMPLATE_MASS_PRODUCED_FEEL.value)
+    return clearable
+
+
 def apply_semantic_review(
     evaluation: PlanEvaluation,
     critique: ProviderCritique | None,
@@ -2128,12 +2167,17 @@ def apply_semantic_review(
     evaluation.critique = critique
     evaluation.provider_evidence = {"state": state, "critique": critique.as_dict()}
 
-    # Revision-level deterministic findings are advisory once a semantic review
-    # runs. Snapshot them so a favorable critique (one that adds no new hard
-    # failure or revision finding) can clear exactly those heuristic revisions.
-    # Hard failures and blocking conditions are never cleared by a review.
-    revision_count_before = len(evaluation.revisions)
-    hard_failure_count_before = len(evaluation.hard_failures)
+    # A later review replaces any earlier adjudication. Restore previously
+    # cleared heuristic revisions so the new evidence must re-justify the
+    # clearance: a stale clearance can never survive a review whose evidence no
+    # longer supports it (e.g. a second strong-tier critique that comes back
+    # UNKNOWN after a routine one looked favorable).
+    if evaluation.adjudicated_revisions:
+        for finding in evaluation.adjudicated_revisions:
+            evaluation.revisions.append(
+                {key: value for key, value in finding.items() if key != "adjudication"}
+            )
+        evaluation.adjudicated_revisions = []
 
     # A claim whose claim-to-evidence support the deterministic lexical check
     # could not confirm is exactly what the semantic review resolves. When that
@@ -2143,7 +2187,9 @@ def apply_semantic_review(
     # Stage 4.3 correctly refuses the internally inconsistent evidence forever
     # (``INCONSISTENT_GOVERNANCE_EVIDENCE``).
     if (
-        evaluation.verification.get("claim_state") == ClaimGroundingState.SUPPORT_UNVERIFIED.value
+        evaluation.integrity_ok
+        and evaluation.verification.get("claim_state")
+        == ClaimGroundingState.SUPPORT_UNVERIFIED.value
         and critique.unsupported_claim == UnsupportedClaimFinding.NONE
         and critique.fidelity != SemanticFidelityFinding.FAIL
     ):
@@ -2284,17 +2330,37 @@ def apply_semantic_review(
             "semantic review found moderate template feel",
         )
 
-    # A favorable review supersedes the deterministic heuristic revisions that
-    # triggered it: if the critique added no new hard-failure or revision finding,
-    # the advisory deterministic revisions are cleared so the plan can be approved
-    # (or approved with caution). If the review itself raised a hard failure or
-    # revision, both it and the original revisions stand and the plan stays
-    # rejected/revision-required.
-    if (
-        len(evaluation.hard_failures) == hard_failure_count_before
-        and len(evaluation.revisions) == revision_count_before
-    ):
-        evaluation.revisions = []
+    # Reason-specific adjudication of *heuristic* deterministic revisions.
+    #
+    # A semantic review only clears the paraphrase/filler/template opinions it
+    # actually refutes with a positive, known finding for the matching
+    # dimension, and only when the review was genuinely available (not
+    # unavailable/invalid or partially UNKNOWN). Measured retention and
+    # proportionality violations stay deterministic requirements: they are never
+    # model-overridable. Cleared findings are retained on
+    # ``adjudicated_revisions`` with the exact adjudication for audit.
+    if state == SEMANTIC_AVAILABLE:
+        clearable = clearable_heuristic_revisions(
+            critique, narration_relevant=narration_is_relevant(evaluation.plan)
+        )
+        if clearable:
+            retained: list[dict[str, object]] = []
+            for finding in evaluation.revisions:
+                code = str(finding.get("code"))
+                if code in clearable:
+                    adjudicated = dict(finding)
+                    adjudicated["adjudication"] = {
+                        "cleared_by": "SEMANTIC_REVIEW",
+                        "semantic_state": state,
+                        "critique_value": critique.value.value,
+                        "critique_template_feel": critique.template_feel.value,
+                        "critique_coherence": critique.coherence.value,
+                        "critique_narration": critique.narration.value,
+                    }
+                    evaluation.adjudicated_revisions.append(adjudicated)
+                else:
+                    retained.append(finding)
+            evaluation.revisions = retained
 
 
 # ---------------------------------------------------------------------------
@@ -2412,6 +2478,30 @@ def _all_reason_codes(evaluation: PlanEvaluation) -> tuple[str, ...]:
     return tuple(ordered)
 
 
+def _critique_has_unknown_decision_dimension(
+    critique: ProviderCritique, *, narration_relevant: bool
+) -> bool:
+    """Whether a critique leaves a decision-critical dimension UNKNOWN.
+
+    Such evidence can never silently produce approval: the plan must defer for
+    governance rather than be advertised as selectable.
+    """
+
+    if critique.fidelity == SemanticFidelityFinding.UNKNOWN:
+        return True
+    if critique.value == SubstantiveValueFinding.UNKNOWN:
+        return True
+    if critique.retention == RetentionEffectFinding.UNKNOWN:
+        return True
+    if critique.coherence == CoherenceFinding.UNKNOWN:
+        return True
+    if critique.unsupported_claim == UnsupportedClaimFinding.UNKNOWN:
+        return True
+    if critique.template_feel == GovernanceLevel.UNKNOWN:
+        return True
+    return narration_relevant and critique.narration == NarrationBurdenFinding.UNKNOWN
+
+
 def finalize(evaluation: PlanEvaluation) -> tuple[GovernancePlanStatus, GovernanceSeverityClass]:
     if evaluation.hard_failures:
         return GovernancePlanStatus.REJECTED_BY_GOVERNOR, GovernanceSeverityClass.HARD_FAIL
@@ -2429,11 +2519,9 @@ def finalize(evaluation: PlanEvaluation) -> tuple[GovernancePlanStatus, Governan
     }:
         return GovernancePlanStatus.GOVERNANCE_DEFERRED, GovernanceSeverityClass.WARNING
     if evaluation.critique is not None:
-        if evaluation.critique.fidelity == SemanticFidelityFinding.UNKNOWN or (
-            evaluation.critique.value == SubstantiveValueFinding.UNKNOWN
+        if _critique_has_unknown_decision_dimension(
+            evaluation.critique, narration_relevant=narration_is_relevant(evaluation.plan)
         ):
-            return GovernancePlanStatus.GOVERNANCE_DEFERRED, GovernanceSeverityClass.WARNING
-        if evaluation.critique.retention == RetentionEffectFinding.UNKNOWN:
             return GovernancePlanStatus.GOVERNANCE_DEFERRED, GovernanceSeverityClass.WARNING
     if evaluation.warnings:
         return GovernancePlanStatus.APPROVED_WITH_CAUTION, GovernanceSeverityClass.WARNING
@@ -2451,14 +2539,15 @@ def build_plan_governance(
         GovernancePlanStatus.APPROVED_FOR_SELECTION,
         GovernancePlanStatus.APPROVED_WITH_CAUTION,
     }
-    criticisms = (
-        {
-            "state": evaluation.semantic_state,
-            "critique": evaluation.critique.as_dict() if evaluation.critique else None,
-        }
-        if evaluation.requires_semantic_review
-        else {"state": SEMANTIC_NOT_REQUIRED, "critique": None}
-    )
+    criticisms = {
+        "state": (
+            evaluation.semantic_state
+            if evaluation.requires_semantic_review
+            else SEMANTIC_NOT_REQUIRED
+        ),
+        "critique": (evaluation.critique.as_dict() if evaluation.critique is not None else None),
+        "adjudicated_revisions": [dict(finding) for finding in evaluation.adjudicated_revisions],
+    }
     return PlanGovernance(
         plan_id=evaluation.plan.plan_id,
         plan_output_fingerprint=evaluation.plan.plan_output_fingerprint,
@@ -2489,8 +2578,11 @@ __all__ = [
     "build_dimensions",
     "build_plan_governance",
     "build_platform_risk",
+    "clearable_heuristic_revisions",
+    "critique_is_complete_favorable",
     "derive_evidence",
     "evaluate_plan",
     "finalize",
+    "narration_is_relevant",
     "revalidate_integrity",
 ]

@@ -1,5 +1,2035 @@
 # Runtime status
 
+> Correction (2026-10-17): a hosted `GEMINI_API_KEY` IS configured in this
+> environment (verified present and used for the live adapter validation and the
+> bounded 3x3 TTS audition). Any earlier section below that says "no hosted
+> provider key is present" is stale; the only missing external prerequisite is
+> authorized source media.
+
+## Stage 4.1/5.0/6 mandatory hook-payoff and grounding corrections (2026-10-19)
+
+Status: **two confirmed integration defects are repaired; Stage 6 remains NOT
+FROZEN and `publication_ready` stays false.** No new TTS calls were made as part
+of the repair.
+
+- **Stage 4 mandatory hook/payoff preservation.** `hook_index`/`payoff_index`
+  are authoritative *source transcript segment* indexes. A new pure
+  `transformation/hook_payoff.py` resolves them against the ordered source
+  segments and enforces the existing endpoint coverage tolerance at Stage 4.1,
+  revalidates it as a deterministic Stage 4.2 integrity failure (never clearable
+  by semantic critique), and guards Stage 4.3 selection. Stage 5.0 keeps its
+  independent FINAL_CLIP rebound-span check and now reports distinct
+  `HOOK_NOT_COVERED` / `PAYOFF_NOT_COVERED` reasons; a null payoff no longer
+  turns a hook failure into a payoff failure.
+- **Stage 6 grounding references.** Stage 4 strings such as `words:3-7` and
+  `words:8-26` are parsed with a strict shared grammar, preserved through
+  authored-block and claim-ledger serialization, and resolved through the plan's
+  planning-word identity to the authoritative Stage 5 binding / FINAL_CLIP
+  words. Planning and FINAL_CLIP index spaces are never mixed. Invalid
+  containers, malformed labels, unsupported kinds, reversed ranges, missing
+  fields, non-finite times, nonexistent/non-source blocks, partial overlap, and
+  out-of-scope references produce explicit `INVALID_GROUNDING_REFERENCE`
+  findings. Policy/validation versions were bumped so stale plans, approvals,
+  selections, contracts, and Stage 6 checkpoints cannot bypass the repairs.
+
+## Stage 6: SOL 5a1de46 correction — consistent ABSENT/INVALID/VALID metadata parsing (2026-10-18, continuation from p5 @ `5a1de46`)
+
+Status: **the one remaining export metadata-validation root cause is fixed with a
+parameterized malformed-metadata matrix. Stage 6 remains NOT FROZEN;
+`publication_ready` stays false. No hosted/provider calls were made.**
+
+### Correction (one root cause: ABSENT vs INVALID vs VALID)
+- **`backend/app/materialization/acceptance_export.py`.** The metadata parsers now
+  distinguish the three states consistently instead of collapsing invalid evidence
+  into absence or skipping it:
+  - `_inventory_set` treats only a genuinely missing `identity`/`readiness` key (or
+    a missing `assets` key) as ABSENT; a supplied null, wrong-typed container, or
+    malformed list entry is INVALID (`PACKAGE_INVENTORY_INVALID`). A present null
+    `identity.assets` is INVALID, never absent, so it can no longer fall back to
+    `readiness.assets` and be accepted (reproduction B).
+  - `_reference_set` requires every supplied narration/supporting reference to be a
+    mapping with a valid nonempty string `relative_path` and `sha256`; a supplied
+    null/non-list container, a non-object entry, or a missing/empty/non-string
+    required field marks the references INVALID
+    (`PACKAGE_INVENTORY_INVALID:references`) instead of being skipped
+    (reproduction A).
+  - `_normalize_identity_entry` requires nonempty string `kind`/`relative_path`/
+    `expected_sha256`, so malformed inventory/record entries are invalid rather than
+    silently dropped.
+  - A supplied null or wrong-typed `index.assets` is INVALID
+    (`PACKAGE_ASSET_METADATA_INVALID`), not an absent key.
+  - Fallback to `readiness.assets` remains available only when `identity.assets` is
+    genuinely absent; malformed identity evidence stays an explicit refusal. No new
+    persistence, competing authority, or package-schema redesign; formats and
+    authority order are unchanged.
+
+### Verification (this session)
+- Docker `oac-stage6-test` (Python 3.12.14, real FFmpeg 7.1.5):
+  - `test_stage6_sol_b141_regressions.py` (now 57): passed — including a
+    **parameterized malformed-metadata matrix** (27 cases: null containers/assets,
+    wrong types, non-object references, missing/empty/non-string required fields)
+    exercising the verifier **and** publication/legacy-migration refusal with
+    specific reasons; both reproductions (malformed references, null authority);
+    positive controls for complete inventory, legitimate readiness fallback
+    (empty and nonempty), explicitly empty consistent inventory; and the **real
+    narrated execution/export** refusal.
+  - `test_stage6_sol_451_regressions.py` + `test_stage6_sol_p5_regressions.py` +
+    `test_stage6_sol_8b6_regressions.py` (47): passed.
+  - `test_stage6_adapter_regressions.py` + `test_stage6_rc_corrections.py` +
+    `test_stage6_rc_v4_corrections.py` + `test_stage6_results_boundary.py` (52) and
+    `test_stage6_api_cli_acceptance.py` + `test_stage6_cache_validation.py` (19,
+    real FFmpeg persisted positive export/HTTP path): passed.
+  - `ruff check app tests`: clean. (`ruff format --check` reports only the
+    pre-existing drift in `acceptance_export.py` at lines unrelated to this change;
+    `test_stage6_sol_b141_regressions.py` is format-clean.)
+- **Zero live provider calls** this session.
+
+### Disposition (corrected)
+- **Fixed**: consistent ABSENT/INVALID/VALID metadata parsing at the parsing
+  boundary (fail-closed on null/wrong-typed/malformed inventory, assets and
+  references).
+- **Code blockers**: none remaining in export verification.
+- **Validation blockers**: lost acoustic evidence and exhausted audition
+  authorization remain.
+- **Externally blocked**: genuine authorized-media acceptance remains outstanding
+  (no authorized source media; a hosted key is present).
+
+## Stage 6: SOL 7057 corrections — fail-closed inventory, real narrated export harness (2026-10-18, continuation from p5 @ `7057c11`)
+
+Status: **the three remaining corrections that blocked closure at `7057c11` are
+implemented with regressions. Stage 6 remains NOT FROZEN; `publication_ready` stays
+false. No hosted/provider calls were made.**
+
+### Corrections
+1. **Absent authoritative inventory fails closed
+   (`backend/app/materialization/acceptance_export.py`).** `_required_asset_reasons`
+   no longer returns silently when there is no authoritative inventory. An absent
+   inventory (no `identity.assets` and no `readiness.assets`) is now **always**
+   diagnostic (`PACKAGE_ASSET_INVENTORY_MISSING`): exported-copy evidence
+   (`index.assets`) alone never proves zero requirements. A present-but-malformed
+   `identity`/`readiness` sub-container is reported invalid
+   (`PACKAGE_INVENTORY_INVALID`), never silently treated as absence. `identity.assets`
+   stays authority, `readiness.assets` the permitted complete fallback, and
+   `index.assets` only copy evidence. An explicitly empty inventory is valid only
+   when structurally valid and consistent with every bound reference and ASS
+   declaration (otherwise `PACKAGE_INVENTORY_ASS_MISSING` /
+   `PACKAGE_INVENTORY_REFERENCE_MISMATCH`). Applied before publication, on reuse, and
+   in legacy migration; a genuinely valid positive case (an explicit inventory
+   consistent with no declarations, and a complete nonempty inventory) is preserved.
+2. **Publication test harness repaired
+   (`tests/test_stage6_sol_b141_regressions.py`).** `_publish_result` now submits the
+   actual prepared package instead of an empty surrogate directory, so negative
+   assertions exercise the intended bytes and assert the intended specific refusal
+   reason (`PACKAGE_ASSET_RECORD_MISSING:narration`, `PACKAGE_ASSET_HASH_MISMATCH`)
+   rather than a generic `PACKAGE_MANIFEST_MISSING`. A positive control proves the
+   same helper publishes a complete valid package; reuse and legacy migration are
+   exercised against the intended bytes and preserve existing valid packages/references.
+3. **Real narrated execution for the export regression.** The persisted export case
+   no longer appends a narration reference to arbitrary "WAV" bytes after
+   finalization. It reuses the `test_stage6_milestone` real authored-card +
+   synthetic-narration setup: prepare, real FFmpeg render and finalize with the valid
+   lossless narration asset bound into the render inputs; export succeeds and the
+   exported narration hash is verified against the asset actually rendered; then only
+   the exported narration mapping/file is removed (retaining the ASS and the
+   authoritative inventory) and the intended refusal is asserted. Synthetic media
+   remains integration evidence, never genuine acceptance.
+
+### Verification (this session)
+- Docker `oac-stage6-test` (Python 3.12.14, real FFmpeg 7.1.5):
+  - `test_stage6_sol_b141_regressions.py` (now 26): passed — including absent /
+    malformed / explicitly-empty / nonempty inventory coverage across publication and
+    legacy migration, the publication positive control, and the **real narrated
+    execution/export** refusal.
+  - `test_stage6_sol_451_regressions.py` + `test_stage6_sol_p5_regressions.py` +
+    `test_stage6_sol_8b6_regressions.py` (47): passed (the legacy valid-package
+    fixtures now carry the explicit empty authoritative inventory).
+  - `test_stage6_adapter_regressions.py` + `test_stage6_rc_corrections.py` +
+    `test_stage6_rc_v4_corrections.py` (45) and
+    `test_stage6_api_cli_acceptance.py` + `test_stage6_cache_validation.py` (19,
+    real FFmpeg persisted positive export/HTTP path): passed.
+  - `ruff check app tests`: clean. (`ruff format --check` reports pre-existing drift
+    in `acceptance_export.py` and `test_stage6_sol_451_regressions.py` at lines
+    unrelated to this change; present at HEAD under the installed ruff 0.16.8.)
+- **Zero live provider calls** this session. Preserved recovery evidence unchanged:
+  `storage/benchmarks/stage-6/tts-audition/{recovery,consumed-budget}.json`
+  (`consumed_attempts=9`, `probe_calls=1`).
+
+### Disposition (corrected)
+- **Fixed**: fail-closed absent inventory; repaired publication harness; real
+  narrated export regression.
+- **Code blockers**: none remaining in export verification.
+- **Validation blockers**: lost acoustic evidence and exhausted audition
+  authorization remain.
+- **Externally blocked**: genuine authorized-media acceptance remains outstanding
+  (no authorized source media; a hosted key is present).
+
+## Stage 6: SOL b141 corrections — complete, self-contained export verification (2026-10-18, continuation)
+
+Status: **the two SOL-reproduced export-integrity defects at `b141097` are
+corrected with regressions. The package verifier now derives the complete required
+asset inventory from the package's own bound evidence and requires an exact,
+byte-verified mapping from every required identity to its exported copy; a
+requirement can no longer be dropped by deleting its exported copy record, and
+every package path (transformed MP4, ASS, narration/supporting assets, index,
+manifest-listed files) is validated through one shared primitive that rejects
+external symlinks in any component. No live hosted calls were made. Stage 6 remains
+NOT FROZEN; `publication_ready` stays false.**
+
+### Corrections (one root-cause group: complete, self-contained export verification)
+1. **Defect A — partial asset omission
+   (`backend/app/materialization/acceptance_export.py`).** `_required_asset_reasons`
+   no longer treats `index.assets` (exported-copy evidence) as the requirement set.
+   It derives the authoritative inventory from the bound snapshot — `identity.assets`
+   (else `readiness.assets`), cross-checked against the bound `narration_references`
+   / `asset_references` and the declared authored-ASS hash — validating the
+   inventory's structure and flagging `identity`/`readiness` disagreement
+   (`PACKAGE_INVENTORY_CONFLICT`) or a reference not covered by the inventory
+   (`PACKAGE_INVENTORY_REFERENCE_MISMATCH`). It then requires an exact mapping from
+   every required `(kind, source_relative_path, expected_sha256)` to a single
+   exported record and verified bytes, rejecting missing (`PACKAGE_ASSET_RECORD_MISSING`),
+   duplicate, unexpected, conflicting, or path-invalid records. Deleting a copy
+   record never removes the requirement. A missing/incomplete legacy inventory
+   (no `identity`/`readiness`/references but present copy records) stays diagnostic
+   (`PACKAGE_ASSET_INVENTORY_MISSING`); an empty inventory is valid only when nothing
+   is declared by any bound source.
+2. **Defect B — external MP4 symlink (and every package path).** One shared
+   primitive, `_package_file_outcome`, now validates every package path — the
+   transformed artifact, the authored ASS, narration/supporting assets, the index,
+   and every manifest-listed file. Each path must be relative and contained, no
+   component may be a symlink (checked before any read), the file must exist and be
+   nonempty, and its hash must match every applicable expected hash and the manifest
+   entry. A symlinked `final.mp4` (or asset) is rejected before its bytes are read
+   (`PACKAGE_FILE_SYMLINK`, `PACKAGE_ARTIFACT_SYMLINK`, `PACKAGE_ASSET_SYMLINK`), so
+   an external file with matching bytes is no longer accepted. Applied consistently
+   before publication, on reuse, and during legacy migration. Preserved: immutable
+   package directories, catalog locking/atomic replacement, diagnostic separation,
+   and existing valid-package preservation.
+
+### Verification (this session)
+- Docker `oac-stage6-test` (Python 3.12.14, real FFmpeg 7.1.5) + PostgreSQL
+  `oac-stage6-pg-v4`:
+  - `test_stage6_sol_b141_regressions.py` (new, 18): passed — complete narrated
+    package genuine; omitted narration record/file and supporting omission
+    (publication/reuse/legacy) refused; removing all copy records never empties the
+    requirement; inventory conflict/reference-mismatch/duplicate/unexpected
+    rejected; symlinked artifact, symlinked asset, symlinked parent directory and
+    escaping path rejected; legacy migration promotes a complete package and
+    rejects a partial one; and a **real persisted narrated export** (real FFmpeg
+    render + finalize) refuses a removed narration mapping with the retained ASS.
+  - `sol_8b6 + sol_451 + sol_p5` (47): passed (the `_asset_package` fixture now
+    carries the bound inventory).
+  - `adapter_regressions + rc_corrections + rc_v4_corrections + results_boundary +
+    cache_validation + api_cli_acceptance` (71, real FFmpeg, persisted positive
+    export/HTTP path): passed.
+  - `ruff check app tests`: clean.
+  - SOL's probes `/tmp/test_sol_b141_review.py` now both **fail** (they assert the
+    fixed defects), confirming the reproduction is closed.
+- **Zero live provider calls** this session. Preserved recovery evidence unchanged:
+  `storage/benchmarks/stage-6/tts-audition/{recovery,consumed-budget}.json`
+  (`consumed_attempts=9`, `probe_calls=1`) and the captured report
+  `/tmp/audition-out.json` (sha256 `2d39a09a…0038`).
+
+### Disposition (corrected)
+- **Fixed**: complete, self-contained export verification (bound-inventory coverage
+  + shared symlink-rejecting file primitive).
+- **Code blockers**: none remaining in export verification.
+- **Validation blockers**: lost acoustic evidence and exhausted audition
+  authorization remain — the consumed-budget floor blocks new synthesis and the
+  audio is irrecoverable.
+- **Unresolved product decision (not a code gap)**: the hosted TTS voice stays
+  **unset by an already-made architectural decision**; further generation needs a
+  separately agreed bounded recovery budget.
+- **Externally blocked**: genuine authorized-media acceptance remains outstanding
+  (no authorized source media; a hosted key is present).
+
+## Stage 6: SOL 8b6 corrections — verified exported asset bytes, case-sensitive protected atoms, versioned history-prefix budget proof (2026-10-17, continuation)
+
+Status: **the three SOL-reproduced defects at `8b6c992` are corrected with
+regressions. A package is genuine only when every required bound referenced asset
+resolves to an actual nonempty file inside the package whose hash matches its
+authoritative expected hash, its index record, and the manifest entry (index
+claims and `destination_verified` booleans are never integrity evidence). Protected
+technical/numeric/URL atoms are compared verbatim (case-sensitive). A positive
+consumed-budget floor is proven by a versioned history-prefix proof that survives a
+legitimate append or local fidelity update. No live hosted calls were made. Stage 6
+remains NOT FROZEN; `publication_ready` stays false.**
+
+### Corrections
+1. **Verified exported assets from bytes
+   (`backend/app/materialization/acceptance_export.py`).** `_package_integrity_reasons`
+   now delegates required-asset verification to `_required_asset_reasons`, which
+   derives the required set from the package's own bound reference records
+   (`assets`) and cross-checks the authoritative expected authored-ASS hash against
+   them. Every required asset must: be covered (a `copied=false`/missing record
+   fails), declare an unambiguous `exported_relative_path` (an absolute or `..`
+   path, a symlink component, or a missing path fails), resolve to an actual
+   nonempty file whose SHA-256 matches its authoritative `expected_sha256`, its
+   index `destination_sha256`, and its manifest entry, and never share a destination
+   with a distinct asset (collision). A missing/malformed requirement set (`assets`
+   absent or non-list while an ASS/reference requirement is declared) can no longer
+   imply an empty set. `destination_verified` booleans are not consulted. The same
+   verifier is applied before genuine publication, on reuse, and during legacy
+   migration; legacy packages lacking this evidence remain diagnostic. New
+   `_build_package` records add `exported_relative_path` (kept separate from the
+   source `relative_path`) and assign package-unique destinations. Retained:
+   immutable directories, catalog preservation, locking, atomic publication.
+2. **Case-sensitive protected atoms (`backend/app/materialization/narration.py`).**
+   `_protected_atoms` no longer case-folds: URLs and technical/numeric forms are
+   preserved verbatim, so `https://example.test/Account?token=AbC` is not accepted as
+   `.../account?token=abc`. Ordinary speech keeps the documented normalization
+   (contraction/filler equivalences) with all negation/order/multiplicity
+   protections; `C++→C`, `C#→C`, compound-number fragmentation, changed URLs, and
+   spelling/transliteration disagreements remain refused/deferred. Versioned
+   `stage6-fidelity-v4` (`tts_gemini.FIDELITY_POLICY_VERSION`) so dependent
+   validation checkpoints invalidate and retained audio is revalidated locally
+   without synthesis, preserving historical findings.
+3. **Versioned history-prefix budget proof
+   (`backend/app/materialization/tts_audition.py`).** The consumed-budget floor now
+   links its count `N` to the **first `N` retained attempt identities** via a
+   versioned `history_proof` (`HISTORY_PROOF_VERSION = 1`): a digest over the
+   audition identity plus each attempt's immutable `attempt_id`, `ordinal`,
+   `request_fingerprint`, `voice`, and `script_id`. Required fields, consecutive
+   ordinals, uniqueness, and reconstructed request identities are validated, and
+   additional retained attempts after the prefix are allowed. Delivery-status
+   refinement and local `fidelity`/`revalidated_fidelity` data are excluded, so a
+   legitimate append or local validation update no longer invalidates the proof. A
+   legacy full-manifest `manifest_digest` is upgraded to a prefix proof only when
+   the complete retained manifest still matches (at record time and at the run gate);
+   otherwise counts are retained and new synthesis is blocked. Incomplete history
+   still blocks without exceeding the ceiling, uncertain fingerprints are never
+   repeated, and all recovery updates stay under the existing ownership lock with no
+   nested acquisition. Effective consumption is `max(floor, retained)`.
+
+### Verification (this session)
+- Docker `oac-stage6-test` (Python 3.12.14, real FFmpeg 7.1.5, google-genai
+  2.31.0) + PostgreSQL `oac-stage6-pg-v4`:
+  - `test_stage6_sol_8b6_regressions.py` (new, 19): passed — required-asset bytes,
+    index-claim/`destination_verified` independence, hash/manifest/expected
+    matching, symlink/escape/collision rejection, missing-metadata rejection,
+    case-sensitive URL/technical atoms, v4 policy, linked-prefix append/restart,
+    legacy-digest upgrade, local-fidelity-update stability, crash-left reservation,
+    stale/proven-legacy blocking.
+  - `test_stage6_sol_8b6 + sol_451 + sol_p5 + tts_boundary + supporting_narration +
+    durable_router + gemini_boundary` (104): passed.
+  - `adapter_regressions + rc_corrections + rc_v4_corrections + results_boundary +
+    cache_validation + api_cli_acceptance` (71, real FFmpeg, persisted positive
+    export/HTTP path incl. a new `exported_relative_path`/destination-byte
+    assertion): passed.
+  - `ruff check app tests`: clean.
+- **Zero live provider calls** this session. Preserved recovery evidence unchanged:
+  `storage/benchmarks/stage-6/tts-audition/{recovery,consumed-budget}.json`
+  (`consumed_attempts=9`, `probe_calls=1`; the floor now blocks new synthesis) and
+  the captured report `/tmp/audition-out.json` (sha256 `2d39a09a…0038`).
+
+### Disposition (corrected)
+- **Fixed**: verified exported asset bytes; case-sensitive protected atoms;
+  versioned history-prefix budget proof.
+- **Later corrected by the next section**: the SOL review of this revision
+  reproduced two further export-integrity defects — a required asset (declared by
+  the bound inventory/references) could be omitted from `index.assets`/the package
+  yet still published, and the transformed MP4 could be an external symlink with
+  matching bytes. So "fixed" above was **not** final for the revision as reviewed.
+- **Validation blockers**: lost acoustic evidence and exhausted audition
+  authorization remain — the floor blocks new synthesis and the audio is
+  irrecoverable.
+- **Unresolved product decision (not a code gap)**: the hosted TTS voice stays
+  **unset by an already-made architectural decision**; further generation needs a
+  separately agreed bounded recovery budget.
+- **Externally blocked**: genuine authorized-media acceptance remains outstanding
+  (no authorized source media; a hosted key is present).
+
+## Stage 6: SOL p5.1 corrections — sealed budget recovery, media-required package verification, fidelity v3 (2026-10-17, continuation)
+
+Status: **the three SOL-reproduced defects at `451b43a` are corrected with
+regressions. A positive consumed-budget floor without complete retained
+per-request history now blocks new synthesis entirely (an empty ledger is never
+recreated and treated as complete); a malformed floor fails closed and preserves
+its bytes. A package is genuine only with an actual nonempty artifact matching its
+index and manifest identity (index-only/absent/mismatched packages are
+diagnostic). Local fidelity restores the documented normalization (contraction
+expansion, approved-filler removal) while keeping technical/numeric/URL forms as
+opaque atoms. No live hosted calls were made. Stage 6 remains NOT FROZEN;
+`publication_ready` stays false.**
+
+### Corrections
+1. **Seal incomplete-history budget recovery
+   (`backend/app/materialization/tts_audition.py`).** `run_audition` now blocks new
+   synthesis whenever a positive consumed-budget floor is not provably backed by
+   **complete retained per-request history** (`_floor_history_complete`: a linked
+   `manifest_digest` and an exact attempt count): status
+   `AUDITION_HISTORY_INCOMPLETE` (or `AUDITION_BUDGET_EXHAUSTED` at the ceiling),
+   zero calls. The previous behavior — recreating an empty ledger and treating it
+   as complete after restart — is removed (the `manifest_was_absent`/`recovered_extra`
+   allowance is gone). `record_consumed_budget` no longer swallows a malformed prior
+   record: it fails closed with the specific `AuditionError` and preserves the
+   original bytes. Recovery and the budget read/modify/write are serialized under
+   the existing audition ownership lock (`_audition_lock(blocking=True)`), and
+   `record_recovery` uses the inner writer to avoid a nested acquisition, so counts
+   stay monotonic under concurrency. Regressions:
+   `test_stage6_sol_451_regressions.py` (partial-lost-history-across-restart,
+   exhausted-floor, malformed-floor-fails-closed, concurrent-monotonic).
+2. **Require actual media before legacy acceptance publication
+   (`backend/app/materialization/acceptance_export.py`).** `_package_integrity_reasons`
+   now requires the supported acceptance index structure, a required nonempty
+   `artifact_file`, its recorded `render_artifact_sha256`, an actual nonempty
+   artifact whose hash matches both the index record and the manifest entry,
+   verified referenced assets (authored ASS and copied assets), and manifest paths
+   contained inside the package. Index-only, missing-metadata, absent-media,
+   mismatched-identity, and escaping-path packages are diagnostic — never a genuine
+   published reference. The same verifier is applied to package reuse and legacy
+   migration, preserving existing directories and references on failure.
+   Regressions: `test_stage6_sol_451_regressions.py` (index-only, missing metadata,
+   absent media, mismatched identity, path escape, legacy index-only not promoted,
+   legacy valid promoted) plus the retained valid-reuse/atomic-publication tests.
+3. **Fidelity v3 — documented normalization without weakening
+   (`backend/app/materialization/narration.py`,
+   `backend/app/materialization/tts_gemini.py`).** The separate protected
+   comparison now considers only **technical/numeric/URL atoms** (`_protected_atoms`:
+   URLs, compound `-_.@/:+#` forms, `C++`/`C#`, and Western/Arabic-Indic numbers);
+   ordinary Latin words no longer introduce a second raw comparison that reversed
+   the documented normalization. The previously documented equivalences hold again
+   (`"I don't know"` ↔ `"I do not know"`, `"We can start"` ↔ `"We um can start"`),
+   while `C++→C`, `C#→C`, compound-number fragmentation, and changed URLs remain
+   refused, and Arabic spelling/transliteration disagreements remain deferred. The
+   policy is versioned `stage6-fidelity-v3`, so retained audio is revalidated
+   locally (no synthesis) with historical findings preserved.
+   Regressions: `test_stage6_sol_451_regressions.py` (documented equivalences,
+   technical refusals, deferred Arabic disagreement) + `test_stage6_tts_boundary.py`.
+
+### Verification (this session)
+- Docker `oac-stage6-test` (Python 3.12.14, real FFmpeg 7.1.5, google-genai
+  2.31.0) + PostgreSQL `oac-stage6-pg-v4`:
+  - `test_stage6_sol_451_regressions.py` (new, 14): passed.
+  - `cache_validation` + `results_boundary` + `api_cli_acceptance` (26, real
+    FFmpeg, persisted export/HTTP path): passed.
+  - `sol_451 + sol_p5 + tts_boundary + adapter_regressions + supporting_narration
+    + component_recovery + rc_corrections + rc_v4_corrections + sol2 + sol3 +
+    blocker_regressions + materialization_core + durable_router + gemini_boundary
+    + sol3_postgres + finalizer_currentness_postgres` (221): passed.
+  - `ruff check app tests`: clean.
+- Frontend: `vitest run` **72 passed** (incl. 8 mounted DOM tests); `eslint
+  src --max-warnings=0` clean; `tsc --noEmit` retains only the pre-existing
+  `job-poller.test.tsx` test-only typing error.
+- **Zero live provider calls** this session. Preserved recovery evidence: the
+  prior `storage/benchmarks/stage-6/tts-audition/{recovery,consumed-budget}.json`
+  (`consumed_attempts=9`, `probe_calls=1`) stands and now blocks new synthesis; the
+  captured report `/tmp/audition-out.json` (sha256 `2d39a09a…0038`) is unchanged.
+
+### Disposition (corrected)
+- **Fixed**: incomplete-history budget sealing; media-required package verification;
+  fidelity v3 documented normalization.
+- **Later corrected by the next section**: the SOL review of this revision
+  reproduced three further defects — index-claim/`destination_verified` asset
+  acceptance, case-folded protected atoms, and a full-manifest budget proof that a
+  legitimate append/fidelity update invalidated. So "fixed" above was **not** final
+  for the revision as reviewed.
+- **Validation blockers**: lost acoustic evidence and exhausted audition
+  authorization remain — the floor blocks new synthesis and the audio is
+  irrecoverable.
+- **Unresolved product decision (not a code gap)**: the hosted TTS voice stays
+  **unset by an already-made architectural decision**; any further live generation
+  needs a separately agreed bounded recovery budget.
+- **Externally blocked**: genuine authorized-media acceptance remains outstanding
+  (no authorized source media; a hosted key is present).
+
+## Stage 6: SOL p5 corrections — cancellation reconciliation, export reuse/migration integrity, audition accounting, fidelity policy v2, evidence recovery (2026-10-17, continuation)
+
+Status: **the SOL-reviewed defects at p5 (`b768f6b`) are corrected with mounted-UI
+and backend regressions. Cancellation now treats inventory failure as UNKNOWN and
+reconciles an already-ended target from a fresh read; export verifies an existing
+package before reuse, fails closed on a corrupt/malformed/unsupported catalog, and
+preserves legacy diagnostic classification; the audition checks shared admission
+before every attempt, records typed delivery-vs-content outcomes through the same
+pure classification production uses, applies the shared rate-limit cooldown, and
+enforces a durable consumed-budget floor; local fidelity is versioned
+(`stage6-fidelity-v2`) with atomic protected forms and a deferred (not confirmed)
+transcript disagreement; and the spent audition budget plus lost evidence are
+recorded durably. Stage 6 remains NOT FROZEN; `publication_ready` stays false.**
+
+### Corrections
+1. **Cancellation reconciliation (`frontend/src/lib/produce-runner.ts`).** An
+   unreadable inventory is now `UNKNOWN`, never absence: `findActiveIngestJob`
+   returns found/none/unknown, and unknown yields `CANCEL_UNCONFIRMED` with a
+   retryable reason instead of falsely reporting "Cancelled". A failed/already-ended
+   target (`409`) is reconciled by **freshly reading that exact job/materialization**
+   (`resolveJobTarget` / `resolveMaterializationTarget`); only a verified terminal
+   (or 404-absent) read settles, a failed read does not. Run-owned terminal
+   identities are cleared (`clearJobIdentity`) so an old succeeded job cannot hide
+   a later active target, and the inventory is only consulted after run-owned
+   in-flight submissions are drained. Regressions:
+   `frontend/src/components/produce-runner.dom.test.tsx` (now **8** mounted tests,
+   incl. inventory-unavailable-then-recovery, 409-fresh-read, and
+   terminal-cleared-then-later-active-target).
+2. **Export integrity at reuse and migration
+   (`backend/app/materialization/acceptance_export.py`).** `_publish_case_package`
+   no longer trusts `target.exists()`: `_package_integrity_reasons` re-verifies the
+   manifest hash against the declared identity, the index, and every listed
+   destination file hash. On mismatch it fails closed (`integrity_failure`) without
+   deleting the valid staging evidence or overwriting the existing package, and the
+   catalog is not updated as successful. `_read_catalog` fails closed
+   (`CatalogIntegrityError`) on an unreadable/malformed/unsupported catalog instead
+   of resetting it to empty, and legacy migration establishes a published reference
+   only from explicit favorable metadata *and* verified package evidence — a
+   `published=true, genuine_acceptance=false` entry is preserved as diagnostic.
+   Regressions: `backend/tests/test_stage6_sol_p5_regressions.py` (corrupt reuse,
+   malformed/unsupported catalog, legacy diagnostic, valid reuse).
+3. **Audition admission and delivery accounting
+   (`backend/app/materialization/tts_audition.py`, `app/cli.py`).** Shared HIGH
+   admission is checked before *each* new attempt (a denial spends none) and a 429
+   notifies the same admission controller's cooldown so later samples cannot proceed
+   through it. Failures are classified by the shared pure
+   `app/materialization/delivery.py` (also used by production materialization): a
+   timeout/transport ambiguity is `UNCERTAIN`, a known HTTP rejection is
+   `FAILED_KNOWN`, and a received-but-unusable response is `RESPONDED` with its
+   content validation failure; a crash-left reservation is `UNCERTAIN`. The typed
+   category and a sanitized reason are persisted, and historical uncertainty never
+   has a category inferred for it.
+4. **Fidelity policy v2 (`app/materialization/narration.py`,
+   `app/materialization/tts_gemini.py`, `app/materialization/executor.py`).**
+   `compare_transcripts` preserves ordered content, multiplicity, negation, numbers,
+   and — reusing `app.transcription.dialect.extract_protected_tokens` atomically —
+   protected technical/numeric forms (so `C++`/`C#` are never accepted as `C`,
+   URLs and compound numbers stay exact). A **lone ASR transcript disagreement is
+   now `DEFERRED`** with a structured reason/diff, not a confirmed
+   `MEANING_MISMATCH`; independently established audio/content failures
+   (silent/empty/truncated/clipped/invalid) still `REJECT`. The policy version
+   (`FIDELITY_POLICY_VERSION = "stage6-fidelity-v2"`) participates in the validator
+   runtime identity, so retained audio is revalidated locally (no synthesis) on a
+   policy change, and the historical raw findings are preserved under
+   `revalidated_fidelity` rather than rewritten. MIME parsing now refuses
+   conflicting duplicate parameters and invalid non-null declared numeric metadata
+   while retaining the working parameterized PCM response. Regressions:
+   `test_stage6_tts_boundary.py` (19) + `test_stage6_sol_p5_regressions.py`.
+5. **Evidence recovery and spent budget
+   (`app/materialization/tts_audition.py`, `app/cli.py`
+   `stage6-tts-audition-recover`).** `record_recovery`/`record_consumed_budget`
+   verify any surviving captured audio against its recorded hash and write a
+   durable `consumed-budget.json` floor (plus a `recovery.json` record) under
+   managed storage, so a missing ledger, a changed storage root, or a container
+   restart can never authorize another nine-call batch. `run_audition` refuses a
+   missing-ledger run against an exhausted floor (`AUDITION_BUDGET_EXHAUSTED`).
+
+### Verification (this session)
+- Docker `oac-stage6-test` (Python 3.12.14, real FFmpeg 7.1.5, google-genai
+  2.31.0) + PostgreSQL `oac-stage6-pg-v4`:
+  - `test_stage6_sol_p5_regressions.py` (new, 14): passed.
+  - `test_stage6_tts_boundary.py` (19), `adapter_regressions`, `sol2_regressions`,
+    `sol3_regressions`, `supporting_narration`, `blocker_regressions` (62):
+    passed.
+  - `results_boundary` + `cache_validation` (20, real FFmpeg): passed.
+  - `adapter_regressions` + `api_cli_acceptance` + `rc_corrections` +
+    `rc_v4_corrections` (51): passed.
+  - `ruff check app tests`: clean.
+- Frontend: `vitest run` **72 passed** (10 files, incl. 8 mounted DOM tests);
+  `eslint src --max-warnings=0` clean; `next build` succeeded; `tsc --noEmit`
+  retains only the pre-existing `job-poller.test.tsx` test-only typing error.
+- **No live provider calls** were made in this session. The prior session's
+  accounting stands: 1 probe + 9 audition = 10 hosted synthesis calls. Recovery
+  confirms 9 audition attempts + 1 probe; all audition audio is **lost**
+  (ephemeral container storage) and is recorded as such.
+- Durable evidence paths (managed storage, gitignored runtime data):
+  `storage/benchmarks/stage-6/tts-audition/recovery.json` and
+  `storage/benchmarks/stage-6/tts-audition/consumed-budget.json`
+  (`consumed_attempts=9`, `probe_calls=1`). The captured report
+  (`/tmp/audition-out.json`, sha256 `2d39a09a…0038`) is preserved unchanged.
+
+### Fixed / unproven / blocked
+- **Fixed**: cancellation reconciliation; export reuse/migration integrity;
+  audition admission/delivery accounting + cooldown + budget floor; fidelity
+  policy v2 (protected forms, deferred disagreement, versioned fingerprints) and
+  MIME hardening; evidence recovery.
+- **Unproven (unresolved product decision)**: the hosted TTS voice. No voice is
+  validated; `provisional_voice` remains unset. Any further live generation needs
+  a separately agreed bounded recovery budget.
+- **Internally blocked** (corrected by the next section): none in this session's
+  own scope, but the SOL review of this revision later reproduced three remaining
+  code defects (incomplete-history budget recovery, index-only package promotion,
+  and a protected-word comparison that reversed documented normalization). Those
+  were required code corrections, so "internally blocked: none" was **not**
+  accurate for the revision as reviewed.
+- **Externally blocked**: Task 9 genuine authorized-media acceptance (no
+  authorized source media). A hosted key is present; only authorized media is
+  missing.
+
+## Stage 6: frontend cancellation ownership, Results render binding, immutable export publication, and live TTS audition (2026-10-17, continuation)
+
+Status: **the three remaining implementation blockers are corrected with mounted-UI
+and backend regressions, and the bounded hosted TTS audition was actually run
+end-to-end against the configured provider. A real adapter defect was found and
+fixed: the live provider echoes a parameterized PCM container
+(`audio/l16; rate=24000; channels=1`), which the adapter had rejected. The
+audition spent exactly nine raw synthesis calls (3 voices x 3 scripts) and
+returned NO technically viable voice, so no provisional voice was recorded. Stage
+6 remains NOT FROZEN; `publication_ready` stays false.**
+
+### Corrections
+1. **Frontend cancellation ownership (`frontend/src/lib/produce-runner.ts`,
+   `components/produce-runner.tsx`).** A stop request now belongs to one per-run
+   controller (`RunState = RUNNING | STOPPING | CANCEL_UNCONFIRMED | TERMINAL`)
+   rather than the browser poll loop: `requestStop` drains every in-flight
+   create/queue operation (`drainInFlight`), reconciles the exact returned
+   materialization (Stage 6) or legacy ingest job (`findActiveIngestJob`),
+   performs the exact cancellation (`performCancellation`), and only settles to
+   `TERMINAL` when the server confirms (`settleCancellation`); a failed cancel is
+   `CANCEL_UNCONFIRMED` with a fresh retry, the controller/identities are retained
+   across retry, Produce is disabled while unresolved, and stale run callbacks are
+   ignored via a `runTokenRef` identity guard. Regressions:
+   `frontend/src/components/produce-runner.dom.test.tsx` (5 mounted jsdom tests:
+   cancel-fail-then-settle-then-retry, late pre-Stage-6 queue response, active
+   ingest cancellation, late Stage 6 submission cancel, stop during pending GET)
+   plus the existing orchestrator tests.
+2. **Results verdict bound to the exact render (`backend/app/api/app.py`,
+   `frontend/src/app/results/page.tsx`, `frontend/src/lib/api-client.ts`).**
+   `RenderArtifactResponse` (transformed short) now carries
+   `render_output_fingerprint`, `repair_revision`, `artifact_sha256`, and
+   `bound_render`; readiness is inherited only when the envelope
+   `render_execution_id == row.id` and the reverse render binding validates, with a
+   HISTORICAL/DIAGNOSTIC non-bound path that never inherits readiness. The
+   render-by-id artifact endpoint re-verifies the transformed artifact (size +
+   SHA-256) via `_verify_transformed_render_artifact`, and the Results UI suppresses
+   unverified artifact actions. Regressions: `test_stage6_results_boundary.py`
+   (7 tests incl. fresh POST -> pending -> executor/callback/finalizer -> ready, a
+   retained historical render not inheriting readiness, and a corrupt historical
+   artifact being suppressed).
+3. **Immutable export publication
+   (`backend/app/materialization/acceptance_export.py`).** Each case is published
+   into an immutable, content-versioned directory
+   `packages/<case_label>/<package_identity>/` with diagnostic attempts kept
+   separate; the catalog is now version 2 (`CATALOG_VERSION = 2`), keyed by case
+   with a separate published reference plus diagnostic attempts, and read/merge/
+   write happen under an exclusive process lock (`_catalog_lock`, `fcntl`) with an
+   atomic replace (`_write_catalog_atomic`) after bytes are published
+   (`_publish_case_package`, `_merge_case_into_catalog`). Regressions:
+   `test_stage6_cache_validation.py` (diagnostic preservation, unrelated-case merge,
+   catalog-publication-failure preservation).
+
+### Task 7 hosted provider validation (live)
+- **Adapter defect fixed (`backend/app/materialization/tts_gemini.py`).** The live
+  `gemini-3.8-flash-tts` Interactions (`v1beta`) response returns
+  `mime_type = "audio/l16; rate=24000; channels=1"`. The adapter matched the bare
+  `audio/l16` with strict equality and raised `MALFORMED_OUTPUT`, so every
+  synthesis failed. `_parse_audio_mime` / `_resolve_int` now parse the base
+  container plus parameters, require the declared numeric fields and container
+  parameters to agree (never guessed), keep unknown containers refused, and wrap
+  PCM exactly once. Verified live (single call: 3.36 s, 24 kHz, mono WAV) and by
+  `test_stage6_tts_boundary.py` (12 tests, incl. parameterized-PCM, conflicting
+  metadata, and unknown-container refusals).
+- **Audition result (truthful negative).** `python -m app.cli stage6-tts-audition`
+  ran the fixed 3 voices x 3 scripts set: `raw_calls = 9`, `provisional_voice =
+  null`, `status = OK`. The captured result is exactly: **two accepted English
+  samples, five rejected comparisons, and two uncertain failures** (Achird failed
+  two provider calls). "No voice validated" is justified by that evidence.
+  **Confirmed failure of all three voices' Arabic speech is NOT established** —
+  the five rejections were strict transcript-disagreement comparisons, which the
+  later `stage6-fidelity-v2` policy reclassifies as *deferred* evidence, not
+  confirmed meaning mismatches. No voice cleared all three scripts, so the
+  conservative default stands: **no provisional voice; the hosted TTS voice
+  remains an unresolved product decision, not a placeholder.** The comparison gate
+  was NOT loosened (that would weaken Stage 6). The audio/history was produced in
+  an ephemeral container storage root and is irrecoverable; the consumed budget is
+  preserved (see the next section).
+
+### Verification (this session)
+- Docker `oac-stage6-test` (Python 3.12.14, real FFmpeg 7.1.5, google-genai
+  2.31.0) + PostgreSQL `oac-stage6-pg-v4`:
+  - focused backend batch (`results_boundary`, `cache_validation`,
+    `adapter_regressions`, `tts_boundary`, `rc_corrections`, `rc_v4_corrections`,
+    `api_cli_acceptance`, `durable_router`, `materialization_core`,
+    `supporting_narration`, `blocker_regressions`): **144 passed**.
+  - `test_stage6_tts_boundary.py`: 12 passed.
+- Frontend: `vitest run` **69 passed** (10 files, incl. the new mounted DOM suite);
+  `eslint src --max-warnings=0` clean; `next build` succeeded (compiled, 10/10
+  static pages); `tsc --noEmit` retains only the pre-existing
+  `job-poller.test.tsx` test-only typing error.
+- Live hosted validation: 1 provider probe call (adapter fix) + 9 audition calls
+  = 10 hosted synthesis calls; no other live provider calls.
+- `HANDOFF.md` and `oac_implementation_evidence.txt` remain untracked.
+
+## Stage 6: SOL six-defect corrections — Produce state machine, truthful cancel, Results assessment, resume revalidation, cache/assessment unification, export integrity (2026-10-17, continuation)
+
+Status: **the six SOL-reopened defects are corrected with behavioral regressions
+across backend (persisted, real-FFmpeg, and PostgreSQL) and frontend
+(orchestrator + component). The Produce state machine tracks the durable
+materialization id across preparation/rendering/finalization and exposes a
+transformed short only after the committed readiness response permits review;
+cancellation is truthful including an in-flight submission; Results consults the
+shared Stage 6 readiness evaluator; id-based resume revalidates live inputs before
+any work; completed-cache verification requires the committed assessment; and
+export verifies every copied destination byte and preserves the last valid
+package. No live hosted/provider call is made. Task 9 still has no genuine
+authorized-media acceptance. Stage 6 is NOT FROZEN.**
+
+### Corrections (SOL reproduction → corrected + regression)
+
+1. **Produce state machine (`frontend/src/lib/produce-runner.ts`,
+   `components/produce-runner.tsx`).** The preparation `ProcessingJob` is only
+   intermediate progress: after `queueMaterialization` the run polls the read-only
+   `GET /api/materializations/{id}` across changing render/finalizer job
+   identities, tracking the durable materialization id throughout. A transformed
+   short is exposed only when `readiness.review_ready`, `lifecycle=COMPLETE`,
+   `is_current`, and a verified artifact agree — `artifact_available` alone is
+   insufficient, and media that exists but is not review-ready is not offered.
+   Blocked/deferred/rejected/cancelled/stale/no-output/unavailable outcomes are
+   explicit (zero output is valid). At most one bounded durable-resume recovery is
+   attempted for a stalled pending-finalization generation; polling never triggers
+   provider retries or synchronous worker waits, and GET stays read-only.
+   Regressions: `produce-runner.test.ts` (prep-success-is-not-completion,
+   artifact-availability-is-insufficient, changing render identities, bounded
+   resume, `produce-runner.test.tsx` smoke).
+2. **Truthful cancellation (`produce-runner.ts`).** A stop-requested flag is
+   independent of browser polling. Cancellation reconciles an in-flight
+   `queueMaterialization` submission, then cancels the exact returned
+   materialization (Stage 6) or the exact active job (pre-Stage 6). A failure is
+   surfaced as an explicit unconfirmed state with a retry path (each retry a fresh
+   attempt); a confirmed cancellation is never displayed for a swallowed failure.
+   Regressions: in-flight-submission reconciliation and unconfirmed-then-retry.
+3. **Results consults Stage 6 assessment (`app/api/app.py`,
+   `app/results/page.tsx`).** `RenderArtifactResponse` for `TRANSFORMED_SHORT`
+   entries now carries materialization identity, lifecycle, semantic outcome,
+   currentness/readiness (from the shared `evaluate_readiness`), findings, exact
+   lineage, and the verified materialization artifact endpoint; a
+   `materialization_state` distinguishes `REVIEW_READY` from pending/deferred/
+   rejected/no-output/blocked/failed/cancelled and historical/diagnostic media.
+   Historical inspectability never implies current review readiness. CORE behavior
+   is preserved. Regressions: `test_stage6_results_boundary.py` (4 tests incl. the
+   real Produce→Results HTTP flow).
+4. **Resume revalidation (`app/materialization/queue.py`).**
+   `resume_materialization_by_id` reconstructs the exact persisted request options
+   and revalidates live prerequisites plus the recomputed input fingerprint under
+   the candidate lock *before* any active recovery, cache acceptance, job
+   creation, binding change, or dispatch; a stale/superseded generation is refused
+   `UPSTREAM_REVALIDATION_REQUIRED` with no new work, while a genuine match
+   preserves checkpoint reuse. Regressions: `test_stage6_rc_v4_corrections.py`
+   (refused-without-live-prerequisites, no job allocation) and
+   `test_stage6_finalizer_currentness_postgres.py::test_resume_refuses_superseded_final_clip_without_new_work`.
+5. **Completed-cache vs committed assessment (`queue.py`).** A COMPLETE
+   `cache_eligible` envelope is a cache hit only when it satisfies the same
+   committed-assessment/live-input/render-binding/QC/artifact requirements as the
+   shared readiness view. A missing/mismatched assessment is
+   `CACHE_ASSESSMENT_RECOVERABLE`: the exact completed render is preserved and one
+   finalizer is recovered over it (no provider repeat, no re-render). Ordinary
+   POST and resume converge on the same authoritative durable router. Regressions:
+   `test_stage6_cache_validation.py` (missing-assessment recovery, resume cache
+   convergence, resume missing-assessment recovery).
+6. **Export integrity and publication (`acceptance_export.py`).** Every copied
+   destination byte set (MP4, bound ASS, narration, supporting) is verified against
+   its authoritative expected hash before publishing; the snapshot/recheck binds
+   the complete render/QC/assessment and referenced-asset identities. A diagnostic
+   export never replaces a valid package: the last valid package is preserved and
+   the diagnostic package is published separately; the catalog is updated
+   atomically with a package identity. Regressions:
+   `test_export_verifies_copied_destination_bytes`
+   (destination-only ASS corruption invalidates acceptance) and
+   `test_diagnostic_export_preserves_last_valid_package`.
+
+### Verification (this session)
+
+- Docker `oac-stage6-test` (Python 3.12.14, real FFmpeg 7.1.5, google-genai
+  2.31.0); PostgreSQL 16 `oac-stage6-pg-v4`:
+  - `test_stage6_rc_v4_corrections.py` + `test_stage6_finalizer_currentness_postgres.py`
+    (with `CLIPFACTORY_TEST_POSTGRES_URL`): 33 passed.
+  - `test_stage6_cache_validation.py`: 11 passed (real FFmpeg; 3 new cache/resume
+    + 2 new export-integrity tests).
+  - `test_stage6_results_boundary.py` (new, 4 tests): 4 passed.
+  - `test_stage6_durable_router + api_cli_acceptance + materialization_core +
+    finalizer_evidence + finalization_gates + rc_corrections`: 89 passed.
+  - `test_stage6_component_recovery + sol2_regressions + sol3_regressions +
+    runtime_ownership + runtime_corrections + worker_chain + test_api_sources`:
+    63 passed, 7 skipped.
+  - `test_stage6_sol3_postgres + finalizer_currentness_postgres`: 16 passed.
+  - `ruff check app tests` clean.
+- Frontend: `vitest run` 64 passed (6 new orchestrator tests + component smoke);
+  `eslint src --max-warnings=0` clean; `next build` succeeded (types + lint +
+  10/10 static pages); `tsc --noEmit` retains only the pre-existing
+  `job-poller.test.tsx` test-only typing error (untouched).
+- Zero live hosted/provider calls in this session; no hosted quota was spent.
+
+### BLOCKERS (not done)
+
+- Task 9 genuine authorized-media acceptance: no authorized source media is
+  available in this environment, so no genuine `MANUAL CHECK REQUIRED NOW`
+  artifact exists. This is a real external prerequisite, not a code gap. (A hosted
+  `GEMINI_API_KEY` IS configured; only authorized media is missing. This corrects
+  an earlier status note that wrongly implied no hosted key was present.)
+- Actual hosted writing/TTS quality and the provisional voice audition were not
+  exercised in that session; they are addressed in the next session's section
+  above (live adapter validation + a truthful-negative audition).
+
+### NON-BLOCKING LIMITATIONS
+
+- The frontend has no DOM test environment (jsdom/@testing-library are not
+  installed), so the Produce component is covered by a static render smoke test
+  plus behavioral orchestrator tests; in-flight cancellation and cancellation
+  failure are asserted at the orchestrator boundary rather than through a mounted
+  component.
+- The full `pytest -k stage6` suite is long-running and was validated in focused
+  batches rather than one run.
+- `tsc --noEmit` retains the pre-existing `job-poller.test.tsx` typing error.
+
+## Stage 6: SOL-reopened defects corrected — committed readiness, id-scoped cancel/resume, artifact verification, narration identity, export snapshot (2026-10-16, continuation)
+
+Status: **this session corrects the remaining gaps in the six SOL-reopened root
+causes with persisted and real-HTTP regressions
+(`backend/tests/test_stage6_rc_v4_corrections.py`, 20 tests). Review readiness now
+requires the finalizer's *committed* assessment — lifecycle COMPLETE, a persisted
+reviewable semantic outcome with the human-review flag set, and a persisted final
+assessment whose fingerprint/policy/render binding matches the freshly verified
+evidence. Freshness, lifecycle, and review readiness are separate; an unavailable
+verdict is `UNKNOWN`/`is_effective=false`. Cancel/resume are id-scoped and
+generation-authoritative: a historical/stale id is refused `409` and a newer
+current generation is never resolved or mutated. Artifact inspection and the
+download endpoint share one read-only verifier (corrupt/wrong-purpose/pending
+media is never served; historical verified media stays inspectable with explicit
+metadata). Narration synthesis dependencies now include the *effective* synthesizer
+runtime identity; the audition checks provider availability and shared HIGH
+admission before reserving a durable attempt and re-runs missing/deferred local
+validation on reuse. Export assembles in an export-owned staging directory,
+verifies the copied artifact bytes against the accepted hash, and requires the
+same refreshed identity before publishing. Task 8's frontend now has
+materialization types/client, a Produce→materialize flow with server-authoritative
+cancel-before-stop, and a core-vs-transformed Results distinction; the bounded
+source/candidate readiness inventory reports concrete prerequisite reasons. Task 9
+still has no genuine authorized-media acceptance. Stage 6 is NOT FROZEN.**
+
+### Corrections (SOL reproduction → corrected + regression)
+
+1. **Committed final assessment (readiness).** `materialization/readiness.py`
+   `evaluate_readiness` now requires `lifecycle=COMPLETE`, a persisted reviewable
+   `semantic_outcome` with `human_review_required=true`, and a *committed*
+   assessment (`assessment_fingerprint` + `assessment_policy_version` +
+   `render_output_fingerprint` binding, matching the freshly recomputed
+   fingerprint). AWAITING_RENDER/cancelled/missing-or-mismatched-assessment cases
+   can no longer report ready. `_materialization_response` reads freshness/
+   `is_effective` from the view (UNKNOWN/False on `READINESS_UNAVAILABLE`).
+   Regressions: `test_readiness_requires_committed_assessment`,
+   `test_committed_assessment_fingerprint_binding`,
+   `test_readiness_rejects_awaiting_render_without_assessment`,
+   `test_readiness_rejects_cancelled_generation`,
+   `test_readiness_historical_is_not_effective`,
+   `test_readiness_unavailable_reports_unknown_freshness`.
+2. **ID-based cancel/resume authority (`queue.py`).**
+   `cancel_materialization_by_id` / `resume_materialization_by_id` operate on the
+   requested envelope under the candidate-first lock, require it to be the exact
+   current generation, and refuse historical ids with `409` (no mutation or
+   delivery); repeated cancellation is idempotent. Resume uses the envelope's
+   exact persisted options/checkpoints, returns verified cache for a valid COMPLETE
+   result, and an explicit resume of a cancelled current generation creates a new
+   fenced job preserving accepted components/budgets/repair usage while old jobs
+   stay terminal and no uncertain attempt is re-spent. The candidate/CLI wrappers
+   (`cancel_materialization`, `resume_materialization`) delegate to the same logic.
+   Regressions: `test_cancel_historical_id_is_refused_without_mutation`,
+   `test_cancel_current_id_is_idempotent`, `test_resume_historical_id_is_refused`,
+   `test_resume_cancelled_current_creates_new_fenced_job`,
+   `test_cancel_by_id_service_refuses_historical`.
+3. **Exact reverse-bound artifact verification.** `readiness.verify_artifact`
+   requires the reverse-bound `TRANSFORMED_SHORT` render/output/repair identity, a
+   completed render, and actual on-disk size+digest; the download endpoint and the
+   API `artifact_available` flag share it. Regressions:
+   `test_artifact_valid_current_is_served_with_metadata`,
+   `test_artifact_corrupted_is_not_served`,
+   `test_artifact_wrong_purpose_is_not_served`,
+   `test_artifact_pending_render_is_not_served`,
+   `test_artifact_historical_is_inspectable_with_explicit_metadata`.
+4. **Effective narration identities + audition recovery.**
+   `_narration_chunk_fingerprint` includes the effective synthesizer runtime
+   identity; `_validation_input_fingerprint` records missing runtime as an explicit
+   sentinel; `run_audition` checks availability/HIGH admission before reserving and
+   never poisons the manifest, and `_reuse_attempt` re-runs missing/deferred or
+   dependency-mismatched local validation. Regressions:
+   `test_narration_effective_synthesizer_identity_invalidates_reuse`,
+   `test_audition_unavailable_does_not_poison_manifest`,
+   `test_audition_deferred_fidelity_is_revalidated_on_reuse`.
+5. **Export snapshot verification.** `export_materialization` stages the package,
+   verifies copied artifact bytes against the accepted hash, and requires the same
+   refreshed identity before publishing (`EXPORT_ARTIFACT_MISMATCH` /
+   `EXPORT_IDENTITY_CHANGED`). Regression:
+   `test_export_rejects_artifact_bytes_mismatch`.
+6. **Task 8 UI / Task 9 inventory.** Frontend adds `Materialization*` types and
+   client methods, a Stage 6 `materialize` produce step (no preliminary core
+   render), server-authoritative cancel-before-stop, and a core-vs-transformed
+   Results distinction; `inventory_source_readiness` now reports concrete
+   prerequisite reasons per source.
+
+### Verification (this session)
+
+- Docker `oac-stage6-test` (Python 3.12.14, real FFmpeg 7.1.5, google-genai
+  2.31.0), PostgreSQL 16 (fresh disposable `oac-stage6-pg-v4`):
+  - `test_stage6_rc_v4_corrections.py` (new, 20 corrected regressions): 20 passed.
+  - rc_v4 + rc_corrections + api_cli_acceptance + durable_router +
+    finalizer_evidence + finalization_gates: 88 passed.
+  - component_recovery + tts_boundary + cache_validation + durable_router +
+    service + materialization_core: 61 passed.
+  - finalizer_currentness_postgres + runtime_ownership: 19 passed.
+  - `ruff check app tests` clean.
+- Frontend: `vitest run` 57 passed; `eslint src --max-warnings=0` clean; `tsc
+  --noEmit` retains one pre-existing `job-poller.test.tsx` test-only typing error
+  (untouched).
+- No live hosted/provider call is made; hosted adapters run through the real
+  installed SDK over a fake transport.
+
+### BLOCKERS (not done)
+
+- Task 8 Produce→Results UI is implemented but not exercised against a live
+  end-to-end produce (no hosted provider key or authorized media here).
+- Task 9 genuine authorized-media acceptance: no authorized source media is
+  configured, so no genuine `MANUAL CHECK REQUIRED NOW` artifact exists.
+
+### NON-BLOCKING LIMITATIONS
+
+- The full `pytest -k stage6` suite (real-FFmpeg executor milestone tests) is
+  long-running and was validated here in focused batches rather than one run.
+- `tsc --noEmit` retains a pre-existing test-file typing error in
+  `job-poller.test.tsx`.
+
+## (Superseded) Stage 6: SOL reopened RC1–RC6; RC1–RC5 corrections (2026-10-16, continuation)
+
+Status: **SOL reopened the six root causes; the previous session's "corrected"
+claim was overbroad. RC1–RC6 are now corrected with new persisted regressions
+(`backend/tests/test_stage6_rc_corrections.py`, 17 tests) that assert the
+*corrected* behavior. A read-only Stage 6 readiness view now backs both the API
+and the acceptance export. Task 8's rich API boundary is implemented; its
+Produce→Results UI and Task 9's genuine authorized-media acceptance remain NOT
+done.** No genuine `MANUAL CHECK REQUIRED NOW` media exists. Stage 6 is NOT
+FROZEN.
+
+Truthful disposition of the six root causes (SOL reproduction → corrected):
+
+1. **Strict response structure (RC1).** `gemini._parse_critique` /
+   `_parse_copies` now validate the *entire* response against the exact requested
+   block set before any decision: each requested block exactly once and every
+   requested dimension exactly once. Unexpected/duplicate/malformed/missing/
+   contradictory entries invalidate the whole response (`MALFORMED_OUTPUT`,
+   deferred); a favorable remainder is never retained. Tri-state verdict,
+   critical-UNKNOWN deferral, and noncritical-finding preservation are unchanged.
+2. **Separate synthesis vs validation identity (RC2).**
+   `CheckpointedNarrationSynthesizer` persists a *validation-input fingerprint*
+   (actual audio hash, exact script, policy version, effective ASR runtime/options)
+   distinct from the synthesis dependency. Changed ASR configuration reruns local
+   validation (no TTS call), preserves accepted synthesis, and a missing
+   production validator now defers (never returns True). Strict normalized
+   lexical-sequence matching and cancellation wiring are preserved.
+3. **No implicit replay of uncertain work (RC3).** `DurableRequestGateway`
+   refuses an ordinary recovery/redelivery when a matching `RESERVED`/`UNCERTAIN`
+   attempt already exists (budget-consumed); a crash-left reservation is recovered
+   durably as `UNCERTAIN`. The old unused helper is now the enforced boundary.
+4. **Interactions retries + typed-exception accounting (RC4).**
+   `GeminiNarrationSynthesizer` disables the private Interactions resource retry
+   config in a guarded client-local boundary (`sdk_configuration.retry_config=None`)
+   and fails closed if unavailable; the real installed SDK (`google-genai 2.31.0`)
+   now makes exactly one request for 200/429/503/timeout. The gateway classifies
+   typed provider exceptions (known HTTP rejection → `FAILED_KNOWN`, ambiguous
+   transport loss → `UNCERTAIN`) and notifies the shared cooldown on rate limits.
+5. **Durable, serialized nine-attempt audition (RC5).** `run_audition` uses one
+   StorageService-resolved directory, an exclusive `fcntl` lock (`AUDITION_ACTIVE`
+   when held), and a versioned durable manifest: RESERVED persisted before each
+   HTTP op, response persisted before validation, crash-left reservations
+   recovered as UNCERTAIN, a durable nine-attempt ceiling, a fixed audition
+   identity (`AUDITION_IDENTITY_MISMATCH`, zero calls), and malformed history
+   failing closed. Missing/deferred/rejected fidelity is nonviable; the CLI wires
+   local fidelity.
+6. **Authoritative readiness shared by export and API (RC6).**
+   `materialization/readiness.py::evaluate_readiness` is the single read-only
+   view reusing the finalizer's live-input, render-binding, render-identity/QC,
+   assessment, artifact, and referenced-asset checks. Export copies the *bound*
+   authored ASS and assets (verifying hashes; never a newer deterministic-path
+   file), rechecks identity before publishing the index, and labels synthetic/
+   incomplete cases `diagnostic` (never genuine). `publication_ready` stays false.
+   TASK 8 additionally enriches `MaterializationResponse` and adds
+   GET `/api/materializations/{id}`, POST `.../cancel`, POST `.../resume`, and
+   GET `.../artifact`.
+
+### Verification (this session)
+
+- Docker `oac-stage6-test` (Python 3.12.14, real FFmpeg 7.1.5, google-genai
+  2.31.0), PostgreSQL 16 (`oac-stage6-pg`, network `oac-stage6-net`):
+  - `test_stage6_rc_corrections.py` (new, 17 corrected regressions): 17 passed.
+  - Focused batches: `component_recovery + gemini_boundary + tts_boundary +
+    adapter_regressions + api_cli_acceptance + rc_corrections + cache_validation +
+    finalizer_evidence + finalization_gates` → 106 passed.
+  - `providers + materialization_core + service + runtime_corrections +
+    durable_router + runtime_ownership + worker_chain + sol2_regressions +
+    sol3_regressions` → 81 passed, 7 skipped.
+  - `supporting_narration + temp_cleanup + overlays + asset_localization +
+    audio_recipe_mapping + repair + limiter_repair + real_executor +
+    worker_pipeline + integration` → 35 passed.
+  - PostgreSQL currentness/sol3: 15 passed.
+  - `ruff check app tests` clean.
+- The corrected regressions exercise the real installed SDK via a fake httpx
+  transport and seeded media, not a live hosted call.
+
+### BLOCKERS (not done)
+
+- Task 8 frontend: the Produce→Results transformed polling/cancel-before-stop UI
+  and the review surface are not implemented (backend boundary only).
+- Task 9 genuine authorized-media acceptance: no authorized source media and no
+  hosted provider key are configured here, so no genuine assessed artifact
+  exists. This is a real external prerequisite, not a code gap.
+
+### NON-BLOCKING LIMITATIONS
+
+- Acceptance-export and readiness tests use synthetic fixtures and therefore now
+  assert *non-genuine* outcomes (the corrected behavior); no positive genuine
+  end-to-end export is asserted without real authorized media.
+- `ruff format --check` reports pre-existing formatting drift in untouched files
+  (not enforced by the project's `ruff check`).
+
+## Stage 6: recovery review-state defect fixed; grounded writing/critique, TTS + local fidelity, audition and acceptance export implemented (2026-10-16, continuation)
+
+Status: **the recovery review-state defect is fixed with extended normal-POST
+regressions; Task 6 (hosted grounded writing + categorical critique) and the core
+of Task 7 (Gemini TTS adapter, separately checkpointed local Whisper fidelity
+validation, bounded provisional-voice audition) are implemented and tested; Task
+8's profile import, resume/cancel commands, and default-profile resolution are
+implemented; Task 9's read-only acceptance exporter is implemented. The
+candidate API review surface (profile-key query parity, richer response types)
+and the Produce/Results UI parity remain. No genuine authorized-media acceptance
+artifact exists (no authorized source configured, no hosted provider key). Stage
+6 is NOT FROZEN.**
+
+### 1. Recovery review-state defect (fixed)
+
+`materialization/queue.py` `CACHE_RECOVERABLE` changed `COMPLETE` to
+`AWAITING_RENDER`, cleared cache eligibility and the forward render binding, but
+preserved the previous `human_review_required=true`. It now atomically clears
+current final-review eligibility: `human_review_required=false`,
+`publication_ready=false`, `semantic_outcome=None` (historical assessment
+metrics/components/ledger are preserved). Only a verified current final
+assessment restores review readiness; an AWAITING_RENDER generation never carries
+a stale review requirement. `finalize_materialization` reconstructs the outcome
+on the recovered render.
+
+Extended regressions (`backend/tests/test_stage6_cache_validation.py`, real
+FFmpeg, normal POST): missing/corrupted artifacts, a demoted bound render, a
+stale output binding, and a failed render-handoff delivery. Each asserts the
+persisted state *and* the fresh GET response (`_materialization_response`); the
+demoted-render case runs the recovered finalizer and proves the flags are
+restored with an identical assessment fingerprint and untouched
+component/ledger/repair state (no duplicate provider work). 6 passed.
+
+### 2. Task 6 — grounded writing and categorical critique
+
+`materialization/gemini.py` (new) implements `GeminiWritingProvider` and
+`GeminiCritiqueProvider` through the durable reserve-before-invoke gateway:
+exactly one `generateContent` request per invocation, v1, temperature 0, routine
+`gemini-3.5-flash-lite` / strong `gemini-3.8-flash` (low thinking), strict
+structured-output schemas with closed enums, disabled SDK retries, lazy client,
+key scrubbed on release. A hosted failure defers truthfully (never raises into
+the pipeline). The critique is now categorical per block
+(grounding/entailment, substantive added value, semantic fidelity, unsupported
+facts, code-switch preservation, redundancy, dialect/register fit, naturalness,
+length/necessity); acceptance requires a known-positive grounding + added-value
+verdict plus no critical concern/failure, and a favorable critique can never clear
+a deterministic UNMET finding. `providers.py`, `components.py` (checkpointed
+serialization), `executor.py` (explicit `allow_hosted` from the configured mode,
+never inferred from a critique object's presence), and `settings.py`
+(`CLIPFACTORY_MATERIALIZATION_MODE`, models, thinking) are wired.
+`backend/tests/test_stage6_gemini_boundary.py` (16 tests) exercises the real
+installed SDK via a fake httpx transport (model/URL/body/schema/temperature/one
+request, 429/refusal/malformed, missing key, categorical acceptance).
+
+### 3. Task 7 — TTS, local fidelity, provisional voice, audition
+
+Verified current official docs (2026-10-11/12): Python `google-genai>=2.25.0`,
+model `gemini-3.8-flash-tts`, Interactions API `v1beta`, verbatim `input` with a
+`speech_metadata` style annotation, `response_format` audio, and
+`generation_config.speech_config` voice — the architecture's boundaries are
+confirmed and unchanged. `backend/pyproject.toml` now pins `google-genai>=2.25,<3`
+(the test image was raised to 2.31.0).
+
+`materialization/tts_gemini.py` (new) implements `GeminiNarrationSynthesizer`
+(single Interactions request, WAV saved as-is / `audio/l16` wrapped exactly once,
+managed lossless bytes through StorageService) and
+`validate_narration_fidelity` (a *separate* checkpointed step) which transcribes
+the WAV under the existing heavy-model lease and applies the strict
+order/occurrence-, negation-, number-, and code-switch-aware comparison; unknown
+fidelity defers, a clear mismatch rejects. `components.py`
+(`CheckpointedNarrationSynthesizer`) runs and idempotently persists the fidelity
+validation; a rejected/deferred validation never accepts the chunk. `executor.py`
+builds the per-run Gemini synthesizer (bound to the resolved source) and the
+fidelity validator from settings. `materialization/tts_audition.py` (new) runs
+exactly Charon/Kore/Achird × three fixed scripts (≤9 raw calls, cached by request
+identity) and proposes one technically viable PROVISIONAL voice.
+`backend/tests/test_stage6_tts_boundary.py` (9 tests) covers the SDK boundary,
+WAV/PCM handling, missing key/malformed, and fidelity accept/defer/reject.
+
+### 4. Task 8 (partial) and Task 9 (exporter)
+
+- Omitted `profile_key` now resolves to the current `channel_key='default'`
+  profile when one exists, else the neutral no-voice profile
+  (`service._current_profile`).
+- New CLI commands: `materialization-resume`, `materialization-cancel`
+  (cooperative, cancels the exact active render through the existing convention),
+  `production-profile-import` (strict JSON, new current revision per
+  `channel_key`; `profiles.import_profile`), `stage6-acceptance-export`,
+  `stage6-tts-audition`.
+- `materialization/acceptance_export.py` (new): read-only export of the exact
+  persisted lineage (MP4, readable index, ASS, timeline, audio recipe, QC/repair
+  evidence, provider attempt counts, SHA-256 manifest) plus a bounded
+  review-ready inventory that never fabricates eligibility.
+- `backend/tests/test_stage6_api_cli_acceptance.py` (6 tests): profile import
+  revision/validation, acceptance export package + manifest, eligible discovery,
+  audition ≤9 calls + caching.
+
+### Verification (this session)
+
+- Docker Python 3.12.14 + real FFmpeg 7.1.5 (`oac-stage6-test`, google-genai
+  2.31.0) and PostgreSQL 16 (`oac-stage6-pg`):
+  `test_stage6_cache_validation.py` 6 passed; broad SQLite suite
+  (providers/gemini/tts/component-recovery/api-cli/core/service/sol2/sol3/
+  migration/durable-router/ownership/repair/finalization-gates) 131 passed, 8
+  skipped; PostgreSQL-gated
+  (finalizer-currentness/sol3-postgres/ownership/durable-router) 33 passed.
+- `ruff check app tests` clean.
+
+### BLOCKERS (not done)
+
+- Task 8 API/UI completion: GET `profile_key` query parity with POST, richer
+  candidate/materialization response types (lifecycle vs semantic vs live
+  freshness, component progress, exact render binding, findings), and the
+  Produce→Results transformed polling/cancel-before-stop UI.
+- Task 9 genuine acceptance: no authorized source media and no hosted provider
+  key in this environment, so no `MANUAL CHECK REQUIRED NOW` media exists.
+
+### NON-BLOCKING LIMITATIONS
+
+- TTS narration defaults (`CLIPFACTORY_MATERIALIZATION_TTS_*`) are fallbacks; a
+  channel profile must configure `tts_provider`/`tts_voice` for narration to run.
+- The acceptance exporter is exercised against a seeded envelope; it has not run
+  over a genuine end-to-end produce.
+
+## Stage 6: SOL review blockers corrected — cache verification, narrated chain, deterministic lock, exported package (2026-10-15, continuation)
+
+Status: **the four SOL-noted blockers that kept the persisted milestone from being
+accepted are corrected and verified. The completed-cache path now verifies the
+exact effective bound transformed render, the complete generation/output/repair
+binding, the live render scope, and the actual artifact digest before claiming a
+cache hit; identical-invalid inputs recover truthfully through the existing render
+reactivation/re-handoff boundary instead of returning a verified-cache claim. The
+narrated persisted chain now runs prepare -> real FFmpeg render -> callback ->
+finalizer -> final assessment with a deterministic audible time-varying synthetic
+signal and an explicit profile-driven narration gain; a real product defect (a
+contract narration slot without a block index could never be verified at
+finalization) was found and fixed. The publication/lock regression now handshakes
+on the actual PostgreSQL lock (a not-granted lock on the holder's transaction id)
+instead of an elapsed sleep, and a second ordering test exercises a live
+``queue_materialization`` POST against publication. The current tested synthetic
+package (happy, repaired, narrated) is exported persistently. Tasks 6 (hosted
+grounded writing/critique), 7 (TTS/voice/ASR fidelity), 8 (candidate API/CLI/UI),
+and 9 (genuine authorized-media acceptance) remain NOT done. No genuine
+authorized-media acceptance artifact exists and no hosted provider key is
+configured. Stage 6 is NOT FROZEN.**
+
+### 1. Completed-cache verification (fixed)
+
+`materialization.queue` previously trusted only `cache_eligible + COMPLETE`. The
+new `_completed_cache_state` classifies a COMPLETE envelope as `CACHE_VALID`,
+`CACHE_RECOVERABLE`, or `CACHE_TERMINAL`:
+
+- `CACHE_VALID` requires the exact effective bound render
+  (`_bound_completed_render`: same envelope reverse-binding, `TRANSFORMED_SHORT`,
+  `COMPLETE`, current, cache-eligible), the complete binding identity
+  (`finalization._validate_render_binding`: output fingerprint + materialization id
+  + `repair_revision`), a currently-fresh render scope
+  (`render.execution.service._live_request_freshness` recomputes the request input
+  fingerprint), and a real artifact whose size+digest match the recorded
+  reference (`finalization._artifact_identity`).
+- `CACHE_RECOVERABLE` (demoted bound render, deleted/corrupted artifact, stale
+  output/repair binding) is never returned as cached. The forward render binding is
+  cleared, the envelope returns to `AWAITING_RENDER`, and the exact transform is
+  technically recovered through the render boundary: `dispatch_transformed_render`
+  reactivates an equivalent revision whose artifact still verifies (then a
+  finalizer resumes) or queues a bounded technical re-render. No provider work and
+  no semantic regeneration is repeated; accepted components, budgets, repair
+  usage, and historical artifacts are preserved.
+- `CACHE_TERMINAL` keeps the existing truthful COMPLETE-not-eligible skip.
+
+New `backend/tests/test_stage6_cache_validation.py` (real FFmpeg, normal POST):
+`test_valid_completed_replay_is_cached_without_duplicated_work`,
+`test_demoted_bound_render_is_recovered_not_cached`,
+`test_missing_or_corrupted_artifact_is_recovered_not_cached[deleted|corrupted]`,
+`test_stale_output_binding_is_recovered_not_cached`.
+
+### 2. Narrated persisted chain (finished)
+
+`test_real_authored_card_with_synthetic_narration` no longer stops after the
+render. The fixture now synthesizes a deterministic, audible, time-varying signal
+(a 400 Hz -> 2400 Hz sweep at half scale) and exercises an explicit nonzero
+narration gain. Production support was added: `policy.narration_gain_db` resolves
+and clamps a bounded `tts_settings["narration_gain_db"]` (range -12..+6 dB) and
+`timeline.build_audio_recipe` applies it to every `NARRATION` entry (so it flows
+through the frozen renderer's `volume=<gain>dB` and participates in the
+output fingerprint). The test asserts: the render request carries the exact gain
+on the narration track; the decoded final MP4 has the time-varying narration
+actually placed in the authored-card window (rising zero-crossing rate) and absent
+from the source-only tail (a 440 Hz tone); final decoded audio is ~-16 LUFS +/- 1
+LU and true peak <= -1.5 dBTP; exact lineage (render id, refinement id, managed
+narration asset sha256); every handled job terminal; and a replay with zero
+duplicated provider/render work.
+
+Product defect fixed: a required contract `AUTHORED_NARRATION` slot with no
+`block_index` was persisted as `block_index=None`, so the finalizer's
+material-presence check (`_slot_material_present`) always failed and every narrated
+generation truthfully but incorrectly deferred as `DEFERRED_EVIDENCE`.
+`service._narration_slot_ids` now returns `slot_id -> narration block index` and
+`scripting.resolve_slots` records the exact fulfilled block, so narration
+fulfillment is verifiable. Extra milestone fixture: the profile is created with
+`tts_settings={"narration_gain_db": -6.0}`.
+
+### 3. Deterministic publication/lock regressions (fixed)
+
+`test_publication_waits_on_concurrent_candidate_lock_then_refuses` replaced its
+`time.sleep(1.0)` with `_wait_for_lock_waiter`, which polls `pg_locks` for a
+not-granted lock on the holder's exact transaction id: the test now proves the
+finalizer is genuinely blocked on the intended PostgreSQL row lock before the
+holder commits, asserts it has not completed while blocked, and asserts both
+threads terminate. A new
+`test_publication_and_queue_share_lock_order_without_deadlock` runs a real
+`queue_materialization` POST (candidate lock first, in production order) against
+publication: it verifiably waits on the queue POST's lock, both terminate within
+bounded timeouts, and no lock-order inversion/deadlock occurs. Bounded
+`lock_timeout`/`statement_timeout` are preserved.
+
+### 4. Current tested synthetic package (exported)
+
+`_export_synthetic_package` now writes one identifiable subdirectory per case with
+`index.json` (IDs, input/output/assessment fingerprints, semantic findings, reason
+codes, repair history/actions, narration references, audio recipe incl. gain, QC,
+job dispositions, artifact sha256), `final.mp4`, `authored.ass`, `SHA256SUMS`, and
+a top-level `catalog.json`. Exported cases (SYNTHETIC INTEGRATION, not product
+acceptance), absolute host paths:
+
+- `storage/benchmarks/stage-6/synthetic-integration/happy-no-narration/`
+- `storage/benchmarks/stage-6/synthetic-integration/repaired/` (`repair_count=1`)
+- `storage/benchmarks/stage-6/synthetic-integration/narrated/` (1 WAV, gain -6.0)
+
+### Verification (this session)
+
+- `pytest -k stage6` with `CLIPFACTORY_TEST_POSTGRES_URL` on isolated disposable
+  PostgreSQL 16 (Python 3.12.14, FFmpeg/ffprobe 7.1.5): **241 passed, 0 failed,
+  0 skipped** (includes the 6 new tests; the prior 235 baseline plus the new
+  cases).
+- Targeted: `test_stage6_cache_validation.py` (5 passed),
+  `test_stage6_milestone.py` (7 passed),
+  `test_stage6_finalizer_currentness_postgres.py` (12 passed).
+- `ruff check app tests` clean for all changed files.
+
+### BLOCKERS (not done)
+
+- **Task 6** — hosted grounded writing / categorical critique adapter not
+  implemented (the interface and the deterministic/fake providers are stable).
+- **Task 7** — Gemini TTS adapter, local ASR fidelity validation, and the
+  persistent provisional channel voice not implemented; `google-genai` must be
+  raised to the spec's `>=2.25,<3` (test image currently 2.24.0). Synthetic
+  narration proves placement/gain only, never production TTS/ASR fidelity.
+- **Task 8** — candidate API/CLI response types, Produce->Results transformed
+  polling, cancel-before-stop, and the review UI not completed.
+- **Task 9** — no authorized source media configured, so no genuine
+  `MANUAL CHECK REQUIRED NOW` artifact exists.
+
+### NON-BLOCKING LIMITATIONS
+
+- The exported package is synthetic generated media, never genuine acceptance.
+
+## Stage 6: confirmed evidence bug fixed, PostgreSQL failures reconciled, persisted milestone complete (2026-10-15)
+
+Status: **the confirmed finalizer evidence bug is fixed with persisted
+regressions; the two PostgreSQL `test_change_after_revalidation_before_publication_refuses`
+failures are reconciled by replacing label-conflating assertions with exact
+disposition assertions; and the persisted execution milestone (five items) is
+implemented and verified with real FFmpeg, real PostgreSQL, and the declared test
+dependencies. Tasks 6 (hosted grounded writing/critique), 7 (TTS/voice/audition),
+8 (candidate API/CLI/Produce/Results), and 9 (genuine authorized-media acceptance)
+remain NOT done. No genuine authorized-media acceptance artifact exists and no
+hosted provider key is configured. Stage 6 is NOT FROZEN.**
+
+Runtime/tooling (verified this session): Docker `oac-backend-test` base with
+Python **3.12.14**, PostgreSQL **16** (isolated disposable container/database),
+FFmpeg/ffprobe **7.1.5** (shared libass). `pytest` pinned to the declared range
+`>=8.3,<9` (effective **8.4.2**), `ruff` 0.16.8, `mypy` 2.3.1. Broker delivery is
+kept out of the loop in tests via injected dispatchers / no-op delivery; a live
+Celery consumer is not required.
+
+### Confirmed evidence bug (fixed)
+
+`finalization._derive_evidence` replaced `base.extra_findings` with the top-level
+`quality_findings` list, discarding adverse evidence held only in a validated,
+dependency-bound pre-render snapshot (SOL's `PARAPHRASE_ONLY` / `SUBSTANTIVE_VALUE`
+UNMET reproduction). Fixed by `_merge_context_findings`: the snapshot's and the
+row's findings are unioned by `(dimension, level, reason_codes)` (first occurrence
+wins, so snapshot provenance/evidence is preserved), the merged set now drives
+`levels`/`unmet`/`unknown_required`/`unknown_critical`, and the merged findings are
+persisted. Severity is never weakened (the worst level per dimension still
+dominates); contradictory critical evidence defers or rejects truthfully and can
+never silently become favorable. Persisted regressions in
+`test_stage6_finalizer_evidence.py`:
+`test_snapshot_adverse_finding_is_not_discarded`,
+`test_snapshot_critical_unknown_defers`,
+`test_snapshot_adverse_finding_survives_idempotent_replay`.
+
+### PostgreSQL failures reconciled
+
+`test_change_after_revalidation_before_publication_refuses[output_revision|cancel]`
+asserted `semantic_outcome not in {READY_FOR_HUMAN_REVIEW, MATERIALIZED_WITH_CAUTION}`,
+conflating the legal pre-render `MATERIALIZED_WITH_CAUTION` label with review
+readiness. A semantic label alone never authorizes artifact exposure or human
+review: readiness requires the effective completed assessment plus exact bindings
+and flags. The assertions now cover the exact result/reasons, lifecycle,
+effectiveness (no published `assessment_fingerprint`), review/cache/publication
+flags, job disposition and artifact eligibility:
+`final_clip`/`plan` → `SUPERSEDED`/`UPSTREAM_REVALIDATION_REQUIRED`/`BLOCKED`/job
+`SUCCEEDED`; `output_revision` → `SUPERSEDED`/`RENDER_BINDING_STALE`/
+`AWAITING_RENDER` (label preserved); `cancel` → `CANCELLED`/lifecycle `CANCELLED`/
+job `CANCELLED`. No gate was weakened and no mutation test was removed.
+
+### Persisted milestone (all five items, verified)
+
+New `backend/tests/test_stage6_milestone.py` (7 tests) plus enhancements to
+`test_stage6_real_executor.py` and `test_stage6_finalizer_currentness_postgres.py`:
+
+1. **Real-FFmpeg repair chain** (`test_real_repair_chain_end_to_end`): a hot real
+   source makes the transformed render fail closed with `AUDIO_PEAK_REPAIR_NEEDED`
+   and a durable `mix_measurement`; the finalizer CAS-allocates exactly one bounded
+   peak repair (`repair_count` 0→1, revised output fingerprint/recipe), dispatches
+   the revised render, runs it through real FFmpeg (final true peak ≤ -1.5 dBTP),
+   callbacks to the finalizer (COMPLETE, review-required), rejects the historical
+   pre-repair callback (`request_finalization_job` returns None), and proves an
+   idempotent replay with no second repair.
+2. **Authored card + synthetic lossless narration**
+   (`test_real_authored_card_with_synthetic_narration`,
+   `test_narration_asset_hash_mismatch_fails_localization`): a local network-free
+   synthesizer persists real 24 kHz lossless WAV bytes through StorageService; the
+   production render executor verifies and localizes the managed narration asset
+   (authored payload carries `NARRATION_AUDIO` + track), and a tampered managed
+   asset fails closed with `ASSET_HASH_MISMATCH`.
+3. **Synchronized lock interleaving**
+   (`test_publication_waits_on_concurrent_candidate_lock_then_refuses`, real
+   PostgreSQL): a second session holds the candidate row lock, mutates the
+   authoritative FINAL_CLIP, and commits while the finalizer is inside its
+   publication path; with bounded `lock_timeout`/`statement_timeout` the finalizer
+   waits (no deadlock), revalidates under the lock, and refuses to publish the
+   stale generation.
+4. **Cancellation / recovery / replay invocation counts**
+   (`test_post_replay_makes_no_extra_provider_or_render_calls`,
+   `test_lost_callback_recovered_by_post_without_rerunning_work`,
+   `test_cancelled_prepare_invokes_no_provider`): observed provider/render call
+   counts show a POST replay and duplicate prepare delivery repeat no provider or
+   render work, a lost callback is recovered by POST without re-running providers
+   or re-dispatching a render, and a cancelled prepare performs zero provider work.
+5. **Persistent SYNTHETIC INTEGRATION evidence + real core-artifact coexistence**
+   (`_export_synthetic_package` extended with findings, policy/assessment
+   fingerprints, measured loudness/true-peak, narration references, reason codes,
+   artifact sha256; `test_real_core_artifact_coexists_with_transformed`): a real
+   CORE render and a real TRANSFORMED render are both genuinely executed by the
+   real executor and remain independently current (purpose-scoped
+   `get_current_render_execution` returns the matching row). This is distinct from
+   the seeded core-row isolation tests.
+
+### Verification (Docker Python 3.12.14 + PostgreSQL 16 + FFmpeg 7.1.5)
+
+- `pytest -k "stage6"` (with `CLIPFACTORY_TEST_POSTGRES_URL` set to an isolated
+  disposable database): **235 passed, 0 failed, 0 skipped**.
+- `test_stage6_finalizer_evidence.py`: 24 passed (incl. the 3 new persisted
+  snapshot-contradiction regressions).
+- `test_stage6_finalizer_currentness_postgres.py`: 11 passed (incl. the
+  reconciled `output_revision`/`cancel` cases and the synchronized lock case).
+- `test_stage6_milestone.py` + `test_stage6_real_executor.py`: 8 passed.
+- `ruff check app tests` clean. `mypy --no-incremental --follow-imports=skip
+  app/materialization/finalization.py` clean.
+- No migrations were added or changed this session; the isolated test database is
+  created and dropped per run and never touches the application database.
+
+### BLOCKERS (not done)
+
+- **Task 6** — hosted grounded writing / categorical critique adapters
+  (`materialization/gemini.py`) are not implemented; the default bundle remains
+  deterministic and network-free. No hosted provider key is configured.
+- **Task 7** — Gemini TTS adapter, local ASR fidelity validation, and the
+  persistent provisional channel voice are not implemented. The `google-genai`
+  version must be raised to the spec's `>=2.25,<3` before the TTS boundary; the
+  current test image has 2.24.0. Current official provider documentation and
+  installed-SDK serialization for the required models/APIs were not verified.
+- **Task 8** — candidate API/CLI response types (separate lifecycle/semantic/live
+  freshness, component progress, render binding, findings), the Produce→Results
+  transformed pipeline polling, cancel-before-stop, and the review UI are not
+  completed.
+- **Task 9** — genuine authorized-media acceptance: no authorized source media is
+  configured, so no `MANUAL CHECK REQUIRED NOW` media exists; eligibility is not
+  fabricated.
+
+### NON-BLOCKING LIMITATIONS
+
+- `google-genai` installed in the test image is 2.24.0 (spec pins `>=2.25,<3`).
+- The `test_stage6_finalizer_evidence.py` snapshot regressions inject a
+  contradictory extra finding into a persisted snapshot; they exercise the real
+  persisted finalizer assessment, not a live hostile provider.
+
+## Stage 6 SOL review reopened the finalizer blockers; six root-cause corrections (2026-10-15)
+
+Status: **SOL reviewed the previous continuation and reopened the "five blockers
+closed" claim, demonstrating six defects (A–F) through the actual finalizer with
+isolated persisted SQLite fixtures and seeded render evidence. This session
+corrects the four root causes that produced A–F and adds persisted regressions.
+The real-FFmpeg milestone, the two-session PostgreSQL interleavings, tasks 6–9,
+and genuine authorized-media acceptance remain NOT done. Stage 6 is NOT FROZEN.**
+
+This session ran outside Docker: host Python 3.10.12, **no FFmpeg/ffprobe on
+PATH**, no PostgreSQL, no Redis consumer, SQLite only. Results below are
+supplementary, not equivalent to the required Docker Python 3.12 / disposable
+PostgreSQL / real-FFmpeg evidence.
+
+- **Root cause 1 — complete authoritative semantic evidence (SOL A, B).**
+  `components.py` now persists the recomputable SCRIPT `dependency_inputs` (the
+  exact generation dependency set: plan/source/verification/narration/profile
+  context plus writer/critic identities). `finalization._accepted_script_blocks`
+  validates the checkpoint's `dependency_fingerprint` against the *live* inputs
+  (`_script_dependency_matches`), so a self-consistent result hash with no
+  dependency binding (or copied from another generation) is refused.
+  `_derive_evidence`/`_rebuild_context` now treat an `UNKNOWN` required dimension
+  and `UNKNOWN` critical semantic evidence (GROUNDING_VERIFICATION,
+  FIDELITY_ATTRIBUTION, SUBSTANTIVE_VALUE) as *missing* evidence
+  (`critical_fidelity_unknown` → `DEFERRED_EVIDENCE`), never a favorable default;
+  the presence of a dimension label no longer establishes a satisfied gate.
+  Regressions in `test_stage6_finalizer_evidence.py`:
+  `test_missing_script_dependency_binding_defers`,
+  `test_script_dependency_inputs_must_match_live_generation`,
+  `test_unknown_grounding_dimension_defers` (blocker A/B reproductions).
+- **Root cause 2 — callback identity vs successful-assessment evidence (SOL C).**
+  `_complete_render_identity_error` requires, on the COMPLETE branch only, exact
+  `output_fingerprint` + `runtime_fingerprint` + `qc_fingerprint`, a complete
+  artifact binding, and finite measured loudness/true-peak. A terminal
+  FAILED/BLOCKED render remains finalizable without successful QC (the pre-QC
+  repair/defer paths are unchanged). Regression:
+  `test_complete_render_requires_exact_identity`.
+- **Root cause 3 — short fenced publication transaction + lock order (SOL D, F).**
+  `_publish_assessment` now ends the prior snapshot, acquires the architecture's
+  lock order **candidate → upstream deps (selection/contract/plan/FINAL_CLIP/
+  visual/profile) → materialization → render → jobs** (candidate locked *before*
+  the envelope, matching queueing; the previous order was inverted), revalidates
+  exact current render scope (`envelope.render_execution_id == render.id and
+  render.is_current`), the exact binding and artifact identity, then **recomputes
+  the assessment under the locks** and refuses to publish when the fingerprint/
+  outcome changed (`EVIDENCE_CHANGED_DURING_PUBLICATION`). Regression:
+  `test_render_demoted_before_publication_is_not_published`.
+- **Root cause 4 — every handled owned-job disposition closes the job (SOL E).**
+  `_disposition` always attempts `finish_owner_job` under the exact job fence even
+  when envelope ownership was lost; the bare `FinalizationResult(SUPERSEDED,
+  OWNERSHIP_LOST)` early-returns were replaced with `_ownership_lost`, which
+  terminalizes this execution's own job (never a newer owner's). Regression:
+  `test_materialization_demoted_before_publication_closes_owned_job`.
+- **Verification (this session, NOT the Docker runtime).** Host Python 3.10.12 +
+  SQLite: `test_stage6_finalizer_evidence.py` (21 passed),
+  `test_stage6_finalization_gates.py`, `test_stage6_vertical_slice.py`,
+  `test_stage6_component_recovery.py`, `test_stage6_materialization_core.py`,
+  `test_stage6_runtime_ownership.py`, `test_stage6_worker_chain.py`,
+  `test_stage6_durable_router.py`, `test_stage6_service.py`,
+  `test_stage6_runtime_corrections.py`, `test_stage6_sol3_regressions.py`,
+  `test_stage6_blocker_regressions.py`, `test_stage6_repair.py`,
+  `test_stage6_temp_cleanup.py`, `test_stage6_authored_spec.py`,
+  `test_stage6_asset_localization.py`, `test_stage6_audio_recipe_mapping.py`,
+  `test_stage6_overlays.py`, `test_stage6_providers.py`,
+  `test_stage6_supporting_narration.py`, `test_stage6_sol2_regressions.py`,
+  `test_stage6_migration.py` → all green. `ruff` clean on changed modules.
+  `mypy --no-incremental --follow-imports=skip` clean on `finalization.py`
+  (pre-existing `components.py` any-returns unchanged).
+- **Remaining BLOCKERS.** (a) Real-FFmpeg failed-render → persisted measurements →
+  finalizer repair CAS → revised render → callback → final assessment with no
+  second repair, and the authored-card + synthetic-narration sub-case
+  (`test_stage6_limiter_repair.py::test_bounded_limiter_repair_survives_to_final_qc`
+  and `test_stage6_worker_pipeline.py` both error here: `FileNotFoundError:
+  ffmpeg`). (b) Synchronized PostgreSQL publication/queue interleavings with
+  bounded statement/lock timeouts (written, skipped — no PostgreSQL). (c) Tasks 6
+  (hosted grounded writing/critique), 7 (TTS/voice/audition), 8 (candidate
+  API/CLI/UI), 9 (genuine manual-acceptance package). (d) Genuine authorized-media
+  acceptance (no authorized source configured and no hosted provider key).
+- **NON-BLOCKING LIMITATIONS.** The `google-genai` installed version is 2.22.0
+  (spec pins >=2.25,<3); no hosted call is made by any code path in this session.
+
+## (Superseded) Stage 6 SOL continuation: production blockers 1–5 "closed" + worker-task pipeline (2026-10-15)
+
+> SOL review reopened this claim; see the section above. The worker-pipeline test
+> below requires real FFmpeg, which is not present in the current environment, and
+> the two-session PostgreSQL regressions are skipped here.
+
+Status: **the five SOL-identified production blockers were believed corrected with
+regressions, and the persisted execution milestone runs through the actual
+Celery worker-task callables (prepare → render → callback → finalizer) with real
+FFmpeg and a real broker on the no-narration path.** Tasks 6 (hosted grounded
+writing/critique), 7 (TTS/voice/audition), 8 (candidate API/CLI/UI) and 9
+(genuine manual-acceptance package) remain NOT done. The authored-card +
+synthetic-narration sub-case and the worker-pipeline staleness/recovery
+two-session cases are NOT done. No genuine authorized-media acceptance artifact
+exists. Stage 6 is NOT FROZEN. That session ran outside Docker: host Python
+3.10.12, static FFmpeg 7.0.2, a bundled Redis, SQLite; the two-session PostgreSQL
+regressions were written but skipped (no PostgreSQL available).**
+
+
+- **Blocker 1 — content, not status labels (`finalization.py`).** `_derive_evidence`
+  now validates the dependency-bound accepted *content*: an accepted SCRIPT
+  checkpoint must carry a well-formed `result` with validated authored blocks, a
+  matching `result_fingerprint`, and top-level `authored_blocks` equal to it; the
+  timeline must have real segments, schema, frame/sample totals, and an intact
+  SOURCE hero; every FULFILLED slot resolution must correspond to actually
+  accepted material (authored block or narration chunk). Gates are only ever
+  tightened (never loosened by absence of findings). A missing/invalid snapshot is
+  rebuilt only from complete evidence (content + the deterministic critical
+  findings); any gap yields `DEFERRED_EVIDENCE`. Regressions:
+  `test_stage6_finalizer_evidence.py` (accepted-status-without-content,
+  fulfilled-slot-without-material, contradictory top-level blocks, favorable
+  snapshot cannot override missing content).
+- **Blocker 2 — failed-render finalization + bounded repair (blocker 2).**
+  `_validate_render_binding` separates exact callback identity from
+  successful-QC evidence (a pre-QC failed render has no `qc_fingerprint` and is
+  now finalizable). `mark_failed`/`_mark_terminal` persist a `RenderProcessError`'s
+  partial measurement manifest under the render fence
+  (`render/execution/executor.py`, `service.py`). `finalize_materialization` now
+  handles terminal FAILED/BLOCKED renders: a persisted `AUDIO_PEAK_REPAIR_NEEDED`
+  measurement justifies the one bounded peak repair, allocated by the new
+  `repository.allocate_repair` CAS `repair_count` 0 → 1, which revises the recipe
+  and output fingerprint, records the repair action/evidence, returns the envelope
+  to `AWAITING_RENDER`, and dispatches exactly one repaired render. Unrepairable
+  peak → `REJECTED_QUALITY`; other terminal failures → `DEFERRED_EVIDENCE`.
+  Regressions: `test_stage6_repair.py` (single repair, no second repair, historical
+  callback cannot revive, non-peak failure defers). Real-FFmpeg end-to-end repair
+  (high-crest → measurements → finalizer → repaired render → callback → final
+  assessment) is NOT yet wired as a single persisted test.
+- **Blocker 3 — shared router + complete binding (`queue.py`, `workers/tasks.py`).**
+  A terminal **BLOCKED** render now routes to finalization (was falling through to
+  render-handoff recovery); `resolve_job_phase` and `_route_awaiting_render` share
+  one finalizable-state set. `_validate_render_binding` requires the complete exact
+  binding (bound materialization id, `spec`, `authored`, and `repair_revision`);
+  missing/malformed identity is invalid, never accepted on a fingerprint match.
+  `_validate_task_binding` rejects a Celery task whose transient candidate/source/
+  kind/refinement disagrees with its durable envelope. Regressions added to
+  `test_stage6_durable_router.py`.
+- **Blocker 4 — publication race (`finalization.py`).** The COMPLETE path is split
+  into a lock-free preparation (hash the artifact, compute the assessment) and a
+  short fenced publication transaction (`_publish_assessment`) that ends any prior
+  snapshot, acquires the frozen lock order (candidate → contract → plan →
+  FINAL_CLIP → visual composition), re-runs the live revalidation and the exact
+  artifact-identity check (size+mtime, not a re-hash) under the locks, and finishes
+  the envelope/job/release together. A prerequisite mutation, cancellation, or
+  output/repair change committed after the initial revalidation cannot authorize a
+  stale review readiness. Synchronized two-session `autoflush=False,
+  expire_on_commit=False` PostgreSQL regressions (change after revalidation before
+  publication: final clip / plan / output revision / cancel + unchanged case) added
+  to `test_stage6_finalizer_currentness_postgres.py` — **skipped here, no
+  PostgreSQL.**
+- **Blocker 5 — no other-worker temp sweep.** The global
+  `cleanup_temporary_files(older_than_seconds=0, limit=200)` sweep was removed from
+  `MaterializationExecutor._release_resources` and the Stage 5.1
+  `VisualCompositionExecutor._release_resources` (both own no temp files; the sweep
+  deleted another worker's fresh in-progress `.tmp`). New
+  `test_stage6_temp_cleanup.py` runs the actual release method against the real
+  StorageService and asserts an unrelated in-progress `.tmp` survives; the Stage 5.1
+  suite (`260 passed, 35 skipped`) confirms the composition change.
+- **Persisted milestone — worker-task entry points.** New
+  `test_stage6_worker_pipeline.py` drives the actual Celery task callables
+  (`run_materialization_job` → render dispatch → `run_render_execution` → callback →
+  `run_materialization_finalization`) with real generated media, real
+  FFmpeg/compiler/runner/probe/QC, and a real broker. It asserts exact persisted
+  lineage, final decoded loudness/true-peak, all handled jobs terminal, replay with
+  no duplicated work, and current **core/transformed coexistence** (a preexisting
+  current CORE render is not demoted), plus an operator-cancel-is-truthful case.
+  The authored-card + synthetic-narration (nonzero gain, production asset
+  localization) sub-case is not yet covered.
+- **Verification (this session, NOT the Docker runtime).** Host Python 3.10.12 +
+  SQLite + static FFmpeg 7.0.2 + bundled Redis: `pytest -k "stage6 or stage52"`
+  (excluding the PostgreSQL-gated tests) → **299 passed, 48 skipped** with only
+  `test_stage52_remediation.py::test_runtime_identity_is_truthful` failing because
+  the *static* FFmpeg links libass statically (no shared-object hash); it passes
+  with a dynamic libass build. `ruff` clean on all changed modules/tests; `mypy
+  --no-incremental --follow-imports=skip` clean on `materialization/{finalization,
+  queue,repository}` and `workers/tasks`. The pre-existing `render/execution/
+  service.py` no-any findings are unchanged.
+- **Remaining BLOCKERS.** (a) The real-FFmpeg failed-render→repair→final-assessment
+  persisted test. (b) The authored-card + synthetic-narration milestone sub-case.
+  (c) Worker-pipeline staleness/recovery two-session cases. (d) Tasks 6–9. (e)
+  Verification of the two-session PostgreSQL regressions and the Docker Python 3.12
+  runtime. (f) Genuine authorized-media acceptance (no authorized source configured
+  and no hosted provider key).
+
+## Stage 6 SOL defect corrections 1–4 + real persisted executor (2026-10-15)
+
+Status: **the four reproduced SOL defects are corrected with regressions, a real
+production bug (the prepare→render handoff silently never ran because of a stale
+identity-map envelope under `expire_on_commit=False`) is fixed, the durable
+delivery/resume router exists, and a genuine persisted end-to-end executor
+integration test now runs real FFmpeg/compiler/runner/probe/QC through normal
+executor entry points producing a real transformed MP4. Tasks 6 (hosted
+grounded writing/critique), 7 (TTS/voice/audition), 8 (candidate API/CLI/UI
+completion) and 9 (genuine manual-acceptance package) remain NOT done. No
+genuine authorized-media acceptance artifact exists. Stage 6 is NOT FROZEN.**
+
+- **Defect 1 — live currentness at finalization.** `finalize_materialization`
+  now re-assembles the exact persisted request options through
+  `assemble_inputs` and compares the current input fingerprint to the envelope
+  before assessing. A stale FINAL_CLIP/selection/plan/contract/composition →
+  `SUPERSEDED` with `lifecycle=BLOCKED`, `semantic_outcome=
+  UPSTREAM_REVALIDATION_REQUIRED`, `human_review_required=false`,
+  `cache_eligible=false` (history preserved). `critical_evidence_current` is no
+  longer forced to a `true` constant. Two-session PostgreSQL regressions in
+  `test_stage6_finalizer_currentness_postgres.py` cover changes during rendering
+  and immediately before assessment, plus FINAL_CLIP/plan/output-revision
+  changes and concurrent POSTs sharing one finalizer.
+- **Defect 2 — versioned, dependency-bound evidence.** The pre-render snapshot
+  is now `{version, materialization_output_fingerprint, context}`
+  (`stage6-prerender-context-v2`); a missing/empty/partial/malformed/
+  dependency-mismatched snapshot is refused and rebuilt deterministically from
+  authoritative evidence. Required slots are derived from the authoritative
+  contract plus persisted resolutions (an empty list never means "no
+  requirements"; a required `DEFERRED` resolution is a distinct failure from
+  missing evidence). Accepted script/timeline/narration evidence and stored
+  findings are validated; an empty dict or malformed field can never imply a
+  satisfied gate. Regressions in `test_stage6_finalizer_evidence.py`.
+- **Defect 3 — one guarded disposition commit.** Every handled finalization exit
+  (complete/defer/superseded/cancelled, including missing render/artifact/
+  evidence) commits through `_disposition`, which closes the exact owned job and
+  releases its binding while ownership permits and never mutates another
+  worker's claim. Handled semantic defer/rejection is not an execution failure.
+- **Defect 4 — one durable delivery/resume router.** `queue_materialization`
+  and the render callback (`request_finalization_job`) share one authoritative
+  phase router (`queue.resolve_job_phase`) resolving PREPARE vs FINALIZE from
+  the job's bound envelope: AWAITING_RENDER with no bound render recovers the
+  handoff; an active render returns its identity and recovers a marked
+  broker-delivery failure; an exact terminal render queues/recovers one
+  finalizer; a dispatch-failed FINALIZE job is redispatched to finalization
+  (never preparation); terminal/cancelled/blocked generations are preserved
+  truthfully. `request_finalization_job` requires a terminal, current,
+  exactly-bound render and ignores historical/nonterminal callbacks. The
+  materialization and finalization Celery tasks both delegate to the shared
+  phase resolution. Regressions in `test_stage6_durable_router.py`.
+- **Defect 5 — real persisted executor integration.** `executor.py` re-reads the
+  envelope after `commit_prepared` before deciding the render handoff (the
+  previous stale-object check silently skipped every handoff). A narrow
+  test-fixture media factory (`seed_stage50/51 media_writer`) generates real
+  1080p30/AAC source media *before* contract/composition/materialization
+  fingerprints. `test_stage6_real_executor.py` drives POST/queue → prepare
+  executor → render handoff → `RenderExecutionExecutor` → real
+  FFmpeg/compiler/runner/probe/QC → completion callback → finalizer executor →
+  replay with zero extra calls, asserting all jobs terminal and the final
+  decoded `final_integrated_lufs`/`final_true_peak_dbtp` measured from the real
+  MP4. No COMPLETE/PASS/artifact evidence is inserted manually. A persistent
+  SYNTHETIC INTEGRATION package (index.json + final.mp4 + authored.ass +
+  SHA256SUMS, actual DB UUIDs/fingerprints/QC/audio recipe) is written to
+  `storage/benchmarks/stage-6/synthetic-integration/`. The bounded limiter
+  repair has a real-FFmpeg regression (`test_stage6_limiter_repair.py`):
+  high-crest source → `AUDIO_PEAK_REPAIR_NEEDED` with a partial measurement
+  manifest; the authorized repair starts from the lossless mix, changes the
+  limited intermediate, and satisfies final decoded QC.
+- **Verification.** Docker Python 3.12.14 + PostgreSQL 16 + real FFmpeg:
+  `pytest -k "stage6 or stage52"` → `331 passed, 0 failed, 0 skipped`. `ruff`
+  clean on `app`+`tests`. `mypy --no-incremental --follow-imports=skip` clean on
+  the changed/new modules (`finalization`, `queue`, `repository`, `workers/
+  tasks`); the pre-existing `components`/`executor` no-any findings are
+  unchanged. Frontend: `vitest run` 55 passed, `eslint` clean (one pre-existing
+  `tsc` test-file typing error in `job-poller.test.tsx`, untouched).
+- **Remaining BLOCKERS (not done).** Task 6 hosted grounded writing/critique
+  adapters; Task 7 TTS adapter + local fidelity + provisional-voice audition
+  (the "authored card plus synthetic narration asset, nonzero gain" integration
+  case is therefore not exercised); Task 8 candidate API/CLI/UI completion;
+  Task 9 genuine manual-acceptance package over authorized media (no
+  authorized source media configured in this environment).
+
+## Stage 6 SOL defect fixes A–E + worker-chain wiring (2026-10-15, commits 6041709, eb6a0b1)
+
+Status: **the five SOL-reproduced defects (A finalizer content/technical gates,
+B exact generation binding/currentness, C authored-asset localization, D audio
+recipe preservation, E idempotence finishing the current job) are fixed with
+regressions, and the prepare→render→finalize worker chain is wired. Task G (a
+single persisted end-to-end executor test through real FFmpeg with genuine
+media), Task 6 (hosted grounded writing/critique), Task 7 (TTS/voice), Task 8
+(candidate API/CLI/UI) and Task 9 (genuine manual-acceptance package) are NOT
+done. No production-path transformed MP4 and no manual-acceptance artifact
+exist. Stage 6 is NOT FROZEN.**
+
+- **A — finalizer gates (`6041709`).** `finalize_materialization` no longer
+  unconditionally writes `READY_FOR_HUMAN_REVIEW`. It rebuilds an
+  `AssessmentContext` from the durable pre-render snapshot (`metrics.
+  pre_render_assessment_context`, now persisted by `components`), stored
+  categorical findings, and the actual render/QC/loudness measurements, then runs
+  the existing categorical assessment. Missing critical evidence → `DEFERRED_
+  EVIDENCE`; unmet substantive value/fidelity/slots → `REJECTED_QUALITY`/
+  `NO_OUTPUT`; unsupported essential → `BLOCKED_VERIFICATION`; out-of-policy
+  loudness/true peak (`-16 LUFS ±1 LU`, `≤ -1.5 dBTP`) → `REJECTED_QUALITY`. A
+  stored `PASS` label cannot override contradictory/missing measurements; stored
+  findings/reasons are preserved; `publication_ready` stays false.
+- **B — exact binding (`6041709`).** Finalization validates the render's
+  `request_payload` expected output fingerprint, bound materialization id, and
+  authored repair revision against the current envelope; a stale/late callback
+  is `SUPERSEDED` and never finalizes a repaired revision.
+- **C — asset localization (`6041709`).** `RenderExecutionExecutor` verifies and
+  localizes every referenced authored (non-source) asset through
+  `StorageService` (hash/size/traversal checked, controlled attempt-local name)
+  before compilation; authored narration no longer fails `AUTHORED_ASSET_INVALID`.
+- **D — audio recipe (`6041709`).** `materialization/rendering._tracks` preserves
+  each entry's requested gain and translates authorized ducking into bounded,
+  monotonic gain points (80 ms attack/180 ms release); overlapping narration and
+  unsupported instructions are rejected, not dropped. An authorized peak-limit
+  repair reaches the renderer via `MasteringSpec.repair_peak_limit_db` and a bounded
+  `alimiter` pass in the runner; other mastering fields already flowed through.
+- **E — idempotence (`6041709`).** A replayed identical assessment still
+  completes/releases the *current* job under its exact owner fence and preserves
+  the assessment fingerprint.
+- **F — worker chain (`eb6a0b1`).** The materialization executor dispatches the
+  `TRANSFORMED_SHORT` render for the exact revision after in-line prepare
+  (non-renderable outcomes never dispatch); the render handoff persists the
+  reverse materialization binding and the forward render binding before broker
+  delivery; a render-completion callback requests one coalesced `MATERIALIZATION`
+  finalizer job; the executor branches to finalization without rerunning accepted
+  writing/synthesis.
+- **Regressions.** `test_stage6_finalization_gates.py` (UNMET value, unresolved
+  verification, missing slot, unknown critical fidelity, out-of-policy loudness
+  despite a PASS label, missing loudness, stale output/repair revision, replay
+  finishes the job, cancelled), `test_stage6_audio_recipe_mapping.py` (gain +
+  ducking translation, overlap rejection, peak-limit routing),
+  `test_stage6_asset_localization.py`, `test_stage6_worker_chain.py`, and the
+  updated `test_stage6_vertical_slice.py`. Docker Python 3.12.14 + PostgreSQL 16:
+  `pytest -k "stage6 or stage52"` → `307 passed, 0 skipped`. `ruff` clean on
+  `app`+`tests`; `mypy --no-incremental` clean on the changed modules (the
+  pre-existing `app/materialization/{components,service,executor}.py` no-any
+  findings are unchanged). Migrations unchanged.
+- **Remaining (internal work).** Task G's single persisted end-to-end executor
+  test needs real source media (the seed fixtures carry a stub `source.mp4` that
+  `build_render_spec` cannot probe); Task 6/7 hosted adapters; Task 8 API/CLI/UI;
+  Task 9 manual acceptance. No hosted provider call was made.
+
+## Stage 6 authored renderer defects fixed + production-path integration (2026-10-15)
+
+Status: **the four renderer defects SOL reproduced are fixed with regressions,
+and the persisted materialization now maps to a typed TRANSFORMED_SHORT render
+request that compiles and runs through the frozen renderer with a two-phase
+lossless mastering path and purpose-aware QC. A transformed render dispatch
+helper and an idempotent finalizer exist and are tested. The automatic
+dispatch/callback chain inside the worker, hosted scripting/critique (Task 6),
+TTS/narration (Task 7), the candidate API/CLI/UI completion (Task 8), and the
+genuine manual-acceptance package (Task 9) are NOT done. No production-path
+transformed MP4 and no manual-acceptance artifact exist. Stage 6 is NOT FROZEN.**
+
+- **Renderer defects (`a181277`).** (1) `TRANSFORMED_SHORT` fails closed without
+  an authored payload in validation, `compile_render`, and the render
+  queue/service; a core purpose with an authored payload is rejected. (2)
+  `compile_authored_render` executes *every* accepted SOURCE scene in source
+  order (framed/captioned in source time like the frozen core compiler),
+  validates unit/occurrence/frame mappings, and requires full hero coverage. (3)
+  The complete audio recipe is executed: all gain points (explicit ramps),
+  per-interval conform to authoritative samples, sample-based `adelay`
+  placement, `asplit` for repeated inputs. (4) Two-phase lossless mastering
+  (`render/execution/audio.py`): mix -> `loudnorm` measurement -> feasible
+  linear mastering -> lossless PCM master -> one H.264/AAC encode, all under one
+  shared deadline; partial measurements attach to pre-encode failures. Purpose
+  is threaded through render queue cache/envelope lookups so a transformed row
+  never demotes a coexisting core row. The synthetic audio recipe is corrected
+  (source 0-3, narration 3-4, source 4-7).
+- **Persisted integration (`48e7915`).** `materialization/rendering.py`
+  (`build_transformed_render_spec`) maps the accepted persisted timeline/audio
+  recipe to a `TRANSFORMED_SHORT` request bound to the exact materialization
+  id/output fingerprint, builds and stores the authored ASS in output time, and
+  emits SOURCE/CARD units plus source/narration tracks and mastering. The render
+  queue/service/executor load the exact bound materialization (never the newest
+  row), persist `materialization_id`/`expected_output_fingerprint`, set
+  `stage6_implemented` only on the transformed path, and verify/localize the
+  authored ASS bytes.
+- **Purpose-aware QC (`b02d9f3`).** Authored output samples intentional card
+  intervals and requires real decoded integrated loudness and true-peak evidence
+  from the final AAC; a missing measurement is a hard failure. Core QC is
+  unchanged.
+- **Dispatch/finalizer (`c6f63af`).** `dispatch_transformed_render` binds a
+  `TRANSFORMED_SHORT` render to the exact materialization through the existing
+  render queue; `finalize_materialization` rebuilds assessment from stored render
+  evidence and is an idempotent no-op on replay (`publication_ready=false`).
+- **Verification evidence.** Docker Python 3.12.14 + PostgreSQL 16: `pytest -k
+  "stage6 or stage52"` -> `255 passed, 27 skipped`; `pytest -k stage6` -> `139
+  passed, 11 skipped`; `pytest -k stage52` -> `117 passed, 16 skipped`;
+  `pytest tests/test_stage6_authored_render.py` and
+  `tests/test_stage6_vertical_slice.py` pass with real FFmpeg. `ruff` clean on
+  the changed modules; `mypy` clean on `app/materialization/rendering.py`,
+  `finalization.py`, and the changed `app/render/execution` modules (the wider
+  `app` tree has pre-existing mypy findings unrelated to this work). No hosted
+  provider call or manual-acceptance artifact was produced.
+- **Remaining blockers.** Automatic dispatch from the materialization executor
+  and the render-completion callback that requests the finalization job; hosted
+  grounded scripting/critique; optional TTS + local fidelity validation + a
+  provisional channel voice; candidate API/CLI/UI completion; genuine manual
+  acceptance over authorized source media.
+
+## Stage 6 session/ownership corrections + authored renderer (2026-10-15)
+
+Status: **the four SOL PostgreSQL-probe corrections are fixed with regressions,
+and a real authored renderer path now produces an actual authored MP4 (synthetic
+fixture) through the frozen compiler/runner. The remaining integration — DB
+mapping (`materialization/rendering.py`) and wiring the authored purpose through
+the existing `RenderExecutionExecutor`/queue/QC, plus two-phase lossless audio
+mastering and Tasks 5–9 — is not done. No production-path transformed MP4 or
+manual-acceptance package exists. Stage 6 is NOT FROZEN.**
+
+- **Corrections (`b048c6c`).** (1) Application-session semantics: repository
+  reads/locked refresh now use fresh SQL (`populate_existing`/`with_for_update`)
+  so the production session (`autoflush=False`, `expire_on_commit=False`) no
+  longer rejects a just-claimed job or loses sequential SUPPORTING/TIMELINE
+  checkpoints; `claim_materialization` verifies the caller's *expected* job claim
+  token. (2) Historical reactivation demotes+flush then reactivates the target
+  row atomically (CANDIDATE/FINAL_CLIP/CANDIDATE). (3) Deferred/rejected
+  writing/critique responses are persisted truthfully, never replayed as
+  accepted, retried with a fresh bounded attempt, and commit with their reusable
+  checkpoint atomically. (4) The executor freshly revalidates upstream
+  effectiveness/identity before `commit_prepared` and records supersession
+  (`BLOCKED`/`UPSTREAM_REVALIDATION_REQUIRED`, no output) with the job transition
+  in one transaction. Regressions: `test_stage6_runtime_corrections.py`
+  (real Celery wrapper + production session factory, sequential checkpoint/attempt
+  updates, deferred recovery, stale-during-writing) and a PostgreSQL historical
+  reactivation test.
+- **Authored renderer (`c197ad1`, `1443eb3`).** `compile_authored_render`
+  produces one H.264/AAC output from ordered SOURCE (framed, canonical Stage 5.1
+  ASS burned in source time) and CARD units (near-black), applies the Stage 6
+  authored ASS in output time after concat, and mixes explicit source+narration
+  tracks. `compile_render` dispatches on `TRANSFORMED_SHORT`; core behavior and
+  fingerprints are unchanged. `build_authored_ass` emits output-time cards/
+  annotations with escaping/bidi safety and readability findings. A real-FFmpeg
+  integration test produces and probes an actual authored MP4 with visible card
+  frames (synthetic fixture, explicitly NOT product acceptance).
+- **Remaining blockers.** `materialization/rendering.py`
+  (`build_transformed_render_spec` from the persisted materialization/contract/
+  composition) and full purpose wiring through the render queue/service/executor
+  and purpose-aware QC; the specified two-phase lossless mix→measure→master→encode
+  (current authored path applies single-pass `loudnorm`); the Stage 6 finalizer and
+  bounded repair, hosted writing/critique/TTS adapters, candidate API/CLI/UI
+  completion, and the genuine manual-acceptance package.
+- **Verification evidence (Docker Python 3.12.14 + PostgreSQL 16).** `pytest -k
+  "stage6 or stage52 or stage51"` ran `565 passed`; `mypy app/materialization`
+  and `ruff` are clean. No hosted provider call or manual-acceptance artifact was
+  produced.
+
+## Stage 6 durable ownership + component gateway, authored payload (2026-10-15)
+
+Status: **the six structural gaps in the inspected Stage 6 code are corrected
+with real-PostgreSQL regressions, and the production executor now drives a
+durable reserve-before-invoke component gateway. The frozen authored render
+payload and cumulative timing are implemented. The Stage 5.2 `TRANSFORMED_SHORT`
+renderer execution (video/audio/QC), the finalizer, hosted writing/critique/TTS
+adapters, API/CLI/UI completion, and the genuine manual-acceptance package remain
+outstanding. No transformed-short MP4 exists. Stage 6 is NOT FROZEN.**
+
+- **Envelope-first ownership (`2360ee8`).** New `materialization/repository.py`
+  defines `MaterializationOwner` and the paired job/envelope predicates (two
+  local claim tokens, never compared across jobs). The envelope is created before
+  any provider work; the queue locks the candidate, finds-or-creates the
+  generation envelope, and CASes `active_job_id` so concurrent/retried requests
+  share one envelope and one job. Failed broker dispatch is marked and recovered
+  by the next request; a read never dispatches. Migration `0024` downgrade now
+  preserves `DEFERRED_EVIDENCE` rows (`FAILED`/`BLOCKED`, all flags false) instead
+  of deleting them. Regressions: `test_stage6_runtime_ownership.py` (real
+  PostgreSQL: concurrent enqueue, fresh generations with independent local claim
+  counters, stale-worker rejection, dispatch recovery, envelope-before-provider).
+- **Durable component gateway (`0e5c0d5`).** New `materialization/components.py`
+  reserves a unique attempt durably before each provider call and persists the
+  accepted writing/critique/synthesis subcomponent immediately, so a crash resumes
+  the last accepted work without repeating providers. Reserved-but-unanswered
+  attempts become `UNCERTAIN` and stay budget-consumed; denied admission or
+  exhausted budget defers without consuming a local attempt. The production
+  executor routes through `prepare_materialization`; `run_materialization`
+  remains the fixture helper. Regressions: `test_stage6_component_recovery.py`
+  (observer-before-provider reservation, writing-before-critique and
+  synthesis-before-ASR replay, cancellation without a next call, exhausted
+  budget, real executor resume).
+- **Frozen authored payload (`682483e`).** `render/execution/authored.py` adds the
+  typed `MediaAssetRef`/`RenderUnit`/`GainPoint`/`AudioTrackSpec`/`MasteringSpec`/
+  `AuthoredRenderPayload` value objects with strict parsing and structural
+  validation (contiguous complete visual units, at least one SOURCE and the
+  complete hero, per-SOURCE occurrence binding, bounded non-overlapping
+  gain-monotonic tracks), plus exact `Fraction` cumulative frame/sample
+  boundaries. `RenderSpec.authored` is optional and leaves core serialization and
+  fingerprints unchanged when absent. Regressions: `test_stage6_authored_spec.py`.
+- **Remaining blockers (concrete).** The Stage 5.2 `TRANSFORMED_SHORT` compiler
+  branch and real video/audio execution (cards/overlays, explicit tracks and gain
+  envelopes, final `-16 LUFS`/`-1.5 dBTP` mastering and decoded-AAC QC),
+  `materialization/rendering.py`+`overlays.py`, the idempotent finalizer and
+  bounded repair, hosted writing/critique/TTS adapters, the candidate
+  API/CLI/UI completion, and the manual-acceptance package remain. Real FFmpeg
+  execution is the load-bearing next step.
+- **Verification evidence (Docker Python 3.12.14 + PostgreSQL 16).** `pytest -k
+  stage6` runs `130 passed`; the adjacent Stage 5.1/5.2 renderer suites pass
+  (`407 passed, 20 skipped`) after the Stage 5.2 migration test was retargeted
+  explicitly below Stage 6's new head. `ruff` and `mypy app/materialization` are
+  clean. Migrations `0023`/`0024` apply and reverse on PostgreSQL. No FFmpeg
+  render, hosted provider call, or manual-acceptance artifact was produced.
+
+## Stage 6 third-review corrections and production dispatch path (2026-10-14)
+
+Status: **the three third-round SOL-review defects are corrected with regressions
+(commit `9084370`), and the production dispatch path is implemented: a
+candidate-scoped Stage 6 queue, durable executor, Celery task, API, and CLI drive
+`assemble_inputs` through genuine persisted ORM relationships into a fenced,
+current `clip_materializations` row (commits `fa8961c`, `71400db`). The reusable
+Stage 5.2 `TRANSFORMED_SHORT` renderer (authored cards/overlays, mixed/mastered
+audio, final-purpose QC), the idempotent Stage 6 finalizer, hosted
+writing/critique/TTS adapters, the review UI integration, and the genuine
+manual-acceptance package remain outstanding. No transformed-short MP4 exists.
+Stage 6 is NOT FROZEN.**
+
+- **Third-round corrections (`9084370`).** (1) `persist_materialization` fences the
+  whole candidate/profile scope before any authoritative mutation: a newer/equal
+  claim on a different current generation can never be demoted by a historical
+  token, and a worker mutation must present its exact active job identity, claim
+  token, and a RUNNING executing job. (2) `CallLedger` is replay-safe and
+  durable: each raw attempt is reserved under a unique identity before
+  invocation; replayed/crashed attempts stay budget-consumed and are never
+  re-invoked; merging unions attempts by identity (no blind addition or max of
+  partial counters); ceilings hold across the whole generation. (3)
+  `transcription_matches` folds Arabic orthographic variants and uses order- and
+  occurrence-aware alignment (negation/number set-and-order, Latin order,
+  first-occurrence order of distinct content tokens, ordered-LCS coverage),
+  rejecting reversed participant attribution and changed number attribution.
+- **Production dispatch path (`fa8961c`, `71400db`).** `queue_materialization`
+  validates every current live-effective prerequisite and claims a single
+  `MATERIALIZATION` job per candidate/refinement scope via an atomic CAS on the
+  durable dispatch token. `MaterializationExecutor` claims/fences the job,
+  re-derives prerequisites, assembles inputs through persisted ORM rows, resumes
+  the durable call ledger, runs the bounded deterministic pipeline, and persists
+  a fenced current row; it observes cancellation and releases providers on every
+  exit path. `run_materialization_job` wraps it with the existing job
+  ownership/retry conventions; `POST/GET /api/candidates/{id}/materialization`
+  and `materialize`/`materialization-status` expose it. A latent `RenderContract`
+  binding bug (`transformation_selection_id`, not `selection_id`) was fixed.
+- **Remaining acceptance blockers (concrete).** The Stage 5.2 `TRANSFORMED_SHORT`
+  renderer (authored-timeline execution, cards/overlays, explicit audio tracks
+  and gain envelopes, final mix measurement/mastering at `-16 LUFS`/`-1.5 dBTP`,
+  final-purpose QC), the idempotent Stage 6 finalizer, hosted writing/critique/TTS
+  adapters (the default bundle is deterministic and network-free), review UI
+  integration, and the genuine manual-acceptance package. The renderer is the
+  load-bearing prerequisite for any transformed MP4 and needs real FFmpeg
+  execution.
+- **Verification evidence (Docker Python 3.12.14 + real PostgreSQL 16).** The
+  Stage 6 set (second/third-round regressions, Postgres ownership regressions,
+  blocker regressions, core, providers, supporting/narration, service, migration,
+  integration, settings) ran `131 passed` with `0 skipped` and `0 failed`; `ruff`
+  and `mypy app/materialization` are clean. Migrations `20261014_0023`/`0024`
+  apply and reverse on PostgreSQL. No FFmpeg render, hosted provider call, or
+  manual-acceptance artifact was produced.
+
+## Stage 6 second-review corrections (2026-10-14)
+
+Status: **the seven second-round SOL-review defects are corrected with
+regressions (commit `f3a79df`; migration `20261014_0024`). The production
+vertical slice beyond DB assembly/orchestration/persistence is NOT implemented:
+the MATERIALIZATION queue/executor, hosted semantic/critique and TTS adapters,
+the reusable Stage 5.2 `TRANSFORMED_SHORT` renderer (authored cards/overlays,
+mixed/mastered audio, final-purpose QC), the idempotent finalizer, the candidate
+API/CLI/UI, and the genuine manual-acceptance package are outstanding. No
+transformed-short MP4 exists. Stage 6 is NOT FROZEN.**
+
+- **Corrections (`f3a79df`).** (1) `resolve_prerequisites` re-derives live
+  effectiveness/currentness from the frozen upstream read helpers and binds the
+  exact contract selection/plan/FINAL_CLIP/composition identities; only a
+  frozen-ready `FINAL_TRANSCRIPT_READY` FINAL_CLIP is usable (not
+  `NEEDS_MANUAL_TRANSCRIPT_REVIEW`). (2) `assemble_inputs` reads the
+  authoritative plan-set target context; the plan row has no `target_context`.
+  (3) A deterministic hard failure is never clearable by a favorable critique.
+  (4) Final readiness requires complete, in-policy render/QC/loudness evidence;
+  missing/unknown critical evidence defers (`DEFERRED_EVIDENCE`) and genuine
+  mastering-policy violations are unmet; pre-render state is separated from
+  final review readiness. (5) Generated narration is bound to required contract
+  narration slots with validated audio. (6) ASR/script matching expands
+  contractions and validates sequence and protected meaning (removed contracted
+  negation, reversed attribution). (7) Persistence preserves the repair allowance
+  and durable call budget across retries and fences stale workers via a durable
+  `claim_version`.
+- **Remaining acceptance blockers (concrete).** MATERIALIZATION queue/executor
+  with claim fencing/cancellation/resume; hosted writing/critique and TTS
+  adapters; the reusable-renderer `TRANSFORMED_SHORT` extension and complete
+  audio mix/mastering + final-purpose QC; idempotent finalizer; candidate
+  API/CLI/UI; and the genuine manual-acceptance package. Required verification
+  under Python 3.12 and disposable PostgreSQL was not run (host Python 3.10.12
+  only). The renderer extension is the load-bearing prerequisite for any
+  transformed MP4 and needs real FFmpeg execution.
+
+## Stage 6 review corrections and production-path service (2026-10-14)
+
+Status: **eight SOL-review defects are corrected with regressions (commit
+`7d37cd7`); the DB-assembly/orchestration/persistence service is implemented
+(commit `d38e274`). The MATERIALIZATION queue/executor, semantic/TTS provider
+adapters, authored renderer integration (cards/overlays, mixed/mastered audio,
+final-purpose QC), idempotent finalizer, candidate API/CLI/UI, and real
+manual-acceptance package are NOT implemented. Stage 6 is NOT FROZEN; no
+transformed-short MP4 exists.**
+
+- **Defects corrected (`7d37cd7`).** (1) Invalid/unresolvable grounding
+  references no longer fall back to the whole transcript and unrelated factual
+  copy is no longer a resolved inference; novel copy routes to bounded semantic
+  review and is never accepted on lexical novelty alone. (2) The authored
+  timeline uses Stage 5.0 rebound contract bindings as the execution truth, never
+  copied plan timestamps; a missing/invalid binding is reported. (3) Measured
+  narration/reading durations are no longer capped at eight seconds and
+  fractional-duration heroes are not falsely rejected by frame quantization. (4)
+  ASR/script matching rejects removed negation and changed numbers. (5) Slot
+  resolution includes required contract narration slots. (6) Assessment requires
+  render/QC/loudness evidence for readiness, honours provider deferral, and
+  treats unknown critical fidelity as a concern. (7) Supporting assets require
+  complete provenance, a valid content hash, an allowed use, and required
+  attribution. (8) Narration assets are written through StorageService with a
+  safe filename. Writing requests now carry bounded actual resolved source
+  evidence and a provider-neutral semantic critique assesses grounded copy.
+- **Service (`d38e274`).** `app/materialization/service.py` assembles immutable
+  inputs from current persisted evidence, revalidates currentness, runs the
+  bounded deterministic pipeline, and persists a durable `ClipMaterialization`
+  with component checkpoints, a durable call ledger, fingerprints, and a
+  truthful outcome (identical work updates in place; changed input creates a
+  history row and demotes the previous current one).
+- **Remaining (explicit acceptance blockers).** DB-assembly queue/executor and
+  the idempotent finalizer; hosted semantic writing/critique and TTS adapters;
+  the reusable-renderer `TRANSFORMED_SHORT` extension and complete audio
+  mix/mastering + final-purpose QC; candidate API/CLI and Produce/Results UI; and
+  the genuine manual-acceptance package. Required verification under Python 3.12
+  and disposable PostgreSQL was not run (host Python 3.10.12 only).
+
+## Stage 6 materialization persistence and deterministic core (2026-10-14)
+
+Status: **two prerequisite corrections are committed; the Stage 6 durable
+persistence and deterministic materialization core are implemented and tested;
+the DB-assembly service/queue/executor, semantic/TTS provider adapters, authored
+renderer integration, API/CLI/UI, and real acceptance are NOT implemented. Stage 6
+is NOT FROZEN and is awaiting human media review and SOL review.**
+
+- **Prerequisite A (fixed, commit `ab9d0bc`).** Production transcription
+  configuration defaulted to `v1` and overrode the dedicated provider's `v1beta`
+  default, so the effective Interactions request used the wrong surface. The
+  Settings default and `.env.example`/`docs/ENVIRONMENT.md` now use `v1beta`
+  (the surface that serves the Interactions API); the local `.env` explicit
+  legacy override was corrected too. Adjudication and the Stage 2.7/Stage 4
+  providers keep their independently configured `v1` generateContent surface.
+  A regression asserts the *effective* URL/body through the production Settings
+  factory and the real installed SDK with a fake HTTP transport. No live hosted
+  transcription success has been established.
+- **Prerequisite B (fixed, commit `fb401cb`).** Stage 4.2 governance cleared a
+  heuristic revision on an incomplete review (UNKNOWN coherence/narration still
+  produced `APPROVED_FOR_SELECTION`, `eligible_for_stage4_3=True`). A heuristic
+  revision is now cleared only by a genuinely complete, favorable review; any
+  `UNKNOWN`/concerning decision-critical dimension defers governance; a later
+  weaker review restores a previously cleared revision. Measured hero/payoff/
+  duration/over-edit findings stay deterministic and non-clearable. Policy and
+  validation advanced to `stage4.2-v8` (commit `fb401cb`).
+- **Persistence (commit `fac3d22`).** Migration `20261014_0023` adds a
+  `MATERIALIZATION` job kind, the `TRANSFORMED_SHORT` render purpose,
+  `channel_production_profiles` and `clip_materializations` (one current row per
+  candidate/profile scope, `repair_count` 0..1, cache/readiness consistency), and
+  nullable `materialization_id` FKs on `processing_jobs` and `render_executions`.
+  No `PipelineStage`, `PipelineRun`, `_NEXT_STAGE` entry, or source-lifecycle
+  change. Migration upgrade/downgrade is covered on SQLite (PostgreSQL gated by
+  `CLIPFACTORY_TEST_POSTGRES_URL`).
+- **Deterministic core (commits `fac3d22`, `848f872`).** `app/materialization/`
+  provides versioned policy/budgets, immutable types, DB-independent inputs,
+  stable fingerprints (voice-only changes never invalidate no-narration output),
+  profile semantic-context matching, authored-copy validation with a claim ledger
+  and slot resolution, authored timeline/audio-recipe construction with hero
+  protection, a rights-gated supporting-visual library, a provider-neutral
+  narration synthesis interface, and categorical assessment that is always
+  `publication_ready=false` with `human_review_required=true` on success.
+- **Remaining (explicit blockers for acceptance).** Semantic writing/critique
+  provider adapter, Gemini TTS adapter, DB-assembly service/queue/executor and
+  idempotent finalizer, `TRANSFORMED_SHORT` renderer extension (authored
+  cards/output overlays, mixed/mastered audio, final-purpose QC),
+  candidate-scoped API/CLI/UI, and real manual acceptance. No transformed-short
+  MP4 exists; no acceptance or live-provider success is claimed.
+
 ## Stage 5.2 tracked-crop defect remediation (2026-10-08)
 
 Status: **the confirmed production TRACKED_CROP execution defect is remediated
@@ -707,8 +2737,8 @@ Deterministic verification: 108 focused Stage 4.2 tests (governor, providers,
 service, executor/queue/cache/concurrency/cancellation, API/CLI/handoff/migration)
 plus the full backend suite in Docker Python 3.12 with the repository compose/.env
 files mounted, with no live provider calls in the automated suite. Versions:
-governor `stage4.2-v6`, schema `stage4.2-schema-v1`, validation
-`stage4.2-validation-v6`. See [docs/STAGE_4_2_OPERATIONS.md](docs/STAGE_4_2_OPERATIONS.md).
+governor `stage4.2-v7`, schema `stage4.2-schema-v1`, validation
+`stage4.2-validation-v7`. See [docs/STAGE_4_2_OPERATIONS.md](docs/STAGE_4_2_OPERATIONS.md).
 
 ### Stage 4.2 corrective patch (2026-09-17)
 
@@ -734,12 +2764,17 @@ governor `stage4.2-v6`, schema `stage4.2-schema-v1`, validation
 - **Revision-level semantic adjudication (2026-10-14).** In adaptive mode with a
   provider, a plan whose only deterministic findings are revision-level (no hard
   failure, no blocking condition) is sent to the semantic review instead of being
-  rejected outright. A favorable critique clears the advisory deterministic
-  revisions so the plan can be approved or approved-with-caution; a critique that
-  confirms a problem keeps both its finding and the deterministic revision. Hard
+  rejected outright. Clearance is **reason-specific**: only heuristic
+  paraphrase/filler/template opinions are cleared, and only when the critique
+  supplies a positive, known finding for the matching dimension; `UNKNOWN`,
+  concern, unavailable, or malformed evidence clears nothing. Measured
+  retention/proportionality violations (hero delay, interruption, duration,
+  over-edit, fragmentation) stay deterministic requirements and are never
+  model-overridable. Cleared findings are retained on the audit record
+  (`provider_evidence.adjudicated_revisions`) with their adjudication. Hard
   failures and blocking conditions are never reviewed away. Without a provider the
   deterministic revisions stand unchanged. Versions advanced to
-  `stage4.2-v6`/`stage4.2-validation-v6`.
+  `stage4.2-v7`/`stage4.2-validation-v7`.
 - **Strict hero thresholds** (`short_moment_seconds`,
   `high_moment_density_floor`) now actually govern strict hero-window
   classification and remain fingerprint-invalidating.

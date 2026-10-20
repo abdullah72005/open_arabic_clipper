@@ -173,6 +173,7 @@ def seed_stage51(
     narration: str = "NONE",
     planning_on_final: bool = True,
     config: Stage51Config | None = None,
+    media_writer: Any | None = None,
 ) -> Stage51Fixture:
     """Seed a Stage 5.0 fixture and persist one executable render contract."""
 
@@ -184,6 +185,7 @@ def seed_stage51(
         result_specs=result_specs,
         narration=narration,
         planning_on_final=planning_on_final,
+        media_writer=media_writer,
     )
     view = create_render_contract(
         session,

@@ -121,6 +121,7 @@ def _value(kind: SubstantiveValueKind, intent: str, **overrides: Any) -> PlanPro
         "substantive_value_kind": kind,
         "semantic_intent": intent,
         "why_unavailable": "The excerpt alone does not provide this added dimension",
+        "grounding_refs": ("block:0",),
     }
     base.update(overrides)
     return PlanProviderBlock(**base)
@@ -388,6 +389,7 @@ def test_hero_appearance_time_uses_elapsed_blocks(session: Session) -> None:
                 SubstantiveValueKind.AUTHORED_THESIS,
                 "Frame the claim before the source",
                 estimated_duration=2.0,
+                grounding_refs=("block:1",),
             ),
             _source(),
         ],

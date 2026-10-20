@@ -7,7 +7,7 @@ representation and never mutates, rewrites, or repairs it.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from app.core.enums import (
     ClaimGroundingState,
@@ -147,6 +147,7 @@ class GovernanceInputs:
     refinement_output_fingerprint: str
     target_context: PlanningContext
     plans: tuple[PlanEvidence, ...]
+    mandatory_evidence: Mapping[str, object] = field(default_factory=dict)
 
     @property
     def duration(self) -> float:
