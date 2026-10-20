@@ -259,6 +259,7 @@ class PlanProviderBlock:
     semantic_intent: str | None = None
     why_unavailable: str | None = None
     grounding_refs: tuple[str, ...] = ()
+    grounding_refs_present: bool = False
     grounding_refs_invalid: bool = False
     grounding_refs_errors: tuple[str, ...] = ()
     delivery_intent: DeliveryIntent | None = None
@@ -295,6 +296,9 @@ class PlanProviderResult:
     plans: tuple[PlanProviderPlan, ...] = ()
     notes: str = ""
     confidence: float = 0.0
+    # Bounded, non-executable response context for rejection diagnostics.
+    # Never raw provider text or transcript content.
+    response_evidence: Mapping[str, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -381,6 +385,9 @@ class StrategyAttempt:
     reasons: tuple[str, ...] = ()
     provider_input_fingerprint: str = ""
     checkpoint: Mapping[str, object] | None = None
+    # Bounded operator diagnostics for a rejected/deferred attempt. Kept
+    # separate from executable plan blocks and reusable accepted checkpoints.
+    diagnostics: Mapping[str, object] | None = None
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -390,6 +397,7 @@ class StrategyAttempt:
             "reasons": list(self.reasons),
             "provider_input_fingerprint": self.provider_input_fingerprint,
             "checkpoint": dict(self.checkpoint) if self.checkpoint is not None else None,
+            "diagnostics": dict(self.diagnostics) if self.diagnostics is not None else None,
         }
 
 

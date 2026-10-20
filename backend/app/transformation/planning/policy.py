@@ -19,15 +19,16 @@ from app.core.enums import (
     TransformationStrategyType,
 )
 
-# v8 Arabic multi-token closure: bounded Arabic selection grammar covers
-# multi-token identities (for example "اختر محمد رمضان راوياً").
-POLICY_VERSION = "stage4.1-v9"
-SCHEMA_VERSION = "stage4.1-schema-v9"
+# v10 producer-contract alignment: authoritative mandatory/source-selection
+# evidence, one hosted schema shared with the prompt hash, and versioned
+# rejection diagnostics. v8 Arabic multi-token closure remains in force.
+POLICY_VERSION = "stage4.1-v10"
+SCHEMA_VERSION = "stage4.1-schema-v10"
 VALIDATION_VERSION = "stage4.1-validation-v11"
 INPUT_FINGERPRINT_VERSION = "2"
 OUTPUT_FINGERPRINT_VERSION = "2"
 PLAN_FINGERPRINT_VERSION = "2"
-PROVIDER_INPUT_FINGERPRINT_VERSION = "1"
+PROVIDER_INPUT_FINGERPRINT_VERSION = "2"
 
 # Official Gemini model documentation was checked 2026-09-14. See
 # docs/STAGE_4_1_OPERATIONS.md for the exact links.

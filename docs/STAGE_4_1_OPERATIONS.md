@@ -48,6 +48,39 @@ the target/narration semantic context. A whole video or whole multi-hour
 transcript is never included, and Stage 4.0 eligibility/ranking is never
 recomputed.
 
+## Producer request contract (V4)
+
+The provider request is a single authoritative, bounded contract; it is not a
+lossy subset of the deterministic validators. `build_planning_request` exposes:
+
+- `mandatory_evidence` with separate `hook` and `payoff` entries. Each reports
+  its truthful state (`ABSENT`, `RESOLVED`, `MALFORMED`, or `UNRESOLVED`), the
+  authoritative source segment index, absolute start/end, whether offered
+  planning words overlap it, and the inclusive planning-word indexes that do.
+  A declared but malformed/unresolved requirement is never hidden.
+- `source_selection` with the inclusive planning-word index scope, offered word
+  count and first/last word, word-coverage sufficiency, the selectable window,
+  minimum excerpt duration, block/plan duration limits, and the effective strict
+  or normal hero/elapsed/authored caps.
+- `strategy_constraints` with the strategy type, the offered value kind, the
+  closed allowed value-kind set for that strategy, and the external-verification
+  requirement.
+- `nonselectable_context` with `context_text`, `suggested_hook_copy`, idea/topic
+  summaries, and an explicit note that none of it is citable evidence.
+- `words` with the exact planning-word text and absolute times offered for
+  selection.
+
+The authoritative hosted schema is the Pydantic `PlanningOutputSchema` used by
+`google-genai`: top-level plan identity/outcome/narration/blocks and the
+conditional block fields are required by the schema convention, with descriptions
+stating the conditional obligations. `PLANNING_OUTPUT_SCHEMA` is generated from
+that same model, so the prompt hash and the object Google receives cannot drift.
+The instruction and schema state the source-selector, mandatory-coverage,
+grounding grammar/equality, verification-linkage, narration-consistency, and
+TTS/rendering/evasion prohibitions. A provider output that is otherwise
+well-formed but omits a required declaration is rejected deterministically;
+there is no retry loop or automatic repair.
+
 ## Plan-set schema
 
 `transformation_plan_sets` — one durable planning envelope per candidate:
@@ -167,6 +200,11 @@ malformed, out-of-range, or conflicting indexes are unresolved and never
 satisfied. Rejection reasons are distinct (`HOOK_NOT_COVERED`,
 `PAYOFF_NOT_COVERED`, and the corresponding malformed/unresolved/missing codes).
 
+The producer request exposes this evidence directly. Role labels such as `HOOK`
+or `PAYOFF` alone never prove coverage, and a null payoff never waives a hook.
+When the authoritative requirement is malformed or unresolved, no guessed span
+can satisfy it.
+
 ## Required source grounding
 
 `ORIGINAL_VALUE` and `TEXTUAL_ANNOTATION` are substantive authored blocks and
@@ -180,6 +218,14 @@ requirement.
 
 Declarations use the shared strict grammar (`transformation/grounding.py`):
 source block index, planning word range, source time span, or exact source quote.
+The provider instruction states the production scopes explicitly: `block:N`
+identifies the zero-based index in the complete returned block array and must be
+a `SOURCE_EXCERPT`; `words:N-M` uses inclusive planning-word indexes; `source:A-B`
+uses absolute seconds covered exactly by selected evidence; and a plain quote must
+equal an entire selected excerpt after strip/casefold. A bare decimal such as
+`793.32` is a quote declaration, not a timestamp, and a transcript substring is
+not a whole-excerpt quote. Object references and `final_clip` are not Stage 4.1
+source evidence.
 Resolution happens only after source excerpts are resolved, against the exact
 selected planning-word/block evidence and selected source bounds. The complete
 cited range must be covered; partial overlap, out-of-scope indexes, nonexistent
@@ -424,6 +470,14 @@ dialect shifting, publication-ready full scripts, voice/provider/model
 selection, frame-level rendering instructions, final-plan approval, and
 platform-detection evasion.
 
+The hosted schema is the same authoritative Pydantic model whose JSON schema is
+hashed by `planning_prompt_hash`; there is no separate documentary schema for
+Gemini. It requires the plan identity/outcome fields, narration shape, block
+type/purpose/duration, grounding declarations, dependency ids and the other
+declaration fields, and it documents the conditional rules (for example hero,
+mandatory coverage, grounding, and verification linkage) that deterministic
+validation enforces. Closed vocabularies remain inline enums.
+
 Gemini clients are lazy, constructed only at first call, closed on every exit
 path, and the key is scrubbed on release. Credentials, transcript content,
 prompts, and remote response bodies never appear in errors or logs. Gemini calls
@@ -484,6 +538,19 @@ stalled inside provider work is never reclaimed merely because its original
 Duplicate delivery of a live claim still performs zero provider work, and
 claim-version fencing remains the final guard against stale persistence.
 
+Every rejected or deferred provider attempt may also retain bounded, structural
+rejection diagnostics in the plan-set `provider_evidence.attempt_diagnostics`
+list and in its `strategy_attempts` row. Each entry is tied to the job, strategy,
+route, provider-input fingerprint, prompt hash, schema/policy versions and
+provider identity; it records the failure phase/codes/block, safely represented
+submitted selectors, resolved selected-source word/time identities, expected
+mandatory evidence, source-selection limits, and bounded response digest/size
+(never the raw response). Phases distinguish contract rejection, explicit
+decline, omission and transport failure. Quote declarations are retained only as
+digests, and diagnostics are never executable plan content, never reusable
+checkpoints, and never include transcript text or credentials. Earlier per-job
+diagnostics survive later runs (bounded to the most recent 20).
+
 Failed planning jobs retain bounded, sanitized operator diagnostics. A
 prerequisite (planning-input) failure records the repository-owned prerequisite
 message; an unexpected failure records only the exception type; a provider
@@ -511,8 +578,8 @@ unresolved/entity/dialect/code-switch evidence; bounded context actually sent;
 Stage 4.0 source moment, assessments, platform risk, preservation and
 verification evidence; target-market/language/register semantic context;
 narration-enabled/language/register semantic policy; Stage 4.1 policy/config/
-validation/schema; and planning provider mode, tier route, model, API, prompt
-hash, schema, temperature, thinking, and budgets.
+validation/schema; and planning provider mode, tier route, model, API, effective
+instruction/schema prompt hash, schema, temperature, thinking, and budgets.
 
 It excludes the Gemini key value or presence, admission/cooldown/outage state, TTS
 provider/model/voice/fallback voice, speech-generation settings, rendering/
@@ -617,7 +684,14 @@ present. The required-source-grounding correction advanced the validation
 version to `stage4.1-validation-v11` (authoritative declaration resolution, a
 required-grounding policy for substantive authored blocks, bounded word-range
 work, and Stage 6-parity time-point/range coverage), so prior plans and
-checkpoints invalidate through the input fingerprint. The earlier Arabic
+checkpoints invalidate through the input fingerprint. The producer-contract V4
+correction advanced planning to `stage4.1-v10` / `stage4.1-schema-v10` and the
+provider-input fingerprint to version `2`: the request now exposes authoritative
+mandatory hook/payoff evidence and planning-word mappings, source-selection and
+strategy constraints; the hosted schema is generated from the same Pydantic model
+used by Gemini; and the effective instruction/schema participates in provider
+identity. Prior plans, checkpoints, and caches therefore invalidate normally.
+The earlier Arabic
 multi-token closure advanced planning versions to `stage4.1-v8` /
 `stage4.1-schema-v8` / `stage4.1-validation-v8` (bounded Arabic selection grammar
 covers multi-token identities such as `اختر محمد رمضان راوياً`, in addition to

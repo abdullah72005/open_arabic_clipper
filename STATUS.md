@@ -1,3 +1,55 @@
+## Stage 4.1 producer-contract V4 (2026-10-20)
+
+Status: **the Stage 4.1 producer contract is aligned with the preserved
+validators and proven offline satisfiable on authentic saved evidence. No real
+provider, TTS, Ollama, rendering, acceptance, worker, or Stage 7 work was
+performed. Stage 6 remains NOT FROZEN; Stage 7 remains unstarted.**
+
+- **Authoritative request evidence.** `build_planning_request` now exposes
+  `mandatory_evidence` (truthful `ABSENT`/`RESOLVED`/`MALFORMED`/`UNRESOLVED`
+  hook/payoff state, source segment identity/bounds, offered planning-word
+  mapping), `source_selection` (planning-index scope, offered words, coverage,
+  selectable window, excerpt/block/duration/hero caps), `strategy_constraints`
+  (allowed value kinds and verification requirement), and
+  `nonselectable_context` (context, suggested hook copy, summaries) separated
+  from authoritative evidence.
+- **One authoritative schema.** `PlanningOutputSchema` is the Pydantic model
+  Google receives, and `PLANNING_OUTPUT_SCHEMA` is generated from it. Required
+  plan/block/narration/declaration fields and descriptions now state hero,
+  mandatory coverage, grounding grammar/equality, verification linkage and
+  narration/TTS/rendering boundaries. A documentary-only schema can no longer
+  differ from the hosted request.
+- **Identity chain preserved.** Planning indexes remain after filtering/capping
+  and distinct from source segment positions and FINAL_CLIP indexes. Selected
+  `planning_words` survive validation, persistence, Stage 4.3 live guards,
+  Stage 5.0 binding and materialization partial-range resolution. A
+  tolerance-admitted word that is not part of a selected excerpt remains
+  unresolved as a citation.
+- **Bounded rejection diagnostics.** Rejected/deferred attempts retain
+  job/strategy/route/fingerprint/contract identity, phase, failure codes/block,
+  structural selectors, resolved selected-source identities, expected mandatory
+  evidence and response digest/size, separated from executable plans and reusable
+  checkpoints. Quote declarations are digests only; no raw provider/transcript
+  text or credential is persisted. Prior per-job diagnostics survive later runs.
+- **Versions.** Planning `stage4.1-v10`, schema `stage4.1-schema-v10`,
+  validation `stage4.1-validation-v11`, provider-input fingerprint `2`; prior
+  plans/checkpoints invalidate normally. The effective instruction/schema
+  participates in provider runtime/prompt identity.
+
+Offline evidence: four deliberate fixtures under
+`backend/tests/fixtures/stage41_contract_v4/` extracted from the read-only
+`clipfactory_stage6_acceptance` snapshot (SHA-256
+`259d3128301b130da8573676211a84e1c7fc92de6039d28577210ec4998d92da`), plus
+`test_stage41_contract_v4.py`. One authored provider-format response grounded in
+the authentic `a725e62d` hero passes the actual schema/parser, Stage 4.1,
+Stage 4.2 integrity and deterministic governance, Stage 4.3 mandatory guards,
+Stage 5.0 FINAL_CLIP compatibility and materialization partial-range resolution.
+Negative controls still reject missing hooks, declared missing payoff, empty/
+malformed/mixed/invalid grounding, bare decimals, substring-only quotes,
+unknown blocks, partial/out-of-scope/huge/reversed ranges, malformed mandatory
+identity and unsupported claims. No approval rows or semantic critiques were
+fabricated.
+
 # Runtime status
 
 > Correction (2026-10-17): a hosted `GEMINI_API_KEY` IS configured in this

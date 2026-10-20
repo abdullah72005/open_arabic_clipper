@@ -12,12 +12,12 @@ from __future__ import annotations
 import hashlib
 import json
 import time
-from collections.abc import Callable, Sequence
-from typing import Any, Literal
+from collections.abc import Callable, Mapping, Sequence
+from typing import Any
 
 from google import genai
 from google.genai import types
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from app.candidates.providers import ProviderErrorCategory
 from app.transformation.planning.policy import (
@@ -28,6 +28,10 @@ from app.transformation.planning.policy import (
 )
 from app.transformation.planning.providers import (
     PLANNING_SYSTEM_INSTRUCTION,
+    PlanningBlockSchema,
+    PlanningNarrationSchema,
+    PlanningOutputSchema,
+    PlanningPlanSchema,
     PlanningProviderError,
     PlanningRequest,
     parse_plan_results,
@@ -47,100 +51,12 @@ _RETRYABLE = frozenset(
     }
 )
 
-# The structured-output schema must constrain closed vocabularies. Declaring the
-# enum fields as plain ``str`` let the hosted model emit unconstrained values
-# (for example ``original_value`` or ``hero``); the deterministic parser matches
-# enum values case-sensitively, so every block was dropped and every hosted plan
-# failed with ``NO_SOURCE_EXCERPT``. These ``Literal`` aliases mirror the parser's
-# closed enums and make Pydantic emit an inline ``enum`` in the Gemini schema, so
-# the model can only emit valid values. ``test_stage41_providers`` asserts each
-# alias equals its enum, so the two can never silently drift.
-_BlockTypeLiteral = Literal[
-    "SOURCE_EXCERPT",
-    "ORIGINAL_VALUE",
-    "TRANSITION",
-    "TEXTUAL_ANNOTATION",
-    "FACT_VERIFICATION_PLACEHOLDER",
-]
-_SourceRoleLiteral = Literal["HERO", "HOOK", "PAYOFF", "SUPPORT"]
-_ValueKindLiteral = Literal[
-    "MISSING_CONTEXT",
-    "INFERENCE",
-    "EXPLANATION",
-    "COMPARISON",
-    "COUNTERPOINT",
-    "VERIFICATION_CORRECTION",
-    "SYNTHESIS",
-    "AUTHORED_THESIS",
-    "USEFUL_TAKEAWAY",
-    "SOURCE_AS_EVIDENCE",
-]
-_DeliveryIntentLiteral = Literal["ON_SCREEN_TEXT", "NARRATION", "FLEXIBLE"]
-_NarrationNeedLiteral = Literal["NONE", "OPTIONAL", "RECOMMENDED", "REQUIRED"]
-_NarrationPurposeLiteral = Literal[
-    "CONTEXT",
-    "ANALYSIS",
-    "COUNTERPOINT",
-    "EXPLANATION",
-    "TAKEAWAY",
-    "HOOK",
-    "TRANSITION",
-]
-
-
-class _GeminiNarration(BaseModel):
-    need: _NarrationNeedLiteral = "NONE"
-    purposes: list[_NarrationPurposeLiteral] = Field(default_factory=list)
-    language: str | None = None
-    register_intent: str | None = None
-    estimated_duration: float = 0.0
-    placement_block_index: int | None = None
-    max_source_interruption_seconds: float = 0.0
-    overlaps_source_audio: bool = False
-    replaces_silence: bool = False
-    essential: bool = False
-    verification_dependency_ids: list[str] = Field(default_factory=list)
-
-
-class _GeminiBlock(BaseModel):
-    block_type: _BlockTypeLiteral
-    purpose: str = ""
-    estimated_duration: float = 0.0
-    interrupts_source: bool = False
-    preservation_constraints: list[str] = Field(default_factory=list)
-    dependency_ids: list[str] = Field(default_factory=list)
-    source_role: _SourceRoleLiteral | None = None
-    word_start_index: int | None = None
-    word_end_index: int | None = None
-    use_full_window: bool = False
-    continuity_rationale: str | None = None
-    substantive_value_kind: _ValueKindLiteral | None = None
-    semantic_intent: str = ""
-    why_unavailable: str = ""
-    grounding_refs: list[str] = Field(default_factory=list)
-    delivery_intent: _DeliveryIntentLiteral | None = None
-    draft_line: str | None = None
-    claim_dependency: str | None = None
-    verification_rationale: str | None = None
-    intended_use: str | None = None
-    must_verify_before_execution: bool = False
-    dependent_block_ids: list[int] = Field(default_factory=list)
-
-
-class _GeminiPlan(BaseModel):
-    strategy_id: str
-    strategy_key: str
-    confidence: float = 0.0
-    no_valid_plan: bool = False
-    no_valid_reason: str = ""
-    planner_notes: str = ""
-    preservation_constraints: list[str] = Field(default_factory=list)
-    blocks: list[_GeminiBlock] = Field(default_factory=list)
-    narration: _GeminiNarration = Field(default_factory=_GeminiNarration)
-
-
-class _GeminiPlanningOutput(BaseModel):
-    plans: list[_GeminiPlan] = Field(default_factory=list)
+# The authoritative schema lives in ``providers`` so the prompt hash, the
+# offline schema tests, and the object Google receives can never diverge.
+_GeminiNarration = PlanningNarrationSchema
+_GeminiBlock = PlanningBlockSchema
+_GeminiPlan = PlanningPlanSchema
+_GeminiPlanningOutput = PlanningOutputSchema
 
 
 class GeminiPlanningProvider:
@@ -318,7 +234,11 @@ class GeminiPlanningProvider:
         content = _response_content(response)
         if not isinstance(content, dict):
             raise PlanningProviderError(ProviderErrorCategory.MALFORMED_OUTPUT.value)
-        return parse_plan_results(content, requests)
+        return parse_plan_results(
+            content,
+            requests,
+            response_evidence=_response_evidence(content),
+        )
 
     def _accumulate_usage(self, response: Any) -> None:
         usage = getattr(response, "usage_metadata", None)
@@ -350,6 +270,17 @@ def _response_issue(response: Any) -> str | None:
     else:
         return ProviderErrorCategory.MALFORMED_OUTPUT.value
     return None
+
+
+def _response_evidence(content: Mapping[str, object]) -> dict[str, object]:
+    encoded = json.dumps(content, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    plans = content.get("plans")
+    return {
+        "content_digest": hashlib.sha256(encoded).hexdigest(),
+        "content_bytes": len(encoded),
+        "truncated": False,
+        "returned_plan_count": len(plans) if isinstance(plans, list) else 0,
+    }
 
 
 def _response_content(response: Any) -> object:
