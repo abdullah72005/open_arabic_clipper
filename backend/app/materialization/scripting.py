@@ -12,6 +12,7 @@ usefulness, or Arabic naturalness.
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
@@ -126,11 +127,17 @@ class GroundingResolution:
 
 
 def _content_tokens(text: str) -> list[str]:
-    return [
-        token
-        for token in (match.group(0).casefold() for match in _WORD_RE.finditer(text))
-        if token and token not in _STOPWORDS
-    ]
+    tokens: list[str] = []
+    for match in _WORD_RE.finditer(text):
+        token = match.group(0).casefold()
+        if not token or token in _STOPWORDS:
+            continue
+        # The Arabic Unicode block also contains punctuation (؟ ، etc.), so a
+        # regex match alone is not evidence of content.
+        if not any(unicodedata.category(character)[0] in {"L", "N"} for character in token):
+            continue
+        tokens.append(token)
+    return tokens
 
 
 def _has_marker(text: str, markers: Sequence[str]) -> bool:
@@ -247,6 +254,18 @@ def validate_authored_block(
                 evidence={"block_index": index},
             )
         )
+    elif block_type in _SUBSTANTIVE_BLOCK_TYPES and not _content_tokens(copy):
+        # Punctuation, whitespace, or stopword-only copy is content-free. A
+        # substantive slot can never be satisfied by non-content, and this is a
+        # deterministic hard failure rather than a semantic-review request.
+        findings.append(
+            QualityFinding(
+                dimension="SUBSTANTIVE_VALUE",
+                level=QualityLevel.UNMET.value,
+                reason_codes=("MISSING_REQUIRED_VALUE",),
+                evidence={"block_index": index, "reason": "CONTENT_FREE"},
+            )
+        )
 
     if resolution.unresolved:
         findings.append(
@@ -344,6 +363,13 @@ def validate_authored_block(
     hard_failure = any(finding.level == QualityLevel.UNMET.value for finding in findings)
     if hard_failure:
         requires_semantic_review = False
+    elif essential:
+        # A lexical pass can prove source support but cannot establish intent
+        # fulfilment or non-redundancy for a required substantive value. Never
+        # let a deterministic acceptance bypass that review. The explicit
+        # SOURCE_AS_EVIDENCE exception (``essential`` is False) remains
+        # deterministic.
+        requires_semantic_review = True
 
     claim = ClaimLedgerEntry(
         claim_id=str(block.get("claim_id", f"claim-{index}")),

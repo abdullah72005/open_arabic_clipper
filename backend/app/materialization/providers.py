@@ -30,6 +30,7 @@ from app.materialization.policy import (
     Stage6Config,
 )
 from app.materialization.scripting import resolve_grounding, validate_authored_block
+from app.materialization.timeline import MIN_AUTHORED_CARD_SECONDS, READING_CHARS_PER_SECOND
 from app.materialization.types import AuthoredBlock, GroundingRef, QualityFinding
 
 _SUBSTANTIVE_BLOCK_TYPES = frozenset({"ORIGINAL_VALUE", "TEXTUAL_ANNOTATION"})
@@ -363,10 +364,11 @@ class CritiqueRequest:
 class CritiqueResult:
     """Semantic-critique outcome: whether each grounded block is supported.
 
-    ``blocks`` carries the full categorical findings; ``accepted`` is the legacy
-    bool-only map (kept for simple/fake providers). ``decision`` prefers the
-    categorical verdict and only falls back to ``accepted`` when no categorical
-    finding exists for the block.
+    ``blocks`` carries the full categorical findings; ``accepted`` is a legacy
+    bool-only map retained for parsing older checkpoints/test adapters. A
+    boolean-positive entry is never approval evidence: only complete categorical
+    findings can authorize acceptance. A boolean-negative entry remains a safe
+    rejection.
     """
 
     accepted: Mapping[int, bool] = field(default_factory=dict)
@@ -380,23 +382,25 @@ class CritiqueResult:
         block = self.blocks.get(index)
         if block is not None:
             return block.accepted
-        if index in self.accepted:
-            return bool(self.accepted[index])
+        if index in self.accepted and not self.accepted[index]:
+            # A known-negative boolean remains a safe rejection. A positive
+            # boolean is not complete categorical evidence, so it can never
+            # authorize approval; it stays unknown.
+            return False
         return None
 
     def verdict(self, index: int, requested: Sequence[str] = CRITIQUE_DIMENSIONS) -> str | None:
         """Tri-state verdict for one block, preferring full categorical evidence.
 
-        A boolean-only result (a legacy/fake provider) is honored for test
-        compatibility, but the production acceptance path always supplies
-        categorical ``blocks`` and therefore never relies on a bare boolean.
+        Complete categorical ``blocks`` are required. A legacy boolean-positive
+        result is not evidence and defers; a negative boolean still rejects.
         """
 
         block = self.blocks.get(index)
         if block is not None:
             return block.verdict(requested)
         if index in self.accepted:
-            return CRITIQUE_ACCEPTED if self.accepted[index] else CRITIQUE_REJECTED
+            return CRITIQUE_ACCEPTED if self.accepted[index] is False else CRITIQUE_DEFERRED
         return None
 
     def findings_for(self, index: int) -> tuple[CritiqueDimensionFinding, ...]:
@@ -571,17 +575,49 @@ class FakeCritiqueProvider:
                 deferred=True,
                 reason_code="DEFERRED_PROVIDER",
             )
+        targets = {target.block_index: target for target in request.targets}
+        blocks: dict[int, BlockCritique] = {}
+        for index, accepted in self._accepted.items():
+            target = targets.get(index)
+            if target is None:
+                continue
+            level = "PASS" if accepted else "FAIL"
+            findings = tuple(
+                CritiqueDimensionFinding(
+                    dimension=dimension,
+                    level=level,
+                    copy_quote=target.copy if dimension == "INTENT_FULFILLMENT" else "",
+                    grounding_refs=(
+                        target.offered_grounding_refs[:1]
+                        if dimension == "INTENT_FULFILLMENT"
+                        else ()
+                    ),
+                    added_relation=(
+                        "Fake critique accepted the supplied relation."
+                        if dimension == "INTENT_FULFILLMENT"
+                        else ""
+                    ),
+                )
+                for dimension in CRITIQUE_DIMENSIONS
+            )
+            blocks[index] = BlockCritique(block_index=index, findings=findings)
         return CritiqueResult(
             accepted=dict(self._accepted),
             provider_identity=self.runtime_identity(),
             notes="fake",
+            blocks=blocks,
         )
 
     def release(self) -> None:
         self.released += 1
 
 
-def build_writing_request(inputs: MaterializationInputs, *, config: Stage6Config) -> WritingRequest:
+def build_writing_request(
+    inputs: MaterializationInputs,
+    *,
+    config: Stage6Config,
+    narration_available: bool = True,
+) -> WritingRequest:
     """Build one bounded writing request from the plan's substantive blocks.
 
     Each target carries bounded *actual* resolved source evidence (never only a
@@ -609,7 +645,9 @@ def build_writing_request(inputs: MaterializationInputs, *, config: Stage6Config
                 verification_dependency_id=_first_dependency(block, inputs),
                 why_unavailable=str(block.get("why_unavailable", "") or ""),
                 delivery_intent=str(block.get("delivery_intent", "") or ""),
-                proposed_delivery=_proposed_delivery(block, inputs),
+                proposed_delivery=_proposed_delivery(
+                    block, inputs, narration_available=narration_available
+                ),
             )
         )
     tier = SEMANTIC_STRONG_TIER if inputs.intensity == "STRONG" else SEMANTIC_ROUTINE_TIER
@@ -627,28 +665,33 @@ def build_writing_request(inputs: MaterializationInputs, *, config: Stage6Config
 
 
 def _proposed_delivery(
-    block: Mapping[str, object], inputs: MaterializationInputs
+    block: Mapping[str, object],
+    inputs: MaterializationInputs,
+    *,
+    narration_available: bool,
 ) -> dict[str, object]:
-    """Bounded delivery/duration facts for the critique's LENGTH_NECESSITY.
+    """Executable delivery facts for the critique's LENGTH_NECESSITY.
 
-    These are the facts the current plan intends, not a rendered timeline. The
-    critique must judge the actual interruption, not assume it is justified.
+    The timeline delivers narration only when the plan requires/recommends it,
+    narration is allowed by the profile, and a synthesizer is available; every
+    other authored block becomes a silent standalone card. A plan's
+    ``delivery_intent`` (including ``FLEXIBLE``) is not the executable delivery
+    and cannot make a silent card look like spoken text.
     """
 
-    delivery = str(block.get("delivery_intent", "") or "")
     narration_need = str(inputs.narration.get("need", "NONE"))
+    narration_will_run = (
+        narration_need in {"RECOMMENDED", "REQUIRED"}
+        and narration_available
+        and bool(inputs.profile.narration_allowed)
+    )
+    kind = "NARRATION" if narration_will_run else "STANDALONE_CARD"
     estimated = block.get("estimated_duration")
     duration = (
         float(estimated)
         if isinstance(estimated, (int, float)) and not isinstance(estimated, bool)
         else 0.0
     )
-    if narration_need in {"RECOMMENDED", "REQUIRED"}:
-        kind = "NARRATION"
-    elif delivery == "ON_SCREEN_TEXT":
-        kind = "STANDALONE_CARD"
-    else:
-        kind = "AUTHORED_TEXT"
     return {
         "delivery": kind,
         "planned_duration_seconds": round(duration, 6),
@@ -696,6 +739,7 @@ def materialize_script(
     allow_hosted: bool,
     attempt_scope: str = "",
     critique_provider: MaterializationCritiqueProvider | None = None,
+    narration_available: bool = True,
 ) -> MaterializationScript:
     """Run exactly one bounded writing request and validate its copy.
 
@@ -706,7 +750,7 @@ def materialize_script(
     so a replayed checkpoint or a crashed attempt never spends the budget twice.
     """
 
-    request = build_writing_request(inputs, config=config)
+    request = build_writing_request(inputs, config=config, narration_available=narration_available)
     identity = provider.runtime_identity()
     if not request.targets:
         return MaterializationScript((), True, identity, False, ())
@@ -765,6 +809,23 @@ def materialize_script(
                 target.block_type in _SUBSTANTIVE_BLOCK_TYPES
                 and target.substantive_value_kind != "SOURCE_AS_EVIDENCE"
             )
+            proposed_delivery = dict(target.proposed_delivery)
+            reading_seconds = len(copy) / READING_CHARS_PER_SECOND
+            if str(proposed_delivery.get("delivery", "")) == "STANDALONE_CARD":
+                # The timeline's executable duration for a silent card is the
+                # readable minimum derived from the actual copy, not the plan's
+                # estimate. The critique must judge the interruption that will
+                # actually be delivered.
+                proposed_delivery["planned_duration_seconds"] = round(
+                    max(MIN_AUTHORED_CARD_SECONDS, reading_seconds), 6
+                )
+                proposed_delivery["silent"] = True
+            proposed_delivery["copy_characters"] = len(copy)
+            proposed_delivery["reading_seconds"] = round(reading_seconds, 6)
+            require_length_necessity = substantive and (
+                str(proposed_delivery.get("delivery", "")) == "STANDALONE_CARD"
+                or str(inputs.narration.get("need", "NONE")) == "RECOMMENDED"
+            )
             review_targets.append(
                 CritiqueTarget(
                     block_index=target.block_index,
@@ -775,21 +836,14 @@ def materialize_script(
                     source_evidence=target.source_evidence,
                     offered_grounding_refs=_offered_refs(target.grounding_refs),
                     delivery_intent=target.delivery_intent,
-                    proposed_delivery={
-                        **dict(target.proposed_delivery),
-                        "copy_characters": len(copy),
-                        "reading_seconds": round(len(copy) / 14.0, 6),
-                    },
+                    proposed_delivery=proposed_delivery,
                     substantive=substantive,
-                    require_length_necessity=(
-                        substantive
-                        and target.delivery_intent == "ON_SCREEN_TEXT"
-                        and str(inputs.narration.get("need", "NONE")) == "NONE"
-                    ),
+                    require_length_necessity=require_length_necessity,
                 )
             )
 
     unresolved = False
+    reviewed_by_block = {target.block_index: target for target in review_targets}
     if review_targets:
         evaluation = _run_critique(
             critique_provider,
@@ -809,7 +863,7 @@ def materialize_script(
                 identity,
                 True,
                 ("GROUNDED_INFERENCE_REQUIRES_REVIEW",),
-                _combined_findings(findings_by_block, accepted_indexes, {}),
+                _combined_findings(findings_by_block, accepted_indexes, {}, reviewed_by_block),
             )
         for target in review_targets:
             index = target.block_index
@@ -844,7 +898,9 @@ def materialize_script(
             identity,
             True,
             tuple(dict.fromkeys((*reasons, "GROUNDED_INFERENCE_REQUIRES_REVIEW"))),
-            _combined_findings(findings_by_block, accepted_indexes, critique_by_block),
+            _combined_findings(
+                findings_by_block, accepted_indexes, critique_by_block, reviewed_by_block
+            ),
         )
 
     for target in request.targets:
@@ -888,7 +944,9 @@ def materialize_script(
         provider_identity=result.provider_identity,
         deferred=False,
         reason_codes=tuple(dict.fromkeys(reasons)),
-        findings=_combined_findings(findings_by_block, accepted_indexes, critique_by_block),
+        findings=_combined_findings(
+            findings_by_block, accepted_indexes, critique_by_block, reviewed_by_block
+        ),
     )
 
 
@@ -896,6 +954,7 @@ def _combined_findings(
     findings_by_block: Mapping[int, list[QualityFinding]],
     accepted_indexes: Mapping[int, bool],
     critique_by_block: Mapping[int, BlockCritique],
+    reviewed_targets: Mapping[int, CritiqueTarget] | None = None,
 ) -> tuple[QualityFinding, ...]:
     """All persisted script findings, including noncritical categorical concerns.
 
@@ -905,14 +964,32 @@ def _combined_findings(
     as quality findings for *every* reviewed block, so a noncritical concern
     (e.g. NATURALNESS) survives into persisted script evidence and the final
     assessment even when the block was accepted.
+
+    Positive ``LENGTH_NECESSITY`` evidence additionally records the exact block,
+    copy and delivery/duration it reviewed, so timeline assessment can never
+    credit a sibling block's PASS or a stale copy.
     """
 
+    targets = reviewed_targets or {}
     combined: list[QualityFinding] = []
     for index, findings in findings_by_block.items():
         if accepted_indexes.get(index, False):
             continue
         combined.extend(findings)
     for block in critique_by_block.values():
+        target = targets.get(block.block_index)
+        reviewed_facts: dict[str, object] = {"block_index": block.block_index}
+        if target is not None:
+            reviewed_facts.update(
+                {
+                    "copy": target.copy,
+                    "reviewed_delivery": target.proposed_delivery.get("delivery"),
+                    "reviewed_duration_seconds": target.proposed_delivery.get(
+                        "planned_duration_seconds"
+                    ),
+                    "reviewed_copy_characters": target.proposed_delivery.get("copy_characters"),
+                }
+            )
         for finding in block.findings:
             dimension = CRITIQUE_TO_QUALITY_DIMENSION.get(finding.dimension)
             level = CRITIQUE_TO_QUALITY_LEVEL.get(finding.level)
@@ -930,6 +1007,7 @@ def _combined_findings(
                         level=level,
                         reason_codes=(f"CRITIQUE_{finding.dimension}_PASS",),
                         evidence={
+                            **reviewed_facts,
                             "critique_dimension": finding.dimension,
                             "critique_level": finding.level,
                             "evidence": finding.evidence,
@@ -943,6 +1021,7 @@ def _combined_findings(
                     level=level,
                     reason_codes=(f"CRITIQUE_{finding.dimension}_{finding.level}",),
                     evidence={
+                        **reviewed_facts,
                         "critique_dimension": finding.dimension,
                         "critique_level": finding.level,
                         "evidence": finding.evidence,
@@ -1049,34 +1128,10 @@ def _run_critique(
                 substantive=target.substantive,
                 require_length_necessity=target.require_length_necessity,
             )
-        elif target.block_index in result.accepted:
-            # Boolean-only legacy/fake result: synthesize a block that carries
-            # the boolean as complete evidence only when it is a rejection.
-            accepted = bool(result.accepted[target.block_index])
-            level = "PASS" if accepted else "FAIL"
-            blocks[target.block_index] = BlockCritique(
-                block_index=target.block_index,
-                findings=tuple(
-                    CritiqueDimensionFinding(
-                        dimension=dimension,
-                        level=level,
-                        copy_quote=target.copy if dimension == "INTENT_FULFILLMENT" else "",
-                        grounding_refs=(
-                            target.offered_grounding_refs[:1]
-                            if dimension == "INTENT_FULFILLMENT"
-                            else ()
-                        ),
-                        added_relation=(
-                            "Fake critique accepted the supplied relation."
-                            if dimension == "INTENT_FULFILLMENT"
-                            else ""
-                        ),
-                    )
-                    for dimension in CRITIQUE_DIMENSIONS
-                ),
-                substantive=target.substantive,
-                require_length_necessity=target.require_length_necessity,
-            )
+        # A boolean-only (legacy/malformed) result has no complete categorical
+        # evidence. It is never promoted into findings, quotes, references or an
+        # added relation. Leaving the block absent makes the caller defer
+        # without resending the provider request.
     if not blocks:
         return None
     return CritiqueEvaluation(blocks=blocks)

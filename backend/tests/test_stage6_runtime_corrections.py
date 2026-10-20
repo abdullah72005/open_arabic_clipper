@@ -19,6 +19,7 @@ from test_stage6_component_recovery import (
     AcceptingCritiqueProvider,
     ScriptedWritingProvider,
     _ready_composition,
+    accepting_critique_result,
 )
 from test_stage6_materialization_core import make_inputs
 
@@ -185,7 +186,7 @@ class ToggleCritiqueProvider(AcceptingCritiqueProvider):
                 deferred=True,
                 reason_code="DEFERRED_PROVIDER",
             )
-        return CritiqueResult(accepted={1: True}, provider_identity=self.runtime_identity())
+        return accepting_critique_result(request, self.runtime_identity())
 
 
 def test_deferred_script_is_not_replayed_and_recovers(tmp_path: Any) -> None:

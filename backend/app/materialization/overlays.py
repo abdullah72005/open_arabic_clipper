@@ -18,6 +18,11 @@ from __future__ import annotations
 
 import hashlib
 import math
+import os
+import re
+import shutil
+import subprocess
+import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
 
@@ -25,7 +30,7 @@ from app.composition.ass import escape_ass_text_with_evidence
 from app.composition.policy import SafeZoneProfile, safe_zone_for
 from app.materialization.types import AuthoredTimeline, TimelineSegment
 
-AUTHORED_ASS_POLICY_VERSION = "stage6-authored-ass-v2"
+AUTHORED_ASS_POLICY_VERSION = "stage6-authored-ass-v3"
 CARD_KIND = "CARD"
 ANNOTATION_KIND = "TEXTUAL_ANNOTATION"
 
@@ -33,12 +38,16 @@ MAX_AUTHORED_LINES = 3
 READING_CHARS_PER_SECOND = 14.0
 DEFAULT_AUTHORED_FONT_FAMILY = "Noto Sans Arabic"
 DEFAULT_AUTHORED_FONT_SIZE = 88
-#: Conservative advance-width estimate (fraction of font size) for the installed
-#: Arabic-capable font. Deliberately generous so the measured width is a safe
-#: upper bound rather than an optimistic guess.
-_CHAR_WIDTH_FACTOR = 0.55
 _LINE_HEIGHT_FACTOR = 1.25
 _READING_TOLERANCE_SECONDS = 0.05
+#: Approximate character advance used only to choose line breaks. Readability is
+#: decided from the actual libass rasterization below, never from this estimate.
+_WRAP_CHAR_WIDTH_FACTOR = 0.55
+#: Rendered outline width in the ASS style. The measured ink bbox covers the
+#: glyph fill; padding by the outline keeps the actual stroked glyph inside the
+#: safe area too.
+_OUTLINE_MARGIN_PX = 3
+_BBOX_PATTERN = re.compile(r"x1:(?P<x1>\d+)\s+x2:(?P<x2>\d+)\s+y1:(?P<y1>\d+)\s+y2:(?P<y2>\d+)")
 
 _STYLE_FORMAT = (
     "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, "
@@ -92,7 +101,7 @@ def _wrap(text: str, max_chars: int) -> list[str]:
 
 
 def _max_chars_for_width(usable_width: int, font_size: int) -> int:
-    char_width = max(1.0, font_size * _CHAR_WIDTH_FACTOR)
+    char_width = max(1.0, font_size * _WRAP_CHAR_WIDTH_FACTOR)
     return max(1, int(math.floor(usable_width / char_width)))
 
 
@@ -109,6 +118,97 @@ def _layout_finding(
         "reason_codes": [reason],
         "evidence": dict(evidence),
     }
+
+
+def _ass_header(
+    *,
+    play_res_x: int,
+    play_res_y: int,
+    left: int,
+    right: int,
+    top: int,
+    font_family: str,
+    font_size: int,
+) -> list[str]:
+    return [
+        "[Script Info]",
+        "ScriptType: v4.00+",
+        f"PlayResX: {play_res_x}",
+        f"PlayResY: {play_res_y}",
+        "WrapStyle: 2",
+        "ScaledBorderAndShadow: yes",
+        "",
+        "[V4+ Styles]",
+        _STYLE_FORMAT,
+        (
+            f"Style: Card,{font_family},{font_size},&H00FFFFFF,&H000000FF,"
+            f"&H00000000,&H80000000,0,0,0,0,100,100,0,0,1,3,0,5,"
+            f"{left},{right},{top},1"
+        ),
+        "",
+        "[Events]",
+        _EVENT_FORMAT,
+    ]
+
+
+def _dialogue_line(start: float, end: float, center_x: float, center_y: float, display: str) -> str:
+    return (
+        f"Dialogue: 0,{_format_ass_time(start)},{_format_ass_time(end)},Card,,0,0,0,,"
+        f"{{\\an5\\pos({center_x:.0f},{center_y:.0f})}}{display}"
+    )
+
+
+def _measure_ink_bounds(
+    data: bytes, *, play_res_x: int, play_res_y: int
+) -> tuple[int, int, int, int] | None:
+    """Measure the actual libass glyph ink for a one-event ASS document.
+
+    Returns ``(x1, y1, x2, y2)`` inclusive, or ``None`` when the local renderer
+    or its ``bbox`` filter is unavailable. ``None`` must be treated as refusal,
+    never as a favorable layout.
+    """
+
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        return None
+    try:
+        with tempfile.TemporaryDirectory(prefix="stage6-authored-") as directory:
+            ass_path = os.path.join(directory, "measure.ass")
+            with open(ass_path, "wb") as handle:
+                handle.write(data)
+            command = [
+                ffmpeg,
+                "-hide_banner",
+                "-loglevel",
+                "info",
+                "-f",
+                "lavfi",
+                "-i",
+                f"color=c=black:s={play_res_x}x{play_res_y}:r=10:d=1",
+                "-vf",
+                "ass=measure.ass,bbox=min_val=32",
+                "-frames:v",
+                "1",
+                "-f",
+                "null",
+                "-",
+            ]
+            completed = subprocess.run(
+                command, cwd=directory, capture_output=True, text=True, timeout=20, check=False
+            )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    match = _BBOX_PATTERN.search(completed.stderr)
+    if match is None:
+        return None
+    return (
+        int(match.group("x1")),
+        int(match.group("y1")),
+        int(match.group("x2")),
+        int(match.group("y2")),
+    )
 
 
 def build_authored_ass(
@@ -136,25 +236,16 @@ def build_authored_ass(
 
     findings: list[Mapping[str, object]] = []
     layout: list[Mapping[str, object]] = []
-    lines: list[str] = [
-        "[Script Info]",
-        "ScriptType: v4.00+",
-        f"PlayResX: {play_res_x}",
-        f"PlayResY: {play_res_y}",
-        "WrapStyle: 2",
-        "ScaledBorderAndShadow: yes",
-        "",
-        "[V4+ Styles]",
-        _STYLE_FORMAT,
-        (
-            f"Style: Card,{font_family},{font_size},&H00FFFFFF,&H000000FF,"
-            f"&H00000000,&H80000000,0,0,0,0,100,100,0,0,1,3,0,5,"
-            f"{left},{right},{top},1"
-        ),
-        "",
-        "[Events]",
-        _EVENT_FORMAT,
-    ]
+    header = _ass_header(
+        play_res_x=play_res_x,
+        play_res_y=play_res_y,
+        left=left,
+        right=right,
+        top=top,
+        font_family=font_family,
+        font_size=font_size,
+    )
+    lines: list[str] = list(header)
     total_lines = 0
     event_count = 0
     authored_kinds = {CARD_KIND, ANNOTATION_KIND, "AUTHORED_CARD"}
@@ -175,11 +266,23 @@ def build_authored_ass(
             continue
         escaped, reasons = escape_ass_text_with_evidence(text)
         wrapped = _wrap(escaped, max_chars)
+        display = "\\N".join(wrapped)
         duration = max(0.0, segment.output_end - segment.output_start)
         reading_seconds = len(text) / READING_CHARS_PER_SECOND
         widest = max((len(line) for line in wrapped), default=0)
-        estimated_width = widest * font_size * _CHAR_WIDTH_FACTOR
+        estimated_width = widest * font_size * _WRAP_CHAR_WIDTH_FACTOR
         estimated_height = len(wrapped) * font_size * _LINE_HEIGHT_FACTOR
+        measurement = _ass_header(
+            play_res_x=play_res_x,
+            play_res_y=play_res_y,
+            left=left,
+            right=right,
+            top=top,
+            font_family=font_family,
+            font_size=font_size,
+        ) + [_dialogue_line(0.0, 1.0, center_x, center_y, display)]
+        measurement_data = ("\n".join(measurement) + "\n").encode("utf-8")
+        ink = _measure_ink_bounds(measurement_data, play_res_x=play_res_x, play_res_y=play_res_y)
         evidence: dict[str, object] = {
             "font_family": font_family,
             "font_size": font_size,
@@ -195,6 +298,8 @@ def build_authored_ass(
             "wrapped_lines": len(wrapped),
             "estimated_width": round(estimated_width, 3),
             "estimated_height": round(estimated_height, 3),
+            "measured_ink_bbox": list(ink) if ink is not None else None,
+            "measurement": "LIBASS_RASTER" if ink is not None else "UNAVAILABLE",
             "duration_seconds": round(duration, 6),
             "reading_seconds": round(reading_seconds, 6),
             "delivery": "STANDALONE_CARD",
@@ -220,10 +325,29 @@ def build_authored_ass(
             findings.append(
                 _layout_finding("FAIL", "AUTHORED_TEXT_REQUIRES_SHORTENING", segment, evidence)
             )
-        if estimated_width > usable_width + 1e-6 or estimated_height > usable_height + 1e-6:
+        if ink is None:
+            # Without actual renderer measurement a positive readability finding
+            # cannot be justified. Refuse rather than rely on the old estimate.
             findings.append(
-                _layout_finding("FAIL", "AUTHORED_TEXT_EXCEEDS_SAFE_AREA", segment, evidence)
+                _layout_finding(
+                    "FAIL", "AUTHORED_LAYOUT_MEASUREMENT_UNAVAILABLE", segment, evidence
+                )
             )
+        else:
+            x1, y1, x2, y2 = ink
+            safe_right = play_res_x - right
+            safe_bottom = play_res_y - bottom
+            if (
+                x1 - _OUTLINE_MARGIN_PX < left
+                or x2 + _OUTLINE_MARGIN_PX > safe_right
+                or y1 - _OUTLINE_MARGIN_PX < top
+                or y2 + _OUTLINE_MARGIN_PX > safe_bottom
+                or estimated_width > usable_width + 1e-6
+                or estimated_height > usable_height + 1e-6
+            ):
+                findings.append(
+                    _layout_finding("FAIL", "AUTHORED_TEXT_EXCEEDS_SAFE_AREA", segment, evidence)
+                )
         if (
             not segment.narration_chunk_id
             and reading_seconds > duration + _READING_TOLERANCE_SECONDS
@@ -242,11 +366,8 @@ def build_authored_ass(
 
         total_lines += len(wrapped)
         event_count += 1
-        display = "\\N".join(wrapped)
         lines.append(
-            f"Dialogue: 0,{_format_ass_time(segment.output_start)},"
-            f"{_format_ass_time(segment.output_end)},Card,,0,0,0,,"
-            f"{{\\an5\\pos({center_x:.0f},{center_y:.0f})}}{display}"
+            _dialogue_line(segment.output_start, segment.output_end, center_x, center_y, display)
         )
 
     data = ("\n".join(lines) + "\n").encode("utf-8")

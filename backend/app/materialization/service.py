@@ -579,6 +579,7 @@ def run_materialization(
 
     active_ledger = ledger or CallLedger()
     attempt_scope = input_fingerprint(inputs)
+    tts_available = narration_synthesizer is not None and narration_synthesizer.available()
     script = materialize_script(
         provider,
         inputs,
@@ -587,10 +588,10 @@ def run_materialization(
         allow_hosted=allow_hosted,
         attempt_scope=attempt_scope,
         critique_provider=critique_provider,
+        narration_available=tts_available,
     )
 
     narration: tuple[NarrationAudio, ...] = ()
-    tts_available = narration_synthesizer is not None and narration_synthesizer.available()
     narration_required = _narration_required(inputs)
     if script.accepted and narration_required and inputs.profile.narration_allowed:
         narration = _synthesize_narration(
@@ -761,20 +762,19 @@ def _delivery_pacing_findings(
     """Record explicit delivery/pacing facts for standalone authored cards.
 
     A dominant silent card (at least 40% of the timeline and ending the output)
-    is only pacing-satisfied when the existing critique explicitly assessed its
-    length necessity. No critique evidence means UNKNOWN, never a favorable
-    default.
+    is only pacing-satisfied when its *own* block has an explicit length-
+    necessity PASS that was reviewed against the same copy, delivery and
+    duration actually assembled. A sibling PASS, an unreviewed duration or a
+    stale copy can never authorize the card. No matching evidence means UNKNOWN,
+    never a favorable default.
     """
 
     total = max(0.0, timeline.output_duration)
     if total <= 0.0:
         return ()
-    length_assessed = any(
-        finding.dimension == "PACING_CONTEXT_DENSITY"
-        and finding.level == "SATISFIED"
-        and any("LENGTH_NECESSITY_PASS" in code for code in finding.reason_codes)
-        for finding in script_findings
-    )
+    reviewed = _reviewed_length_assessments(script_findings)
+    frame_tolerance = 1.0 / float(timeline.frame_rate) if timeline.frame_rate > 0 else 0.04
+    duration_tolerance = max(frame_tolerance, 0.05) + 1e-6
     findings: list[QualityFinding] = []
     for segment in timeline.segments:
         if segment.kind != "AUTHORED_CARD" or not segment.text.strip():
@@ -784,6 +784,15 @@ def _delivery_pacing_findings(
         duration = max(0.0, segment.output_end - segment.output_start)
         fraction = duration / total if total else 0.0
         dominant = fraction >= 0.4 and segment.output_end >= total - 0.05
+        actual_delivery = segment.delivery or "STANDALONE_CARD"
+        assessment = reviewed.get(segment.plan_block_index)
+        length_assessed = (
+            assessment is not None
+            and assessment["copy"] == segment.text
+            and assessment["delivery"] == actual_delivery
+            and isinstance(assessment["duration"], (int, float))
+            and abs(duration - float(assessment["duration"])) <= duration_tolerance
+        )
         if length_assessed:
             level = "SATISFIED"
             reason = "AUTHORED_PAUSE_NECESSITY_ASSESSED"
@@ -811,10 +820,34 @@ def _delivery_pacing_findings(
                         "has_source_or_narration_audio": False,
                     },
                     "dominant": dominant,
+                    "length_necessity_reviewed": length_assessed,
                 },
             )
         )
     return tuple(findings)
+
+
+def _reviewed_length_assessments(
+    script_findings: Sequence[QualityFinding],
+) -> dict[int, dict[str, object]]:
+    """Per-block LENGTH_NECESSITY PASS facts bound to the reviewed copy."""
+
+    reviewed: dict[int, dict[str, object]] = {}
+    for finding in script_findings:
+        if finding.dimension != "PACING_CONTEXT_DENSITY" or finding.level != "SATISFIED":
+            continue
+        if not any("LENGTH_NECESSITY_PASS" in code for code in finding.reason_codes):
+            continue
+        index = finding.evidence.get("block_index")
+        copy = finding.evidence.get("copy")
+        delivery = finding.evidence.get("reviewed_delivery")
+        duration = finding.evidence.get("reviewed_duration_seconds")
+        if isinstance(index, bool) or not isinstance(index, int):
+            continue
+        if not isinstance(copy, str) or not isinstance(delivery, str):
+            continue
+        reviewed[index] = {"copy": copy, "delivery": delivery, "duration": duration}
+    return reviewed
 
 
 def _narration_required(inputs: MaterializationInputs) -> bool:

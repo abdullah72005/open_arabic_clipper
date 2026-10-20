@@ -88,6 +88,12 @@ def test_assessed_length_necessity_allows_an_intentional_silent_card() -> None:
         dimension="PACING_CONTEXT_DENSITY",
         level="SATISFIED",
         reason_codes=("CRITIQUE_LENGTH_NECESSITY_PASS",),
+        evidence={
+            "block_index": 1,
+            "copy": _CARD_TEXT,
+            "reviewed_delivery": "STANDALONE_CARD",
+            "reviewed_duration_seconds": 3.72,
+        },
     )
     pacing = _delivery_pacing_findings(timeline, (assessed,))
     assert pacing[0].level == "SATISFIED"

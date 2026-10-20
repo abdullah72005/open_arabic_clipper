@@ -425,8 +425,13 @@ def _writing_result_from_dict(data: Mapping[str, object]) -> WritingResult:
 
 def _critique_result_to_dict(result: CritiqueResult) -> dict[str, object]:
     return {
+        # Persist booleans only alongside complete categorical evidence. A bare
+        # positive boolean is not authoritative and must not survive a checkpoint
+        # as if it were.
         "accepted": [
-            {"index": int(index), "value": bool(value)} for index, value in result.accepted.items()
+            {"index": int(index), "value": bool(value)}
+            for index, value in result.accepted.items()
+            if index in result.blocks
         ],
         "blocks": [block.as_dict() for block in result.blocks.values()],
         "provider_identity": dict(result.provider_identity),
@@ -453,14 +458,24 @@ def _critique_result_from_dict(data: Mapping[str, object]) -> CritiqueResult:
                 block = BlockCritique.from_dict(item)
                 if block.block_index >= 0:
                     blocks[block.block_index] = block
+    # A legacy/malformed boolean-only entry has no complete categorical
+    # evidence. Drop it and defer truthfully so replay can never synthesize
+    # approval or resend the provider request.
+    boolean_only = [index for index in accepted if index not in blocks]
+    for index in boolean_only:
+        del accepted[index]
     identity = data.get("provider_identity")
     reason_code = data.get("reason_code")
     return CritiqueResult(
         accepted=accepted,
         provider_identity=dict(identity) if isinstance(identity, Mapping) else {},
         notes=str(data.get("notes", "")),
-        deferred=bool(data.get("deferred", False)),
-        reason_code=reason_code if isinstance(reason_code, str) else None,
+        deferred=bool(data.get("deferred", False)) or bool(boolean_only),
+        reason_code=(
+            reason_code
+            if isinstance(reason_code, str)
+            else ("MALFORMED_CRITIQUE_EVIDENCE" if boolean_only else None)
+        ),
         blocks=blocks,
     )
 
@@ -834,9 +849,7 @@ class CheckpointedNarrationSynthesizer:
         validation = chunk.get("validation")
         return dict(validation) if isinstance(validation, Mapping) else None
 
-    def _record_validation(
-        self, chunk_id: str, dep: str, validation: Mapping[str, object]
-    ) -> None:
+    def _record_validation(self, chunk_id: str, dep: str, validation: Mapping[str, object]) -> None:
         from app.models import ClipMaterialization
 
         session = self._gateway.context.session
