@@ -41,6 +41,7 @@ from app.materialization.providers import (
     BlockCritique,
     CritiqueRequest,
     CritiqueResult,
+    CritiqueTarget,
     MaterializationCritiqueProvider,
     MaterializationProviderError,
     MaterializationScript,
@@ -543,6 +544,33 @@ def _reviewed_targets_payload(request: CritiqueRequest) -> list[dict[str, object
     """Snapshot the bounded target facts exactly as the provider saw them."""
 
     return [target.as_dict() for target in request.targets]
+
+
+def critique_request_fingerprint(
+    reviewed_targets: Sequence[Mapping[str, object]],
+    source_context: Mapping[str, object],
+) -> str | None:
+    """Recompute the exact bounded critique request fingerprint for a replay.
+
+    The persisted target snapshots must be canonical (no missing/extra keys) so a
+    replayed judgment is bound to the precise facts the provider reviewed. Returns
+    ``None`` when the snapshot is malformed.
+    """
+
+    targets: list[CritiqueTarget] = []
+    for data in reviewed_targets:
+        target = CritiqueTarget.from_dict(data)
+        if target is None or dict(data) != target.as_dict():
+            return None
+        targets.append(target)
+    request = CritiqueRequest(targets=tuple(targets), source_context=dict(source_context))
+    return _critique_request_fingerprint(request)
+
+
+def parse_critique_result(response: Mapping[str, object]) -> CritiqueResult:
+    """Parse a persisted critique response with legacy/malformed deferral."""
+
+    return _critique_result_from_dict(response)
 
 
 # --- checkpointing provider decorators --------------------------------------

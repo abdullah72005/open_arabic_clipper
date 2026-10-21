@@ -343,6 +343,44 @@ class CritiqueTarget:
             "proposed_delivery": dict(self.proposed_delivery),
         }
 
+    @classmethod
+    def from_dict(cls, data: Mapping[str, object]) -> "CritiqueTarget | None":
+        """Parse the exact bounded target snapshot persisted with a critique.
+
+        Returns ``None`` for malformed/missing fields. ``substantive`` and
+        ``require_length_necessity`` are not part of the provider request
+        snapshot; callers that need them derive them from accepted evidence.
+        """
+
+        index = data.get("block_index")
+        if isinstance(index, bool) or not isinstance(index, int):
+            return None
+        values: dict[str, str] = {}
+        for key in (
+            "copy",
+            "substantive_value_kind",
+            "semantic_intent",
+            "claim_class",
+            "source_evidence",
+            "delivery_intent",
+        ):
+            value = data.get(key)
+            if not isinstance(value, str):
+                return None
+            values[key] = value
+        raw_refs = data.get("offered_grounding_refs")
+        if not isinstance(raw_refs, list) or any(not isinstance(ref, str) for ref in raw_refs):
+            return None
+        proposed = data.get("proposed_delivery")
+        if not isinstance(proposed, Mapping):
+            return None
+        return cls(
+            block_index=index,
+            offered_grounding_refs=tuple(raw_refs),
+            proposed_delivery=dict(proposed),
+            **values,
+        )
+
 
 @dataclass(frozen=True)
 class CritiqueRequest:
@@ -724,6 +762,12 @@ def _source_context(inputs: MaterializationInputs) -> dict[str, object]:
         "source_language": inputs.source_language,
         "source_dialect": dict(inputs.source_dialect),
     }
+
+
+def critique_source_context(inputs: MaterializationInputs) -> dict[str, object]:
+    """Public source-context accessor for critique request binding validation."""
+
+    return _source_context(inputs)
 
 
 @dataclass(frozen=True)

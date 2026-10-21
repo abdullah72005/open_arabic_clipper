@@ -1,3 +1,37 @@
+## Stage 6 V4 finalization/readiness critique binding after SOL review (2026-10-21)
+
+Status: **offline correction implemented and locally verified. The 2026-10-20
+genuine MP4 remains FAILED human acceptance. Stage 6 remains UNFROZEN, Stage 7
+UNSTARTED, `publication_ready=false`. No hosted/Gemini/TTS/Qwen call, worker,
+production job, new candidate, acceptance retry, publication or Stage 7 activity
+was run. Stage 5.2 (`backend/app/render/execution/`) is untouched.**
+
+Reviewed BASE/HEAD `e49dfb1d46d202a2a290f459bc26af5c84456dd5`. SOL's F3
+downstream gap is closed:
+
+- **F3.** Accepted-script validation now enforces the same critique
+  request/evidence binding as replay. When a required substantive block (or any
+  accepted block whose evidence records a critique) is trusted without prepare,
+  finalization and authoritative readiness recompute the exact bounded request
+  fingerprint and require the reviewed target snapshot's copy, claim class,
+  delivery and timing facts to match the accepted blocks and assembled timeline.
+  Missing, legacy-unbound, malformed or stale proof defers; it cannot restore
+  review readiness or qualify as a verified completed cache. Deterministic
+  `SOURCE_AS_EVIDENCE`/no-critique paths remain explicit. Reusable writing,
+  accepted-copy history, budgets and checkpoints are preserved; no provider is
+  called automatically. The binding reuses `stage6-critique-request-v1`; no new
+  semantic pass or Stage 4/5 contract change was added.
+
+Verification: 7 new finalization/readiness regressions (observed failing before
+the fix), 112 combined provider/component/finalizer tests, and 6 isolated-
+Postgres cache/POST/resume tests passed; `ruff check app tests` and changed-file
+formatting are clean. Diagnostic before/after evidence is under
+`storage/benchmarks/stage-6/manual-acceptance/review-notes/2026-10-21-v4-finalization-binding/`
+and is **diagnostic-only, never acceptance evidence**.
+
+The unresolved repeated-box/sampling provenance remains open, and no genuine
+acceptance attempt is authorized. Human acceptance remains mandatory.
+
 ## Stage 6 V4 replay-binding corrections after SOL follow-up review (2026-10-21)
 
 Status: **offline corrections implemented and locally verified. The 2026-10-20

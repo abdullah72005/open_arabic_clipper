@@ -239,6 +239,58 @@ they are not semantic, video or human acceptance evidence.
   `f8063f4f430824669dd389e9bbb4f6fcf9647802dca0de5b9bfdd9a56b2ea4ff`
   (11 passed).
 
+## F3 — finalization/readiness critique binding (2026-10-21)
+
+Reviewed BASE/HEAD `e49dfb1d46d202a2a290f459bc26af5c84456dd5`. SOL's remaining
+finding was that `_accepted_script_blocks` trusted an accepted SCRIPT whose
+critique checkpoint no longer carried `request_fingerprint`/`reviewed_targets`;
+the downstream finalizer then produced `MATERIALIZED_WITH_CAUTION`,
+human-review-required, cache-eligible, and the shared readiness view returned
+`review_ready=true` without passing through the e49dfb1 replay guard.
+
+The correction carries the existing binding into the no-prepare trust path:
+
+- Accepted-script validation identifies blocks whose value is authorized by a
+  critique: essential substantive blocks always, and any block whose accepted
+  `validation_evidence` actually records a critique. Deterministic
+  `SOURCE_AS_EVIDENCE`/no-critique blocks remain exempt.
+- It requires the critique checkpoint's SCRIPT dependency match, canonical
+  reviewed target snapshots, the exact `stage6-critique-request-v1` fingerprint
+  recomputed from those snapshots plus the live source context, and complete
+  categorical evidence for every reviewed block.
+- The reviewed copy, claim class, substantive kind, executable delivery and
+  standalone-card duration must match the accepted blocks and assembled timeline.
+  A sibling/current fact cannot stand in for the reviewed fact.
+- Missing, legacy-unbound, malformed or stale proof defers in finalization and
+  readiness. It is never review-ready or a verified completed cache. Existing
+  writing/accepted-copy checkpoints, budgets and artifacts are preserved; no
+  provider is called automatically and no semantic pass or Stage 4/5 contract is
+  changed. Stage 5.2 remains untouched.
+
+Versioning reuses `stage6-critique-request-v1`; no new evidence version was
+required because the binding format is unchanged and old unbound checkpoints are
+refused.
+
+Verification (offline Docker Python 3.12; network disabled except an isolated
+local Postgres bridge for the existing cache suite):
+
+- `tests/test_stage6_v4_finalization_binding_regressions.py`: **7 passed**
+  (authored before the fix; observed failing).
+- Combined new + e49dfb1 replay/follow-up/intent/delivery/provider/component/
+  finalization-gate/finalizer-evidence batch: **112 passed**.
+- Isolated-Postgres cache subset including new POST and resume cases:
+  **6 passed**.
+- `ruff check app tests`: clean; changed files `ruff format --check` clean.
+
+Diagnostic artifacts (diagnostic-only):
+`storage/benchmarks/stage-6/manual-acceptance/review-notes/2026-10-21-v4-finalization-binding/`.
+`before/` is SOL's reproduced pre-fix output; `after/` shows the unbound case as
+`accepted_after_binding_removed=false`, `finalization_outcome=DEFERRED`,
+`semantic_outcome=DEFERRED_EVIDENCE`, `cache_eligible=false` and
+`read_view_review_ready=false`, while the current-bound control remains
+review-ready. The fixture uses SQLite, fake semantic/render-QC evidence and a real
+transformed spec/authored ASS; it is **not** semantic, video or human acceptance.
+
 ## Unresolved repeated-face-box provenance (open blocker)
 
 The original run's saved right-hand two-shot detections repeat identically at

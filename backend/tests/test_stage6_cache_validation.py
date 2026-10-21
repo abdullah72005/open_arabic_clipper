@@ -15,6 +15,7 @@ Real FFmpeg media; SYNTHETIC INTEGRATION evidence, not product acceptance.
 
 from __future__ import annotations
 
+import copy
 import uuid
 from collections.abc import Iterator
 from typing import Any
@@ -527,6 +528,74 @@ def _remove_committed_assessment(materialization_id: uuid.UUID) -> None:
         session.commit()
     finally:
         session.close()
+
+
+def _remove_script_critique_binding(materialization_id: uuid.UUID) -> None:
+    """Remove only the replay binding from an otherwise-accepted SCRIPT."""
+
+    session = _session()
+    try:
+        row = session.get(ClipMaterialization, materialization_id)
+        assert row is not None
+        checkpoints = copy.deepcopy(dict(row.component_checkpoints or {}))
+        script = dict(checkpoints["SCRIPT"])
+        critique = dict(script["critique"])
+        critique.pop("request_fingerprint", None)
+        critique.pop("reviewed_targets", None)
+        script["critique"] = critique
+        checkpoints["SCRIPT"] = script
+        row.component_checkpoints = checkpoints
+        session.commit()
+    finally:
+        session.close()
+
+
+@pytest.mark.parametrize("entry", ["post", "resume"])
+def test_unbound_completed_critique_is_not_cached_and_regenerates_nothing(
+    engine: Engine, monkeypatch: Any, entry: str
+) -> None:
+    """A completed assessment whose critique binding is gone is not a verified cache.
+
+    POST/resume must not return it as cached, must clear stale review eligibility,
+    and must preserve accepted copy, provider ledger, and checkpoints (no hosted,
+    TTS, or semantic regeneration).
+    """
+
+    from test_stage6_real_executor import _write_source
+
+    from app.materialization.queue import resume_materialization_by_id
+
+    candidate_id, materialization_id, _render_id, _storage = _complete_materialization(
+        engine, monkeypatch, media_writer=_write_source
+    )
+    before = _fresh_state(materialization_id)
+    _remove_script_critique_binding(materialization_id)
+    capture = _Capture()
+    session = _session()
+    try:
+        if entry == "post":
+            outcome = queue_materialization(
+                session, candidate_id, priority="CANDIDATE", render_dispatcher=capture
+            )
+        else:
+            outcome = resume_materialization_by_id(
+                session, materialization_id, settings=get_settings(), dispatcher=capture
+            )
+        session.commit()
+    finally:
+        session.close()
+
+    assert outcome.cached is False
+    after = _fresh_state(materialization_id)
+    assert after["human_review_required"] is False
+    assert after["publication_ready"] is False
+    assert after["cache_eligible"] is False
+    assert after["call_ledger"] == before["call_ledger"]
+    checkpoint_script = after["component_checkpoints"]["SCRIPT"]
+    before_script = before["component_checkpoints"]["SCRIPT"]
+    assert checkpoint_script["writing"] == before_script["writing"]
+    assert checkpoint_script["result"] == before_script["result"]
+    assert "request_fingerprint" not in checkpoint_script["critique"]
 
 
 def test_missing_committed_assessment_is_recovered_not_cached(
