@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -112,6 +112,10 @@ _raised_attempt_status = raised_attempt_status
 #: (ambiguous transport loss) is unresolved uncertainty: a later ordinary
 #: recovery/redelivery must never silently invoke the provider again.
 _UNCERTAIN_UNRESOLVED_REASON = "PROVIDER_UNCERTAIN_UNRESOLVED"
+#: Version of the bounded critique request/evidence binding persisted with each
+#: accepted critique checkpoint. A checkpoint without it predates request binding
+#: and can never authorize a new generation.
+_CRITIQUE_EVIDENCE_VERSION = "stage6-critique-request-v1"
 
 
 def script_dependency_inputs(
@@ -523,6 +527,24 @@ def _script_checkpoint(gateway: DurableRequestGateway) -> Mapping[str, object]:
     return entry if isinstance(entry, Mapping) else {}
 
 
+def _critique_request_fingerprint(request: CritiqueRequest) -> str:
+    """Fingerprint the exact bounded critique request a judgment reviewed."""
+
+    return stable_digest(
+        {
+            "component": "SCRIPT.CRITIQUE.REQUEST",
+            "evidence_version": _CRITIQUE_EVIDENCE_VERSION,
+            "request": request.as_dict(),
+        }
+    )
+
+
+def _reviewed_targets_payload(request: CritiqueRequest) -> list[dict[str, object]]:
+    """Snapshot the bounded target facts exactly as the provider saw them."""
+
+    return [target.as_dict() for target in request.targets]
+
+
 # --- checkpointing provider decorators --------------------------------------
 
 
@@ -629,6 +651,7 @@ class CheckpointedCritiqueProvider:
         self._gateway = gateway
         self._dep = dependency_fingerprint
         self.reused = False
+        self.deferred_reason: str | None = None
 
     def available(self) -> bool:
         return bool(self._provider.available())
@@ -637,8 +660,15 @@ class CheckpointedCritiqueProvider:
         return dict(self._provider.runtime_identity())
 
     def critique(self, request: CritiqueRequest) -> CritiqueResult:
-        stored = self._stored_critique()
+        request_fingerprint = _critique_request_fingerprint(request)
+        stored = self._stored_critique(request_fingerprint)
         if stored is not None:
+            if stored.deferred:
+                # A stored judgment exists but cannot be re-used for this exact
+                # request (or predates binding). Defer truthfully; never relabel
+                # it with current facts and never resend automatically.
+                self.deferred_reason = stored.reason_code
+                return stored
             self.reused = True
             return stored
 
@@ -653,6 +683,8 @@ class CheckpointedCritiqueProvider:
                 "status": "PENDING",
                 "critique": {
                     "dependency_fingerprint": self._dep,
+                    "request_fingerprint": request_fingerprint,
+                    "reviewed_targets": _reviewed_targets_payload(request),
                     "response": _critique_result_to_dict(result),
                 },
             }
@@ -680,7 +712,7 @@ class CheckpointedCritiqueProvider:
         assert isinstance(result, CritiqueResult)
         return result
 
-    def _stored_critique(self) -> CritiqueResult | None:
+    def _stored_critique(self, request_fingerprint: str) -> CritiqueResult | None:
         critique = _script_checkpoint(self._gateway).get("critique")
         if not isinstance(critique, Mapping):
             return None
@@ -688,8 +720,39 @@ class CheckpointedCritiqueProvider:
             return None
         response = critique.get("response")
         if not isinstance(response, Mapping):
+            # Deferred/absent responses are not reusable; an ordinary later run
+            # may invoke the provider under the existing budget rules.
             return None
-        return _critique_result_from_dict(response)
+        stored_request = critique.get("request_fingerprint")
+        if stored_request != request_fingerprint:
+            # A response produced for different facts (or an older unbound
+            # checkpoint) must never be presented as a judgment of this request.
+            return CritiqueResult(
+                accepted={},
+                provider_identity=self._provider.runtime_identity(),
+                deferred=True,
+                reason_code=(
+                    "CRITIQUE_CHECKPOINT_UNBOUND"
+                    if not isinstance(stored_request, str)
+                    else "CRITIQUE_CHECKPOINT_REQUEST_MISMATCH"
+                ),
+            )
+        result = _critique_result_from_dict(response)
+        if result.deferred:
+            # Malformed/legacy positive evidence defers without a resend.
+            return result
+        reviewed: dict[int, Mapping[str, object]] = {}
+        raw_targets = critique.get("reviewed_targets")
+        if isinstance(raw_targets, list):
+            for item in raw_targets:
+                if not isinstance(item, Mapping):
+                    continue
+                index = item.get("block_index")
+                if isinstance(index, int) and not isinstance(index, bool):
+                    reviewed[index] = dict(item)
+        if reviewed:
+            result = replace(result, reviewed_targets=reviewed)
+        return result
 
     def release(self) -> None:
         return None

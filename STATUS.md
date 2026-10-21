@@ -1,3 +1,36 @@
+## Stage 6 V4 replay-binding corrections after SOL follow-up review (2026-10-21)
+
+Status: **offline corrections implemented and locally verified. The 2026-10-20
+genuine MP4 remains FAILED human acceptance. Stage 6 remains UNFROZEN, Stage 7
+UNSTARTED, `publication_ready=false`. No hosted/Gemini/TTS/Qwen call, worker,
+production job, new candidate, render, acceptance retry, publication or Stage 7
+activity was run. Stage 5.2 (`backend/app/render/execution/`) is untouched.**
+
+Reviewed BASE/HEAD `86d6dc5632781690e2b9ebbed095a205e9fc5017`. The two remaining
+SOL findings are corrected:
+
+1. **F1.** `CritiqueResult.verdict` now returns `REJECTED` for an explicit
+   negative legacy boolean, matching `decision`. Positive/missing boolean
+   evidence never approves; structured categorical evidence still takes
+   precedence.
+2. **F2.** Accepted critique checkpoints persist the exact bounded request
+   fingerprint (`stage6-critique-request-v1`) and reviewed target snapshot.
+   Replay requires an exact request match; mismatched, legacy-unbound or
+   malformed checkpoints defer without an automatic provider resend. Findings
+   use the facts actually reviewed, never current delivery/timing facts.
+   Exact-match replay remains zero-call and valid writing checkpoints remain
+   reusable.
+
+Verification (offline Docker Python 3.12, network disabled): 11 focused
+replay-binding regressions (7 failed before the fix), 121 provider/component/V4
+suites, 10 finalization-gate, 24 finalizer-evidence and 7 results-boundary tests
+passed; `ruff check app tests` clean. Diagnostic before/after evidence is under
+`storage/benchmarks/stage-6/manual-acceptance/review-notes/2026-10-21-v4-replay-binding-corrections/`
+and is **diagnostic-only, never acceptance evidence**.
+
+The unresolved repeated-box/sampling provenance remains open, and no genuine
+acceptance attempt is authorized. Human acceptance remains mandatory.
+
 ## Stage 6 V4 follow-up corrections after independent SOL review (2026-10-20)
 
 Status: **offline follow-up corrections implemented and locally verified. The

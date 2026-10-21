@@ -377,6 +377,11 @@ class CritiqueResult:
     deferred: bool = False
     reason_code: str | None = None
     blocks: Mapping[int, "BlockCritique"] = field(default_factory=dict)
+    #: Exact bounded target facts (``CritiqueTarget.as_dict()``) a replayed
+    #: checkpointed critique actually reviewed. Persisted findings use these
+    #: facts, never the current target, so an old judgment can never be
+    #: relabelled with delivery/timing evidence the provider did not see.
+    reviewed_targets: Mapping[int, Mapping[str, object]] = field(default_factory=dict)
 
     def decision(self, index: int) -> bool | None:
         block = self.blocks.get(index)
@@ -400,7 +405,10 @@ class CritiqueResult:
         if block is not None:
             return block.verdict(requested)
         if index in self.accepted:
-            return CRITIQUE_ACCEPTED if self.accepted[index] is False else CRITIQUE_DEFERRED
+            # An explicit negative legacy boolean is a safe rejection, matching
+            # :meth:`decision`. A positive boolean is not complete categorical
+            # evidence and can never authorize approval; it defers.
+            return CRITIQUE_DEFERRED if self.accepted[index] else CRITIQUE_REJECTED
         return None
 
     def findings_for(self, index: int) -> tuple[CritiqueDimensionFinding, ...]:
@@ -843,7 +851,9 @@ def materialize_script(
             )
 
     unresolved = False
-    reviewed_by_block = {target.block_index: target for target in review_targets}
+    reviewed_by_block = {
+        target.block_index: _target_review_facts(target) for target in review_targets
+    }
     if review_targets:
         evaluation = _run_critique(
             critique_provider,
@@ -856,15 +866,25 @@ def materialize_script(
         )
         if evaluation is None:
             # No usable critique evidence: the review-required block defers
-            # honestly rather than being accepted on novelty alone.
+            # honestly rather than being accepted on novelty alone. Preserve a
+            # checkpoint-level deferral reason (e.g. a request mismatch) so the
+            # mismatch is observable without a provider resend.
+            deferred_reason = getattr(critique_provider, "deferred_reason", None)
+            reasons_out = ("GROUNDED_INFERENCE_REQUIRES_REVIEW",)
+            if isinstance(deferred_reason, str) and deferred_reason:
+                reasons_out = (deferred_reason, *reasons_out)
             return MaterializationScript(
                 (),
                 False,
                 identity,
                 True,
-                ("GROUNDED_INFERENCE_REQUIRES_REVIEW",),
+                reasons_out,
                 _combined_findings(findings_by_block, accepted_indexes, {}, reviewed_by_block),
             )
+        # A replayed checkpoint contributes the facts it actually reviewed;
+        # those win over the current targets so findings stay bound to the
+        # judgment that produced them.
+        reviewed_by_block.update(evaluation.reviewed_facts)
         for target in review_targets:
             index = target.block_index
             block = evaluation.blocks.get(index)
@@ -950,11 +970,38 @@ def materialize_script(
     )
 
 
+def _target_review_facts(target: CritiqueTarget) -> dict[str, object]:
+    """The bounded delivery/timing facts a critique of this target reviewed."""
+
+    proposed = target.proposed_delivery
+    return {
+        "block_index": target.block_index,
+        "copy": target.copy,
+        "reviewed_delivery": proposed.get("delivery"),
+        "reviewed_duration_seconds": proposed.get("planned_duration_seconds"),
+        "reviewed_copy_characters": proposed.get("copy_characters"),
+    }
+
+
+def _review_facts_from_target(index: int, data: Mapping[str, object]) -> dict[str, object]:
+    """Reconstruct reviewed facts from a persisted ``CritiqueTarget.as_dict()``."""
+
+    proposed = data.get("proposed_delivery")
+    delivery = proposed if isinstance(proposed, Mapping) else {}
+    return {
+        "block_index": index,
+        "copy": data.get("copy"),
+        "reviewed_delivery": delivery.get("delivery"),
+        "reviewed_duration_seconds": delivery.get("planned_duration_seconds"),
+        "reviewed_copy_characters": delivery.get("copy_characters"),
+    }
+
+
 def _combined_findings(
     findings_by_block: Mapping[int, list[QualityFinding]],
     accepted_indexes: Mapping[int, bool],
     critique_by_block: Mapping[int, BlockCritique],
-    reviewed_targets: Mapping[int, CritiqueTarget] | None = None,
+    reviewed_facts: Mapping[int, Mapping[str, object]] | None = None,
 ) -> tuple[QualityFinding, ...]:
     """All persisted script findings, including noncritical categorical concerns.
 
@@ -967,29 +1014,22 @@ def _combined_findings(
 
     Positive ``LENGTH_NECESSITY`` evidence additionally records the exact block,
     copy and delivery/duration it reviewed, so timeline assessment can never
-    credit a sibling block's PASS or a stale copy.
+    credit a sibling block's PASS or a stale copy. ``reviewed_facts`` carries the
+    facts snapshot from the checkpoint that actually produced the judgment.
     """
 
-    targets = reviewed_targets or {}
+    targets = reviewed_facts or {}
     combined: list[QualityFinding] = []
     for index, findings in findings_by_block.items():
         if accepted_indexes.get(index, False):
             continue
         combined.extend(findings)
     for block in critique_by_block.values():
-        target = targets.get(block.block_index)
-        reviewed_facts: dict[str, object] = {"block_index": block.block_index}
-        if target is not None:
-            reviewed_facts.update(
-                {
-                    "copy": target.copy,
-                    "reviewed_delivery": target.proposed_delivery.get("delivery"),
-                    "reviewed_duration_seconds": target.proposed_delivery.get(
-                        "planned_duration_seconds"
-                    ),
-                    "reviewed_copy_characters": target.proposed_delivery.get("copy_characters"),
-                }
-            )
+        facts: dict[str, object] = {"block_index": block.block_index}
+        reviewed = targets.get(block.block_index)
+        if isinstance(reviewed, Mapping):
+            facts.update(dict(reviewed))
+            facts["block_index"] = block.block_index
         for finding in block.findings:
             dimension = CRITIQUE_TO_QUALITY_DIMENSION.get(finding.dimension)
             level = CRITIQUE_TO_QUALITY_LEVEL.get(finding.level)
@@ -1007,7 +1047,7 @@ def _combined_findings(
                         level=level,
                         reason_codes=(f"CRITIQUE_{finding.dimension}_PASS",),
                         evidence={
-                            **reviewed_facts,
+                            **facts,
                             "critique_dimension": finding.dimension,
                             "critique_level": finding.level,
                             "evidence": finding.evidence,
@@ -1021,7 +1061,7 @@ def _combined_findings(
                     level=level,
                     reason_codes=(f"CRITIQUE_{finding.dimension}_{finding.level}",),
                     evidence={
-                        **reviewed_facts,
+                        **facts,
                         "critique_dimension": finding.dimension,
                         "critique_level": finding.level,
                         "evidence": finding.evidence,
@@ -1090,6 +1130,10 @@ class CritiqueEvaluation:
     """Validated categorical critique for the requested review targets."""
 
     blocks: Mapping[int, BlockCritique]
+    #: Per-block facts the accepted judgment actually reviewed. A replayed
+    #: checkpoint supplies its recorded snapshot; a fresh response uses the
+    #: current bounded request.
+    reviewed_facts: Mapping[int, Mapping[str, object]] = field(default_factory=dict)
 
     def verdict(self, index: int) -> str | None:
         block = self.blocks.get(index)
@@ -1119,6 +1163,12 @@ def _run_critique(
     )
     if result.deferred:
         return None
+    reviewed_facts = {target.block_index: _target_review_facts(target) for target in targets}
+    # A bound replay reports the exact target snapshot it reviewed; prefer it so
+    # persisted findings can never describe facts the provider did not see.
+    for index, data in result.reviewed_targets.items():
+        if isinstance(data, Mapping):
+            reviewed_facts[index] = _review_facts_from_target(index, data)
     blocks: dict[int, BlockCritique] = {}
     for target in targets:
         block = result.blocks.get(target.block_index)
@@ -1134,7 +1184,7 @@ def _run_critique(
         # without resending the provider request.
     if not blocks:
         return None
-    return CritiqueEvaluation(blocks=blocks)
+    return CritiqueEvaluation(blocks=blocks, reviewed_facts=reviewed_facts)
 
 
 def _refs(value: object) -> tuple[GroundingRef, ...]:

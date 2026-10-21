@@ -180,6 +180,65 @@ the original media. The existing Stage 5.2 engine test
 frozen-renderer `BACKGROUND_FILL` execution check; no new media claim is made
 here.
 
+## Replay-binding corrections after SOL follow-up review (2026-10-21)
+
+Reviewed BASE/HEAD: `86d6dc5632781690e2b9ebbed095a205e9fc5017`.
+Disposition: **CHANGES REQUESTED — F1/F2**, both offline contract defects in
+`docs/superpowers/handoffs/2026-10-21-stage-6-v4-followup-sol-review.md`.
+
+| Finding | Before (reproduced) | After (offline correction) |
+| --- | --- | --- |
+| F1 legacy verdict | `CritiqueResult(accepted={1: False}).decision(1)` was `False` but `.verdict(1)` returned `ACCEPTED`. | An explicit negative boolean returns `REJECTED`, matching `decision`; positive/missing boolean evidence remains `DEFERRED`/unknown. Structured categorical evidence still takes precedence. |
+| F2 replay binding | The real replay wrapper checked only the SCRIPT dependency. With identical inputs and only narration availability changed, it reused an old silent-card `LENGTH_NECESSITY PASS` with zero critic calls and relabelled it `reviewed_delivery=NARRATION`, `reviewed_duration_seconds=0.0`. | Accepted critique checkpoints persist the exact bounded request fingerprint (`stage6-critique-request-v1`) and the exact reviewed target snapshot. Reuse requires an exact request match; mismatched, legacy-unbound or malformed stored judgments defer without a provider resend. Persisted findings use the reviewed snapshot, never the current target. Exact-match replay still makes zero calls; valid writing checkpoints remain reusable. |
+
+No new semantic pass, provider call, orchestration branch, Stage 4/5 contract or
+Stage 5.2 change was added. The SCRIPT dependency and validation versions are
+unchanged, so the new binding is limited to the critique checkpoint evidence.
+
+### Verification
+
+Docker Python 3.12 (`oac-stage6-test`), read-only backend mount, network disabled,
+`PYTHONPATH=/app:/app/tests`, `PYTHONDONTWRITEBYTECODE=1`, `-p no:cacheprovider`.
+
+- `tests/test_stage6_v4_replay_binding_regressions.py`: **11 passed**. With only
+  the two application fixes reverted, the same file had **7 failed / 4 passed**
+  (the 4 passes are the already-correct positive/missing/structured F1 cases and
+  exact-match replay).
+- `tests/test_stage6_v4_replay_binding_regressions.py
+  tests/test_stage6_component_recovery.py
+  tests/test_stage6_v4_followup_regressions.py
+  tests/test_stage6_v4_delivery_regressions.py
+  tests/test_stage6_v4_intent_regressions.py tests/test_stage6_providers.py
+  tests/test_stage6_overlays.py tests/test_stage6_gemini_boundary.py
+  tests/test_stage6_adapter_regressions.py tests/test_stage6_materialization_core.py`:
+  **121 passed**.
+- `tests/test_stage6_finalization_gates.py`: **10 passed**;
+  `tests/test_stage6_finalizer_evidence.py`: **24 passed**;
+  `tests/test_stage6_results_boundary.py`: **7 passed**.
+- `ruff check app tests`: clean. Changed files are `ruff format --check` clean.
+
+### Diagnostic artifacts (diagnostic-only)
+
+Directory:
+`storage/benchmarks/stage-6/manual-acceptance/review-notes/2026-10-21-v4-replay-binding-corrections/`
+(`README.md`, `manifest.json`, `before/`, `after/`). SOL's `replay_probe.py` is
+copied unchanged. `before/` reproduces the reviewed defects; `after/` shows the
+bound/deferred outcomes. The probes use local provider stubs and simulated QC;
+they are not semantic, video or human acceptance evidence.
+
+- `manifest.json` hashes every archived file. Key results:
+  `before/replay-probe.json`
+  `6f08cfdb4ebc494236834b6cd1ff4fe38981d1e8a885b58ba4a414f38129c76f`
+  (negative verdict `ACCEPTED`; stale replay accepted and relabelled);
+  `after/replay-probe.json`
+  `bbebc389106acf13c1663ae620d89d5d7841ab997fc692015fa3018a72e5b5e2`
+  (verdict `REJECTED`; replay used false, one critic call, no stale PASS);
+  `before/regressions.txt`
+  `b8f204466ae4aa59ca236e3979762f35d7725915477c7432aaac55b15419cd2d`
+  (7 failed / 4 passed) and `after/regressions.txt`
+  `f8063f4f430824669dd389e9bbb4f6fcf9647802dca0de5b9bfdd9a56b2ea4ff`
+  (11 passed).
+
 ## Unresolved repeated-face-box provenance (open blocker)
 
 The original run's saved right-hand two-shot detections repeat identically at
