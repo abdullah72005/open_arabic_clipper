@@ -23,6 +23,7 @@ from fractions import Fraction
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
+from app.composition.policy import OUTPUT_HEIGHT, OUTPUT_WIDTH, safe_zone_for
 from app.core.enums import (
     JobStatus,
     MaterializationLifecycle,
@@ -49,6 +50,10 @@ from app.materialization.inputs import (
 from app.materialization.narration import (
     NarrationSynthesizer,
     narration_requests,
+)
+from app.materialization.overlays import (
+    READING_CHARS_PER_SECOND,
+    build_authored_ass,
 )
 from app.materialization.policy import (
     STAGE6_POLICY_VERSION,
@@ -87,6 +92,7 @@ from app.materialization.types import (
     AuthoredTimeline,
     MaterializationAssessment,
     NarrationAudio,
+    QualityFinding,
     SlotResolution,
     SupportingAssetSelection,
 )
@@ -391,8 +397,11 @@ def _merge_blocks(
                 "index": index,
                 "block_type": block_type,
                 "semantic_intent": plan_block.get("semantic_intent", ""),
+                "why_unavailable": plan_block.get("why_unavailable", ""),
+                "purpose": plan_block.get("purpose", contract_block.get("purpose", "")),
                 "draft_line": plan_block.get("draft_line"),
                 "substantive_value_kind": plan_block.get("substantive_value_kind", ""),
+                "delivery_intent": plan_block.get("delivery_intent"),
                 "grounding_refs": plan_block.get("grounding_refs", ()),
                 "dependency_ids": plan_block.get("dependency_ids", ()),
                 "source_text": source_text,
@@ -570,6 +579,7 @@ def run_materialization(
 
     active_ledger = ledger or CallLedger()
     attempt_scope = input_fingerprint(inputs)
+    tts_available = narration_synthesizer is not None and narration_synthesizer.available()
     script = materialize_script(
         provider,
         inputs,
@@ -578,10 +588,10 @@ def run_materialization(
         allow_hosted=allow_hosted,
         attempt_scope=attempt_scope,
         critique_provider=critique_provider,
+        narration_available=tts_available,
     )
 
     narration: tuple[NarrationAudio, ...] = ()
-    tts_available = narration_synthesizer is not None and narration_synthesizer.available()
     narration_required = _narration_required(inputs)
     if script.accepted and narration_required and inputs.profile.narration_allowed:
         narration = _synthesize_narration(
@@ -643,6 +653,17 @@ def assemble_result(
     )
     recipe, audio_conflicts = build_audio_recipe(inputs, build.timeline, narration, config=config)
 
+    authored_layout = build_authored_ass(
+        build.timeline,
+        play_res_x=OUTPUT_WIDTH,
+        play_res_y=OUTPUT_HEIGHT,
+        safe_zone=safe_zone_for("SHORTS_VERTICAL_SAFE_ZONE_V1"),
+    )
+    layout_findings = _layout_quality_findings(authored_layout.findings)
+    pacing_findings = _delivery_pacing_findings(build.timeline, script.findings)
+    delivery_findings = (*layout_findings, *pacing_findings)
+    readable_copy = not authored_layout.failed
+
     script_fp = script_fingerprint(
         inputs,
         [block.as_dict() for block in script.authored_blocks],
@@ -675,11 +696,13 @@ def assemble_result(
         audio_conflicts=audio_conflicts,
         critical_evidence_current=True,
         render_complete=False,
+        readable_copy=readable_copy,
         # Required-slot fulfilment is authoritative from ``slot_resolutions``;
         # the per-block SLOT_FULFILLMENT finding must not double-count an
         # optional/declined block as a missing required value.
         extra_findings=tuple(
-            finding for finding in script.findings if finding.dimension != "SLOT_FULFILLMENT"
+            [finding for finding in script.findings if finding.dimension != "SLOT_FULFILLMENT"]
+            + list(delivery_findings)
         ),
     )
     assessment = assess_materialization(
@@ -705,6 +728,124 @@ def assemble_result(
         removals=build.removals,
         assessment_context=context.as_dict(),
     )
+
+
+def _layout_quality_findings(
+    findings: Sequence[Mapping[str, object]],
+) -> tuple[QualityFinding, ...]:
+    """Convert measured authored-layout findings into Stage 6 quality evidence."""
+
+    converted: list[QualityFinding] = []
+    for finding in findings:
+        dimension = str(finding.get("dimension", "VISUAL_CAPTION_READABILITY"))
+        level = str(finding.get("level", "UNKNOWN"))
+        raw_codes = finding.get("reason_codes")
+        codes = (
+            tuple(str(code) for code in raw_codes) if isinstance(raw_codes, (list, tuple)) else ()
+        )
+        evidence = finding.get("evidence")
+        converted.append(
+            QualityFinding(
+                dimension=dimension,
+                level=level,
+                reason_codes=codes,
+                evidence=dict(evidence) if isinstance(evidence, Mapping) else {},
+            )
+        )
+    return tuple(converted)
+
+
+def _delivery_pacing_findings(
+    timeline: AuthoredTimeline,
+    script_findings: Sequence[QualityFinding],
+) -> tuple[QualityFinding, ...]:
+    """Record explicit delivery/pacing facts for standalone authored cards.
+
+    A silent card is only pacing-satisfied when its *own* block has an explicit
+    length-necessity PASS that was reviewed against the same copy, delivery and
+    duration actually assembled. A sibling PASS, an unreviewed duration, a stale
+    copy, or a merely non-dominant timeline fraction can never authorize the
+    card. No matching evidence means UNKNOWN, never a favorable default.
+    """
+
+    total = max(0.0, timeline.output_duration)
+    if total <= 0.0:
+        return ()
+    reviewed = _reviewed_length_assessments(script_findings)
+    frame_tolerance = 1.0 / float(timeline.frame_rate) if timeline.frame_rate > 0 else 0.04
+    duration_tolerance = max(frame_tolerance, 0.05) + 1e-6
+    findings: list[QualityFinding] = []
+    for segment in timeline.segments:
+        if segment.kind != "AUTHORED_CARD" or not segment.text.strip():
+            continue
+        if segment.narration_chunk_id:
+            continue
+        duration = max(0.0, segment.output_end - segment.output_start)
+        fraction = duration / total if total else 0.0
+        dominant = fraction >= 0.4 and segment.output_end >= total - 0.05
+        actual_delivery = segment.delivery or "STANDALONE_CARD"
+        assessment = reviewed.get(segment.plan_block_index)
+        length_assessed = (
+            assessment is not None
+            and assessment["copy"] == segment.text
+            and assessment["delivery"] == actual_delivery
+            and isinstance(assessment["duration"], (int, float))
+            and abs(duration - float(assessment["duration"])) <= duration_tolerance
+        )
+        if length_assessed:
+            level = "SATISFIED"
+            reason = "AUTHORED_PAUSE_NECESSITY_ASSESSED"
+        else:
+            # A small fraction is not a substitute for the required judgment.
+            # Without its own matching review the card is unassessed and defers.
+            level = "UNKNOWN"
+            reason = "AUTHORED_PAUSE_NECESSITY_NOT_ASSESSED"
+        findings.append(
+            QualityFinding(
+                dimension="PACING_CONTEXT_DENSITY",
+                level=level,
+                reason_codes=(reason,),
+                evidence={
+                    "block_index": segment.plan_block_index,
+                    "delivery": segment.delivery or "STANDALONE_CARD",
+                    "delivery_rationale": segment.delivery_rationale,
+                    "duration_seconds": round(duration, 6),
+                    "reading_seconds": round(len(segment.text) / READING_CHARS_PER_SECOND, 6),
+                    "fraction_of_timeline": round(fraction, 6),
+                    "silence_interval": {
+                        "start": round(segment.output_start, 6),
+                        "end": round(segment.output_end, 6),
+                        "has_source_or_narration_audio": False,
+                    },
+                    "dominant": dominant,
+                    "length_necessity_reviewed": length_assessed,
+                },
+            )
+        )
+    return tuple(findings)
+
+
+def _reviewed_length_assessments(
+    script_findings: Sequence[QualityFinding],
+) -> dict[int, dict[str, object]]:
+    """Per-block LENGTH_NECESSITY PASS facts bound to the reviewed copy."""
+
+    reviewed: dict[int, dict[str, object]] = {}
+    for finding in script_findings:
+        if finding.dimension != "PACING_CONTEXT_DENSITY" or finding.level != "SATISFIED":
+            continue
+        if not any("LENGTH_NECESSITY_PASS" in code for code in finding.reason_codes):
+            continue
+        index = finding.evidence.get("block_index")
+        copy = finding.evidence.get("copy")
+        delivery = finding.evidence.get("reviewed_delivery")
+        duration = finding.evidence.get("reviewed_duration_seconds")
+        if isinstance(index, bool) or not isinstance(index, int):
+            continue
+        if not isinstance(copy, str) or not isinstance(delivery, str):
+            continue
+        reviewed[index] = {"copy": copy, "delivery": delivery, "duration": duration}
+    return reviewed
 
 
 def _narration_required(inputs: MaterializationInputs) -> bool:

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from app.composition.policy import Stage51Config
 from app.composition.tracking import build_tracks, persistent_tracks
 from app.composition.types import FaceDetection
@@ -167,3 +169,72 @@ def test_persistent_tracks_sorted_by_face_height_then_id() -> None:
 def test_empty_input_returns_no_tracks() -> None:
     assert build_tracks(0, [], _config()) == ()
     assert build_tracks(0, [(0.0, ())], _config()) == ()
+
+
+def test_internal_box_convention_has_self_iou_one_and_true_geometry() -> None:
+    from app.composition.tracking import (
+        _centroid_distance,
+        _detection_box,
+        _iou,
+        _size_difference,
+    )
+
+    detection = _det(0.4, 0.2, 0.2, 0.4)
+    box = _detection_box(detection)
+
+    assert box == pytest.approx((0.4, 0.2, 0.6, 0.6))
+    assert _iou(box, box) == 1.0
+    assert abs(_centroid_distance(box, box)) == pytest.approx(0.0)
+    assert _size_difference(box, box) == pytest.approx(0.0)
+    # A translated identical box has the same size and no overlap.
+    shifted = (0.7, 0.2, 0.9, 0.6)
+    assert _iou(box, shifted) == 0.0
+    assert abs(_size_difference(box, shifted)) == pytest.approx(0.0)
+    assert abs(_centroid_distance(box, shifted) - 0.3) < 1e-12
+
+
+def test_translation_consistent_association_keeps_one_track() -> None:
+    frames = [
+        (0.0, (_det(0.30, 0.40, 0.10, 0.20),)),
+        (0.5, (_det(0.32, 0.40, 0.10, 0.20),)),
+        (1.0, (_det(0.34, 0.40, 0.10, 0.20),)),
+    ]
+    tracks = build_tracks(0, frames, _config())
+
+    assert len(tracks) == 1
+    assert len(tracks[0].samples) == 3
+
+
+def test_recorded_two_shot_to_close_up_jump_is_not_associated() -> None:
+    """Exact saved boxes from the failed acceptance plan.
+
+    Right two-shot face: cx=0.729885, cy=0.508918, w=0.060453, h=0.13346.
+    Close-up face: cx=0.568219, cy=0.383399, w=0.091679, h=0.240932.
+    Correct centroid distance is 0.20467 (> the 0.13346 box diameter); the old
+    XYWH/edge confusion measured 0.08137 and falsely joined them.
+    """
+
+    from app.composition.tracking import _centroid_distance, _detection_box
+
+    right = _det(
+        0.729885 - 0.060453 / 2.0,
+        0.508918 - 0.13346 / 2.0,
+        0.060453,
+        0.13346,
+    )
+    close = _det(
+        0.568219 - 0.091679 / 2.0,
+        0.383399 - 0.240932 / 2.0,
+        0.091679,
+        0.240932,
+    )
+    distance = _centroid_distance(_detection_box(right), _detection_box(close))
+    assert abs(distance - 0.20467) < 1e-4
+    assert distance > 0.13346
+
+    tracks = build_tracks(
+        1,
+        [(584.66, (right,)), (585.66, (close,))],
+        _config(track_min_persistence_samples=1),
+    )
+    assert len(tracks) == 2

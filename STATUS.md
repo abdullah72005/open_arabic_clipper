@@ -1,3 +1,246 @@
+## Stage 6 V4 finalization/readiness critique binding after SOL review (2026-10-21)
+
+Status: **offline correction implemented and locally verified. The 2026-10-20
+genuine MP4 remains FAILED human acceptance. Stage 6 remains UNFROZEN, Stage 7
+UNSTARTED, `publication_ready=false`. No hosted/Gemini/TTS/Qwen call, worker,
+production job, new candidate, acceptance retry, publication or Stage 7 activity
+was run. Stage 5.2 (`backend/app/render/execution/`) is untouched.**
+
+Reviewed BASE/HEAD `e49dfb1d46d202a2a290f459bc26af5c84456dd5`. SOL's F3
+downstream gap is closed:
+
+- **F3.** Accepted-script validation now enforces the same critique
+  request/evidence binding as replay. When a required substantive block (or any
+  accepted block whose evidence records a critique) is trusted without prepare,
+  finalization and authoritative readiness recompute the exact bounded request
+  fingerprint and require the reviewed target snapshot's copy, claim class,
+  delivery and timing facts to match the accepted blocks and assembled timeline.
+  Missing, legacy-unbound, malformed or stale proof defers; it cannot restore
+  review readiness or qualify as a verified completed cache. Deterministic
+  `SOURCE_AS_EVIDENCE`/no-critique paths remain explicit. Reusable writing,
+  accepted-copy history, budgets and checkpoints are preserved; no provider is
+  called automatically. The binding reuses `stage6-critique-request-v1`; no new
+  semantic pass or Stage 4/5 contract change was added.
+
+Verification: 7 new finalization/readiness regressions (observed failing before
+the fix), 112 combined provider/component/finalizer tests, and 6 isolated-
+Postgres cache/POST/resume tests passed; `ruff check app tests` and changed-file
+formatting are clean. Diagnostic before/after evidence is under
+`storage/benchmarks/stage-6/manual-acceptance/review-notes/2026-10-21-v4-finalization-binding/`
+and is **diagnostic-only, never acceptance evidence**.
+
+The unresolved repeated-box/sampling provenance remains open, and no genuine
+acceptance attempt is authorized. Human acceptance remains mandatory.
+
+## Stage 6 V4 replay-binding corrections after SOL follow-up review (2026-10-21)
+
+Status: **offline corrections implemented and locally verified. The 2026-10-20
+genuine MP4 remains FAILED human acceptance. Stage 6 remains UNFROZEN, Stage 7
+UNSTARTED, `publication_ready=false`. No hosted/Gemini/TTS/Qwen call, worker,
+production job, new candidate, render, acceptance retry, publication or Stage 7
+activity was run. Stage 5.2 (`backend/app/render/execution/`) is untouched.**
+
+Reviewed BASE/HEAD `86d6dc5632781690e2b9ebbed095a205e9fc5017`. The two remaining
+SOL findings are corrected:
+
+1. **F1.** `CritiqueResult.verdict` now returns `REJECTED` for an explicit
+   negative legacy boolean, matching `decision`. Positive/missing boolean
+   evidence never approves; structured categorical evidence still takes
+   precedence.
+2. **F2.** Accepted critique checkpoints persist the exact bounded request
+   fingerprint (`stage6-critique-request-v1`) and reviewed target snapshot.
+   Replay requires an exact request match; mismatched, legacy-unbound or
+   malformed checkpoints defer without an automatic provider resend. Findings
+   use the facts actually reviewed, never current delivery/timing facts.
+   Exact-match replay remains zero-call and valid writing checkpoints remain
+   reusable.
+
+Verification (offline Docker Python 3.12, network disabled): 11 focused
+replay-binding regressions (7 failed before the fix), 121 provider/component/V4
+suites, 10 finalization-gate, 24 finalizer-evidence and 7 results-boundary tests
+passed; `ruff check app tests` clean. Diagnostic before/after evidence is under
+`storage/benchmarks/stage-6/manual-acceptance/review-notes/2026-10-21-v4-replay-binding-corrections/`
+and is **diagnostic-only, never acceptance evidence**.
+
+The unresolved repeated-box/sampling provenance remains open, and no genuine
+acceptance attempt is authorized. Human acceptance remains mandatory.
+
+## Stage 6 V4 follow-up corrections after independent SOL review (2026-10-20)
+
+Status: **offline follow-up corrections implemented and locally verified. The
+2026-10-20 genuine MP4 remains FAILED human acceptance. Stage 6 remains UNFROZEN,
+Stage 7 UNSTARTED, `publication_ready=false`. No hosted/Gemini/TTS/Qwen call,
+worker, production job, new candidate, acceptance retry, publication, or Stage 7
+activity was run. Stage 5.2 (`backend/app/render/execution/`) is untouched.**
+
+The independent SOL review at BASE `39560e3b6c898d3bb60d4f132750ebc1821405a3`
+requested changes (R1–R5). The bounded corrections are:
+
+1. **R1.** Content-free substantive copy (punctuation/whitespace/stopwords only)
+   is a deterministic `CONTENT_FREE` hard failure; every essential substantive
+   block still requires the semantic intent/redundancy review. `SOURCE_AS_EVIDENCE`
+   handling is preserved; no critique means honest defer.
+2. **R2.** Boolean-only positive critique results/checkpoints are never promoted
+   into quotes, references or relations. They defer without a provider resend;
+   complete categorical evidence is required. `stage6-validation-v3`.
+3. **R3.** Delivery facts follow executable policy: narration only when it will
+   actually run, otherwise a silent card whose duration comes from the actual
+   copy. `LENGTH_NECESSITY` is required for silent/optional-narration delivery and
+   bound to its own block, copy, delivery and duration; sibling/stale evidence
+   cannot authorize a card; UNKNOWN/FAIL defers.
+4. **R4.** Authored layout readability is decided by actual local FFmpeg/libass
+   glyph-ink measurement (fontconfig fallback, outline padding), not a
+   per-character estimate. Unsafe/unbreakable copy is refused, never truncated
+   or shrunk; findings reach render admission and final assessment.
+   `stage6-authored-ass-v3`.
+5. **R5.** Leading/trailing/interior subject gaps beyond the detection hold fail
+   containment proof and use the existing full-source `BACKGROUND_FILL` fallback
+   with `CROP_LOSES_SUBJECT`. Recentering is not visibility proof.
+   `stage5.1-framing-v3`.
+
+Verification (offline Docker Python 3.12, `PYTHONPATH=/app`; network disabled,
+with an isolated internal bridge only for Postgres-backed tests): 87 focused
+Stage 6/5.1 regressions, 212 Stage 5.1 suites, 99 provider/schema/V4 suites,
+19 recovery/service suites, 10 finalization-gate, 24 finalizer-evidence,
+7 results-boundary and 13 cache-validation tests, 27 milestone/authored suites,
+and 3 executor/worker-pipeline tests passed; `ruff check app tests` is clean.
+Exact commands are in the remediation note. Diagnostic before/after probes are
+under
+`storage/benchmarks/stage-6/manual-acceptance/review-notes/2026-10-20-v4-followup-corrections/`
+and are **diagnostic-only, never acceptance evidence**.
+
+The unresolved original repeated-box/sampling provenance remains open. No
+genuine acceptance attempt is authorized; human acceptance remains mandatory.
+
+## Stage 6 V4 offline remediation after FAILED human acceptance (2026-10-20)
+
+Status: **offline remediation implemented and locally verified; the 2026-10-20
+genuine MP4 remains FAILED human acceptance. Stage 6 remains UNFROZEN, Stage 7
+UNSTARTED, `publication_ready=false`. No hosted/provider/TTS/Qwen call, new
+genuine candidate, production submission, acceptance retry, publication, or
+worker was run. Stage 5.2 is untouched.**
+
+All four acceptance failures were addressed behind existing owning contracts:
+
+1. **Arabic caption order (Stage 5.1).** The derived ASS now carries logical
+   Unicode text; libass owns BiDi. The manual visual permutation (double-applied
+   by libass) is removed from the deployed asset. Per-token active emphasis is
+   allowed only for single-direction LTR scripts; RTL/mixed scripts degrade to
+   the static phrase state with `ACTIVE_EMPHASIS_UNSAFE_BIDI` and are not claimed
+   repaired. `stage5.1-ass-v6`, `stage5.1-caption-bidi-v3`.
+2. **Tracking/framing (Stage 5.1).** Internal boxes now use one `(x1,y1,x2,y2)`
+   convention, so self-IoU is 1 and the recorded two-shot→close-up jump is
+   0.20467 (rejected) instead of 0.08137 (falsely accepted). The final smoothed,
+   rate-limited, simplified and interpolated path is validated against
+   contemporaneous subject boxes; an unsafe path degrades the scene to
+   `BACKGROUND_FILL` (`CROP_LOSES_SUBJECT`). `stage5.1-framing-v2`. Saved source
+   evidence renders the actual subject instead of hand/curtain in the former
+   failure window.
+3. **Stage 6 delivery/cards/assessment.** Standalone authored copy is an explicit
+   measured delivery: safe-area-centred `Noto Sans Arabic` 88 px card, at most
+   three lines, no truncation, complete copy, measured reading budget/layout/
+   silence/fraction evidence persisted, absent judgments not defaulted to
+   SATISFIED, and dominant silent endings without assessed `LENGTH_NECESSITY`
+   defer. `stage6-authored-ass-v2`, `stage6-timeline-v2`.
+4. **Stage 4 promise / Stage 6 value.** Planning and governance requests separate
+   rendered selected evidence from nonrendered context and require content
+   sufficiency. The Stage 6 critique adds critical `INTENT_FULFILLMENT` with
+   exact copy-quote/offered-grounding/added-relation evidence; structural anchors
+   are deterministically validated, missing/invalid evidence cannot PASS,
+   `REDUNDANCY` is consequential for substantive blocks, and
+   `adds_beyond_source` is the reviewed relation rather than an echoed promise.
+   Planning `stage4.1-v13`/validation `v13`; governance `stage4.2-v10`/validation
+   `v12`; Gemini schema `stage6-gemini-schema-v2`.
+
+**Verification (offline, Docker Python 3.12, network disabled, `PYTHONPATH=/app`):**
+Stage 5.1 ASS/BiDi/tracking/framing/analysis/planner/fingerprints/types plus the
+new V4 regressions pass; Stage 6 provider/schema/delivery/intent/finalization/
+cache/results/acceptance suites pass; `ruff check app tests` is clean. Exact
+commands/results are in the final V4 report and the remediation note. No offline
+result is genuine acceptance.
+
+**Open blocker (unresolved provenance).** Production detection boxes repeat
+identically through 585.16 s and fresh replay already shows the close-up at
+584.16 s. A bounded replay confirms the `fps`-filter sample digest at 584.16 s
+differs from the exact input-seek frame, so the `start + index/fps` label is not
+proof of the selected input frame near a cut. The original run retained no
+per-sample frame digest, so detector/cache/decoder/sampling attribution cannot be
+made from surviving evidence. Full genuine framing/sampling correction is not
+claimed; see the V4 remediation note.
+
+## Stage 4.1 producer-contract V4 (2026-10-20)
+
+Status: **the Stage 4.1 producer contract is aligned with the preserved
+validators and proven offline satisfiable on authentic saved evidence through
+Stage 5.0 compatibility/binding/contract assembly and the Stage 6 merge/grounding
+path. Deterministic Stage 4.3 still declines automatic selection because the
+offline governance result has no semantic-fidelity review; a persisted executable
+contract therefore remains blocked pending independent hosted semantic review. No
+real provider, TTS, Ollama, rendering, acceptance, worker, or Stage 7 work was
+performed. Stage 6 remains NOT FROZEN; Stage 7 remains unstarted.**
+
+- **Authoritative request evidence.** `build_planning_request` now exposes
+  `mandatory_evidence` (truthful `ABSENT`/`RESOLVED`/`MALFORMED`/`UNRESOLVED`
+  hook/payoff state, source segment identity/bounds, descriptive offered
+  planning-word mapping, validator-aligned `mandatory_coverage_feasible`, and
+  `supported_selection`), `source_selection` (planning-index scope, offered
+  words, coverage, selectable window, excerpt/block/duration/hero caps),
+  `strategy_constraints` (allowed value kinds and verification requirement), and
+  `nonselectable_context` (context, suggested hook copy, summaries) separated
+  from authoritative evidence. Feasibility follows the validator's endpoint
+  tolerance and supported word-selection/full-window semantics, so an endpoint
+  in an inter-word gap or a wordless full-window case is not falsely declined;
+  only truly uncoverable, malformed, or unresolved evidence requires declining.
+- **One authoritative schema.** `PlanningOutputSchema` is the Pydantic model
+  Google receives, and `PLANNING_OUTPUT_SCHEMA` is generated from it. Required
+  plan/block/narration/declaration fields and descriptions now state hero,
+  mandatory coverage, grounding grammar/equality, verification linkage and
+  narration/TTS/rendering boundaries. A documentary-only schema can no longer
+  differ from the hosted request.
+- **Identity chain preserved.** Planning indexes remain after filtering/capping
+  and distinct from source segment positions and FINAL_CLIP indexes. Selected
+  `planning_words` survive validation, persistence, Stage 4.3 live guards,
+  Stage 5.0 binding and materialization partial-range resolution. A
+  tolerance-admitted word that is not part of a selected excerpt remains
+  unresolved as a citation.
+- **Bounded rejection diagnostics.** Rejected/deferred attempts retain
+  job/strategy/route/fingerprint/contract identity, phase, failure codes/block,
+  structural selectors, resolved selected-source identities, expected mandatory
+  evidence and response digest/size, separated from executable plans and reusable
+  checkpoints. Parser rejections are retained independently of collected plans:
+  mismatched/unknown/duplicate identities and malformed entries keep bounded
+  codes, requested identity, returned-identity digests/counts and unmatched-entry
+  structure, so they are not misreported as true `PROVIDER_OMITTED`; accepted
+  siblings remain isolated and transport failures keep no response evidence.
+  Quote declarations are digests only; no raw provider/transcript text or
+  credential is persisted. Prior per-job diagnostics survive later runs.
+- **Versions.** Planning `stage4.1-v11`, schema `stage4.1-schema-v11`,
+  validation `stage4.1-validation-v11`, provider-input fingerprint `2`; prior
+  plans/checkpoints invalidate normally without resetting counters. The effective
+  instruction/schema participates in provider runtime/prompt identity.
+
+Offline evidence: four deliberate fixtures under
+`backend/tests/fixtures/stage41_contract_v4/` extracted from the read-only
+`clipfactory_stage6_acceptance` snapshot (SHA-256
+`259d3128301b130da8573676211a84e1c7fc92de6039d28577210ec4998d92da`), plus
+`test_stage41_contract_v4.py`. The request/schema/instruction are captured through
+the real adapter for all four fixtures. One authored provider-format response
+grounded in the authentic `1827c524` CONTEXT_HOOK evidence states a concrete
+explanatory relation between two authentic phrases (the quoted gold/diamonds are
+the quoted family demands), and passes the actual schema/parser, Stage 4.1,
+Stage 4.2 integrity and deterministic governance, Stage 4.3 live mandatory
+guards, Stage 5.0 FINAL_CLIP compatibility/binding/contract assembly, and the
+production Stage 6 `_merge_blocks`/grounding resolver with nonzero planning
+indexes, partial-range citations, corrupted-mapping failures and
+tolerance-admitted out-of-scope rejection. Deterministic governance cannot
+provide the semantic-fidelity review dimension, so Stage 4.3 truthfully reports
+`NO_SELECTABLE_PLAN` offline and a persisted executable contract remains blocked
+pending independent hosted semantic review. Negative controls still reject
+missing hooks, declared missing payoff, empty/malformed/mixed/invalid grounding,
+bare decimals, substring-only quotes, unknown blocks, partial/out-of-scope/huge/
+reversed ranges, malformed mandatory identity and unsupported claims. No
+approval rows or semantic critiques were fabricated.
+
 # Runtime status
 
 > Correction (2026-10-17): a hosted `GEMINI_API_KEY` IS configured in this
@@ -2533,11 +2776,11 @@ emphasis off by default: captions render as plain static single-color phrase
 text. Setting `CLIPFACTORY_VISUAL_CAPTION_DYNAMIC_EMPHASIS=true` re-enables
 active-word emphasis, highlighting the word currently being spoken in a
 configurable accent color on a stationary block using the exact FINAL_CLIP word
-timings, degrading to static captions on unreliable timing. Because the deployed
-libass build does not reorder mixed-direction text (measured), the derived ASS
-asset carries a deterministic run-level visual order from the pure `bidi.py`
-transform while canonical transcript text stays in logical order; run-aware
-wrapping keeps a Latin phrase such as `content creator` together. `BACKGROUND_FILL`
+timings, degrading to static captions on unreliable timing. Historical (superseded by the top 2026-10-20 V4 entry): the older section below
+assumed libass did not reorder mixed-direction text and wrote a manual visual
+order into the derived ASS. That assumption failed human acceptance; the current
+serializer emits logical text and libass owns BiDi. Run-aware wrapping still
+keeps a Latin phrase such as `content creator` together. `BACKGROUND_FILL`
 uses a strong blur plus modest dim/desaturation so the background reads as
 background. Known limitations:
 `CLIPFACTORY_VISUAL_COMPOSITION_ENABLED` is enforced by both the queue and the

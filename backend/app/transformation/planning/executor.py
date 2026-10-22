@@ -778,6 +778,7 @@ class TransformationPlanningExecutor:
             provider_identity=self._provider_identity(),
             mode=self._mode,
             is_cancelled=self._should_stop,
+            job_id=self._active_job_id,
         )
         try:
             return service.plan(
@@ -847,7 +848,13 @@ class TransformationPlanningExecutor:
         plan_set.provider_mode = self._mode
         plan_set.provider_identity = dict(outcome.provider_identity)
         plan_set.provider_status = outcome.provider_status
-        plan_set.provider_evidence = dict(outcome.provider_evidence)
+        plan_set.provider_evidence = {
+            **dict(outcome.provider_evidence),
+            "attempt_diagnostics": _merged_attempt_diagnostics(
+                (plan_set.provider_evidence or {}).get("attempt_diagnostics"),
+                outcome.attempts,
+            ),
+        }
         plan_set.strategy_attempts = [attempt.as_dict() for attempt in outcome.attempts]
         plan_set.input_fingerprint = outcome.input_fingerprint
         plan_set.output_fingerprint = outcome.output_fingerprint
@@ -945,6 +952,26 @@ class TransformationPlanningExecutor:
                 release()
             except Exception:
                 pass
+
+
+def _merged_attempt_diagnostics(
+    prior: object, attempts: Sequence[object]
+) -> list[dict[str, object]]:
+    """Keep bounded per-job rejection evidence across later runs.
+
+    Diagnostics are intentionally separate from executable plan blocks and from
+    reusable accepted checkpoints. No raw provider text, transcript payload, or
+    credential can appear here.
+    """
+
+    entries = (
+        [dict(item) for item in prior if isinstance(item, dict)] if isinstance(prior, list) else []
+    )
+    for attempt in attempts:
+        diagnostics = getattr(attempt, "diagnostics", None)
+        if isinstance(diagnostics, Mapping):
+            entries.append(dict(diagnostics))
+    return entries[-20:]
 
 
 def build_transformation_planning_executor(

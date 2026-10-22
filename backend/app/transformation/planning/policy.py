@@ -19,15 +19,21 @@ from app.core.enums import (
     TransformationStrategyType,
 )
 
-# v8 Arabic multi-token closure: bounded Arabic selection grammar covers
-# multi-token identities (for example "اختر محمد رمضان راوياً").
-POLICY_VERSION = "stage4.1-v9"
-SCHEMA_VERSION = "stage4.1-schema-v9"
-VALIDATION_VERSION = "stage4.1-validation-v11"
+# v12 producer/validator selection-agreement correction: WORD_SELECTION is
+# advertised only when word coverage is sufficient, and insufficient nonempty
+# word evidence uses the existing full-window fallback instead of advertising a
+# word span the validator rejects. v11 producer feasibility/diagnostics
+# alignment (mandatory feasibility follows validator selection/endpoint
+# semantics and parser rejections are retained as bounded diagnostics), v10
+# producer-contract alignment, and v8 Arabic multi-token closure remain in
+# force.
+POLICY_VERSION = "stage4.1-v13"
+SCHEMA_VERSION = "stage4.1-schema-v12"
+VALIDATION_VERSION = "stage4.1-validation-v13"
 INPUT_FINGERPRINT_VERSION = "2"
 OUTPUT_FINGERPRINT_VERSION = "2"
 PLAN_FINGERPRINT_VERSION = "2"
-PROVIDER_INPUT_FINGERPRINT_VERSION = "1"
+PROVIDER_INPUT_FINGERPRINT_VERSION = "2"
 
 # Official Gemini model documentation was checked 2026-09-14. See
 # docs/STAGE_4_1_OPERATIONS.md for the exact links.

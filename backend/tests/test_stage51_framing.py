@@ -965,3 +965,163 @@ def test_build_scene_with_decision_uses_the_decision() -> None:
         FramingEvidence.HERO_PROTECTION_APPLIED.value in keyframe.evidence
         for keyframe in scene.crop_keyframes
     )
+
+
+# ---------------------------------------------------------------------------
+# Final path containment (smoothed crop must keep the subject visible)
+# ---------------------------------------------------------------------------
+
+
+def test_smoothed_tracked_path_that_loses_the_face_falls_back_to_background() -> None:
+    geometry = _geometry(3840, 2160)
+    track = _track(
+        1,
+        [
+            _sample(0.0, 0.90, 0.45, w=0.06, h=0.13),
+            _sample(0.5, 0.20, 0.45, w=0.09, h=0.24),
+            _sample(1.0, 0.20, 0.45, w=0.09, h=0.24),
+        ],
+    )
+    scene = build_scene(
+        scene_index=0,
+        block_index=0,
+        scene_start=0.0,
+        scene_end=1.0,
+        cut_start=False,
+        mode=FramingMode.TRACKED_CROP,
+        tracks=(track,),
+        config=_config(),
+        geometry=geometry,
+        is_hero=True,
+    )
+
+    assert scene.framing.mode == FramingMode.BACKGROUND_FILL.value
+    assert FramingEvidence.CROP_LOSES_SUBJECT.value in scene.framing.evidence
+    assert scene.framing.fallback_parameters["reason"] == "SUBJECT_NOT_PRESERVED_IN_CROP"
+    assert scene.framing.fallback_parameters["requested_mode"] == FramingMode.TRACKED_CROP.value
+    assert all(
+        keyframe.mode == FramingMode.BACKGROUND_FILL.value for keyframe in scene.crop_keyframes
+    )
+
+
+def test_smoothed_tracked_path_that_keeps_the_face_stays_tracked() -> None:
+    geometry = _geometry(3840, 2160)
+    track = _track(
+        1,
+        [
+            _sample(0.0, 0.50, 0.45, w=0.08, h=0.18),
+            _sample(0.5, 0.505, 0.45, w=0.08, h=0.18),
+            _sample(1.0, 0.51, 0.45, w=0.08, h=0.18),
+        ],
+    )
+    scene = build_scene(
+        scene_index=0,
+        block_index=0,
+        scene_start=0.0,
+        scene_end=1.0,
+        cut_start=False,
+        mode=FramingMode.TRACKED_CROP,
+        tracks=(track,),
+        config=_config(),
+        geometry=geometry,
+    )
+
+    assert scene.framing.mode == FramingMode.TRACKED_CROP.value
+    assert FramingEvidence.CROP_LOSES_SUBJECT.value not in scene.framing.evidence
+
+
+# ---------------------------------------------------------------------------
+# R5: unobserved intervals beyond the hold cannot certify containment
+# ---------------------------------------------------------------------------
+
+
+def _scene_for_samples(
+    samples: list[TrackSample],
+    *,
+    scene_start: float,
+    scene_end: float,
+    is_hero: bool = True,
+):
+    return build_scene(
+        scene_index=0,
+        block_index=0,
+        scene_start=scene_start,
+        scene_end=scene_end,
+        cut_start=False,
+        mode=FramingMode.TRACKED_CROP,
+        tracks=(_track(1, samples),),
+        config=_config(),
+        geometry=_geometry(3840, 2160),
+        is_hero=is_hero,
+    )
+
+
+def test_leading_subject_gap_beyond_hold_falls_back_to_full_source() -> None:
+    scene = _scene_for_samples(
+        [
+            _sample(2.0, 0.50, 0.45, w=0.08, h=0.18),
+            _sample(2.5, 0.505, 0.45, w=0.08, h=0.18),
+        ],
+        scene_start=0.0,
+        scene_end=3.0,
+    )
+
+    assert scene.framing.mode == FramingMode.BACKGROUND_FILL.value
+    assert FramingEvidence.CROP_LOSES_SUBJECT.value in scene.framing.evidence
+
+
+def test_trailing_subject_gap_beyond_hold_falls_back_to_full_source() -> None:
+    scene = _scene_for_samples(
+        [
+            _sample(0.0, 0.50, 0.45, w=0.08, h=0.18),
+            _sample(0.5, 0.505, 0.45, w=0.08, h=0.18),
+            _sample(1.0, 0.51, 0.45, w=0.08, h=0.18),
+        ],
+        scene_start=0.0,
+        scene_end=6.0,
+    )
+
+    assert scene.framing.mode == FramingMode.BACKGROUND_FILL.value
+    assert FramingEvidence.CROP_LOSES_SUBJECT.value in scene.framing.evidence
+
+
+def test_interior_subject_gap_beyond_hold_falls_back_to_full_source() -> None:
+    scene = _scene_for_samples(
+        [
+            _sample(0.0, 0.50, 0.45, w=0.08, h=0.18),
+            _sample(0.5, 0.505, 0.45, w=0.08, h=0.18),
+            _sample(3.0, 0.51, 0.45, w=0.08, h=0.18),
+            _sample(3.5, 0.515, 0.45, w=0.08, h=0.18),
+        ],
+        scene_start=0.0,
+        scene_end=3.5,
+    )
+
+    assert scene.framing.mode == FramingMode.BACKGROUND_FILL.value
+    assert FramingEvidence.CROP_LOSES_SUBJECT.value in scene.framing.evidence
+
+
+def test_subject_gap_exactly_at_the_hold_boundary_is_still_contained() -> None:
+    scene = _scene_for_samples(
+        [
+            _sample(0.0, 0.50, 0.45, w=0.08, h=0.18),
+            _sample(0.5, 0.505, 0.45, w=0.08, h=0.18),
+            _sample(1.0, 0.51, 0.45, w=0.08, h=0.18),
+        ],
+        scene_start=0.0,
+        scene_end=2.0,
+    )
+
+    assert scene.framing.mode == FramingMode.TRACKED_CROP.value
+    assert FramingEvidence.CROP_LOSES_SUBJECT.value not in scene.framing.evidence
+
+
+def test_complete_subject_coverage_stays_tracked() -> None:
+    scene = _scene_for_samples(
+        [_sample(index * 0.5, 0.50 + index * 0.002, 0.45, w=0.08, h=0.18) for index in range(7)],
+        scene_start=0.0,
+        scene_end=3.0,
+    )
+
+    assert scene.framing.mode == FramingMode.TRACKED_CROP.value
+    assert FramingEvidence.CROP_LOSES_SUBJECT.value not in scene.framing.evidence

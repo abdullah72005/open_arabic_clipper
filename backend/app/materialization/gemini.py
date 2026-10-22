@@ -44,7 +44,7 @@ GEMINI_ROUTINE_MODEL = "gemini-3.5-flash-lite"
 GEMINI_STRONG_MODEL = "gemini-3.8-flash"
 #: Bumped whenever the prompt text or structured-output schema changes, so a
 #: stale accepted checkpoint is never reused against a different instruction.
-GEMINI_SCHEMA_VERSION = "stage6-gemini-schema-v1"
+GEMINI_SCHEMA_VERSION = "stage6-gemini-schema-v2"
 
 WRITING_SYSTEM_INSTRUCTION = (
     "You are a precise bilingual short-form video writer. For each target you "
@@ -67,17 +67,30 @@ WRITING_SYSTEM_INSTRUCTION = (
 
 CRITIQUE_SYSTEM_INSTRUCTION = (
     "You are a strict bilingual semantic reviewer. For each block you receive the "
-    "authored copy, its intended value, an optional source language/dialect, and "
-    "the bounded ACTUAL source evidence it claims to be grounded in. Return "
-    "exactly one categorical finding for each dimension: GROUNDING_ENTAILMENT, "
-    "SUBSTANTIVE_ADDED_VALUE, SEMANTIC_FIDELITY, UNSUPPORTED_FACTS, "
+    "authored copy, the rendered selected evidence the audience actually receives, "
+    "its intended value, an optional source language/dialect, and the bounded ACTUAL "
+    "source evidence it claims to be grounded in. Return exactly one categorical "
+    "finding for each dimension: GROUNDING_ENTAILMENT, SUBSTANTIVE_ADDED_VALUE, "
+    "INTENT_FULFILLMENT, SEMANTIC_FIDELITY, UNSUPPORTED_FACTS, "
     "CODE_SWITCH_PRESERVATION, REDUNDANCY, DIALECT_REGISTER_FIT, NATURALNESS, "
     "LENGTH_NECESSITY. Each level is PASS, CONCERN, FAIL, or UNKNOWN with short "
-    "evidence. Grounding, substantive added value, semantic fidelity, unsupported "
-    "facts, and code-switch preservation must each be a known PASS to be approved; "
-    "a missing or UNKNOWN critical dimension cannot be approved. Do not infer "
-    "knowledge from outside the provided evidence: if the evidence is insufficient "
-    "to judge a dimension, answer UNKNOWN rather than PASS."
+    "evidence. For INTENT_FULFILLMENT you must also return an intent_fulfillment "
+    "object: copy_quote is a nonempty exact substring of the actual copy, "
+    "grounding_refs is a nonempty list drawn only from the offered grounding "
+    "references, and added_relation is a short bounded statement of the relationship "
+    "that quote expresses beyond restating the source. Never invent, rewrite, or "
+    "extend the copy. Grounding, substantive added value, intent fulfillment, "
+    "semantic fidelity, unsupported facts, and code-switch preservation must each be "
+    "a known PASS to be approved; for a substantive block REDUNDANCY must also be a "
+    "known PASS, and for standalone authored text LENGTH_NECESSITY must be a known "
+    "PASS. A missing or UNKNOWN required dimension cannot be approved. A restatement "
+    "in Modern Standard Arabic of what a dialect source already says is NOT added "
+    "value. Do not attribute an unsupported psychological mechanism or motive to a "
+    "speaker unless the rendered evidence states it. Judge only the evidence the "
+    "audience receives; broader transcript context may explain what is missing but "
+    "never proves the rendered excerpt conveys it. Do not infer knowledge from "
+    "outside the provided evidence: if the evidence is insufficient to judge a "
+    "dimension, answer UNKNOWN rather than PASS."
 )
 
 
@@ -93,6 +106,7 @@ class _WritingOutput(BaseModel):
 _DimensionLiteral = Literal[
     "GROUNDING_ENTAILMENT",
     "SUBSTANTIVE_ADDED_VALUE",
+    "INTENT_FULFILLMENT",
     "SEMANTIC_FIDELITY",
     "UNSUPPORTED_FACTS",
     "CODE_SWITCH_PRESERVATION",
@@ -104,10 +118,19 @@ _DimensionLiteral = Literal[
 _LevelLiteral = Literal["PASS", "CONCERN", "FAIL", "UNKNOWN"]
 
 
+class _IntentFulfillmentOutput(BaseModel):
+    """Bounded review evidence; never new authored copy or provider timestamps."""
+
+    copy_quote: str = ""
+    grounding_refs: list[str] = Field(default_factory=list)
+    added_relation: str = ""
+
+
 class _CritiqueFindingOutput(BaseModel):
     dimension: _DimensionLiteral
     level: _LevelLiteral
     evidence: str = ""
+    intent_fulfillment: _IntentFulfillmentOutput | None = None
 
 
 class _BlockCritiqueOutput(BaseModel):
@@ -177,9 +200,7 @@ class _GeminiChatAdapter:
         self._digest = hashlib.sha256(
             f"gemini-{self._kind}:{routine_model}:{strong_model}".encode()
         ).hexdigest()
-        self._prompt_sha256 = hashlib.sha256(
-            self._system_instruction.encode("utf-8")
-        ).hexdigest()
+        self._prompt_sha256 = hashlib.sha256(self._system_instruction.encode("utf-8")).hexdigest()
         self.rate_limited = False
         self._usage: dict[str, int] = {
             "prompt_token_count": 0,
@@ -362,9 +383,7 @@ class GeminiCritiqueProvider(_GeminiChatAdapter):
 
     def critique(self, request: CritiqueRequest) -> CritiqueResult:
         if not request.targets:
-            return CritiqueResult(
-                accepted={}, blocks={}, provider_identity=self.runtime_identity()
-            )
+            return CritiqueResult(accepted={}, blocks={}, provider_identity=self.runtime_identity())
         try:
             content = self._generate_once(
                 tier=request.tier,
@@ -478,11 +497,38 @@ def _parse_critique(
                 return None
             seen.add(dimension)
             evidence = finding.get("evidence", "")
+            intent = finding.get("intent_fulfillment")
+            copy_quote = ""
+            grounding_refs: tuple[str, ...] = ()
+            added_relation = ""
+            if intent is not None:
+                if not isinstance(intent, Mapping):
+                    return None
+                raw_quote = intent.get("copy_quote", "")
+                raw_refs = intent.get("grounding_refs", [])
+                raw_relation = intent.get("added_relation", "")
+                if not isinstance(raw_quote, str) or not isinstance(raw_relation, str):
+                    return None
+                if not isinstance(raw_refs, list) or not all(
+                    isinstance(ref, str) for ref in raw_refs
+                ):
+                    return None
+                copy_quote = raw_quote
+                grounding_refs = tuple(raw_refs)
+                added_relation = raw_relation
+            if dimension == "INTENT_FULFILLMENT" and level == "PASS":
+                # A PASS without the required bounded evidence is malformed; the
+                # whole response defers rather than manufacturing approval.
+                if not copy_quote.strip() or not grounding_refs or not added_relation.strip():
+                    return None
             findings.append(
                 CritiqueDimensionFinding(
                     dimension=dimension,
                     level=level,
                     evidence="" if evidence is None else str(evidence),
+                    copy_quote=copy_quote,
+                    grounding_refs=grounding_refs,
+                    added_relation=added_relation,
                 )
             )
         if seen != dimensions:

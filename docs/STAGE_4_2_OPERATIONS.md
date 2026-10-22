@@ -125,6 +125,13 @@ the plan independently.
 ## Independent dimensions (no overall score)
 
 No overall score, viral score, monetization score, or weighted aggregate exists.
+The governance request keeps a plan's **rendered selected evidence**
+(`selected_evidence`, derived only from its `SOURCE_EXCERPT` blocks) separate from
+nonrendered transcript/context/summaries (`evidence_scope`). The governor must
+judge whether the rendered evidence plus the authored value conveys the promised
+idea; a minimum duration or a hook match is not context sufficiency, and a copied
+`required_context` string is never evidence that it appears in the output.
+
 Independent categorical assessments with bounded evidence/reason codes are
 persisted:
 

@@ -41,9 +41,7 @@ from app.materialization.queue import queue_materialization
 from app.models import ClipMaterialization, ProcessingJob
 from app.models.render_execution import RenderExecution
 
-_ANNOTATION_COPY = (
-    "That drop looks milder once you control for which teams already promoted heavily."
-)
+_ANNOTATION_COPY = "Promotion rates fell after teams changed."
 _TERMINAL = {JobStatus.SUCCEEDED, JobStatus.FAILED, JobStatus.CANCELLED}
 
 
@@ -91,9 +89,7 @@ def _seed_with_core(engine: Engine, monkeypatch: Any) -> tuple[Any, uuid.UUID]:
 
     session = Session(engine)
     try:
-        fixture = seed_stage51(
-            session, monkeypatch, narration="NONE", media_writer=_write_source
-        )
+        fixture = seed_stage51(session, monkeypatch, narration="NONE", media_writer=_write_source)
         candidate = fixture.stage50.selection.candidate
         context = SimpleNamespace(
             candidate_id=candidate.id,
@@ -145,9 +141,7 @@ def test_worker_task_chain_end_to_end(engine: Engine, monkeypatch: Any) -> None:
         )
 
     monkeypatch.setattr(tasks_module, "build_materialization_executor", _builder, raising=False)
-    monkeypatch.setattr(
-        "app.materialization.executor.build_materialization_executor", _builder
-    )
+    monkeypatch.setattr("app.materialization.executor.build_materialization_executor", _builder)
 
     context, core_render_id = _seed_with_core(engine, monkeypatch)
     candidate_id = context.candidate_id
@@ -236,9 +230,7 @@ def test_worker_task_chain_end_to_end(engine: Engine, monkeypatch: Any) -> None:
         assert first_fingerprint
         # Every handled job is terminal.
         for job in session.scalars(
-            select(ProcessingJob).where(
-                ProcessingJob.materialization_id == materialization_id
-            )
+            select(ProcessingJob).where(ProcessingJob.materialization_id == materialization_id)
         ).all():
             assert job.status in _TERMINAL
         for job in session.scalars(
