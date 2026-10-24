@@ -34,10 +34,17 @@ from app.core.enums import (
 )
 from app.db.base import Base
 from app.models import ProcessingJob, TransformationPlanSet
+from app.transformation.governance.fingerprints import (
+    build_governance_input_payload,
+    governance_input_fingerprint,
+)
 from app.transformation.governance.inputs import build_governance_inputs
 from app.transformation.governance.policy import DEFAULT_CONFIG as STAGE42_CONFIG
 from app.transformation.governance.providers import build_governance_request
-from app.transformation.planning.executor import TransformationPlanningExecutor
+from app.transformation.planning.executor import (
+    TransformationPlanningExecutor,
+    build_transformation_planning_executor,
+)
 from app.transformation.planning.inputs import (
     PlanningInputError,
     build_planning_inputs,
@@ -617,6 +624,27 @@ def test_governance_recovers_same_scoped_constraints(
         assert payload["operator_direction"]["approved_source_end"] == 24.0
         assert payload["operator_direction"]["editorial_intent"] == (
             "Make the conversation reciprocal by inviting the other person's experience."
+        )
+        current_plan_set_fingerprint = build_transformation_planning_executor(
+            session, settings
+        ).input_fingerprint(plan_set)
+        assert current_plan_set_fingerprint == plan_set.input_fingerprint
+        governance_payload = build_governance_input_payload(
+            inputs=governance,
+            config=STAGE42_CONFIG,
+            provider_mode="adaptive",
+            provider_identity={"provider": "fake"},
+        )
+        assert governance_payload["operator_request"] == {
+            "version": "stage4.1-operator-request-v1",
+            "source_start": 21.0,
+            "source_end": 24.0,
+            "editorial_intent": (
+                "Make the conversation reciprocal by inviting the other person's experience."
+            ),
+        }
+        assert governance_input_fingerprint(governance_payload) == governance_input_fingerprint(
+            governance_payload
         )
 
 
