@@ -396,6 +396,55 @@ def test_request_excluding_mandatory_hook_is_rejected_before_provider(
         assert job.status.value == "FAILED"
 
 
+def test_request_excluding_segment_144_is_rejected_before_provider(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    factory = _factory(tmp_path)
+    settings = FakeStage41Settings()
+    install_stage41_settings(monkeypatch, settings)
+    source_segments = [
+        {"start": 0.0, "end": 259.16, "text": f"pre-{index}"} for index in range(144)
+    ]
+    source_segments.append({"start": 259.16, "end": 259.26, "text": "صح"})
+    source_segments.append({"start": 259.26, "end": 300.0, "text": "post"})
+    with factory() as session:
+        seed = seed_stage41(
+            session,
+            settings=settings,
+            refined=(260.0, 271.0),
+            words=[
+                {"text": "أقنعتين", "start": 260.0, "end": 261.0, "probability": 0.9},
+                {"text": "إن", "start": 261.0, "end": 262.0, "probability": 0.9},
+                {"text": "كتير", "start": 270.68, "end": 271.0, "probability": 0.9},
+            ],
+            source_segments=source_segments,
+            hook_index=144,
+        )
+        candidate_id = seed[1].id
+        session.commit()
+
+    from app.transformation.planning.queue import validate_candidate_for_planning
+
+    with factory() as session:
+        candidate, analysis = validate_candidate_for_planning(session, candidate_id)
+        outcome = queue_transformation_planning(
+            session,
+            candidate,
+            analysis,
+            operator_source_start=260.0,
+            operator_source_end=271.0,
+            editorial_intent="Keep only the approved exchange.",
+        )
+        session.commit()
+        plan_set_id, job_id = outcome.plan_set_id, outcome.job_id
+
+    provider = CapturingPlanningProvider([])
+    with pytest.raises(PlanningInputError) as raised:
+        _execute(factory, settings, plan_set_id, job_id, provider)
+    assert "HOOK_OUTSIDE_APPROVED_WINDOW" in str(raised.value)
+    assert provider.calls == 0
+
+
 def test_changed_scope_or_intent_invalidates_cache_and_checkpoints(
     tmp_path: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
