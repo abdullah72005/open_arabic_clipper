@@ -1479,13 +1479,24 @@ def create_app(
     def queue_transformation_plans_endpoint(
         candidate_id: UUID,
         force: bool = False,
+        source_start: float | None = None,
+        source_end: float | None = None,
+        editorial_intent: str | None = None,
         database: Session = Depends(session),
     ) -> PlanningQueueResponse:
         """Explicitly queue one candidate-scoped Stage 4.1 planning run."""
 
         try:
             candidate, analysis = validate_candidate_for_planning(database, candidate_id)
-            outcome = queue_transformation_planning(database, candidate, analysis, force=force)
+            outcome = queue_transformation_planning(
+                database,
+                candidate,
+                analysis,
+                force=force,
+                operator_source_start=source_start,
+                operator_source_end=source_end,
+                editorial_intent=editorial_intent,
+            )
         except PlanningQueueError as error:
             raise _planning_http(error) from error
         return PlanningQueueResponse(

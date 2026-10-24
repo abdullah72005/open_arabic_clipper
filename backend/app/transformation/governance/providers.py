@@ -212,9 +212,13 @@ class GovernanceRequest:
     originality_risk: str
     plans: tuple[dict[str, object], ...]
     priority: str = GOVERNANCE_PRIORITY
+    operator_source_start: float | None = None
+    operator_source_end: float | None = None
+    operator_editorial_intent: str | None = None
+    operator_request_version: str = ""
 
     def to_payload(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "plan_set_id": self.plan_set_id,
             "candidate_id": self.candidate_id,
             "content_type": self.content_type,
@@ -245,6 +249,20 @@ class GovernanceRequest:
                 ),
             },
         }
+        if (
+            self.operator_request_version
+            or self.operator_source_start is not None
+            or self.operator_source_end is not None
+            or self.operator_editorial_intent
+        ):
+            payload["operator_direction"] = {
+                "role": "OPERATOR_DIRECTION_NOT_SOURCE_EVIDENCE",
+                "version": self.operator_request_version,
+                "approved_source_start": self.operator_source_start,
+                "approved_source_end": self.operator_source_end,
+                "editorial_intent": self.operator_editorial_intent,
+            }
+        return payload
 
 
 def _plan_payload(plan: PlanEvidence) -> dict[str, object]:
@@ -289,6 +307,10 @@ def build_governance_request(inputs: GovernanceInputs, config: Stage42Config) ->
         rights_risk=inputs.rights_risk,
         originality_risk=inputs.originality_risk,
         plans=tuple(_plan_payload(plan) for plan in inputs.plans),
+        operator_source_start=inputs.approved_source_start,
+        operator_source_end=inputs.approved_source_end,
+        operator_editorial_intent=inputs.editorial_intent,
+        operator_request_version=inputs.operator_request_version,
     )
 
 

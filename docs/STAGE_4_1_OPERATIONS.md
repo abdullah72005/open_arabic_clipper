@@ -48,6 +48,58 @@ the target/narration semantic context. A whole video or whole multi-hour
 transcript is never included, and Stage 4.0 eligibility/ranking is never
 recomputed.
 
+## Operator planning request (scope and editorial intent)
+
+The Stage 4.1 entry point accepts an optional operator request:
+
+```bash
+python -m app.cli transformation-plan-generate CANDIDATE_ID \
+  --source-start 259.160 --source-end 271.000 \
+  --editorial-intent "Turn the complaint into a practical reciprocal conversation move."
+```
+
+The same fields are accepted as optional query parameters on
+`POST /api/candidates/{id}/transformation-plans`.
+
+- Bounds must be finite, non-negative, paired, and strictly ordered. A window
+  must be inside the source evidence; otherwise the run fails before any
+  provider call.
+- The approved window replaces the broader refined window as the selectable
+  source scope. Only words wholly inside it are offered. Any wider
+  transcript/context remains explicitly nonselectable guidance.
+- Every declared hook/payoff segment must be inside the window and coverable by
+  an in-window word selection. A request that cannot preserve mandatory
+  evidence is rejected before provider invocation.
+- `editorial_intent` is bounded, validated operator direction. It is sent under
+  `operator_direction` with `role=OPERATOR_DIRECTION_NOT_SOURCE_EVIDENCE`; it is
+  never source evidence, approved copy, a new Stage 4.0 strategy, or a
+  guaranteed plan.
+- Generated source excerpts are validated against the approved window with
+  **zero** tolerance. Existing refined-window tolerance never expands explicit
+  operator authorization. A provider `FULL_WINDOW` selection is rejected for a
+  scoped request; out-of-window plans are rejected, never trimmed or repaired.
+- The request is persisted on the existing plan-set envelope
+  (`transformation_plan_sets.operator_request`) so a separate worker executes
+  the same request. While a planning job is active, another request cannot
+  replace it; a changed request binds to the next run.
+- The request participates in the plan-set input fingerprint, per-strategy
+  provider-input fingerprint, checkpoint identity, cache eligibility, and
+  staleness/freshness. Changing scope or intent invalidates incompatible results;
+  identical requests retain normal idempotency.
+- Stage 4.2 rebuilds the same scoped planning inputs from the persisted request
+  and includes the direction in its input/provider identity. Stage 4.3 and Stage
+  5.0 consume the resulting plan/evidence identities and source spans; the
+  filtered planning-word indexes are not reused as final-clip word indexes.
+- An unscoped legacy call on a fresh plan set behaves exactly as before. Once a
+  request is bound to the current plan set, an unscoped call does not silently
+  remove it; replacing requires another explicit request.
+
+The shared provider instruction explicitly describes `operator_direction` as
+non-evidence direction and states the zero-tolerance window rule. This changes
+the instruction hash (and therefore provider identity/checkpoint identity), so
+prior Stage 4.1 provider caches without the operator contract are not reused;
+unscoped semantics themselves are unchanged.
+
 ## Producer request contract (V4)
 
 The provider request is a single authoritative, bounded contract; it is not a
@@ -102,6 +154,8 @@ there is no retry loop or automatic repair.
   `outcome_reasons`;
 - Stage 4.0 input/output identity snapshot (`stage40_snapshot`);
 - target/audience and narration-policy semantic snapshot (`target_context`);
+- optional operator request (approved source window + bounded editorial intent)
+  in `operator_request`, bound to the plan set and included in input identity;
 - provider mode, stable configured identity, status, sanitized evidence;
 - per-strategy attempt/checkpoint state (`strategy_attempts`);
 - input/output fingerprints, policy/schema/validation versions, cache
@@ -616,8 +670,9 @@ fingerprint; exact bounded transcript, refined bounds, indexed word evidence,
 unresolved/entity/dialect/code-switch evidence; bounded context actually sent;
 Stage 4.0 source moment, assessments, platform risk, preservation and
 verification evidence; target-market/language/register semantic context;
-narration-enabled/language/register semantic policy; Stage 4.1 policy/config/
-validation/schema; and planning provider mode, tier route, model, API, effective
+narration-enabled/language/register semantic policy; any optional operator
+source-window/editorial-direction request; Stage 4.1 policy/config/validation/
+schema; and planning provider mode, tier route, model, API, effective
 instruction/schema prompt hash, schema, temperature, thinking, and budgets.
 
 It excludes the Gemini key value or presence, admission/cooldown/outage state, TTS
@@ -649,7 +704,8 @@ persists newly completed work after cancellation.
 
 - `POST /api/candidates/{candidate_id}/transformation-plans` — queue one
   candidate-scoped planning run (returns plan-set/job/cache/active state; accepts
-  no TTS configuration).
+  optional `source_start`, `source_end`, and `editorial_intent` operator
+  constraints; accepts no TTS configuration).
 - `GET /api/candidates/{candidate_id}/transformation-plans` — read the current
   plan set and plans.
 - `GET /api/transformation-plan-sets/{plan_set_id}` — read one plan set.
@@ -657,7 +713,8 @@ persists newly completed work after cancellation.
   4.2 handoff.
 
 ```bash
-python -m app.cli transformation-plan-generate CANDIDATE_ID [--force]
+python -m app.cli transformation-plan-generate CANDIDATE_ID [--force] \
+  [--source-start SECONDS --source-end SECONDS] [--editorial-intent TEXT]
 python -m app.cli transformation-plans CANDIDATE_ID
 python -m app.cli transformation-plan-handoff CANDIDATE_ID
 ```
@@ -704,6 +761,10 @@ evasion, ASR/ingest changes, or automatic pipeline advancement.
 # focused Stage 4.1
 docker run --rm -e PYTHONPATH=/app -v "$PWD/backend:/app" -w /app oac-backend-test \
   python -m pytest tests/ -k stage41 -q
+
+# operator scope/intent contract (hermetic; no hosted calls)
+docker run --rm -e PYTHONPATH=/app -v "$PWD/backend:/app" -w /app oac-backend-test \
+  python -m pytest tests/test_stage41_operator_request.py -q
 
 # full backend suite (with repository compose/.env mounted for path-based tests)
 docker run --rm -e PYTHONPATH=/app -v "$PWD/backend:/app" \

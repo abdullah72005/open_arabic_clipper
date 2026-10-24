@@ -469,7 +469,12 @@ def resolve_source_span(
     if duration <= 0:
         return None, REJECT_INVALID_SPAN
     if block.use_full_window:
-        start, end = inputs.refined_start, inputs.refined_end
+        if inputs.has_operator_window:
+            # A scoped request is only satisfiable by an explicit in-window word
+            # selection. Never substitute the whole refined window or the whole
+            # approved window for a provider's missing selection.
+            return None, REJECT_INVALID_SPAN
+        start, end = inputs.planning_start, inputs.planning_end
         text = inputs.transcript
         return SpanResolution(start, end, text, None, None), None
     if block.word_start_index is None or block.word_end_index is None:
@@ -483,10 +488,10 @@ def resolve_source_span(
     selected = inputs.words[start_index : end_index + 1]
     start = selected[0].start
     end = selected[-1].end
-    tolerance = 0.75
+    tolerance = 0.0 if inputs.has_operator_window else 0.75
     if end <= start:
         return None, REJECT_INVALID_SPAN
-    if start < inputs.refined_start - tolerance or end > inputs.refined_end + tolerance:
+    if start < inputs.planning_start - tolerance or end > inputs.planning_end + tolerance:
         return None, REJECT_INVALID_SPAN
     text = " ".join(word.text for word in selected)
     return SpanResolution(start, end, text, start_index, end_index), None
@@ -510,7 +515,7 @@ def _resolve_block(
             return None, error or REJECT_INVALID_SPAN
         role = raw.source_role or SourceExcerptRole.SUPPORT
         duration = max(0.0, span.end - span.start)
-        planning_words = ()
+        planning_words: tuple[dict[str, object], ...] = ()
         if span.word_start_index is not None and span.word_end_index is not None:
             planning_words = tuple(
                 word.as_dict()
@@ -742,9 +747,10 @@ def validate_provider_plan(
         return ValidationResult(plan=None, reasons=(REJECT_HERO_PLACEMENT,))
     if hero.source_start is None or hero.source_end is None or hero.source_start >= hero.source_end:
         return ValidationResult(plan=None, reasons=(REJECT_INVALID_SPAN,))
+    hero_tolerance = 0.0 if inputs.has_operator_window else 0.75
     if (
-        hero.source_start < inputs.refined_start - 0.75
-        or hero.source_end > inputs.refined_end + 0.75
+        hero.source_start < inputs.planning_start - hero_tolerance
+        or hero.source_end > inputs.planning_end + hero_tolerance
     ):
         return ValidationResult(plan=None, reasons=(REJECT_INVALID_SPAN,))
 

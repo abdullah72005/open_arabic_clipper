@@ -136,6 +136,7 @@ def build_stage4_2_handoff(
         "input_fingerprint": plan_set.input_fingerprint,
         "output_fingerprint": plan_set.output_fingerprint,
         "target_context": dict(plan_set.target_context or {}),
+        "operator_request": dict(plan_set.operator_request or {}),
     }
     base["cache_eligible"] = bool(plan_set.cache_eligible)
     base["plans"] = [_plan_dict(row) for row in list_plans(session, plan_set.id) if row.is_current]

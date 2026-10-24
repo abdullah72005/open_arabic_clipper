@@ -573,6 +573,17 @@ def transformation_handoff(candidate_id: UUID) -> None:
 def transformation_plan_generate(
     candidate_id: UUID,
     force: bool = typer.Option(False, "--force/--no-force"),
+    source_start: float | None = typer.Option(
+        None, "--source-start", help="Operator-approved source window start in seconds."
+    ),
+    source_end: float | None = typer.Option(
+        None, "--source-end", help="Operator-approved source window end in seconds."
+    ),
+    editorial_intent: str | None = typer.Option(
+        None,
+        "--editorial-intent",
+        help="Operator direction for the plan; never source evidence or accepted copy.",
+    ),
 ) -> None:
     """Queue one explicit candidate-scoped Stage 4.1 planning run."""
 
@@ -581,7 +592,15 @@ def transformation_plan_generate(
             candidate, analysis = validate_candidate_for_planning(session, candidate_id)
         except PlanningQueueError as error:
             raise typer.BadParameter(str(error)) from error
-        outcome = queue_transformation_planning(session, candidate, analysis, force=force)
+        outcome = queue_transformation_planning(
+            session,
+            candidate,
+            analysis,
+            force=force,
+            operator_source_start=source_start,
+            operator_source_end=source_end,
+            editorial_intent=editorial_intent,
+        )
     typer.echo(
         json.dumps(
             {

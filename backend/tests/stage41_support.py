@@ -279,6 +279,9 @@ def seed_stage41(
     words: list[dict[str, object]] | None = None,
     second_strategy: tuple[TransformationStrategyType, str] | None = None,
     settings: FakeStage41Settings | None = None,
+    hook_index: int | None = None,
+    payoff_index: int | None = None,
+    source_segments: list[dict[str, object]] | None = None,
 ) -> tuple[Any, Any, Any, Any, list[Any]]:
     """Create a source/candidate/refinement plus a current Stage 4.0 analysis."""
 
@@ -317,7 +320,8 @@ def seed_stage41(
             normalized_text=transcript,
             corrected_text=transcript,
             final_text=transcript,
-            segments=[
+            segments=source_segments
+            or [
                 {"start": 0.0, "end": 20.0, "text": "Intro"},
                 {"start": 20.0, "end": 45.0, "text": transcript, "corrected_text": transcript},
                 {"start": 45.0, "end": 90.0, "text": "Outro"},
@@ -397,8 +401,8 @@ def seed_stage41(
         },
         source_moment={
             "structure": "CLAIM",
-            "hook_index": None,
-            "payoff_index": None,
+            "hook_index": hook_index,
+            "payoff_index": payoff_index,
             "duration": refined[1] - refined[0],
             "moment_density": 0.65,
             "evidence": ["content_type"],
@@ -476,14 +480,20 @@ def run_planning(
     provider: object | None = None,
     *,
     mode: SemanticProviderMode = SemanticProviderMode.ADAPTIVE,
+    operator_request: object | None = None,
 ) -> Any:
     """Run one planning executor pass over a seed and return the refreshed plan set."""
 
     from app.transformation.planning.executor import TransformationPlanningExecutor
     from app.transformation.planning.queue import get_or_create_plan_set
+    from app.transformation.planning.request import normalize_operator_request
 
     _source, candidate, _refinement, analysis, _strategies = seed
     plan_set = get_or_create_plan_set(session, candidate, analysis)
+    request = normalize_operator_request(operator_request)  # type: ignore[arg-type]
+    if request is not None:
+        plan_set.operator_request = request.as_dict()
+        session.flush()
     executor = TransformationPlanningExecutor(
         session=session,
         settings=settings,

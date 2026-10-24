@@ -467,10 +467,39 @@ class PlanningInputs:
     refinement_status: str
     refinement_output_fingerprint: str
     mandatory_evidence: Mapping[str, object] = field(default_factory=dict)
+    # Optional operator-approved planning scope. The source window is
+    # authoritative for selectable evidence; editorial intent is direction,
+    # never source evidence or accepted copy.
+    operator_request_version: str = ""
+    approved_source_start: float | None = None
+    approved_source_end: float | None = None
+    editorial_intent: str | None = None
+    selectable_start: float | None = None
+    selectable_end: float | None = None
+
+    @property
+    def has_operator_window(self) -> bool:
+        return self.approved_source_start is not None and self.approved_source_end is not None
+
+    @property
+    def has_operator_request(self) -> bool:
+        return (
+            bool(self.operator_request_version)
+            or self.has_operator_window
+            or bool(self.editorial_intent)
+        )
+
+    @property
+    def planning_start(self) -> float:
+        return self.selectable_start if self.selectable_start is not None else self.refined_start
+
+    @property
+    def planning_end(self) -> float:
+        return self.selectable_end if self.selectable_end is not None else self.refined_end
 
     @property
     def duration(self) -> float:
-        return max(0.0, self.refined_end - self.refined_start)
+        return max(0.0, self.planning_end - self.planning_start)
 
 
 def word_evidence_from_mapping(item: Mapping[str, object], index: int) -> WordEvidence | None:

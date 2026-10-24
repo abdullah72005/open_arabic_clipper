@@ -108,6 +108,11 @@ class TransformationPlanSet(Base):
     target_context: Mapped[dict[str, object]] = mapped_column(
         JSON, nullable=False, default=dict, server_default="{}"
     )
+    # Optional operator-approved planning scope and editorial direction. It is
+    # part of the Stage 4.1 input identity and is never source evidence.
+    operator_request: Mapped[dict[str, object]] = mapped_column(
+        JSON, nullable=False, default=dict, server_default="{}"
+    )
 
     provider_mode: Mapped[SemanticProviderMode] = mapped_column(
         Enum(

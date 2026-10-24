@@ -450,7 +450,13 @@ class TransformationPlanningExecutor:
             raise PlanningInputError("no usable Stage 3.5 refinement is available")
         settings = self._settings
         inputs = build_planning_inputs(
-            self._session, candidate, analysis, refinement, settings, self._config
+            self._session,
+            candidate,
+            analysis,
+            refinement,
+            settings,
+            self._config,
+            plan_set.operator_request,
         )
         fingerprint = self._input_fingerprint(inputs)
         return candidate, analysis, refinement, inputs, fingerprint
@@ -470,7 +476,13 @@ class TransformationPlanningExecutor:
         if refinement is None:
             return ""
         inputs = build_planning_inputs(
-            self._session, candidate, analysis, refinement, self._settings, self._config
+            self._session,
+            candidate,
+            analysis,
+            refinement,
+            self._settings,
+            self._config,
+            plan_set.operator_request,
         )
         return self._input_fingerprint(inputs)
 

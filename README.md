@@ -363,10 +363,21 @@ automatic stage chain, adds no `PipelineStage`/`PipelineRun`/`_NEXT_STAGE` entry
 and never touches the source lifecycle.
 
 ```bash
-python -m app.cli transformation-plan-generate CANDIDATE_ID
+python -m app.cli transformation-plan-generate CANDIDATE_ID \
+  [--source-start SECONDS --source-end SECONDS] \
+  [--editorial-intent TEXT]
 python -m app.cli transformation-plans CANDIDATE_ID
 python -m app.cli transformation-plan-handoff CANDIDATE_ID
 ```
+
+`--source-start`/`--source-end` are an optional operator-approved, finite,
+paired source window. Every selectable source excerpt and every mandatory
+hook/payoff segment must stay inside it, with no boundary tolerance expansion.
+`--editorial-intent` is operator direction for the plan, never source evidence,
+accepted copy, or a guaranteed strategy. The request is persisted on the
+existing plan-set envelope, participates in input/provider fingerprints and
+checkpoint/cache freshness, and is recovered by Stage 4.2; an unscoped call
+leaves a previously bound request in force rather than silently removing it.
 
 API: `POST /api/candidates/{id}/transformation-plans`, `GET
 /api/candidates/{id}/transformation-plans`, `GET

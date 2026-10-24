@@ -113,6 +113,7 @@ def seed_stage50(
     source_only: bool = False,
     first_provider_plan_factory: Any | None = None,
     media_writer: Any | None = None,
+    operator_request: Any = None,
 ) -> Stage50Fixture:
     specs = result_specs or [make_result_spec()]
     fixture = seed_selection_fixture(
@@ -125,6 +126,7 @@ def seed_stage50(
         final_transcript=final_transcript,
         source_only=source_only,
         first_provider_plan_factory=first_provider_plan_factory,
+        operator_request=operator_request,
     )
     if clear_hook_payoff:
         for plan in fixture.plans:

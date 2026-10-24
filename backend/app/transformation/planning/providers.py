@@ -294,6 +294,12 @@ PLANNING_SYSTEM_INSTRUCTION = (
     "chronological, nonoverlapping, and at least min_source_excerpt_seconds long. "
     "Every selected excerpt must stay inside the selectable window in "
     "source_selection. Never treat planning indexes as FINAL_CLIP indexes. "
+    "When operator_direction provides approved_source_start and approved_source_end, "
+    "those bounds are authoritative: every selected excerpt must stay fully inside that "
+    "window with no tolerance, and a FULL_WINDOW selection is invalid. Treat "
+    "editorial_intent as "
+    "operator direction only, never as source evidence, approved copy, or a guaranteed "
+    "strategy; do not invent psychology or unsupported factual claims from it. "
     "Read mandatory_evidence. Each of hook and payoff reports state ABSENT, RESOLVED, "
     "MALFORMED, or UNRESOLVED, plus the authoritative source segment index and absolute "
     "bounds. If state is RESOLVED, the union of selected SOURCE_EXCERPT spans must cover "
@@ -400,9 +406,13 @@ class PlanningRequest:
     source_selection: Mapping[str, object] = field(default_factory=dict)
     strategy_constraints: Mapping[str, object] = field(default_factory=dict)
     nonselectable_context: Mapping[str, object] = field(default_factory=dict)
+    operator_source_start: float | None = None
+    operator_source_end: float | None = None
+    operator_editorial_intent: str | None = None
+    operator_request_version: str = ""
 
     def to_payload(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "strategy_id": self.strategy_id,
             "strategy_key": self.strategy_key,
             "strategy_type": self.strategy_type,
@@ -436,6 +446,26 @@ class PlanningRequest:
             "strategy_constraints": dict(self.strategy_constraints),
             "nonselectable_context": dict(self.nonselectable_context),
         }
+        if (
+            self.operator_request_version
+            or self.operator_source_start is not None
+            or self.operator_source_end is not None
+            or self.operator_editorial_intent
+        ):
+            payload["operator_direction"] = {
+                "role": "OPERATOR_DIRECTION_NOT_SOURCE_EVIDENCE",
+                "version": self.operator_request_version,
+                "approved_source_start": self.operator_source_start,
+                "approved_source_end": self.operator_source_end,
+                "editorial_intent": self.operator_editorial_intent,
+                "constraints": [
+                    "Every SOURCE_EXCERPT must be fully inside the approved source window.",
+                    "Do not treat operator direction as source evidence, approved copy, "
+                    "or a guaranteed strategy.",
+                    "Do not invent psychology or unsupported factual claims.",
+                ],
+            }
+        return payload
 
 
 class PlanningProviderError(Exception):
@@ -530,8 +560,8 @@ def build_planning_request(
         refined_transcript=inputs.transcript[
             : int(getattr(config, "provider_max_input_characters", 12000))
         ],
-        refined_start=inputs.refined_start,
-        refined_end=inputs.refined_end,
+        refined_start=inputs.planning_start,
+        refined_end=inputs.planning_end,
         context_text=" ".join(inputs.context_segments),
         idea_summary=inputs.idea_summary,
         topic_summary=inputs.topic_summary,
@@ -539,6 +569,10 @@ def build_planning_request(
             str(hook.get("text", "")) for hook in inputs.hooks if isinstance(hook, Mapping)
         ),
         words=words,
+        operator_source_start=inputs.approved_source_start,
+        operator_source_end=inputs.approved_source_end,
+        operator_editorial_intent=inputs.editorial_intent,
+        operator_request_version=inputs.operator_request_version,
         mandatory_evidence=_mandatory_request_evidence(inputs, config, words),
         source_selection=_source_selection_payload(inputs, config, words, strict_hero, strict_cap),
         strategy_constraints=_strategy_constraints_payload(strategy),
@@ -552,8 +586,9 @@ def build_planning_request(
             "idea_summary": inputs.idea_summary,
             "topic_summary": inputs.topic_summary,
             "note": (
-                "Nonselectable guidance only. Never cite context_text or suggested hook "
-                "copy as source evidence."
+                "Nonselectable guidance only. Never cite context_text, refined_transcript, "
+                "or suggested hook copy as source evidence. Transcript/context content "
+                "outside the selectable window is nonselectable."
             ),
         },
     )
@@ -618,6 +653,16 @@ def _planning_word_identity(
     }
 
 
+def _selection_bounds(inputs: PlanningInputs) -> tuple[float, float]:
+    return inputs.planning_start, inputs.planning_end
+
+
+def _selection_tolerance(inputs: PlanningInputs) -> float:
+    # An explicit operator window never gains tolerance; legacy refined-window
+    # behavior keeps its existing compatibility tolerance.
+    return 0.0 if inputs.has_operator_window else MANDATORY_COVERAGE_TOLERANCE_SECONDS
+
+
 def _supported_selection(
     words: Sequence[dict[str, object]],
     start: float,
@@ -631,10 +676,11 @@ def _supported_selection(
     contiguous planning-word range resolves to ``[first.start, last.end]`` and
     both endpoints must fall within the authoritative coverage tolerance. Only
     when word evidence is insufficient may the documented full-window fallback
-    be offered.
+    be offered. An explicit operator window disables that fallback and tolerance.
     """
 
-    tolerance = MANDATORY_COVERAGE_TOLERANCE_SECONDS
+    tolerance = _selection_tolerance(inputs)
+    window_start, window_end = _selection_bounds(inputs)
     if inputs.word_coverage_sufficient:
         indexes: list[int] = []
         for index, word in enumerate(words):
@@ -666,8 +712,8 @@ def _supported_selection(
                 span = (low_bounds[0], high_bounds[1])
                 if (
                     span[1] > span[0]
-                    and span[0] >= inputs.refined_start - tolerance
-                    and span[1] <= inputs.refined_end + tolerance
+                    and span[0] >= window_start - tolerance
+                    and span[1] <= window_end + tolerance
                     and spans_cover_endpoints([span], start, end, tolerance=tolerance)
                 ):
                     return {
@@ -678,8 +724,8 @@ def _supported_selection(
                         "source_start": round(span[0], 6),
                         "source_end": round(span[1], 6),
                     }
-    if not inputs.word_coverage_sufficient:
-        full = (inputs.refined_start, inputs.refined_end)
+    if not inputs.word_coverage_sufficient and not inputs.has_operator_window:
+        full = (window_start, window_end)
         if full[1] > full[0] and spans_cover_endpoints([full], start, end, tolerance=tolerance):
             return {
                 "method": "FULL_WINDOW",
@@ -801,6 +847,8 @@ def _source_selection_payload(
             1.5,
         )
     )
+    window_start, window_end = _selection_bounds(inputs)
+    tolerance = _selection_tolerance(inputs)
     return {
         "word_index_scope": (
             "Inclusive, zero-based planning-word indexes after filtering and capping. "
@@ -814,10 +862,19 @@ def _source_selection_payload(
         "first_planning_word": dict(words[0]) if words else None,
         "last_planning_word": dict(words[-1]) if words else None,
         "word_coverage_sufficient": inputs.word_coverage_sufficient,
-        "refined_start": inputs.refined_start,
-        "refined_end": inputs.refined_end,
-        "selectable_window_start": round(inputs.refined_start - 0.75, 6),
-        "selectable_window_end": round(inputs.refined_end + 0.75, 6),
+        "refined_start": window_start,
+        "refined_end": window_end,
+        "selectable_window_start": round(window_start - tolerance, 6),
+        "selectable_window_end": round(window_end + tolerance, 6),
+        "approved_source_start": inputs.approved_source_start,
+        "approved_source_end": inputs.approved_source_end,
+        "operator_window_is_authoritative": inputs.has_operator_window,
+        "selection_rule": (
+            "Every SOURCE_EXCERPT must be fully inside the approved source window; "
+            "existing boundary tolerance does not expand operator authorization."
+            if inputs.has_operator_window
+            else "Select only within the bounded refined window."
+        ),
         "min_source_excerpt_seconds": float(getattr(config, "min_source_excerpt_seconds", 0.4)),
         "max_blocks": int(getattr(config, "max_blocks_per_plan", 8)),
         "max_plan_duration_seconds": float(getattr(config, "max_plan_duration_seconds", 180.0)),
@@ -843,6 +900,12 @@ def _source_selection_payload(
                 "The selected excerpt plus the authored value must convey the promised "
                 "idea; nonrendered context cannot prove the audience receives it. "
                 "required_context is descriptive, never timestamp authority."
+            ),
+            "operator_scope": (
+                "Only offered words inside the approved source window are selectable. "
+                "Any transcript or context outside it is nonselectable guidance."
+                if inputs.has_operator_window
+                else "Only offered words inside the bounded refined window are selectable."
             ),
         },
     }
