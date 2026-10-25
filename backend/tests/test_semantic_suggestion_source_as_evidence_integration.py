@@ -49,6 +49,7 @@ from app.materialization.providers import (
     build_writing_request,
     materialize_script,
 )
+from app.materialization.scripting import validate_authored_block
 from app.materialization.service import (
     _contract_slots,
     _final_clip_evidence,
@@ -56,7 +57,7 @@ from app.materialization.service import (
     _source_media_evidence,
 )
 from app.media.ffprobe import MediaMetadata
-from app.models import CandidateRefinement
+from app.models import CandidateRefinement, Transcript
 from app.render.service import create_render_contract
 from app.transformation.executor import build_transformation_executor
 from app.transformation.governance.executor import build_transformation_governance_executor
@@ -199,11 +200,32 @@ def test_source_as_evidence_authored_thesis_suggestion_passes_every_boundary(
         strategy_type=TransformationStrategyType.SOURCE_AS_EVIDENCE,
         value_kind=SubstantiveValueKind.AUTHORED_THESIS,
         transcript=SOURCE_EXCERPT,
+        transcript_duration=360.0,
         refined=(WINDOW_START, WINDOW_END),
+        candidate_start=WINDOW_START,
+        candidate_end=WINDOW_END,
+        source_segments=[
+            {"start": 0.0, "end": WINDOW_START, "text": "Intro"},
+            {
+                "start": WINDOW_START,
+                "end": WINDOW_END,
+                "text": SOURCE_EXCERPT,
+                "corrected_text": SOURCE_EXCERPT,
+            },
+            {"start": WINDOW_END, "end": 360.0, "text": "Outro"},
+        ],
         words=words,
     )
     source, candidate, planning_refinement, analysis, strategies = seed
     assert candidate.id == uuid.UUID(CANDIDATE_ID)
+    assert candidate.start_time == WINDOW_START
+    assert candidate.end_time == WINDOW_END
+    assert planning_refinement.coarse_start == WINDOW_START
+    assert planning_refinement.coarse_end == WINDOW_END
+    transcript_row = session.query(Transcript).filter_by(source_video_id=source.id).one()
+    target_segment = transcript_row.segments[1]
+    assert (target_segment["start"], target_segment["end"]) == (WINDOW_START, WINDOW_END)
+    assert target_segment["text"] == SOURCE_EXCERPT
     assert strategies[0].strategy_type.value == "SOURCE_AS_EVIDENCE"
 
     # Plan against the exact FINAL_CLIP refinement the production path uses.
@@ -299,7 +321,7 @@ def test_source_as_evidence_authored_thesis_suggestion_passes_every_boundary(
     plan = plans[0]
     assert plan.blocks[1]["substantive_value_kind"] == "AUTHORED_THESIS"
     assert plan.blocks[1]["draft_line"] == SUGGESTION
-    assert plan.blocks[0].get("use_full_window") is not True
+    assert provider_plan.blocks[0].use_full_window is False
     assert plan.blocks[0]["word_start_index"] == 0
     assert plan.blocks[0]["word_end_index"] == len(words) - 1
     assert plan.blocks[0]["source_start"] == WINDOW_START
@@ -345,14 +367,31 @@ def test_source_as_evidence_authored_thesis_suggestion_passes_every_boundary(
     assert target.substantive_value_kind == "AUTHORED_THESIS"
     assert target.claim_class == "AUTHORED_SOURCE_LINKED_SUGGESTION"
 
+    # The label is not acceptance: this exact copy requires the complete
+    # semantic critique before it can be accepted.
+    validation = validate_authored_block(
+        {**inputs.blocks[1], "copy": SUGGESTION},
+        inputs,
+        STAGE6_CONFIG,
+    )
+    assert validation.claim is not None
+    assert validation.claim.claim_class == "AUTHORED_SOURCE_LINKED_SUGGESTION"
+    assert validation.requires_semantic_review is True
+    assert validation.accepted is False
+
+    critique_provider = FakeCritiqueProvider(accepted={1: True})
     script = materialize_script(
         FakeWritingProvider(copies={1: SUGGESTION}),
         inputs,
         ledger=CallLedger(),
         config=STAGE6_CONFIG,
         allow_hosted=True,
-        critique_provider=FakeCritiqueProvider(accepted={1: True}),
+        critique_provider=critique_provider,
     )
+    assert len(critique_provider.calls) == 1
+    critique_target = critique_provider.calls[0].targets[0]
+    assert critique_target.block_index == 1
+    assert critique_target.claim_class == "AUTHORED_SOURCE_LINKED_SUGGESTION"
     assert script.accepted
     assert len(script.authored_blocks) == 1
     assert script.authored_blocks[0].substantive_value_kind == "AUTHORED_THESIS"

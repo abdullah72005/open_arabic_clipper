@@ -513,6 +513,21 @@ def test_shared_semantic_contract_is_in_every_stage_instruction() -> None:
     assert "AUTHORED SOURCE-LINKED SUGGESTION" in SEMANTIC_CLAIM_CONTRACT
 
 
+def test_planning_instruction_does_not_require_useful_takeaway_for_suggestions() -> None:
+    from app.core.semantic_contract import SEMANTIC_CLAIM_CONTRACT
+    from app.transformation.planning.providers import PLANNING_SYSTEM_INSTRUCTION
+
+    assert "If the value is an authored suggestion, use USEFUL_TAKEAWAY" not in (
+        PLANNING_SYSTEM_INSTRUCTION
+    )
+    assert "An authored suggestion is a claim category, not a substantive value kind" in (
+        PLANNING_SYSTEM_INSTRUCTION
+    )
+    assert "strategy_constraints.allowed_value_kinds" in PLANNING_SYSTEM_INSTRUCTION
+    assert "SOURCE_AS_EVIDENCE that is AUTHORED_THESIS" in PLANNING_SYSTEM_INSTRUCTION
+    assert "does not require USEFUL_TAKEAWAY" in SEMANTIC_CLAIM_CONTRACT
+
+
 def test_stage6_unfavorable_complete_critique_still_rejects() -> None:
     inputs = _stage6_inputs(
         intent="Offer an authored, source-linked conversational suggestion.",
