@@ -256,6 +256,9 @@ class PlanProviderBlock:
     use_full_window: bool = False
     continuity_rationale: str | None = None
     substantive_value_kind: SubstantiveValueKind | None = None
+    # Bounded raw value retained when the provider supplies an unknown kind so
+    # rejection diagnostics can report the actual value without raw payloads.
+    substantive_value_kind_raw: str | None = None
     semantic_intent: str | None = None
     why_unavailable: str | None = None
     grounding_refs: tuple[str, ...] = ()
@@ -302,6 +305,8 @@ class PlanProviderResult:
     # Bounded parser rejections for this requested identity. These are recorded
     # even when no plan was collected, and never make a rejected entry reusable.
     rejections: tuple[Mapping[str, object], ...] = ()
+    # Bounded SDK/schema parse rejections (distinct from application validation).
+    schema_rejections: tuple[Mapping[str, object], ...] = ()
 
 
 @dataclass(frozen=True)

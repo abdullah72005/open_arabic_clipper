@@ -22,6 +22,7 @@ from app.transcription.reconstruction.providers import (
 )
 from app.transformation.planning.policy import SCHEMA_VERSION
 from app.transformation.planning.providers import (
+    PLANNING_SCHEMA_BINDING_VERSION,
     PLANNING_SYSTEM_INSTRUCTION,
     PlanningProviderError,
     PlanningRequest,
@@ -74,6 +75,7 @@ class LocalPlanningProvider:
             "digest": self._digest,
             "prompt_hash": planning_prompt_hash(),
             "schema_version": SCHEMA_VERSION,
+            "schema_binding_version": PLANNING_SCHEMA_BINDING_VERSION,
             "temperature": self._temperature,
             "max_output_tokens": self._output_tokens,
         }

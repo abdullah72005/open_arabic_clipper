@@ -19,6 +19,9 @@ from app.core.enums import (
     TransformationStrategyType,
 )
 
+# v14 strategy-bound provider schema: the hosted response schema restricts each
+# requested strategy's substantive value kinds to its authoritative subset and
+# SDK/application value-kind rejections carry bounded actual/allowed evidence.
 # v12 producer/validator selection-agreement correction: WORD_SELECTION is
 # advertised only when word coverage is sufficient, and insufficient nonempty
 # word evidence uses the existing full-window fallback instead of advertising a
@@ -27,9 +30,9 @@ from app.core.enums import (
 # semantics and parser rejections are retained as bounded diagnostics), v10
 # producer-contract alignment, and v8 Arabic multi-token closure remain in
 # force.
-POLICY_VERSION = "stage4.1-v13"
-SCHEMA_VERSION = "stage4.1-schema-v12"
-VALIDATION_VERSION = "stage4.1-validation-v13"
+POLICY_VERSION = "stage4.1-v14"
+SCHEMA_VERSION = "stage4.1-schema-v13"
+VALIDATION_VERSION = "stage4.1-validation-v14"
 INPUT_FINGERPRINT_VERSION = "2"
 OUTPUT_FINGERPRINT_VERSION = "2"
 PLAN_FINGERPRINT_VERSION = "2"

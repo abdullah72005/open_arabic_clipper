@@ -90,8 +90,10 @@ from app.transformation.planning.policy import (
 )
 from app.transformation.planning.providers import (
     PLANNING_OUTPUT_SCHEMA,
+    PLANNING_SCHEMA_BINDING_VERSION,
     PLANNING_SYSTEM_INSTRUCTION,
     PlanningOutputSchema,
+    build_planning_output_schema,
     build_planning_request,
     planning_prompt_hash,
 )
@@ -229,7 +231,8 @@ def test_actual_provider_schema_and_instruction_are_the_authoritative_contract(
 
     config = captured["config"]
     assert config.system_instruction == PLANNING_SYSTEM_INSTRUCTION
-    assert config.response_schema is PlanningOutputSchema
+    bound_schema = build_planning_output_schema([request])
+    assert config.response_schema.model_json_schema() == bound_schema.model_json_schema()
     assert PLANNING_OUTPUT_SCHEMA == PlanningOutputSchema.model_json_schema()
 
     block_required = set(PLANNING_OUTPUT_SCHEMA["$defs"]["PlanningBlockSchema"]["required"])
@@ -270,6 +273,7 @@ def test_actual_provider_schema_and_instruction_are_the_authoritative_contract(
         .sha256(
             (
                 PLANNING_SYSTEM_INSTRUCTION
+                + PLANNING_SCHEMA_BINDING_VERSION
                 + json.dumps(PlanningOutputSchema.model_json_schema(), sort_keys=True)
             ).encode("utf-8")
         )
@@ -277,6 +281,7 @@ def test_actual_provider_schema_and_instruction_are_the_authoritative_contract(
     )
     assert planning_prompt_hash() == expected_hash
     assert provider.runtime_identity()["schema_version"] == SCHEMA_VERSION
+    assert provider.runtime_identity()["schema_binding_version"] == PLANNING_SCHEMA_BINDING_VERSION
 
 
 _EXPECTED_PLANNING_WORDS = {
@@ -418,7 +423,10 @@ def test_actual_request_feasibility_and_gemini_boundary_agree_for_every_fixture(
         captured = _capture_gemini_request(request)
         config = captured["config"]
         assert config.system_instruction == PLANNING_SYSTEM_INSTRUCTION
-        assert config.response_schema is PlanningOutputSchema
+        assert (
+            config.response_schema.model_json_schema()
+            == build_planning_output_schema([request]).model_json_schema()
+        )
         contents = json.loads(captured["contents"])
         assert contents["plans_requested"] == [payload]
         assert (

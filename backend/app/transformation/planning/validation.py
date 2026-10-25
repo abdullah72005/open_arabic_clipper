@@ -166,6 +166,9 @@ class ValidationResult:
     plan: ValidatedPlan | None
     reasons: tuple[str, ...] = ()
     explicit_no_plan: bool = False
+    # Bounded structured detail for contract rejections (for example the actual
+    # and allowed substantive value kinds). Never raw provider payloads.
+    rejection_details: tuple[Mapping[str, object], ...] = ()
 
 
 def _tokens(text: str) -> list[str]:
@@ -633,6 +636,32 @@ def _validate_substantive_block(
     return None
 
 
+def _value_kind_rejection(
+    block: PlanBlock,
+    raw: PlanProviderBlock | None,
+    strategy: Mapping[str, object],
+    strategy_type: TransformationStrategyType,
+) -> dict[str, object]:
+    """Bounded, non-secret evidence for an application validation rejection."""
+
+    allowed = [item.value for item in strategy_value_kinds(strategy_type)]
+    actual: str | None
+    if block.substantive_value_kind is not None:
+        actual = block.substantive_value_kind.value
+    else:
+        actual = raw.substantive_value_kind_raw if raw is not None else None
+    return {
+        "origin": "APPLICATION_VALIDATION",
+        "code": REJECT_VALUE_KIND_MISMATCH,
+        "strategy_id": str(strategy.get("id", "")),
+        "strategy_key": str(strategy.get("strategy_key", "")),
+        "block_index": block.index,
+        "field": "substantive_value_kind",
+        "actual_value": actual[:80] if isinstance(actual, str) else actual,
+        "allowed_values": allowed,
+    }
+
+
 def _resolve_narration(
     plan: PlanProviderPlan, inputs: PlanningInputs
 ) -> tuple[NarrationRequirement, str | None]:
@@ -842,7 +871,15 @@ def validate_provider_plan(
     for block in substantive:
         error = _validate_substantive_block(block, inputs, strategy_type, config)
         if error is not None:
-            return ValidationResult(plan=None, reasons=(error,))
+            details: tuple[Mapping[str, object], ...] = ()
+            if error == REJECT_VALUE_KIND_MISMATCH:
+                raw = raw_blocks[block.index] if 0 <= block.index < len(raw_blocks) else None
+                details = (_value_kind_rejection(block, raw, strategy, strategy_type),)
+            return ValidationResult(
+                plan=None,
+                reasons=(error,),
+                rejection_details=details,
+            )
 
     if not substantive and not _verification_blocks(blocks):
         return ValidationResult(plan=None, reasons=(REJECT_NO_VALUE,))

@@ -13,9 +13,9 @@ import json
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Literal, Protocol, cast
+from typing import Literal, Protocol, Union, cast
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, create_model
 
 from app.candidates.providers import ProviderErrorCategory  # noqa: F401  (re-exported)
 from app.core.enums import (
@@ -277,6 +277,106 @@ class PlanningOutputSchema(BaseModel):
 # deliberately not permitted.
 PLANNING_OUTPUT_SCHEMA: dict[str, object] = PlanningOutputSchema.model_json_schema()
 
+# The static schema above is the canonical superset vocabulary. The hosted
+# provider receives a batch-bound derivation whose per-strategy plan variants
+# restrict `substantive_value_kind` to that strategy's authoritative allowed
+# subset. The binding version participates in the prompt identity so a change
+# to this derivation invalidates affected caches.
+PLANNING_SCHEMA_BINDING_VERSION = "stage4.1-strategy-bound-schema-v1"
+
+_PLAN_DESCRIPTION = "Exactly one plan per requested strategy; no unrequested identities."
+_BLOCK_DESCRIPTION = (
+    "Ordered blocks. A valid plan has at least one SOURCE_EXCERPT and exactly one "
+    "HERO at block 0 or 1. Selected SOURCE_EXCERPT spans must cover every resolved "
+    "mandatory hook/payoff segment endpoint. Nonoverlapping chronological excerpts."
+)
+_VALUE_KIND_DESCRIPTION = (
+    "ORIGINAL_VALUE/TEXTUAL_ANNOTATION only. Must be one of this strategy's "
+    "authorized substantive value kinds."
+)
+
+
+def _request_value_kinds(request: PlanningRequest) -> tuple[str, ...]:
+    from app.core.enums import TransformationStrategyType
+
+    try:
+        strategy_type = TransformationStrategyType(str(request.strategy_type))
+    except ValueError:
+        return ()
+    return tuple(item.value for item in strategy_value_kinds(strategy_type))
+
+
+def _value_kind_field_type(allowed: tuple[str, ...]) -> object:
+    if not allowed:
+        # No substantive kind is authorized for an unknown strategy type.
+        return type(None)
+    return Literal[tuple(allowed)] | None  # type: ignore[valid-type]
+
+
+def build_planning_output_schema(
+    requests: Sequence[PlanningRequest],
+) -> type[BaseModel]:
+    """Bind the hosted response schema to the exact requested strategies.
+
+    Each requested strategy gets a plan variant whose `strategy_id` and
+    `strategy_key` are constants and whose block `substantive_value_kind` enum is
+    that strategy's authoritative allowed subset. A mixed batch therefore
+    enforces every strategy's own contract in one serialized schema and still
+    uses exactly one provider call per tier.
+    """
+
+    variants: list[type[BaseModel]] = []
+    seen: set[tuple[str, str, tuple[str, ...]]] = set()
+    for request in requests:
+        allowed = _request_value_kinds(request)
+        signature = (request.strategy_id, request.strategy_key, allowed)
+        if signature in seen:
+            continue
+        seen.add(signature)
+        digest = hashlib.sha256(
+            "|".join((request.strategy_id, request.strategy_key, ",".join(allowed))).encode()
+        ).hexdigest()[:12]
+        block_model = create_model(
+            f"PlanningBlockSchema_{digest}",
+            __base__=PlanningBlockSchema,
+            substantive_value_kind=(
+                _value_kind_field_type(allowed),
+                Field(default=None, description=_VALUE_KIND_DESCRIPTION),
+            ),
+        )
+        plan_model = create_model(
+            f"PlanningPlanSchema_{digest}",
+            __base__=PlanningPlanSchema,
+            strategy_id=(
+                Literal[request.strategy_id],  # type: ignore[valid-type]
+                Field(description="Exact requested strategy_id."),
+            ),
+            strategy_key=(
+                Literal[request.strategy_key],  # type: ignore[valid-type]
+                Field(description="Exact requested strategy_key."),
+            ),
+            blocks=(list[block_model], Field(description=_BLOCK_DESCRIPTION)),
+        )
+        variants.append(plan_model)
+    if not variants:
+        return PlanningOutputSchema
+    items: object
+    if len(variants) == 1:
+        items = variants[0]
+    else:
+        items = Union[tuple(variants)]  # type: ignore[arg-type]
+    return create_model(
+        "PlanningOutputSchema",
+        plans=(list[items], Field(description=_PLAN_DESCRIPTION)),  # type: ignore[valid-type]
+    )
+
+
+def planning_output_schema_digest(requests: Sequence[PlanningRequest]) -> str:
+    """Stable digest of the exact serialized schema sent for a batch."""
+
+    schema = build_planning_output_schema(requests).model_json_schema()
+    return hashlib.sha256(json.dumps(schema, sort_keys=True).encode("utf-8")).hexdigest()
+
 
 PLANNING_SYSTEM_INSTRUCTION = (
     "You produce concrete structured transformation plans for one short Arabic "
@@ -363,9 +463,11 @@ _BOUNDED_LIST = 12
 
 def planning_prompt_hash() -> str:
     return hashlib.sha256(
-        (PLANNING_SYSTEM_INSTRUCTION + json.dumps(PLANNING_OUTPUT_SCHEMA, sort_keys=True)).encode(
-            "utf-8"
-        )
+        (
+            PLANNING_SYSTEM_INSTRUCTION
+            + PLANNING_SCHEMA_BINDING_VERSION
+            + json.dumps(PLANNING_OUTPUT_SCHEMA, sort_keys=True)
+        ).encode("utf-8")
     ).hexdigest()
 
 
@@ -471,10 +573,20 @@ class PlanningRequest:
 class PlanningProviderError(Exception):
     """Sanitized provider failure that never carries credentials or transcript data."""
 
-    def __init__(self, category: str, detail: str = "") -> None:
+    def __init__(
+        self,
+        category: str,
+        detail: str = "",
+        *,
+        rejections: Sequence[Mapping[str, object]] = (),
+        response_evidence: Mapping[str, object] | None = None,
+    ) -> None:
         super().__init__(f"transformation_planning_{category}")
         self.category = category
         self.detail = detail
+        # Bounded structured rejection evidence for SDK/schema failures.
+        self.rejections = tuple(dict(item) for item in rejections)
+        self.response_evidence = dict(response_evidence or {})
 
 
 class PlanningProvider(Protocol):
@@ -510,6 +622,7 @@ class DeterministicPlanningProvider:
             "model": None,
             "prompt_hash": planning_prompt_hash(),
             "schema_version": SCHEMA_VERSION,
+            "schema_binding_version": PLANNING_SCHEMA_BINDING_VERSION,
             "temperature": 0.0,
         }
 
@@ -1045,6 +1158,7 @@ def _parse_block(entry: Mapping[str, object]) -> PlanProviderBlock | None:
     grounding_refs, grounding_refs_invalid, grounding_refs_errors = _parse_grounding_refs(
         entry.get("grounding_refs")
     )
+    raw_value_kind = entry.get("substantive_value_kind")
     return PlanProviderBlock(
         block_type=block_type,  # type: ignore[arg-type]
         purpose=_bounded_text(entry.get("purpose"), _BOUNDED_FIELD),
@@ -1058,6 +1172,9 @@ def _parse_block(entry: Mapping[str, object]) -> PlanProviderBlock | None:
         use_full_window=bool(entry.get("use_full_window", False)),
         continuity_rationale=_bounded_text(entry.get("continuity_rationale"), _BOUNDED_FIELD),
         substantive_value_kind=_enum(entry.get("substantive_value_kind"), SubstantiveValueKind),  # type: ignore[arg-type]
+        substantive_value_kind_raw=(
+            str(raw_value_kind)[:_BOUNDED_FIELD] if raw_value_kind is not None else None
+        ),
         semantic_intent=_bounded_text(entry.get("semantic_intent"), _BOUNDED_FIELD),
         why_unavailable=_bounded_text(entry.get("why_unavailable"), _BOUNDED_FIELD),
         grounding_refs=grounding_refs,
@@ -1160,6 +1277,7 @@ def parse_plan_results(
     requests: Sequence[PlanningRequest],
     *,
     response_evidence: Mapping[str, object] | None = None,
+    schema_rejections: Sequence[Mapping[str, object]] = (),
 ) -> dict[str, PlanProviderResult]:
     """Strictly parse provider plans and retain bounded rejection evidence.
 
@@ -1310,13 +1428,19 @@ def parse_plan_results(
     for key in requested:
         plans = tuple(collected.get(key, ()))
         candidate_rejections = tuple(rejections.get(key, ()))
-        if not plans and not candidate_rejections:
+        candidate_schema_rejections = tuple(
+            dict(item)
+            for item in list(schema_rejections)[:8]
+            if item.get("strategy_key") in (None, key)
+        )
+        if not plans and not candidate_rejections and not candidate_schema_rejections:
             continue
         parsed_results[key] = PlanProviderResult(
             plans=plans,
             confidence=plans[0].confidence if plans else 0.0,
             response_evidence=dict(evidence),
             rejections=candidate_rejections,
+            schema_rejections=candidate_schema_rejections,
         )
     return parsed_results
 
@@ -1358,6 +1482,7 @@ def _block_payload(block: PlanProviderBlock) -> dict[str, object]:
         "substantive_value_kind": (
             block.substantive_value_kind.value if block.substantive_value_kind else None
         ),
+        "substantive_value_kind_raw": block.substantive_value_kind_raw,
         "semantic_intent": block.semantic_intent,
         "why_unavailable": block.why_unavailable,
         "grounding_refs": list(block.grounding_refs),

@@ -787,7 +787,18 @@ only with sufficient word coverage, while insufficient nonempty word evidence
 uses the existing validated `FULL_WINDOW` fallback; the regression uses an
 authentic nonempty word subset whose sufficiency is computed by the production
 helper and verifies both the advertised method and the real validator. The
-required-source-grounding correction advanced the validation
+strategy-bound provider-contract correction advanced planning to
+`stage4.1-v14` / `stage4.1-schema-v13` / `stage4.1-validation-v14` and kept the
+provider-input fingerprint at version `2`: the exact hosted response schema is
+derived per batch from the requested strategies, so each plan variant fixes its
+`strategy_id`/`strategy_key` and restricts `substantive_value_kind` to that
+strategy's authoritative `strategy_value_kinds` subset. Mixed-strategy batches
+therefore enforce every strategy's own contract in one schema and one provider
+call per tier. SDK schema parse failures and application value-kind rejections
+are retained as bounded diagnostics with origin (`SDK_PARSING` or
+`APPLICATION_VALIDATION`), strategy identity, block index, field, actual rejected
+value, and allowed values; raw responses, transcript payloads, and credentials
+are never stored. The required-source-grounding correction advanced the validation
 version to `stage4.1-validation-v11` (authoritative declaration resolution, a
 required-grounding policy for substantive authored blocks, bounded word-range
 work, and Stage 6-parity time-point/range coverage), so prior plans and

@@ -335,6 +335,8 @@ class PlanningService:
                                 outcome="DEFERRED",
                                 phase=phase,
                                 reasons=(error.category,),
+                                response_evidence=error.response_evidence or None,
+                                schema_rejections=error.rejections,
                             ),
                         )
                     )
@@ -361,9 +363,13 @@ class PlanningService:
                 # latter without treating it as an absent plan.
                 self._unfinished = True
                 parser_rejections = tuple(result.rejections) if result is not None else ()
+                schema_rejections = tuple(result.schema_rejections) if result is not None else ()
                 if parser_rejections:
                     reason = str(parser_rejections[0].get("code") or "PARSER_REJECTION")
                     phase = "PARSER_REJECTION"
+                elif schema_rejections:
+                    reason = str(schema_rejections[0].get("code") or "SCHEMA_REJECTION")
+                    phase = "SDK_SCHEMA_REJECTION"
                 else:
                     reason = "PROVIDER_OMITTED"
                     phase = "OMISSION"
@@ -386,6 +392,7 @@ class PlanningService:
                                 result.response_evidence if result is not None else None
                             ),
                             parser_rejections=parser_rejections,
+                            schema_rejections=schema_rejections,
                         ),
                     )
                 )
@@ -400,17 +407,21 @@ class PlanningService:
                 request=request,
                 route=route,
             )
-            if result.rejections:
+            if result.rejections or result.schema_rejections:
                 # Accepted-sibling isolation: the accepted plan remains valid,
-                # while bounded evidence about a rejected sibling/duplicate is
-                # retained independently of the executable result.
+                # while bounded evidence about a rejected sibling/duplicate or a
+                # schema-level rejection is retained independently.
                 rejection_codes = tuple(
-                    str(item.get("code") or "PARSER_REJECTION") for item in result.rejections
+                    str(item.get("code") or "PARSER_REJECTION")
+                    for item in (*result.rejections, *result.schema_rejections)
                 )
                 if attempt.diagnostics:
                     diagnostics = dict(attempt.diagnostics)
                     diagnostics.setdefault(
                         "parser_rejections", [dict(item) for item in result.rejections[:8]]
+                    )
+                    diagnostics.setdefault(
+                        "schema_rejections", [dict(item) for item in result.schema_rejections[:8]]
                     )
                     diagnostics.setdefault("response_evidence", dict(result.response_evidence))
                 else:
@@ -420,10 +431,15 @@ class PlanningService:
                         fingerprint,
                         route,
                         outcome="ACCEPTED",
-                        phase="PARSER_SIBLING_REJECTION",
+                        phase=(
+                            "PARSER_SIBLING_REJECTION"
+                            if result.rejections
+                            else "SDK_SCHEMA_REJECTION"
+                        ),
                         reasons=rejection_codes,
                         response_evidence=result.response_evidence,
                         parser_rejections=result.rejections,
+                        schema_rejections=result.schema_rejections,
                     )
                 attempt = _replace(attempt, diagnostics=diagnostics)
             if plan is not None:
@@ -512,6 +528,8 @@ class PlanningService:
                     phase="CONTRACT_REJECTION",
                     reasons=validation.reasons,
                     response_evidence=result.response_evidence,
+                    schema_rejections=result.schema_rejections,
+                    validation_rejections=validation.rejection_details,
                     provider_plan=provider_plan,
                     inputs=inputs,
                 ),
@@ -545,6 +563,8 @@ class PlanningService:
         reasons: Sequence[str],
         response_evidence: Mapping[str, object] | None = None,
         parser_rejections: Sequence[Mapping[str, object]] = (),
+        schema_rejections: Sequence[Mapping[str, object]] = (),
+        validation_rejections: Sequence[Mapping[str, object]] = (),
         provider_plan: object | None = None,
         inputs: PlanningInputs | None = None,
     ) -> dict[str, object]:
@@ -573,6 +593,19 @@ class PlanningService:
             "parser_rejections": [
                 dict(item) for item in list(parser_rejections)[:8] if isinstance(item, Mapping)
             ],
+            "schema_rejections": [
+                dict(item) for item in list(schema_rejections)[:8] if isinstance(item, Mapping)
+            ],
+            "validation_rejections": [
+                dict(item) for item in list(validation_rejections)[:8] if isinstance(item, Mapping)
+            ],
+            "rejection_origins": list(
+                dict.fromkeys(
+                    (["SDK_PARSING"] if schema_rejections else [])
+                    + (["APPLICATION_VALIDATION"] if validation_rejections else [])
+                    + (["PARSER"] if parser_rejections else [])
+                )
+            ),
         }
 
     def _raw_hosted_calls(self) -> int:

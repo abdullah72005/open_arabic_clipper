@@ -17,24 +17,28 @@ from typing import Any
 
 from google import genai
 from google.genai import types
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from app.candidates.providers import ProviderErrorCategory
+from app.core.enums import TransformationStrategyType
 from app.transformation.planning.policy import (
     GEMINI_API_VERSION,
     GEMINI_ROUTINE_MODEL,
     GEMINI_STRONG_MODEL,
     SCHEMA_VERSION,
+    strategy_value_kinds,
 )
 from app.transformation.planning.providers import (
+    PLANNING_SCHEMA_BINDING_VERSION,
     PLANNING_SYSTEM_INSTRUCTION,
     PlanningBlockSchema,
     PlanningNarrationSchema,
-    PlanningOutputSchema,
     PlanningPlanSchema,
     PlanningProviderError,
     PlanningRequest,
+    build_planning_output_schema,
     parse_plan_results,
+    planning_output_schema_digest,
     planning_prompt_hash,
 )
 from app.transformation.planning.types import PlanProviderResult
@@ -51,12 +55,12 @@ _RETRYABLE = frozenset(
     }
 )
 
-# The authoritative schema lives in ``providers`` so the prompt hash, the
-# offline schema tests, and the object Google receives can never diverge.
+# The authoritative base schema lives in ``providers``. Each call derives a
+# strategy-bound variant so the object Google receives, the prompt hash family,
+# and the offline schema tests share one contract.
 _GeminiNarration = PlanningNarrationSchema
 _GeminiBlock = PlanningBlockSchema
 _GeminiPlan = PlanningPlanSchema
-_GeminiPlanningOutput = PlanningOutputSchema
 
 
 class GeminiPlanningProvider:
@@ -158,6 +162,7 @@ class GeminiPlanningProvider:
             "digest": self._digest,
             "prompt_hash": planning_prompt_hash(),
             "schema_version": SCHEMA_VERSION,
+            "schema_binding_version": PLANNING_SCHEMA_BINDING_VERSION,
             "api_version": self._api_version,
             "temperature": self._temperature,
             "max_output_tokens": self._output_tokens,
@@ -209,10 +214,11 @@ class GeminiPlanningProvider:
         thinking: str | None,
     ) -> dict[str, PlanProviderResult]:
         payload = {"plans_requested": [request.to_payload() for request in requests]}
+        schema = build_planning_output_schema(requests)
         config = types.GenerateContentConfig(
             system_instruction=PLANNING_SYSTEM_INSTRUCTION,
             response_mime_type="application/json",
-            response_schema=_GeminiPlanningOutput,
+            response_schema=schema,
             max_output_tokens=self._output_tokens,
             temperature=self._temperature,
         )
@@ -225,6 +231,12 @@ class GeminiPlanningProvider:
                 contents=json.dumps(payload, ensure_ascii=False),
                 config=config,
             )
+        except ValidationError as error:
+            raise PlanningProviderError(
+                ProviderErrorCategory.MALFORMED_OUTPUT.value,
+                "response_schema_validation_failed",
+                rejections=_schema_rejection_details(error, None, requests),
+            ) from None
         except Exception as error:
             raise PlanningProviderError(_classify_exception(error)) from None
         self._accumulate_usage(response)
@@ -234,10 +246,13 @@ class GeminiPlanningProvider:
         content = _response_content(response)
         if not isinstance(content, dict):
             raise PlanningProviderError(ProviderErrorCategory.MALFORMED_OUTPUT.value)
+        evidence = _response_evidence(content)
+        evidence["output_schema_digest"] = planning_output_schema_digest(requests)
         return parse_plan_results(
             content,
             requests,
-            response_evidence=_response_evidence(content),
+            response_evidence=evidence,
+            schema_rejections=_sdk_schema_rejections(response, schema, content, requests),
         )
 
     def _accumulate_usage(self, response: Any) -> None:
@@ -296,6 +311,119 @@ def _response_content(response: Any) -> object:
         except json.JSONDecodeError:
             return None
     return None
+
+
+def _bounded_rejected_value(value: object) -> object:
+    """Bounded representation of one rejected value; never a full response."""
+
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return value[:80]
+    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    return {
+        "type": type(value).__name__,
+        "digest": hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
+        "characters": len(encoded),
+    }
+
+
+def _schema_rejection_details(
+    error: ValidationError,
+    content: Mapping[str, object] | None,
+    requests: Sequence[PlanningRequest],
+) -> tuple[dict[str, object], ...]:
+    """Turn an SDK Pydantic rejection into bounded, non-secret diagnostics."""
+
+    by_key = {request.strategy_key: request for request in requests}
+    plans = content.get("plans") if isinstance(content, Mapping) else None
+    details: list[dict[str, object]] = []
+    for item in error.errors()[:8]:
+        loc = list(item.get("loc") or ())
+        plan_index: int | None = None
+        if len(loc) >= 2 and loc[0] == "plans" and isinstance(loc[1], int):
+            plan_index = int(loc[1])
+        entry: Mapping[str, object] | None = None
+        if isinstance(plans, list) and plan_index is not None and plan_index < len(plans):
+            candidate = plans[plan_index]
+            if isinstance(candidate, Mapping):
+                entry = candidate
+        strategy_key = entry.get("strategy_key") if entry is not None else None
+        strategy_id = entry.get("strategy_id") if entry is not None else None
+        request: PlanningRequest | None = None
+        if isinstance(strategy_key, str):
+            request = by_key.get(strategy_key)
+        if request is None and len(requests) == 1:
+            request = requests[0]
+        if strategy_key is None and request is not None:
+            strategy_key = request.strategy_key
+        if strategy_id is None and request is not None:
+            strategy_id = request.strategy_id
+        block_index: int | None = None
+        for position, part in enumerate(loc):
+            if part == "blocks" and position + 1 < len(loc) and isinstance(loc[position + 1], int):
+                block_index = int(loc[position + 1])
+                break
+        field = next((part for part in reversed(loc) if isinstance(part, str)), None)
+        allowed: list[str] | None = None
+        if field == "substantive_value_kind" and request is not None:
+            try:
+                strategy_type = TransformationStrategyType(str(request.strategy_type))
+                allowed = [item.value for item in strategy_value_kinds(strategy_type)]
+            except ValueError:
+                allowed = []
+        details.append(
+            {
+                "origin": "SDK_PARSING",
+                "code": (
+                    "SCHEMA_VALUE_NOT_ALLOWED" if allowed is not None else "SCHEMA_VALIDATION_ERROR"
+                ),
+                "strategy_id": str(strategy_id)[:200] if strategy_id is not None else None,
+                "strategy_key": str(strategy_key)[:200] if strategy_key is not None else None,
+                "plan_index": plan_index,
+                "block_index": block_index,
+                "field": str(field)[:80] if field is not None else None,
+                "actual_value": _bounded_rejected_value(item.get("input")),
+                "allowed_values": allowed,
+                "location": [part if isinstance(part, int) else str(part)[:80] for part in loc][
+                    :12
+                ],
+            }
+        )
+    return tuple(details)
+
+
+def _sdk_schema_rejections(
+    response: Any,
+    schema: type[BaseModel],
+    content: Mapping[str, object],
+    requests: Sequence[PlanningRequest],
+) -> tuple[dict[str, object], ...]:
+    """Detect a silent SDK schema parse fallback and retain bounded evidence.
+
+    The google-genai SDK currently swallows Pydantic validation errors and
+    leaves ``response.parsed`` unset. When raw JSON content is still available,
+    validate it against the exact batch-bound schema so the failure is recorded
+    as SDK parsing evidence rather than being mistaken for a clean response.
+    """
+
+    parsed = getattr(response, "parsed", None)
+    if isinstance(parsed, (BaseModel, dict)):
+        return ()
+    try:
+        schema.model_validate(content)
+    except ValidationError as error:
+        return _schema_rejection_details(error, content, requests)
+    except Exception:
+        return (
+            {
+                "origin": "SDK_PARSING",
+                "code": "SCHEMA_VALIDATION_FAILED",
+                "actual_value": None,
+                "allowed_values": None,
+            },
+        )
+    return ()
 
 
 def _classify_exception(error: Exception) -> str:
