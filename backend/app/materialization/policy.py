@@ -12,9 +12,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-STAGE6_POLICY_VERSION = "stage6-v2"
+STAGE6_POLICY_VERSION = "stage6-v3"
 STAGE6_SCHEMA_VERSION = "stage6-schema-v2"
-STAGE6_VALIDATION_VERSION = "stage6-validation-v4"
+# v5: suggestion classification follows explicit suggestion wording and novelty,
+# independent of the plan's substantive value kind; the complete critique gate
+# and every grounding/fact/causality check remain mandatory.
+STAGE6_VALIDATION_VERSION = "stage6-validation-v5"
 STAGE6_TIMELINE_SCHEMA_VERSION = "stage6-timeline-v2"
 STAGE6_QUALITY_POLICY_VERSION = "stage6-quality-v1"
 STAGE6_NATURALNESS_POLICY_VERSION = "stage6-naturalness-v1"

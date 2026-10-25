@@ -19,10 +19,15 @@ from app.core.enums import (
     TransformationStrategyType,
 )
 
-# v15 shared semantic-claim contract: planning distinguishes source-established
-# claims, source-grounded interpretation, authored source-linked suggestions, and
-# external verification claims; draft_line is untrusted and unsupported
-# causal/effect/motive promises are rejected. v14 strategy-bound provider schema:
+# v16 authored-suggestion classification independence: the shared contract makes
+# clear that its four entries are claim categories, not substantive value kinds,
+# so an authored source-linked suggestion uses the strategy's permitted
+# substantive value kind (AUTHORED_THESIS for SOURCE_AS_EVIDENCE) rather than
+# requiring USEFUL_TAKEAWAY. v15 shared semantic-claim contract: planning
+# distinguishes source-established claims, source-grounded interpretation,
+# authored source-linked suggestions, and external verification claims;
+# draft_line is untrusted and unsupported causal/effect/motive promises are
+# rejected. v14 strategy-bound provider schema:
 # the hosted response schema restricts each requested strategy's substantive
 # value kinds to its authoritative subset and SDK/application value-kind
 # rejections carry bounded actual/allowed evidence. v12 producer/validator
@@ -34,9 +39,9 @@ from app.core.enums import (
 # semantics and parser rejections are retained as bounded diagnostics), v10
 # producer-contract alignment, and v8 Arabic multi-token closure remain in
 # force.
-POLICY_VERSION = "stage4.1-v15"
+POLICY_VERSION = "stage4.1-v16"
 SCHEMA_VERSION = "stage4.1-schema-v13"
-VALIDATION_VERSION = "stage4.1-validation-v15"
+VALIDATION_VERSION = "stage4.1-validation-v16"
 INPUT_FINGERPRINT_VERSION = "2"
 OUTPUT_FINGERPRINT_VERSION = "2"
 PLAN_FINGERPRINT_VERSION = "2"

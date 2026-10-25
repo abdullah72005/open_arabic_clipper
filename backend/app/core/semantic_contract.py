@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import re
 
-SEMANTIC_CLAIM_CONTRACT_VERSION = "semantic-claim-contract-v1"
+SEMANTIC_CLAIM_CONTRACT_VERSION = "semantic-claim-contract-v2"
 
 SEMANTIC_CLAIM_CONTRACT = (
     "Apply this claim contract consistently. Distinguish four kinds of content and "
@@ -24,7 +24,10 @@ SEMANTIC_CLAIM_CONTRACT = (
     "action that is relevant to the rendered evidence; it may go beyond the source but "
     "must not say or imply that the speaker recommended it, that it works, or that it "
     "treats, prevents, causes, or guarantees any result, and its link to the evidence "
-    "must be clear. (4) EXTERNAL FACTUAL OR CAUSAL CLAIM — any new fact, statistic, "
+    "must be clear. These four are claim categories, not substantive value kinds: an "
+    "authored source-linked suggestion may use any substantive value kind the strategy "
+    "permits and does not require USEFUL_TAKEAWAY. (4) EXTERNAL FACTUAL OR CAUSAL "
+    "CLAIM — any new fact, statistic, "
     "attribution, mechanism, motive, or cause-and-effect claim not established by the "
     "rendered evidence; it requires the existing verification dependency and is never "
     "approved as authored prose. A prefix such as 'try', 'suggestion', 'اقتراح', or "

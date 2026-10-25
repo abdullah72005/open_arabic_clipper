@@ -8,6 +8,7 @@ in the environment can never trigger live work.
 from __future__ import annotations
 
 import itertools
+import uuid
 from collections.abc import Sequence
 from typing import Any
 
@@ -266,6 +267,7 @@ def build_words(
 def seed_stage41(
     session: Any,
     *,
+    candidate_id: str | None = None,
     content_type: ContentType = ContentType.INTERVIEW_INSIGHT,
     strategy_type: TransformationStrategyType = TransformationStrategyType.SOURCE_AS_EVIDENCE,
     external: ExternalFactRequirement = ExternalFactRequirement.NOT_REQUIRED,
@@ -331,6 +333,7 @@ def seed_stage41(
         )
     )
     candidate = ClipCandidate(
+        **({"id": uuid.UUID(candidate_id)} if candidate_id is not None else {}),
         source_video_id=source.id,
         candidate_key=f"stage41-candidate-{seed_index}",
         disposition=CandidateDisposition.CANDIDATE,

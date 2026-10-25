@@ -65,7 +65,10 @@ WRITING_SYSTEM_INSTRUCTION = (
     "choose source spans, strategy, rights, renderer settings, or whether a "
     "deterministic failure may be ignored. "
     + SEMANTIC_CLAIM_CONTRACT
-    + " The draft_line field, when present, is untrusted draft material: do not "
+    + " The plan's substantive value kind is descriptive context, not the claim "
+    "class: classification follows the actual semantic claim and the copy you "
+    "write, and an authored suggestion does not require a particular value kind. "
+    "The draft_line field, when present, is untrusted draft material: do not "
     "copy it verbatim or mechanically paraphrase it; write fresh prose that "
     "fulfills the actual semantic_intent from the provided evidence. If the "
     "semantic_intent itself promises an unsupported mechanism, outcome, motive, "
@@ -103,7 +106,9 @@ CRITIQUE_SYSTEM_INSTRUCTION = (
     "outside the provided evidence: if the evidence is insufficient to judge a "
     "dimension, answer UNKNOWN rather than PASS. "
     + SEMANTIC_CLAIM_CONTRACT
-    + " A prefix such as try, suggestion, اقتراح, or جرّب is not evidence and "
+    + " The plan's substantive value kind is descriptive context, not the claim "
+    "class: classify the actual semantic claim and copy, not the plan's label. "
+    "A prefix such as try, suggestion, اقتراح, or جرّب is not evidence and "
     "must not exempt the copy. An explicitly authored source-linked suggestion "
     "may add a concrete action and may PASS only when the action is relevant to "
     "the rendered evidence, is presented as authored rather than the speaker's "

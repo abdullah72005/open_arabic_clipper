@@ -226,7 +226,24 @@ def test_stage41_rejects_unsupported_remedy_in_intent_and_draft(session: Session
     assert plan_set.planning_outcome is PlanSemanticOutcome.PLANNING_DEFERRED
 
 
-def test_stage41_accepts_authored_source_linked_suggestion(session: Session) -> None:
+@pytest.mark.parametrize(  # type: ignore[untyped-decorator]
+    ("strategy_type", "value_kind"),
+    [
+        (
+            TransformationStrategyType.SOURCE_AS_EVIDENCE,
+            SubstantiveValueKind.AUTHORED_THESIS,
+        ),
+        (
+            TransformationStrategyType.SUMMARY,
+            SubstantiveValueKind.USEFUL_TAKEAWAY,
+        ),
+    ],
+)
+def test_stage41_accepts_authored_source_linked_suggestion(
+    session: Session,
+    strategy_type: TransformationStrategyType,
+    value_kind: SubstantiveValueKind,
+) -> None:
     from app.transformation.planning.executor import TransformationPlanningExecutor
 
     settings = FakeStage41Settings()
@@ -237,8 +254,8 @@ def test_stage41_accepts_authored_source_linked_suggestion(session: Session) -> 
     seed = seed_stage41(
         session,
         settings=settings,
-        strategy_type=TransformationStrategyType.SUMMARY,
-        value_kind=SubstantiveValueKind.USEFUL_TAKEAWAY,
+        strategy_type=strategy_type,
+        value_kind=value_kind,
         transcript=SOURCE_EXCERPT,
         refined=(259.16, 271.0),
     )
@@ -256,7 +273,7 @@ def test_stage41_accepts_authored_source_linked_suggestion(session: Session) -> 
             PlanProviderBlock(
                 block_type=PlanBlockType.ORIGINAL_VALUE,
                 estimated_duration=4.0,
-                substantive_value_kind=SubstantiveValueKind.USEFUL_TAKEAWAY,
+                substantive_value_kind=value_kind,
                 semantic_intent=(
                     "Offer an authored, source-linked conversational suggestion "
                     "that invites the other person's perspective."
@@ -286,7 +303,7 @@ def test_stage41_accepts_authored_source_linked_suggestion(session: Session) -> 
 
     rows = list_plans(session, plan_set.id)
     assert len(rows) == 1
-    assert rows[0].blocks[1]["substantive_value_kind"] == "USEFUL_TAKEAWAY"
+    assert rows[0].blocks[1]["substantive_value_kind"] == value_kind.value
     assert rows[0].blocks[1]["draft_only"] is True
 
 
@@ -327,13 +344,13 @@ def test_stage42_accepts_authored_suggestion_after_favorable_review() -> None:
                 "Offer an authored, source-linked conversational suggestion that "
                 "invites the other person's perspective."
             ),
-            kind="USEFUL_TAKEAWAY",
+            kind="AUTHORED_THESIS",
         ),
         "draft_line": POSITIVE_SUGGESTION,
     }
     plan = make_plan(
         blocks=[source_block(0, text=SOURCE_EXCERPT), block],
-        original_value_kinds=("USEFUL_TAKEAWAY",),
+        original_value_kinds=("AUTHORED_THESIS",),
     )
     inputs = make_governance_inputs([plan], transcript=SOURCE_EXCERPT)
     evaluation = evaluate_plan(
@@ -393,7 +410,7 @@ def test_stage6_rejects_invented_motive() -> None:
 
 def test_stage6_rejects_generic_irrelevant_advice() -> None:
     _provider, script = _materialize(
-        _stage6_inputs(intent="Offer a practical takeaway.", kind="USEFUL_TAKEAWAY"),
+        _stage6_inputs(intent="Offer a practical takeaway.", kind="AUTHORED_THESIS"),
         "ابتسم دائما وكن واثقا في نفسك.",
     )
 
@@ -437,7 +454,7 @@ def test_stage6_accepts_structured_source_linked_suggestion_after_full_critique(
     inputs = _stage6_inputs(
         intent="Offer an authored, source-linked conversational suggestion.",
         draft=None,
-        kind="USEFUL_TAKEAWAY",
+        kind="AUTHORED_THESIS",
     )
     request = build_writing_request(inputs, config=STAGE6_CONFIG)
     assert request.targets[0].claim_class == "AUTHORED_SOURCE_LINKED_SUGGESTION"
@@ -454,7 +471,7 @@ def test_writing_request_marks_draft_as_untrusted_material() -> None:
     inputs = _stage6_inputs(
         intent="Offer an authored, source-linked conversational suggestion.",
         draft=FAILED_COPY,
-        kind="USEFUL_TAKEAWAY",
+        kind="AUTHORED_THESIS",
     )
     target = build_writing_request(inputs, config=STAGE6_CONFIG).targets[0]
 
@@ -500,7 +517,7 @@ def test_stage6_unfavorable_complete_critique_still_rejects() -> None:
     inputs = _stage6_inputs(
         intent="Offer an authored, source-linked conversational suggestion.",
         draft=None,
-        kind="USEFUL_TAKEAWAY",
+        kind="AUTHORED_THESIS",
     )
     provider = FakeWritingProvider(copies={1: POSITIVE_SUGGESTION})
     script = materialize_script(
@@ -555,7 +572,7 @@ def test_stage6_rejects_concrete_but_irrelevant_suggestion() -> None:
     inputs = _stage6_inputs(
         intent="Offer an authored, source-linked conversational suggestion.",
         draft=None,
-        kind="USEFUL_TAKEAWAY",
+        kind="AUTHORED_THESIS",
     )
     provider = FakeWritingProvider(copies={1: "اقتراح: اشتري هدية للشخص الجديد."})
     script = materialize_script(
@@ -606,7 +623,7 @@ def test_stage6_incomplete_critique_defers_without_accepting() -> None:
     inputs = _stage6_inputs(
         intent="Offer an authored, source-linked conversational suggestion.",
         draft=None,
-        kind="USEFUL_TAKEAWAY",
+        kind="AUTHORED_THESIS",
     )
     provider = FakeWritingProvider(copies={1: POSITIVE_SUGGESTION})
     script = materialize_script(

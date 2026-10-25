@@ -20,7 +20,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Protocol, runtime_checkable
 
-from app.core.enums import ClaimClass, SubstantiveValueKind
+from app.core.enums import ClaimClass
 from app.core.semantic_contract import (
     is_explicit_suggestion,
     unverified_semantic_claim_reason,
@@ -716,7 +716,6 @@ def build_writing_request(
                     block, inputs, narration_available=narration_available
                 ),
                 claim_class=_target_claim_class(
-                    value_kind=value_kind,
                     semantic_intent=semantic_intent,
                     draft_line=draft_line,
                 ),
@@ -737,17 +736,16 @@ def build_writing_request(
     )
 
 
-def _target_claim_class(*, value_kind: str, semantic_intent: str, draft_line: str | None) -> str:
+def _target_claim_class(*, semantic_intent: str, draft_line: str | None) -> str:
     """Label the request's claim kind without authorizing any wording.
 
-    The label tells the writer and critique which evidence rules apply. Copy is
-    still classified again from its actual text and must pass the complete
-    critique gate.
+    The label tells the writer and critique which evidence rules apply. It
+    follows explicit suggestion wording, never the plan's substantive value
+    kind. Copy is still classified again from its actual text and must pass the
+    complete critique gate.
     """
 
-    if value_kind == SubstantiveValueKind.USEFUL_TAKEAWAY.value and (
-        is_explicit_suggestion(semantic_intent) or is_explicit_suggestion(draft_line or "")
-    ):
+    if is_explicit_suggestion(semantic_intent) or is_explicit_suggestion(draft_line or ""):
         return ClaimClass.AUTHORED_SOURCE_LINKED_SUGGESTION.value
     return ClaimClass.SOURCE_GROUNDED_INFERENCE.value
 

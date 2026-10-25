@@ -180,17 +180,17 @@ def classify_claim(
     verification_dependency_id: str | None,
     grounding_declared: bool = True,
     grounding_unresolved: bool = False,
-    substantive_value_kind: str | None = None,
 ) -> ClaimClass:
     """Classify authored copy into the claim ledger vocabulary.
 
     Deterministic classification cannot establish entailment: novel content is
     classified as a source-grounded inference that still requires semantic review,
-    never as a resolved claim. An explicitly authored, source-linked suggestion is
-    its own class so the critique can apply the suggestion-specific rules. A
-    missing/invalid grounding reference, an unsupported number, unsupported proper
-    noun, or an unsupported causal/effect/motive claim makes the copy an external
-    claim requiring verification.
+    never as a resolved claim. Explicit suggestion wording plus novelty is its own
+    class so the critique can apply the suggestion-specific rules, independent of
+    the plan's substantive value kind. A missing/invalid grounding reference, an
+    unsupported number, unsupported proper noun, or an unsupported
+    causal/effect/motive claim makes the copy an external claim requiring
+    verification; those checks always run before suggestion classification.
     """
 
     if verification_dependency_id:
@@ -206,11 +206,7 @@ def classify_claim(
     copy_tokens = set(_content_tokens(copy))
     source_tokens = set(_content_tokens(grounding_text))
     novel = copy_tokens - source_tokens
-    if (
-        substantive_value_kind == SubstantiveValueKind.USEFUL_TAKEAWAY.value
-        and novel
-        and is_explicit_suggestion(copy)
-    ):
+    if novel and is_explicit_suggestion(copy):
         return ClaimClass.AUTHORED_SOURCE_LINKED_SUGGESTION
     if novel:
         return ClaimClass.SOURCE_GROUNDED_INFERENCE
@@ -356,7 +352,6 @@ def validate_authored_block(
         verification_dependency_id=dependency_id,
         grounding_declared=resolution.declared,
         grounding_unresolved=bool(resolution.unresolved),
-        substantive_value_kind=kind,
     )
     essential = block_type in _SUBSTANTIVE_BLOCK_TYPES and kind not in {
         SubstantiveValueKind.SOURCE_AS_EVIDENCE.value,
