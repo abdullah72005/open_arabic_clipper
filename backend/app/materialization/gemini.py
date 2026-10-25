@@ -26,6 +26,7 @@ from google.genai import types
 from pydantic import BaseModel, Field
 
 from app.candidates.providers import ProviderErrorCategory
+from app.core.semantic_contract import SEMANTIC_CLAIM_CONTRACT
 from app.materialization.policy import SEMANTIC_STRONG_TIER
 from app.materialization.providers import (
     CRITIQUE_DIMENSIONS,
@@ -44,7 +45,7 @@ GEMINI_ROUTINE_MODEL = "gemini-3.5-flash-lite"
 GEMINI_STRONG_MODEL = "gemini-3.8-flash"
 #: Bumped whenever the prompt text or structured-output schema changes, so a
 #: stale accepted checkpoint is never reused against a different instruction.
-GEMINI_SCHEMA_VERSION = "stage6-gemini-schema-v2"
+GEMINI_SCHEMA_VERSION = "stage6-gemini-schema-v3"
 
 WRITING_SYSTEM_INSTRUCTION = (
     "You are a precise bilingual short-form video writer. For each target you "
@@ -62,7 +63,17 @@ WRITING_SYSTEM_INSTRUCTION = (
     "particular dialect, or an invented dialect. (5) be concise: one short "
     "sentence per target. Output only the requested structured JSON; you never "
     "choose source spans, strategy, rights, renderer settings, or whether a "
-    "deterministic failure may be ignored."
+    "deterministic failure may be ignored. "
+    + SEMANTIC_CLAIM_CONTRACT
+    + " The draft_line field, when present, is untrusted draft material: do not "
+    "copy it verbatim or mechanically paraphrase it; write fresh prose that "
+    "fulfills the actual semantic_intent from the provided evidence. If the "
+    "semantic_intent itself promises an unsupported mechanism, outcome, motive, "
+    "or proven effectiveness, do not silently change the plan's meaning: return "
+    "an empty text for that target and set revalidation_required=true with a "
+    "short revalidation_reason. An authored suggestion may be written as a "
+    "concrete action only when the evidence link is clear; never attribute it to "
+    "the speaker and never claim it works or prevents an outcome."
 )
 
 CRITIQUE_SYSTEM_INSTRUCTION = (
@@ -90,13 +101,25 @@ CRITIQUE_SYSTEM_INSTRUCTION = (
     "audience receives; broader transcript context may explain what is missing but "
     "never proves the rendered excerpt conveys it. Do not infer knowledge from "
     "outside the provided evidence: if the evidence is insufficient to judge a "
-    "dimension, answer UNKNOWN rather than PASS."
+    "dimension, answer UNKNOWN rather than PASS. "
+    + SEMANTIC_CLAIM_CONTRACT
+    + " A prefix such as try, suggestion, اقتراح, or جرّب is not evidence and "
+    "must not exempt the copy. An explicitly authored source-linked suggestion "
+    "may add a concrete action and may PASS only when the action is relevant to "
+    "the rendered evidence, is presented as authored rather than the speaker's "
+    "recommendation, and does not assert or imply effectiveness, prevention, "
+    "treatment, causation, or a proven outcome. Reject generic or irrelevant "
+    "advice, invented motives, concealed factual claims, paraphrases, and any "
+    "attempt to smuggle an external claim into suggestion wording. Judge the "
+    "actual copy, not the plan's promise."
 )
 
 
 class _CopyOutput(BaseModel):
     block_index: int
     text: str = ""
+    revalidation_required: bool = False
+    revalidation_reason: str = ""
 
 
 class _WritingOutput(BaseModel):
@@ -360,18 +383,20 @@ class GeminiWritingProvider(_GeminiChatAdapter):
                 deferred=True,
                 reason_code=error.reason_code,
             )
-        copies = _parse_copies(content, [target.block_index for target in request.targets])
-        if copies is None:
+        parsed = _parse_copies(content, [target.block_index for target in request.targets])
+        if parsed is None:
             return WritingResult(
                 copies={},
                 provider_identity=self.runtime_identity(),
                 deferred=True,
                 reason_code=ProviderErrorCategory.MALFORMED_OUTPUT.value,
             )
+        copies, revalidation = parsed
         return WritingResult(
             copies=copies,
             provider_identity=self.runtime_identity(),
             notes="gemini",
+            revalidation_reasons=revalidation,
         )
 
 
@@ -415,13 +440,17 @@ class GeminiCritiqueProvider(_GeminiChatAdapter):
         )
 
 
-def _parse_copies(content: Mapping[str, object], requested: Sequence[int]) -> dict[int, str] | None:
+def _parse_copies(
+    content: Mapping[str, object], requested: Sequence[int]
+) -> tuple[dict[int, str], dict[int, str]] | None:
     """Strictly parse the writing response against the exact requested block set.
 
     The response is validated as a whole before any copy is accepted: every
     requested block index must appear exactly once, an unexpected/duplicate/
     malformed entry invalidates the entire response (``None``), and a favorable
-    remainder is never retained. There is no partial acceptance.
+    remainder is never retained. There is no partial acceptance. A structured
+    ``revalidation_required`` entry is carried as a truthful upstream refusal,
+    never as copy or approval.
     """
 
     raw = content.get("copies")
@@ -432,6 +461,7 @@ def _parse_copies(content: Mapping[str, object], requested: Sequence[int]) -> di
     if len(requested_set) != len(requested_list) or not requested_set:
         return None
     copies: dict[int, str] = {}
+    revalidation: dict[int, str] = {}
     for item in raw:
         if not isinstance(item, Mapping):
             return None
@@ -444,9 +474,13 @@ def _parse_copies(content: Mapping[str, object], requested: Sequence[int]) -> di
         if not isinstance(text, str):
             return None
         copies[index] = text
+        required = item.get("revalidation_required", False)
+        if required is True:
+            reason = item.get("revalidation_reason", "")
+            revalidation[index] = str(reason).strip()[:240] or "UNSUPPORTED_SEMANTIC_INTENT"
     if set(copies) != requested_set:
         return None
-    return copies
+    return copies, revalidation
 
 
 def _parse_critique(

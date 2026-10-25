@@ -20,10 +20,15 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Protocol, runtime_checkable
 
-from app.core.enums import ClaimClass
+from app.core.enums import ClaimClass, SubstantiveValueKind
+from app.core.semantic_contract import (
+    is_explicit_suggestion,
+    unverified_semantic_claim_reason,
+)
 from app.materialization.grounding import parse_grounding_refs
 from app.materialization.inputs import MaterializationInputs
 from app.materialization.policy import (
+    REASON_UPSTREAM_REVALIDATION_REQUIRED,
     SEMANTIC_ROUTINE_TIER,
     SEMANTIC_STRONG_TIER,
     CallLedger,
@@ -297,6 +302,8 @@ class WritingTarget:
     why_unavailable: str = ""
     delivery_intent: str = ""
     proposed_delivery: Mapping[str, object] = field(default_factory=dict)
+    claim_class: str = ClaimClass.SOURCE_GROUNDED_INFERENCE.value
+    draft_only: bool = False
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -305,6 +312,8 @@ class WritingTarget:
             "substantive_value_kind": self.substantive_value_kind,
             "semantic_intent": self.semantic_intent,
             "draft_line": self.draft_line,
+            "draft_only": self.draft_only,
+            "claim_class": self.claim_class,
             "grounding_refs": [ref.as_dict() for ref in self.grounding_refs],
             "source_evidence": self.source_evidence,
             "verification_dependency_id": self.verification_dependency_id,
@@ -476,13 +485,19 @@ class WritingRequest:
 
 @dataclass(frozen=True)
 class WritingResult:
-    """Provider writing output (unvalidated copy per block index)."""
+    """Provider writing output (unvalidated copy per block index).
+
+    ``revalidation_reasons`` is a truthful refusal to write: the provider found
+    that the plan's own semantic intent promises a mechanism/outcome/motive the
+    evidence cannot support. It defers upstream and is never an approval path.
+    """
 
     copies: Mapping[int, str]
     provider_identity: Mapping[str, object]
     notes: str = ""
     deferred: bool = False
     reason_code: str | None = None
+    revalidation_reasons: Mapping[int, str] = field(default_factory=dict)
 
 
 @runtime_checkable
@@ -538,10 +553,12 @@ class FakeWritingProvider:
         available: bool = True,
         deferred: bool = False,
         model: str = "fake-model",
+        revalidation: Mapping[int, str] | None = None,
     ) -> None:
         self._copies = dict(copies or {})
         self._available = available
         self._deferred = deferred
+        self._revalidation = dict(revalidation or {})
         self.model = model
         self.calls: list[WritingRequest] = []
         self.released = 0
@@ -565,6 +582,7 @@ class FakeWritingProvider:
             copies=dict(self._copies),
             provider_identity=self.runtime_identity(),
             notes="fake",
+            revalidation_reasons=dict(self._revalidation),
         )
 
     def release(self) -> None:
@@ -679,13 +697,16 @@ def build_writing_request(
         index = _int(block.get("index", -1))
         refs = _refs(block.get("grounding_refs"))
         evidence = resolve_grounding(inputs, refs).text[: config.max_evidence_chars_per_target]
+        draft_line = _optional_str(block.get("draft_line"))
+        semantic_intent = str(block.get("semantic_intent", ""))
+        value_kind = str(block.get("substantive_value_kind", ""))
         targets.append(
             WritingTarget(
                 block_index=index,
                 block_type=block_type,
-                substantive_value_kind=str(block.get("substantive_value_kind", "")),
-                semantic_intent=str(block.get("semantic_intent", "")),
-                draft_line=_optional_str(block.get("draft_line")),
+                substantive_value_kind=value_kind,
+                semantic_intent=semantic_intent,
+                draft_line=draft_line,
                 grounding_refs=refs,
                 source_evidence=evidence,
                 verification_dependency_id=_first_dependency(block, inputs),
@@ -694,6 +715,12 @@ def build_writing_request(
                 proposed_delivery=_proposed_delivery(
                     block, inputs, narration_available=narration_available
                 ),
+                claim_class=_target_claim_class(
+                    value_kind=value_kind,
+                    semantic_intent=semantic_intent,
+                    draft_line=draft_line,
+                ),
+                draft_only=bool(draft_line),
             )
         )
     tier = SEMANTIC_STRONG_TIER if inputs.intensity == "STRONG" else SEMANTIC_ROUTINE_TIER
@@ -708,6 +735,21 @@ def build_writing_request(
         tier=tier,
         source_context=_source_context(inputs),
     )
+
+
+def _target_claim_class(*, value_kind: str, semantic_intent: str, draft_line: str | None) -> str:
+    """Label the request's claim kind without authorizing any wording.
+
+    The label tells the writer and critique which evidence rules apply. Copy is
+    still classified again from its actual text and must pass the complete
+    critique gate.
+    """
+
+    if value_kind == SubstantiveValueKind.USEFUL_TAKEAWAY.value and (
+        is_explicit_suggestion(semantic_intent) or is_explicit_suggestion(draft_line or "")
+    ):
+        return ClaimClass.AUTHORED_SOURCE_LINKED_SUGGESTION.value
+    return ClaimClass.SOURCE_GROUNDED_INFERENCE.value
 
 
 def _proposed_delivery(
@@ -782,6 +824,31 @@ class MaterializationScript:
     findings: tuple[QualityFinding, ...] = ()
 
 
+def _plan_intent_revalidation_reason(inputs: MaterializationInputs) -> str | None:
+    """Detect a plan intent that promises more than its cited evidence supports.
+
+    The writer must not silently narrow or reinterpret that promise. Returning a
+    bounded upstream-revalidation reason keeps the plan meaning unchanged and
+    avoids spending a provider call on a plan that must be regenerated.
+    """
+
+    for block in inputs.blocks:
+        if str(block.get("block_type", "")) not in _SUBSTANTIVE_BLOCK_TYPES:
+            continue
+        if block.get("dependency_ids"):
+            # The plan explicitly links this value to external verification; the
+            # normal verification gate owns that outcome, not this preflight.
+            continue
+        refs = _refs(block.get("grounding_refs"))
+        evidence = resolve_grounding(inputs, refs).text
+        reason = unverified_semantic_claim_reason(
+            str(block.get("semantic_intent", "") or ""), evidence
+        )
+        if reason is not None:
+            return f"{REASON_UPSTREAM_REVALIDATION_REQUIRED}:{reason}"
+    return None
+
+
 def materialize_script(
     provider: MaterializationWritingProvider,
     inputs: MaterializationInputs,
@@ -806,6 +873,16 @@ def materialize_script(
     identity = provider.runtime_identity()
     if not request.targets:
         return MaterializationScript((), True, identity, False, ())
+
+    intent_revalidation = _plan_intent_revalidation_reason(inputs)
+    if intent_revalidation is not None:
+        return MaterializationScript(
+            (),
+            False,
+            identity,
+            True,
+            (REASON_UPSTREAM_REVALIDATION_REQUIRED, intent_revalidation),
+        )
 
     hosted = provider.provider_name != "deterministic"
     if hosted and not allow_hosted:
@@ -833,6 +910,22 @@ def materialize_script(
         return MaterializationScript(
             (), False, result.provider_identity, True, (result.reason_code or "DEFERRED_PROVIDER",)
         )
+    if result.revalidation_reasons:
+        revalidation_reasons = tuple(
+            dict.fromkeys(
+                (
+                    REASON_UPSTREAM_REVALIDATION_REQUIRED,
+                    *(
+                        str(reason)
+                        for reason in result.revalidation_reasons.values()
+                        if str(reason).strip()
+                    ),
+                )
+            )
+        )
+        return MaterializationScript(
+            (), False, result.provider_identity, True, revalidation_reasons
+        )
 
     authored: list[AuthoredBlock] = []
     review_targets: list[CritiqueTarget] = []
@@ -840,6 +933,7 @@ def materialize_script(
     findings_by_block: dict[int, list[QualityFinding]] = {}
     accepted_indexes: dict[int, bool] = {}
     critique_by_block: dict[int, BlockCritique] = {}
+    claim_classes: dict[int, str] = {}
     for target in request.targets:
         copy = result.copies.get(target.block_index, "")
         block_payload = {
@@ -851,6 +945,11 @@ def materialize_script(
             "verification_dependency_id": target.verification_dependency_id,
         }
         validation = validate_authored_block(block_payload, inputs, config)
+        claim_classes[target.block_index] = (
+            validation.claim.claim_class
+            if validation.claim is not None
+            else ClaimClass.SOURCE_GROUNDED_INFERENCE.value
+        )
         findings_by_block[target.block_index] = list(validation.findings)
         for finding in validation.findings:
             reasons.extend(finding.reason_codes)
@@ -997,7 +1096,9 @@ def materialize_script(
                 # concrete relation comes from reviewed intent-fulfillment
                 # evidence; without it the field stays empty.
                 adds_beyond_source=added_relation,
-                claim_class=ClaimClass.SOURCE_GROUNDED_INFERENCE.value,
+                claim_class=claim_classes.get(
+                    target.block_index, ClaimClass.SOURCE_GROUNDED_INFERENCE.value
+                ),
                 grounding_refs=target.grounding_refs,
                 validation_evidence=evidence,
             )

@@ -25,6 +25,7 @@ from app.core.enums import (
     SubstantiveValueFinding,
     UnsupportedClaimFinding,
 )
+from app.core.semantic_contract import SEMANTIC_CLAIM_CONTRACT
 from app.transformation.governance.policy import (
     ACCEPTED_PROVIDER_FINDING_CODES,
     GOVERNOR_SCHEMA_VERSION,
@@ -88,7 +89,18 @@ GOVERNANCE_SYSTEM_INSTRUCTION = (
     "captions, crop, zoom, borders, music, B-roll, filters, or speed receive zero "
     'credit. Narration NONE is valid. Return strict JSON: {"critiques": [...]} with '
     "exactly one item per requested plan, echoing its plan_id and "
-    "plan_output_fingerprint, using only the closed values defined by the schema."
+    "plan_output_fingerprint, using only the closed values defined by the schema. "
+    + SEMANTIC_CLAIM_CONTRACT
+    + " Review unsupported promises already present in semantic_intent and "
+    "draft_line, not only hypothetical final script wording. A causal remedy, "
+    "psychological mechanism, invented motive, or proven-effectiveness claim is "
+    "not acceptable merely because it sounds useful or is prefixed with a "
+    "suggestion marker. An explicitly authored source-linked suggestion may be "
+    "acceptable only when it is concrete, relevant to the rendered evidence, not "
+    "attributed to the speaker, and does not claim efficacy. Generic advice, "
+    "concealed factual claims, invented motives, and paraphrase remain failures. "
+    "Do not approve a plan merely because a later writer could fix it; keep the "
+    "distinction between reviewing plan intent and approving final script wording."
 )
 
 GOVERNANCE_OUTPUT_SCHEMA: dict[str, object] = {

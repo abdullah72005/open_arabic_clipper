@@ -34,6 +34,7 @@ from app.core.enums import (
     TransformationStrategyType,
     UnsupportedClaimFinding,
 )
+from app.core.semantic_contract import unverified_semantic_claim_reason
 from app.transformation.governance.policy import (
     ADDITIVE_VALUE_KINDS,
     FAKE_HOOK_MARKERS,
@@ -1483,6 +1484,20 @@ def _boundary_findings(plan: PlanEvidence, evaluation: PlanEvaluation) -> None:
             )
 
 
+def _cited_evidence(block: dict[str, object], plan: PlanEvidence, inputs: GovernanceInputs) -> str:
+    """Resolve only the source text this substantive block cites."""
+
+    source = _build_source_evidence(plan, inputs)
+    refs = block.get("grounding_refs")
+    matched: list[str] = []
+    if isinstance(refs, list):
+        for ref in refs:
+            resolved = _resolve_ref(ref, source)
+            if resolved and resolved.strip():
+                matched.append(resolved)
+    return " ".join(matched).strip() or source.all_text
+
+
 def _substantive_findings(
     plan: PlanEvidence,
     inputs: GovernanceInputs,
@@ -1522,6 +1537,18 @@ def _substantive_findings(
             hard_distortion = True
         if _has_marker(intent, VERIFIED_CLAIM_MARKERS):
             hard_verified_claim = True
+        combined = f"{intent} {_text(block.get('draft_line'))}".strip()
+        semantic_issue = unverified_semantic_claim_reason(
+            combined, _cited_evidence(block, plan, inputs)
+        )
+        if semantic_issue is not None and not block.get("dependency_ids"):
+            _add(
+                evaluation.hard_failures,
+                GovernanceSeverityClass.HARD_FAIL,
+                _R.UNSUPPORTED_CRITICAL_CLAIM,
+                f"unsupported semantic claim ({semantic_issue})",
+                block_indexes=(index,),
+            )
         if _is_paraphrase(intent, inputs.transcript, config):
             _add(
                 evaluation.revisions,

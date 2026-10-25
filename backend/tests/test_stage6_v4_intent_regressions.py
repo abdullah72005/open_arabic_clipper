@@ -175,6 +175,11 @@ def test_planning_request_separates_rendered_from_nonrendered_evidence() -> None
         word_coverage_sufficient=True,
         refined_start=10.0,
         refined_end=14.0,
+        planning_start=10.0,
+        planning_end=14.0,
+        has_operator_window=False,
+        approved_source_start=None,
+        approved_source_end=None,
     )
     config = SimpleNamespace(min_source_excerpt_seconds=0.4, max_blocks_per_plan=8)
     words = [

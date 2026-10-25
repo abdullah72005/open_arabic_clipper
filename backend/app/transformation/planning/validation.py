@@ -23,6 +23,7 @@ from app.core.enums import (
     TransformationIntensity,
     TransformationStrategyType,
 )
+from app.core.semantic_contract import unverified_semantic_claim_reason
 from app.transformation.grounding import (
     GROUNDING_DECLARATION_MALFORMED,
     validate_source_grounding,
@@ -593,6 +594,8 @@ def _validate_substantive_block(
     inputs: PlanningInputs,
     strategy_type: TransformationStrategyType,
     config: Stage41Config,
+    *,
+    evidence_text: str = "",
 ) -> str | None:
     if block.block_type is PlanBlockType.TRANSITION:
         return None
@@ -616,6 +619,11 @@ def _validate_substantive_block(
         return REJECT_PARAPHRASE
     if _has_marker(combined, VERIFIED_CLAIM_MARKERS):
         return REJECT_UNSUPPORTED_FACT
+    if not block.dependency_ids:
+        intent_issue = unverified_semantic_claim_reason(intent, evidence_text)
+        draft_issue = unverified_semantic_claim_reason(draft, evidence_text)
+        if intent_issue is not None or draft_issue is not None:
+            return REJECT_UNSUPPORTED_FACT
     if any(marker in intent.casefold() for marker in GENERIC_VALUE_MARKERS) and not why:
         return REJECT_EMPTY_INTENT
     allowed = strategy_value_kinds(strategy_type)
@@ -868,8 +876,19 @@ def validate_provider_plan(
         return ValidationResult(plan=None, reasons=mandatory_reasons)
 
     substantive = [b for b in blocks if b.is_substantive]
+    evidence_text = " ".join(
+        str(source.source_text or "")
+        for source in source_blocks
+        if str(source.source_text or "").strip()
+    )
     for block in substantive:
-        error = _validate_substantive_block(block, inputs, strategy_type, config)
+        error = _validate_substantive_block(
+            block,
+            inputs,
+            strategy_type,
+            config,
+            evidence_text=evidence_text,
+        )
         if error is not None:
             details: tuple[Mapping[str, object], ...] = ()
             if error == REJECT_VALUE_KIND_MISMATCH:

@@ -26,6 +26,7 @@ from app.core.enums import (
     SourceExcerptRole,
     SubstantiveValueKind,
 )
+from app.core.semantic_contract import SEMANTIC_CLAIM_CONTRACT
 from app.transformation.hook_payoff import (
     MANDATORY_COVERAGE_TOLERANCE_SECONDS,
     spans_cover_endpoints,
@@ -453,7 +454,19 @@ PLANNING_SYSTEM_INSTRUCTION = (
     "Narration is optional: use need=NONE unless narration is genuinely necessary. If "
     "narration.need is NONE, no block may set delivery_intent=NARRATION. Never make a "
     "plan invalid only because optional narration was removed. Do not select a TTS "
-    "provider, model, or voice."
+    "provider, model, or voice. "
+    + SEMANTIC_CLAIM_CONTRACT
+    + " Every substantive block must align semantic_intent, why_unavailable, "
+    "substantive_value_kind, and draft_line with the shared claim contract. If the "
+    "value is an authored suggestion, use USEFUL_TAKEAWAY and describe a concrete "
+    "source-linked action without claiming the speaker recommended it or that it "
+    "works, prevents, treats, or guarantees any outcome. Never promise a "
+    "psychological mechanism, motive, causal remedy, or proven effectiveness that "
+    "the rendered selected evidence does not establish. draft_line is untrusted "
+    "drafting material, never approved final copy, and it must not smuggle a claim "
+    "the intent cannot justify. If the intended value requires an external fact or "
+    "causal claim, emit a FACT_VERIFICATION_PLACEHOLDER; otherwise decline or use a "
+    "source-grounded interpretation."
 )
 
 _BOUNDED_NOTES = 600

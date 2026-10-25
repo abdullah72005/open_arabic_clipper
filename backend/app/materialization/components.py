@@ -405,6 +405,10 @@ def _writing_result_to_dict(result: WritingResult) -> dict[str, object]:
         "notes": result.notes,
         "deferred": bool(result.deferred),
         "reason_code": result.reason_code,
+        "revalidation_reasons": [
+            {"index": int(index), "reason": str(reason)}
+            for index, reason in result.revalidation_reasons.items()
+        ],
     }
 
 
@@ -419,12 +423,23 @@ def _writing_result_from_dict(data: Mapping[str, object]) -> WritingResult:
                     copies[index] = str(item.get("copy", ""))
     identity = data.get("provider_identity")
     reason_code = data.get("reason_code")
+    revalidation: dict[int, str] = {}
+    raw_revalidation = data.get("revalidation_reasons")
+    if isinstance(raw_revalidation, list):
+        for item in raw_revalidation:
+            if not isinstance(item, Mapping):
+                continue
+            index = item.get("index")
+            reason = item.get("reason")
+            if isinstance(index, int) and not isinstance(index, bool) and isinstance(reason, str):
+                revalidation[index] = reason
     return WritingResult(
         copies=copies,
         provider_identity=dict(identity) if isinstance(identity, Mapping) else {},
         notes=str(data.get("notes", "")),
         deferred=bool(data.get("deferred", False)),
         reason_code=reason_code if isinstance(reason_code, str) else None,
+        revalidation_reasons=revalidation,
     )
 
 
@@ -606,9 +621,14 @@ class CheckpointedWritingProvider:
         hosted = self._provider.provider_name != "deterministic"
 
         def on_response(result: Any) -> Mapping[str, object] | None:
-            if not isinstance(result, WritingResult) or result.deferred:
+            if (
+                not isinstance(result, WritingResult)
+                or result.deferred
+                or result.revalidation_reasons
+            ):
                 # Deferred/rejected output is never reusable: record the status
-                # truthfully without an accepted response so a later run retries.
+                # truthfully without an accepted response so a later run retries
+                # (or the upstream plan is revalidated before any new call).
                 return {
                     "dependency_fingerprint": self._dep,
                     "status": "DEFERRED",
@@ -635,6 +655,10 @@ class CheckpointedWritingProvider:
         if isinstance(response, WritingResult) and response.deferred:
             # Preserve the provider's truthful delivery reason (e.g. UNCERTAIN),
             # never collapsing it into a generic deferral.
+            return response
+        if isinstance(response, WritingResult) and response.revalidation_reasons:
+            # Preserve the writer's structured upstream refusal while keeping it
+            # out of the reusable accepted-writing checkpoint.
             return response
         if status != "RESPONDED" or response is None:
             self.deferred_reason = "DEFERRED_PROVIDER"

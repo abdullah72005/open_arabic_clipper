@@ -17,6 +17,10 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 from app.core.enums import ClaimClass, QualityLevel, SubstantiveValueKind
+from app.core.semantic_contract import (
+    is_explicit_suggestion,
+    unverified_semantic_claim_reason,
+)
 from app.materialization.grounding import (
     grounding_source_text,
     parse_grounding_refs,
@@ -176,13 +180,16 @@ def classify_claim(
     verification_dependency_id: str | None,
     grounding_declared: bool = True,
     grounding_unresolved: bool = False,
+    substantive_value_kind: str | None = None,
 ) -> ClaimClass:
     """Classify authored copy into the claim ledger vocabulary.
 
     Deterministic classification cannot establish entailment: novel content is
     classified as a source-grounded inference that still requires semantic review,
-    never as a resolved claim. A missing/invalid grounding reference, an
-    unsupported number, or an unsupported proper noun makes the copy an external
+    never as a resolved claim. An explicitly authored, source-linked suggestion is
+    its own class so the critique can apply the suggestion-specific rules. A
+    missing/invalid grounding reference, an unsupported number, unsupported proper
+    noun, or an unsupported causal/effect/motive claim makes the copy an external
     claim requiring verification.
     """
 
@@ -194,9 +201,17 @@ def classify_claim(
         return ClaimClass.EXTERNAL_REQUIRES_VERIFICATION
     if _unsupported_facts(copy, grounding_text):
         return ClaimClass.EXTERNAL_REQUIRES_VERIFICATION
+    if unverified_semantic_claim_reason(copy, grounding_text) is not None:
+        return ClaimClass.EXTERNAL_REQUIRES_VERIFICATION
     copy_tokens = set(_content_tokens(copy))
     source_tokens = set(_content_tokens(grounding_text))
     novel = copy_tokens - source_tokens
+    if (
+        substantive_value_kind == SubstantiveValueKind.USEFUL_TAKEAWAY.value
+        and novel
+        and is_explicit_suggestion(copy)
+    ):
+        return ClaimClass.AUTHORED_SOURCE_LINKED_SUGGESTION
     if novel:
         return ClaimClass.SOURCE_GROUNDED_INFERENCE
     return ClaimClass.SOURCE_SUPPORTED
@@ -281,6 +296,22 @@ def validate_authored_block(
             )
         )
 
+    semantic_issue = (
+        unverified_semantic_claim_reason(copy, grounding_text) if copy and grounding_text else None
+    )
+    if semantic_issue is not None:
+        generic = semantic_issue == "GENERIC_ADVICE"
+        findings.append(
+            QualityFinding(
+                dimension="SUBSTANTIVE_VALUE" if generic else "GROUNDING_VERIFICATION",
+                level=QualityLevel.UNMET.value,
+                reason_codes=(
+                    (REASON_GENERIC_FILLER,) if generic else (REASON_UNSUPPORTED_ESSENTIAL_CLAIM,)
+                ),
+                evidence={"block_index": index, "semantic_claim_issue": semantic_issue},
+            )
+        )
+
     if copy:
         if _has_marker(copy, PRESENTATION_ONLY_TERMS) or _has_marker(
             copy, tuple(PRESENTATION_ONLY_CHANGES)
@@ -325,34 +356,40 @@ def validate_authored_block(
         verification_dependency_id=dependency_id,
         grounding_declared=resolution.declared,
         grounding_unresolved=bool(resolution.unresolved),
+        substantive_value_kind=kind,
     )
     essential = block_type in _SUBSTANTIVE_BLOCK_TYPES and kind not in {
         SubstantiveValueKind.SOURCE_AS_EVIDENCE.value,
     }
     requires_semantic_review = False
     if claim_class == ClaimClass.EXTERNAL_REQUIRES_VERIFICATION:
-        if essential:
-            findings.append(
-                QualityFinding(
-                    dimension="GROUNDING_VERIFICATION",
-                    level=QualityLevel.UNMET.value,
-                    reason_codes=(REASON_UNSUPPORTED_ESSENTIAL_CLAIM,),
-                    evidence={"block_index": index, "verification_dependency_id": dependency_id},
-                )
+        # An external factual/causal claim is never approved as authored prose
+        # without the existing verification path, including SOURCE_AS_EVIDENCE
+        # framing. A favorable semantic review cannot substitute for verification.
+        findings.append(
+            QualityFinding(
+                dimension="GROUNDING_VERIFICATION",
+                level=QualityLevel.UNMET.value,
+                reason_codes=(REASON_UNSUPPORTED_ESSENTIAL_CLAIM,),
+                evidence={"block_index": index, "verification_dependency_id": dependency_id},
             )
-        else:
-            requires_semantic_review = True
-    elif claim_class == ClaimClass.SOURCE_GROUNDED_INFERENCE:
+        )
+    elif claim_class in {
+        ClaimClass.SOURCE_GROUNDED_INFERENCE,
+        ClaimClass.AUTHORED_SOURCE_LINKED_SUGGESTION,
+    }:
         # Deterministic checks cannot establish entailment or substantive value,
         # so a genuinely novel contribution is routed to bounded semantic review
-        # rather than accepted on lexical novelty alone.
+        # rather than accepted on lexical novelty alone. An explicitly authored
+        # suggestion is reviewed under the same complete-critique gate; its
+        # suggestion wording is never approval on its own.
         requires_semantic_review = True
         findings.append(
             QualityFinding(
                 dimension="GROUNDING_VERIFICATION",
                 level=QualityLevel.CONCERN.value,
                 reason_codes=(REASON_GROUNDED_INFERENCE_REQUIRES_REVIEW,),
-                evidence={"block_index": index},
+                evidence={"block_index": index, "claim_class": claim_class.value},
             )
         )
 
