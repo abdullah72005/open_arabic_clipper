@@ -1,24 +1,24 @@
-"""Deterministic derived-asset BiDi ordering for Stage 5.1 captions.
+"""Deterministic token-level BiDi helpers for Stage 5.1 captions.
 
-The deployed libass build does not reorder mixed-direction text (empirically
-verified: pure Arabic renders in logical left-to-right order, and Unicode
-paragraph marks / isolates have no effect), so the *derived* ASS asset must
-carry the visual word order itself. This module is pure and provider-free: no
-network, no model, no rendering.
+Ownership contract: Unicode *logical* text is the single source of truth for the
+derived ASS asset. The deployed libass/FriBidi/HarfBuzz runtime applies the
+Unicode Bidirectional Algorithm itself, so writing a second manual permutation
+into the ASS text makes the runtime reorder an already-reordered line (the
+confirmed Stage 6 acceptance defect). Stage 5.1 therefore emits logical tokens
+and lets libass own direction/layout.
 
-Guarantees:
+These helpers remain pure and provider-free (no network, no model, no
+rendering). They are used for deterministic line wrapping, paragraph direction,
+and deciding whether per-word active emphasis is safe:
 
-- canonical transcript text is never read from or written back to here; callers
-  pass an already-tokenized caption and receive a permutation of token indexes;
+- canonical transcript text is never rewritten here; callers pass an already
+  tokenized caption and receive a pure ordering/grouping decision;
 - characters inside a token are never reversed, so Arabic shaping (HarfBuzz)
   and Arabic letters keep their canonical logical order;
-- only whole tokens are moved, using Unicode bidirectional classes, to produce
-  the visual left-to-right reading order for the paragraph base direction.
-
-This is a word/run-level application of the Unicode Bidirectional Algorithm,
-sufficient for captions made of Arabic words, Latin runs, numbers, and
-punctuation. It is deliberately not a token reversal: RTL tokens keep their
-internal order and Latin runs stay internally left-to-right.
+- :func:`active_emphasis_safe` allows per-word color overrides only for a
+  single-direction LTR script, where libass run segmentation is invariant. For
+  RTL/mixed scripts, per-token override blocks change word positions in the
+  installed renderer; Stage 5.1 falls back to the static phrase state there.
 """
 
 from __future__ import annotations
@@ -113,9 +113,27 @@ def visual_order(tokens: Sequence[str], base: str) -> list[int]:
 
 
 def visual_tokens(tokens: Sequence[str], base: str) -> list[str]:
-    """Return the tokens reordered into visual left-to-right order."""
+    """Return the tokens reordered into visual left-to-right order.
+
+    This is a deterministic wrapping/diagnostic helper only. It must never be
+    written into the deployed ASS asset: libass applies the same algorithm at
+    render time, so a manual permutation is double-applied.
+    """
 
     return [tokens[index] for index in visual_order(tokens, base)]
+
+
+def active_emphasis_safe(text: str) -> bool:
+    """Whether per-word color overrides preserve the installed renderer layout.
+
+    Empirically (FFmpeg 7.1.5 / libass 0.17.3) a token wrapped in an override
+    block changes run segmentation for RTL/mixed scripts and moves words. Only a
+    single-direction LTR script (no RTL strong characters) is safe.
+    """
+
+    if paragraph_direction(text) != LTR:
+        return False
+    return not any(token_direction(token) == RTL for token in text.split(" ") if token)
 
 
 def atomic_units(tokens: Sequence[str], base: str) -> list[list[int]]:
@@ -146,6 +164,7 @@ def atomic_units(tokens: Sequence[str], base: str) -> list[list[int]]:
 __all__ = [
     "LTR",
     "RTL",
+    "active_emphasis_safe",
     "atomic_units",
     "paragraph_direction",
     "token_direction",

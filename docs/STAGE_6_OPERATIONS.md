@@ -129,6 +129,61 @@ identity, offending declaration, and concrete reason. Valid grounding proves an
 evidence address only; all deterministic and semantic claim/fidelity/
 substantive-value/verification gates still apply.
 
+## Authored delivery, readability, and semantic value
+
+Standalone authored copy is a first-class, measured delivery decision.
+
+- **Delivery decision.** `ORIGINAL_VALUE`/`TEXTUAL_ANNOTATION` become a
+  standalone reading card. The frozen Stage 5.2 vocabulary has no executable
+  source-hosted annotation unit (only card/source units), so overlaying the hero
+  is never silently attempted; the persisted timeline segment records
+  `delivery=STANDALONE_CARD` (or `NARRATION`) and a `delivery_rationale`.
+- **Layout.** `build_authored_ass` lays copy out inside the shared
+  `SHORTS_VERTICAL_SAFE_ZONE_V1` usable rectangle, centred (`\an5\pos`) with the
+  installed Arabic-capable `Noto Sans Arabic` font at the caption size (88 px at
+  1080x1920). At most three lines. Complete tokens are never truncated or shrunk
+  indefinitely: an overlong/missing/unsafe card records a `FAIL`
+  (`AUTHORED_TEXT_REQUIRES_SHORTENING`, `AUTHORED_TEXT_EXCEEDS_SAFE_AREA`,
+  `AUTHORED_LAYOUT_MEASUREMENT_UNAVAILABLE`, `AUTHORED_READING_BUDGET_INSUFFICIENT`,
+  `MISSING_REQUIRED_VALUE`) and cannot become review-ready. A card with narration
+  is not forced to meet the silent reading budget; the audio carries that
+  delivery.
+- **Measured evidence.** The emitted one-event ASS is rasterized locally through
+  FFmpeg/libass (and fontconfig fallback) and its actual glyph ink is measured;
+  a positive readability finding is never derived from a per-character estimate.
+  The measured ink must sit inside the safe area (including outline padding).
+  Per-card facts (font, safe-area rectangle, character/line count, estimate for
+  line-breaking only, measured ink bbox/measurement method, duration, reading
+  seconds, delivery rationale) are persisted. If local measurement is
+  unavailable, the card is refused. `readable_copy` is derived from these
+  measured findings, never from a default, and reaches render admission and final
+  assessment.
+- **Pacing/continuity.** Each silent card records duration, reading budget,
+  fraction of the timeline, silence interval and delivery rationale under
+  `PACING_CONTEXT_DENSITY`. A `LENGTH_NECESSITY` PASS is bound to its own block,
+  reviewed copy, delivery and executable duration; a sibling PASS, a stale
+  copy/duration or a merely non-dominant timeline fraction cannot authorize a
+  card. A silent card without its own matching assessment is `UNKNOWN` and
+  defers; the dominant flag is reported for context but is not a substitute for
+  the judgment. A legitimate intentional silent reading card remains allowed
+  once value, layout and pause necessity are established.
+- **Critique evidence integrity.** Required substantive copy that is
+  punctuation/stopword-only is a deterministic hard failure. A substantive block
+  never reaches acceptance through lexical validation alone: the required intent
+  and redundancy judgments still run. Legacy boolean-only positive critique
+  results/checkpoints are not promoted into quotes, references or relations; they
+  defer without a provider resend. Complete categorical evidence is required.
+- **Intent fulfillment.** The critique schema adds the critical
+  `INTENT_FULFILLMENT` dimension. For substantive blocks a `PASS` must carry an
+  `intent_fulfillment` object with an exact `copy_quote` substring of the actual
+  copy, a nonempty `grounding_refs` list drawn from the target's offered
+  evidence, and a bounded `added_relation`. Structure/anchors are validated
+  deterministically; the categorical judgment must still establish sufficiency.
+  Missing/invalid evidence cannot produce a `PASS`. `REDUNDANCY` is
+  consequential for substantive blocks (CONCERN/FAIL rejects, missing/UNKNOWN
+  defers). `adds_beyond_source` is the reviewed `added_relation`, never an echo
+  of the plan promise.
+
 ## Objective and ownership
 
 Stage 6 builds one genuine transformed Short from one explicitly selected
@@ -156,7 +211,7 @@ an intermediate prerequisite.
   `processing_jobs` and `render_executions`. No `PipelineStage`, `PipelineRun`,
   `_NEXT_STAGE` entry, or source-lifecycle change is introduced.
 - `backend/app/materialization/policy.py`: versioned policy (`stage6-v1`),
-  validation (`stage6-validation-v1`), timeline schema, quality policy, and the
+  validation (`stage6-validation-v3`), timeline schema, quality policy, and the
   hard budgets (≤4 raw semantic calls including ≤2 strong-tier, ≤3 narration
   chunks, ≤60 s narration, ≤6 raw synthesis calls, ≤180 s clip, one repair,
   conservative boundary-trim limits, `-16 LUFS` / `-1.5 dBTP` / 48 kHz mastering
@@ -238,10 +293,13 @@ explicit `volume=<gain>dB` gain point on the narration track.
   enums, and disabled SDK retries. A 429/quota/refusal/malformed/timeout outcome
   is returned as a truthful *deferred* result, never raised into the pipeline.
 - The script critique is categorical per block (grounding/entailment, substantive
-  added value, semantic fidelity, unsupported facts, code-switch preservation,
-  redundancy, dialect/register fit, naturalness, length/necessity). Acceptance
-  requires a *known positive* grounding and added-value verdict plus no critical
-  concern/failure; a favorable critique never clears a deterministic UNMET finding.
+  added value, intent fulfillment, semantic fidelity, unsupported facts,
+  code-switch preservation, redundancy, dialect/register fit, naturalness,
+  length/necessity). Acceptance requires known-positive grounding, added-value
+  and intent-fulfillment verdicts, a known-positive redundancy verdict for
+  substantive blocks, a known-positive length-necessity verdict for standalone
+  text, and no critical concern/failure; a favorable critique never clears a
+  deterministic UNMET finding.
 - `tts_gemini.py`: `GeminiNarrationSynthesizer` uses the Interactions API
   (`v1beta`, model `gemini-3.8-flash-tts`) with verbatim input, a `speech_metadata`
   style annotation, and a `speech_config` voice; it honors the returned MIME (a
@@ -293,7 +351,14 @@ explicit `volume=<gain>dB` gain point on the narration track.
   technically viable voice — see `STATUS.md`); the missing prerequisite is the
   authorized media, not the provider credential.
 
-Until a genuine manual-acceptance run exists, no acceptance claim is made.
+The 2026-10-20 genuine package for candidate `1827c524` **FAILED human
+acceptance** and remains failed; it is production provenance, not an accepted
+video. Stage 6 remains UNFROZEN, Stage 7 UNSTARTED, `publication_ready=false`.
+Offline V4 remediation (caption ownership, crop containment, measured card
+delivery, intent fulfillment) is implemented and tested locally; it is not a new
+acceptance attempt. One separately authorized genuine attempt may be proposed
+only after SOL closes the open sampling-provenance blocker; human acceptance
+remains mandatory.
 
 ## Verification
 

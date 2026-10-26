@@ -48,6 +48,98 @@ the target/narration semantic context. A whole video or whole multi-hour
 transcript is never included, and Stage 4.0 eligibility/ranking is never
 recomputed.
 
+## Operator planning request (scope and editorial intent)
+
+The Stage 4.1 entry point accepts an optional operator request:
+
+```bash
+python -m app.cli transformation-plan-generate CANDIDATE_ID \
+  --source-start 259.160 --source-end 271.000 \
+  --editorial-intent "Turn the complaint into a practical reciprocal conversation move."
+```
+
+The same fields are accepted as optional query parameters on
+`POST /api/candidates/{id}/transformation-plans`.
+
+- Bounds must be finite, non-negative, paired, and strictly ordered. A window
+  must be inside the source evidence; otherwise the run fails before any
+  provider call.
+- The approved window replaces the broader refined window as the selectable
+  source scope. Only words wholly inside it are offered. Any wider
+  transcript/context remains explicitly nonselectable guidance.
+- Every declared hook/payoff segment must be inside the window and coverable by
+  an in-window word selection. A request that cannot preserve mandatory
+  evidence is rejected before provider invocation.
+- `editorial_intent` is bounded, validated operator direction. It is sent under
+  `operator_direction` with `role=OPERATOR_DIRECTION_NOT_SOURCE_EVIDENCE`; it is
+  never source evidence, approved copy, a new Stage 4.0 strategy, or a
+  guaranteed plan.
+- Generated source excerpts are validated against the approved window with
+  **zero** tolerance. Existing refined-window tolerance never expands explicit
+  operator authorization. A provider `FULL_WINDOW` selection is rejected for a
+  scoped request; out-of-window plans are rejected, never trimmed or repaired.
+- The request is persisted on the existing plan-set envelope
+  (`transformation_plan_sets.operator_request`) so a separate worker executes
+  the same request. While a planning job is active, another request cannot
+  replace it; a changed request binds to the next run.
+- The request participates in the plan-set input fingerprint, per-strategy
+  provider-input fingerprint, checkpoint identity, cache eligibility, and
+  staleness/freshness. Changing scope or intent invalidates incompatible results;
+  identical requests retain normal idempotency.
+- Stage 4.2 rebuilds the same scoped planning inputs from the persisted request
+  and includes the direction in its input/provider identity. Stage 4.3 and Stage
+  5.0 consume the resulting plan/evidence identities and source spans; the
+  filtered planning-word indexes are not reused as final-clip word indexes.
+- An unscoped legacy call on a fresh plan set behaves exactly as before. Once a
+  request is bound to the current plan set, an unscoped call does not silently
+  remove it; replacing requires another explicit request.
+
+The shared provider instruction explicitly describes `operator_direction` as
+non-evidence direction and states the zero-tolerance window rule. This changes
+the instruction hash (and therefore provider identity/checkpoint identity), so
+prior Stage 4.1 provider caches without the operator contract are not reused;
+unscoped semantics themselves are unchanged.
+
+## Producer request contract (V4)
+
+The provider request is a single authoritative, bounded contract; it is not a
+lossy subset of the deterministic validators. `build_planning_request` exposes:
+
+- `mandatory_evidence` with separate `hook` and `payoff` entries. Each reports
+  its truthful state (`ABSENT`, `RESOLVED`, `MALFORMED`, or `UNRESOLVED`), the
+  authoritative source segment index, absolute start/end, whether offered
+  planning words overlap it, and the inclusive planning-word indexes that do.
+  A declared but malformed/unresolved requirement is never hidden.
+- `source_selection` with the inclusive planning-word index scope, offered word
+  count and first/last word, word-coverage sufficiency, the selectable window,
+  minimum excerpt duration, block/plan duration limits, and the effective strict
+  or normal hero/elapsed/authored caps.
+- `strategy_constraints` with the strategy type, the offered value kind, the
+  closed allowed value-kind set for that strategy, and the external-verification
+  requirement.
+- `nonselectable_context` with `context_text`, `suggested_hook_copy`, idea/topic
+  summaries, and an explicit note that none of it is citable evidence.
+- `source_selection.evidence_scope` explicitly separates the **rendered** selected
+  evidence (only the selected `SOURCE_EXCERPT` spans reach the audience) from
+  **nonrendered** transcript/context/summaries, and states the content-sufficiency
+  requirement: the selected excerpt plus the authored value must convey the
+  promised idea. `required_context` is descriptive, never timestamp authority;
+  surrounding material must be selected through the authoritative word/source-span
+  contract.
+- `words` with the exact planning-word text and absolute times offered for
+  selection.
+
+The authoritative hosted schema is the Pydantic `PlanningOutputSchema` used by
+`google-genai`: top-level plan identity/outcome/narration/blocks and the
+conditional block fields are required by the schema convention, with descriptions
+stating the conditional obligations. `PLANNING_OUTPUT_SCHEMA` is generated from
+that same model, so the prompt hash and the object Google receives cannot drift.
+The instruction and schema state the source-selector, mandatory-coverage,
+grounding grammar/equality, verification-linkage, narration-consistency, and
+TTS/rendering/evasion prohibitions. A provider output that is otherwise
+well-formed but omits a required declaration is rejected deterministically;
+there is no retry loop or automatic repair.
+
 ## Plan-set schema
 
 `transformation_plan_sets` — one durable planning envelope per candidate:
@@ -62,6 +154,8 @@ recomputed.
   `outcome_reasons`;
 - Stage 4.0 input/output identity snapshot (`stage40_snapshot`);
 - target/audience and narration-policy semantic snapshot (`target_context`);
+- optional operator request (approved source window + bounded editorial intent)
+  in `operator_request`, bound to the plan set and included in input identity;
 - provider mode, stable configured identity, status, sanitized evidence;
 - per-strategy attempt/checkpoint state (`strategy_attempts`);
 - input/output fingerprints, policy/schema/validation versions, cache
@@ -167,6 +261,32 @@ malformed, out-of-range, or conflicting indexes are unresolved and never
 satisfied. Rejection reasons are distinct (`HOOK_NOT_COVERED`,
 `PAYOFF_NOT_COVERED`, and the corresponding malformed/unresolved/missing codes).
 
+The producer request exposes this evidence directly. Role labels such as `HOOK`
+or `PAYOFF` alone never prove coverage, and a null payoff never waives a hook.
+When the authoritative requirement is malformed or unresolved, no guessed span
+can satisfy it.
+
+Producer feasibility uses the same source-selection and mandatory-coverage
+semantics as validation; it is not an "endpoint lies inside one offered word"
+test. `planning_word_start_index`/`planning_word_end_index` and
+`covered_by_offered_words` are descriptive word mapping only. The authoritative
+`mandatory_coverage_feasible` flag is true when a supported contiguous
+planning-word selection, or the documented full-window fallback when word
+evidence is insufficient, covers both segment endpoints within the existing
+0.75-second tolerance and the resolved span stays inside the selectable window.
+`supported_selection` reports the method (`WORD_SELECTION`/`FULL_WINDOW`) and
+range. `WORD_SELECTION` is advertised only when the planning inputs report
+sufficient word coverage; with insufficient coverage (including nonempty partial
+word evidence), the producer advertises the existing `FULL_WINDOW` fallback
+instead of a word span that validation would reject. This matters when an
+endpoint falls in an inter-word gap: the authentic
+`ac0670c4` hook end does not lie inside any single word, yet the allowed excerpt
+covers it and validation accepts the plan. The instruction therefore tells the
+provider to decline only when `mandatory_coverage_feasible` is false, never
+merely because `covered_by_offered_words` is false. Truly uncoverable, malformed,
+and unresolved evidence remain infeasible and cannot pass validation through a
+word selection or the full-window fallback.
+
 ## Required source grounding
 
 `ORIGINAL_VALUE` and `TEXTUAL_ANNOTATION` are substantive authored blocks and
@@ -180,6 +300,14 @@ requirement.
 
 Declarations use the shared strict grammar (`transformation/grounding.py`):
 source block index, planning word range, source time span, or exact source quote.
+The provider instruction states the production scopes explicitly: `block:N`
+identifies the zero-based index in the complete returned block array and must be
+a `SOURCE_EXCERPT`; `words:N-M` uses inclusive planning-word indexes; `source:A-B`
+uses absolute seconds covered exactly by selected evidence; and a plain quote must
+equal an entire selected excerpt after strip/casefold. A bare decimal such as
+`793.32` is a quote declaration, not a timestamp, and a transcript substring is
+not a whole-excerpt quote. Object references and `final_clip` are not Stage 4.1
+source evidence.
 Resolution happens only after source excerpts are resolved, against the exact
 selected planning-word/block evidence and selected source bounds. The complete
 cited range must be covered; partial overlap, out-of-scope indexes, nonexistent
@@ -424,6 +552,14 @@ dialect shifting, publication-ready full scripts, voice/provider/model
 selection, frame-level rendering instructions, final-plan approval, and
 platform-detection evasion.
 
+The hosted schema is the same authoritative Pydantic model whose JSON schema is
+hashed by `planning_prompt_hash`; there is no separate documentary schema for
+Gemini. It requires the plan identity/outcome fields, narration shape, block
+type/purpose/duration, grounding declarations, dependency ids and the other
+declaration fields, and it documents the conditional rules (for example hero,
+mandatory coverage, grounding, and verification linkage) that deterministic
+validation enforces. Closed vocabularies remain inline enums.
+
 Gemini clients are lazy, constructed only at first call, closed on every exit
 path, and the key is scrubbed on release. Credentials, transcript content,
 prompts, and remote response bodies never appear in errors or logs. Gemini calls
@@ -484,6 +620,30 @@ stalled inside provider work is never reclaimed merely because its original
 Duplicate delivery of a live claim still performs zero provider work, and
 claim-version fencing remains the final guard against stale persistence.
 
+Every rejected or deferred provider attempt may also retain bounded, structural
+rejection diagnostics in the plan-set `provider_evidence.attempt_diagnostics`
+list and in its `strategy_attempts` row. Each entry is tied to the job, strategy,
+route, provider-input fingerprint, prompt hash, schema/policy versions and
+provider identity; it records the failure phase/codes/block, safely represented
+submitted selectors, resolved selected-source word/time identities, expected
+mandatory evidence, source-selection limits, and bounded response digest/size
+(never the raw response). Phases distinguish contract rejection, explicit
+decline, omission, parser rejection and transport failure. A returned plan whose
+requested `strategy_key` carries a mismatched/unknown identity, a duplicate
+identity, or malformed entries is not silently relabeled as `PROVIDER_OMITTED`:
+the parser retains bounded rejection codes (`STRATEGY_ID_MISMATCH`,
+`DUPLICATE_STRATEGY_KEY`, `UNKNOWN_STRATEGY_KEY`, `MALFORMED_ENTRY`,
+`MALFORMED_BLOCKS_CONTAINER`, `MALFORMED_BLOCK_ENTRY`, `UNKNOWN_BLOCK_TYPE`),
+the requested identity, returned-identity digests/lengths, response digest/size/
+returned count, and bounded unmatched-entry structure. Unmatched identities are
+digested rather than persisted verbatim. An accepted sibling remains accepted;
+its parser-sibling rejection evidence is recorded independently. A true omission
+has no parser rejection, and a transport failure has no response evidence.
+Quote declarations are retained only as digests, and diagnostics are never
+executable plan content, never reusable checkpoints, and never include
+transcript text or credentials. Earlier per-job diagnostics survive later runs
+(bounded to the most recent 20).
+
 Failed planning jobs retain bounded, sanitized operator diagnostics. A
 prerequisite (planning-input) failure records the repository-owned prerequisite
 message; an unexpected failure records only the exception type; a provider
@@ -510,9 +670,10 @@ fingerprint; exact bounded transcript, refined bounds, indexed word evidence,
 unresolved/entity/dialect/code-switch evidence; bounded context actually sent;
 Stage 4.0 source moment, assessments, platform risk, preservation and
 verification evidence; target-market/language/register semantic context;
-narration-enabled/language/register semantic policy; Stage 4.1 policy/config/
-validation/schema; and planning provider mode, tier route, model, API, prompt
-hash, schema, temperature, thinking, and budgets.
+narration-enabled/language/register semantic policy; any optional operator
+source-window/editorial-direction request; Stage 4.1 policy/config/validation/
+schema; and planning provider mode, tier route, model, API, effective
+instruction/schema prompt hash, schema, temperature, thinking, and budgets.
 
 It excludes the Gemini key value or presence, admission/cooldown/outage state, TTS
 provider/model/voice/fallback voice, speech-generation settings, rendering/
@@ -543,7 +704,8 @@ persists newly completed work after cancellation.
 
 - `POST /api/candidates/{candidate_id}/transformation-plans` — queue one
   candidate-scoped planning run (returns plan-set/job/cache/active state; accepts
-  no TTS configuration).
+  optional `source_start`, `source_end`, and `editorial_intent` operator
+  constraints; accepts no TTS configuration).
 - `GET /api/candidates/{candidate_id}/transformation-plans` — read the current
   plan set and plans.
 - `GET /api/transformation-plan-sets/{plan_set_id}` — read one plan set.
@@ -551,7 +713,8 @@ persists newly completed work after cancellation.
   4.2 handoff.
 
 ```bash
-python -m app.cli transformation-plan-generate CANDIDATE_ID [--force]
+python -m app.cli transformation-plan-generate CANDIDATE_ID [--force] \
+  [--source-start SECONDS --source-end SECONDS] [--editorial-intent TEXT]
 python -m app.cli transformation-plans CANDIDATE_ID
 python -m app.cli transformation-plan-handoff CANDIDATE_ID
 ```
@@ -599,6 +762,10 @@ evasion, ASR/ingest changes, or automatic pipeline advancement.
 docker run --rm -e PYTHONPATH=/app -v "$PWD/backend:/app" -w /app oac-backend-test \
   python -m pytest tests/ -k stage41 -q
 
+# operator scope/intent contract (hermetic; no hosted calls)
+docker run --rm -e PYTHONPATH=/app -v "$PWD/backend:/app" -w /app oac-backend-test \
+  python -m pytest tests/test_stage41_operator_request.py -q
+
 # full backend suite (with repository compose/.env mounted for path-based tests)
 docker run --rm -e PYTHONPATH=/app -v "$PWD/backend:/app" \
   -v "$PWD/compose.yaml:/compose.yaml:ro" -v "$PWD/.env.example:/.env.example:ro" \
@@ -613,11 +780,49 @@ ruff format app tests alembic && ruff check app tests alembic
 
 All Stage 4.1 tests are deterministic and hermetic: providers are mocked and no
 test makes a live Gemini, Qwen, web, TTS, or rendering call even when a key is
-present. The required-source-grounding correction advanced the validation
+present. The producer/validator selection-agreement correction advanced planning
+to `stage4.1-v12` / `stage4.1-schema-v12` / `stage4.1-validation-v12` and kept
+the provider-input fingerprint at version `2`: `WORD_SELECTION` is advertised
+only with sufficient word coverage, while insufficient nonempty word evidence
+uses the existing validated `FULL_WINDOW` fallback; the regression uses an
+authentic nonempty word subset whose sufficiency is computed by the production
+helper and verifies both the advertised method and the real validator. The
+strategy-bound provider-contract correction advanced planning to
+`stage4.1-v14` / `stage4.1-schema-v13` / `stage4.1-validation-v14` and kept the
+provider-input fingerprint at version `2`: the exact hosted response schema is
+derived per batch from the requested strategies, so each plan variant fixes its
+`strategy_id`/`strategy_key` and restricts `substantive_value_kind` to that
+strategy's authoritative `strategy_value_kinds` subset. Mixed-strategy batches
+therefore enforce every strategy's own contract in one schema and one provider
+call per tier. SDK schema parse failures and application value-kind rejections
+are retained as bounded diagnostics with origin (`SDK_PARSING` or
+`APPLICATION_VALIDATION`), strategy identity, block index, field, actual rejected
+value, and allowed values; raw responses, transcript payloads, and credentials
+are never stored. The required-source-grounding correction advanced the validation
 version to `stage4.1-validation-v11` (authoritative declaration resolution, a
 required-grounding policy for substantive authored blocks, bounded word-range
 work, and Stage 6-parity time-point/range coverage), so prior plans and
-checkpoints invalidate through the input fingerprint. The earlier Arabic
+checkpoints invalidate through the input fingerprint. The producer-contract V4
+correction advanced planning to `stage4.1-v11` / `stage4.1-schema-v11` and kept
+the provider-input fingerprint at version `2`: the request exposes authoritative
+mandatory hook/payoff evidence and planning-word mappings, source-selection and
+strategy constraints; the hosted schema is generated from the same Pydantic model
+used by Gemini; producer feasibility follows validator endpoint/selection
+semantics; parser rejections retain bounded evidence; and the effective
+instruction/schema participates in provider identity. Prior plans, checkpoints,
+and caches therefore invalidate normally without resetting durable counters.
+Offline V4 evidence uses four authentic fixtures and a CONTEXT_HOOK response for
+`1827c524` whose authored block explains the relation between two authentic
+phrases (the quoted gold/diamonds are the quoted family demands), rather than
+merely quoting and attributing one phrase. It passes Stage 4.1 persistence/handoff,
+Stage 4.2 integrity and deterministic governance, Stage 4.3 live mandatory
+guards, Stage 5.0 compatibility/binding/contract assembly, and the production
+Stage 6 `_merge_blocks`/grounding resolver including partial ranges and negative
+mapping controls. Deterministic governance cannot supply the semantic-fidelity
+review dimension, so Stage 4.3 truthfully returns `NO_SELECTABLE_PLAN` offline;
+a persisted executable contract therefore requires an independently reviewed
+hosted semantic result. No approval or semantic-critique rows are fabricated.
+The earlier Arabic
 multi-token closure advanced planning versions to `stage4.1-v8` /
 `stage4.1-schema-v8` / `stage4.1-validation-v8` (bounded Arabic selection grammar
 covers multi-token identities such as `اختر محمد رمضان راوياً`, in addition to

@@ -46,7 +46,11 @@ from app.core.enums import (
 )
 from app.core.settings import Settings
 from app.materialization.acceptance import AssessmentContext, assess_materialization
-from app.materialization.components import script_dependency_inputs
+from app.materialization.components import (
+    critique_request_fingerprint,
+    parse_critique_result,
+    script_dependency_inputs,
+)
 from app.materialization.fingerprints import input_fingerprint, stable_digest
 from app.materialization.inputs import MaterializationInputs
 from app.materialization.policy import (
@@ -59,6 +63,12 @@ from app.materialization.policy import (
     REASON_UNSUPPORTED_ESSENTIAL_CLAIM,
 )
 from app.materialization.profiles import semantic_context_matches
+from app.materialization.providers import (
+    CRITIQUE_ACCEPTED,
+    CRITIQUE_DIMENSIONS,
+    CritiqueTarget,
+    critique_source_context,
+)
 from app.materialization.repository import (
     PRE_RENDER_CONTEXT_METRIC,
     PRE_RENDER_CONTEXT_VERSION,
@@ -801,9 +811,7 @@ def _acquire_publication_locks(
     return True
 
 
-def _artifact_still_matches(
-    storage: StorageService, artifact: _ArtifactIdentity
-) -> bool:
+def _artifact_still_matches(storage: StorageService, artifact: _ArtifactIdentity) -> bool:
     """Verify the exact hashed artifact identity (size + mtime, not a re-hash) under the lock."""
 
     path = (storage.storage_root / artifact.relative_path).resolve()
@@ -876,9 +884,7 @@ def _publish_assessment(
     )
     if envelope is None:
         return _ownership_lost(session, owner)
-    render = session.get(
-        RenderExecution, render_id, populate_existing=True, with_for_update=True
-    )
+    render = session.get(RenderExecution, render_id, populate_existing=True, with_for_update=True)
     if render is None or render.lifecycle.value != "COMPLETE":
         return _disposition(
             session,
@@ -1014,7 +1020,6 @@ def _publish_assessment(
         semantic_outcome=assessment.outcome,
         findings=findings,
     )
-
 
 
 def _disposition_outcome(assessment_outcome: str) -> str:
@@ -1349,9 +1354,7 @@ def _required_contract_slots(contract: RenderContract | None) -> list[Mapping[st
     if not isinstance(slots, list):
         return []
     return [
-        slot
-        for slot in slots
-        if isinstance(slot, Mapping) and bool(slot.get("required", False))
+        slot for slot in slots if isinstance(slot, Mapping) and bool(slot.get("required", False))
     ]
 
 
@@ -1405,6 +1408,8 @@ def _accepted_script_blocks(
     top_blocks = [dict(block) for block in top if isinstance(block, Mapping)]
     if top_blocks != [dict(block) for block in blocks]:
         return False, ()
+    if not _critique_binding_matches(envelope, checkpoint, inputs, blocks):
+        return False, ()
     return True, blocks
 
 
@@ -1445,6 +1450,209 @@ def _script_dependency_matches(
     # Canonical comparison: the live-recomputed dependency set must digest to the
     # same stored fingerprint (tuple/list JSON round-trips are normalized).
     return bool(stable_digest(expected) == dependency)
+
+
+#: Accepted plan block types that always require semantic critique. A
+#: ``SOURCE_AS_EVIDENCE`` block is the explicit deterministic exception.
+_CRITIQUE_REQUIRED_BLOCK_TYPES = frozenset({"ORIGINAL_VALUE", "TEXTUAL_ANNOTATION"})
+
+
+def _critique_required_indexes(
+    blocks: tuple[Mapping[str, object], ...],
+) -> set[int]:
+    """Accepted blocks whose value is authorized by a semantic critique.
+
+    An essential substantive block always requires review. A nonessential block
+    (including ``SOURCE_AS_EVIDENCE``) requires it only when the accepted evidence
+    actually records a critique; a purely deterministic acceptance has no
+    ``validation_evidence.critique`` and remains the explicit no-critique path.
+    """
+
+    required: set[int] = set()
+    for block in blocks:
+        index = block.get("block_index")
+        if isinstance(index, bool) or not isinstance(index, int):
+            continue
+        essential = (
+            str(block.get("block_type") or "") in _CRITIQUE_REQUIRED_BLOCK_TYPES
+            and str(block.get("substantive_value_kind") or "") != "SOURCE_AS_EVIDENCE"
+        )
+        validation = block.get("validation_evidence")
+        critiqued = isinstance(validation, Mapping) and isinstance(
+            validation.get("critique"), Mapping
+        )
+        if essential or critiqued:
+            required.add(index)
+    return required
+
+
+def _critique_binding_matches(
+    envelope: ClipMaterialization,
+    checkpoint: Mapping[str, object],
+    inputs: MaterializationInputs,
+    blocks: tuple[Mapping[str, object], ...],
+) -> bool:
+    """Prove the stored SCRIPT critique reviewed this exact bounded request.
+
+    Finalization/readiness trust an accepted SCRIPT without re-running prepare, so
+    they must independently enforce the same request/evidence binding as replay:
+    every required substantive block is covered by a complete categorical verdict
+    whose reviewed copy/delivery/timing facts match the accepted blocks and the
+    assembled timeline. Missing, legacy-unbound, malformed or stale proof defers;
+    a valid ``SOURCE_AS_EVIDENCE``/no-critique path remains deterministic.
+    """
+
+    required = _critique_required_indexes(blocks)
+    if not required:
+        return True
+    critique = checkpoint.get("critique")
+    if not isinstance(critique, Mapping):
+        return False
+    if critique.get("dependency_fingerprint") != checkpoint.get("dependency_fingerprint"):
+        return False
+    request_fingerprint = critique.get("request_fingerprint")
+    if not isinstance(request_fingerprint, str) or not request_fingerprint:
+        return False
+    raw_targets = critique.get("reviewed_targets")
+    response = critique.get("response")
+    if not isinstance(raw_targets, list) or not raw_targets:
+        return False
+    if not isinstance(response, Mapping):
+        return False
+
+    by_index = {
+        int(block["block_index"]): block
+        for block in blocks
+        if isinstance(block.get("block_index"), int)
+        and not isinstance(block.get("block_index"), bool)
+    }
+    reviewed: dict[int, Mapping[str, object]] = {}
+    canonical_targets: list[dict[str, object]] = []
+    for item in raw_targets:
+        if not isinstance(item, Mapping):
+            return False
+        target = _parse_critique_target(item)
+        if target is None:
+            return False
+        index = target.get("block_index")
+        if isinstance(index, bool) or not isinstance(index, int):
+            return False
+        if index in reviewed:
+            return False
+        reviewed[index] = target
+        canonical_targets.append(target)
+
+    expected_fingerprint = critique_request_fingerprint(
+        canonical_targets, critique_source_context(inputs)
+    )
+    if expected_fingerprint != request_fingerprint:
+        return False
+    if not required <= set(reviewed):
+        return False
+
+    result = parse_critique_result(response)
+    if result.deferred or result.reason_code is not None:
+        return False
+
+    timeline = _timeline_authored_facts(envelope)
+    if timeline is None:
+        return False
+    duration_tolerance = _timeline_duration_tolerance(envelope)
+    narration_need = str(inputs.narration.get("need", "NONE"))
+    for index, target in reviewed.items():
+        block = by_index.get(index)
+        segment = timeline.get(index)
+        if block is None or segment is None:
+            return False
+        copy = block.get("copy")
+        if not isinstance(copy, str) or target.get("copy") != copy:
+            return False
+        if target.get("substantive_value_kind") != block.get("substantive_value_kind"):
+            return False
+        if target.get("claim_class") != block.get("claim_class"):
+            return False
+        proposed = target.get("proposed_delivery")
+        if not isinstance(proposed, Mapping):
+            return False
+        if proposed.get("copy_characters") != len(copy):
+            return False
+        delivery = proposed.get("delivery")
+        if not isinstance(delivery, str) or delivery != segment["delivery"]:
+            return False
+        if delivery == "STANDALONE_CARD":
+            planned = proposed.get("planned_duration_seconds")
+            if not _finite(planned):
+                return False
+            if abs(float(segment["duration"]) - float(planned)) > duration_tolerance:
+                return False
+        block_critique = result.blocks.get(index)
+        if block_critique is None:
+            return False
+        substantive = index in required
+        require_length = substantive and (
+            delivery == "STANDALONE_CARD" or narration_need == "RECOMMENDED"
+        )
+        effective = replace(
+            block_critique,
+            substantive=substantive,
+            require_length_necessity=require_length,
+        )
+        if effective.verdict(CRITIQUE_DIMENSIONS) != CRITIQUE_ACCEPTED:
+            return False
+    return True
+
+
+def _parse_critique_target(data: Mapping[str, object]) -> dict[str, object] | None:
+    """Canonicalize one persisted ``CritiqueTarget.as_dict()`` snapshot."""
+
+    target = CritiqueTarget.from_dict(data)
+    if target is None:
+        return None
+    canonical = target.as_dict()
+    if dict(data) != canonical:
+        return None
+    return canonical
+
+
+def _timeline_authored_facts(
+    envelope: ClipMaterialization,
+) -> dict[int, dict[str, object]] | None:
+    """Index the assembled authored segment facts by plan block index."""
+
+    timeline = envelope.timeline_payload if isinstance(envelope.timeline_payload, Mapping) else {}
+    segments = timeline.get("segments")
+    if not isinstance(segments, list) or not segments:
+        return None
+    facts: dict[int, dict[str, object]] = {}
+    for segment in segments:
+        if not isinstance(segment, Mapping):
+            return None
+        if segment.get("kind") != "AUTHORED_CARD":
+            continue
+        index = segment.get("plan_block_index")
+        if isinstance(index, bool) or not isinstance(index, int):
+            return None
+        delivery = segment.get("delivery")
+        start = segment.get("output_start")
+        end = segment.get("output_end")
+        if not isinstance(delivery, str) or not delivery:
+            return None
+        if not _finite(start) or not _finite(end) or float(end) < float(start):
+            return None
+        if index in facts:
+            return None
+        facts[index] = {
+            "delivery": delivery,
+            "duration": float(end) - float(start),
+        }
+    return facts
+
+
+def _timeline_duration_tolerance(envelope: ClipMaterialization) -> float:
+    timeline = envelope.timeline_payload if isinstance(envelope.timeline_payload, Mapping) else {}
+    frame_rate = timeline.get("frame_rate")
+    frame = 1.0 / float(frame_rate) if _finite(frame_rate) and float(frame_rate) > 0 else 0.04
+    return max(frame, 0.05) + 1e-6
 
 
 def _narration_references(envelope: ClipMaterialization) -> tuple[Mapping[str, object], ...]:
@@ -1543,9 +1751,7 @@ def _slot_evidence(
         else None
     )
     rows = [dict(row) for row in (envelope.slot_resolutions or []) if isinstance(row, Mapping)]
-    by_pair = {
-        (str(row.get("slot_id")), str(row.get("slot_kind", ""))): row for row in rows
-    }
+    by_pair = {(str(row.get("slot_id")), str(row.get("slot_kind", ""))): row for row in rows}
     authored_indexes: set[int] = set()
     for block in authored_blocks:
         index = block.get("block_index")
@@ -1749,18 +1955,14 @@ def _derive_evidence(
     blocks_ok, blocks = _accepted_script_blocks(envelope, inputs, config)
     timeline_ok, hero_bound = _timeline_content(envelope)
     narration = _narration_references(envelope)
-    slots = _slot_evidence(
-        session, envelope, authored_blocks=blocks, narration=narration
-    )
+    slots = _slot_evidence(session, envelope, authored_blocks=blocks, narration=narration)
     narration_required = _narration_required(inputs) and inputs.profile.narration_allowed
 
     # An UNKNOWN required dimension, or UNKNOWN critical semantic evidence, is a
     # missing judgment: the mere presence of a dimension label never establishes a
     # satisfied gate. Missing required content also defers.
     unknown_required = any(levels.get(dim) == "UNKNOWN" for dim in _REBUILD_REQUIRED_DIMENSIONS)
-    unknown_critical = any(
-        levels.get(dim) == "UNKNOWN" for dim in _CRITICAL_SEMANTIC_DIMENSIONS
-    )
+    unknown_critical = any(levels.get(dim) == "UNKNOWN" for dim in _CRITICAL_SEMANTIC_DIMENSIONS)
     missing = (
         not blocks_ok
         or not timeline_ok
@@ -1811,9 +2013,7 @@ def _derive_evidence(
     updates["hero_protected"] = (
         base.hero_protected and hero_bound and REASON_HERO_DAMAGED not in unmet
     )
-    updates["readable_copy"] = (
-        base.readable_copy and REASON_UNREADABLE_REQUIRED_COPY not in unmet
-    )
+    updates["readable_copy"] = base.readable_copy and REASON_UNREADABLE_REQUIRED_COPY not in unmet
     updates["asset_rights_ok"] = (
         base.asset_rights_ok and REASON_UNSUITABLE_ASSET_RIGHTS not in unmet
     )

@@ -208,9 +208,7 @@ def test_writing_adapter_non_retryable_failure_defers_with_one_request() -> None
 
 def test_writing_adapter_malformed_output_defers() -> None:
     transport = _Transport()
-    transport.set_handler(
-        lambda request: httpx.Response(200, json={"candidates": []})
-    )
+    transport.set_handler(lambda request: httpx.Response(200, json={"candidates": []}))
     result = _writing_provider(transport).write(_writing_request())
     assert result.deferred is True
     assert result.reason_code == "MALFORMED_OUTPUT"
@@ -240,21 +238,44 @@ def test_writing_adapter_missing_key_is_unavailable_and_defers() -> None:
     assert result.reason_code == "MISSING_KEY"
 
 
-def _complete_findings(**overrides: str) -> list[dict[str, str]]:
-    return [
-        {"dimension": dimension, "level": overrides.get(dimension, "PASS"), "evidence": "e"}
-        for dimension in CRITIQUE_DIMENSIONS
-    ]
+def _intent_payload() -> dict[str, object]:
+    return {
+        "copy_quote": NOVEL_COPY,
+        "grounding_refs": ["block:0"],
+        "added_relation": "The copy states the mechanism behind the observed drop.",
+    }
+
+
+def _complete_findings(**overrides: str) -> list[dict[str, object]]:
+    findings: list[dict[str, object]] = []
+    for dimension in CRITIQUE_DIMENSIONS:
+        item: dict[str, object] = {
+            "dimension": dimension,
+            "level": overrides.get(dimension, "PASS"),
+            "evidence": "e",
+        }
+        if dimension == "INTENT_FULFILLMENT":
+            item["intent_fulfillment"] = _intent_payload()
+        findings.append(item)
+    return findings
 
 
 def _complete_block(index: int, **overrides: str) -> BlockCritique:
-    return BlockCritique(
-        block_index=index,
-        findings=tuple(
-            CritiqueDimensionFinding(dimension, overrides.get(dimension, "PASS"))
-            for dimension in CRITIQUE_DIMENSIONS
-        ),
-    )
+    findings: list[CritiqueDimensionFinding] = []
+    for dimension in CRITIQUE_DIMENSIONS:
+        if dimension == "INTENT_FULFILLMENT":
+            findings.append(
+                CritiqueDimensionFinding(
+                    dimension,
+                    overrides.get(dimension, "PASS"),
+                    copy_quote=NOVEL_COPY,
+                    grounding_refs=("block:0",),
+                    added_relation="The copy states the mechanism behind the observed drop.",
+                )
+            )
+        else:
+            findings.append(CritiqueDimensionFinding(dimension, overrides.get(dimension, "PASS")))
+    return BlockCritique(block_index=index, findings=tuple(findings))
 
 
 def test_critique_adapter_parses_categorical_findings() -> None:

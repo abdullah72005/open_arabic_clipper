@@ -163,32 +163,27 @@ def _token_lines(event: CaptionEvent) -> tuple[list[str], list[list[int]]]:
     return tokens, [list(range(len(tokens)))]
 
 
-def _visual_line_indexes(tokens: list[str], line: list[int], base: str) -> list[int]:
-    """Reorder one logical line's token indexes into visual left-to-right order."""
-
-    order = bidi.visual_order([tokens[index] for index in line], base)
-    return [line[position] for position in order]
-
-
 def _event_text(event: CaptionEvent, style: CaptionStyle, active_index: int | None = None) -> str:
-    """Render one event with identical per-token scaffolding in every state.
+    """Render one event from its unchanged logical token order.
 
-    Every token is wrapped in the same ``{\\c<color>}token{\\c<primary>}``
-    structure regardless of which word is active (or none). Only the color value
-    changes between the active and inactive tokens, so the override-tag
-    boundaries, BiDi run segmentation, glyph metrics, wrapping, and block
-    position are structurally identical across all active-word states and the
-    static state. Tokens are emitted in the derived visual order for the event's
-    base direction; canonical text is never rewritten.
+    Deployed libass owns the Unicode Bidirectional Algorithm: writing a manual
+    visual permutation here makes libass reorder an already-reordered line (the
+    confirmed acceptance defect). The static state therefore emits logical,
+    escaped tokens with no override scaffolding. Active emphasis is only emitted
+    when :func:`bidi.active_emphasis_safe` proves per-token color overrides keep
+    the renderer's run segmentation/layout invariant; otherwise the caller
+    degrades to the static phrase state.
     """
 
     tokens, lines = _token_lines(event)
-    base = bidi.paragraph_direction(event.text)
-    restore = f"{{\\c{style.primary_color}&}}"
     rendered_lines: list[str] = []
     for line in lines:
+        if active_index is None:
+            rendered_lines.append(" ".join(escape_ass_text(tokens[index]) for index in line))
+            continue
+        restore = f"{{\\c{style.primary_color}&}}"
         rendered_tokens: list[str] = []
-        for index in _visual_line_indexes(tokens, line, base):
+        for index in line:
             color = style.active_color if index == active_index else style.primary_color
             rendered_tokens.append(f"{{\\c{color}&}}{escape_ass_text(tokens[index])}{restore}")
         rendered_lines.append(" ".join(rendered_tokens))
@@ -232,6 +227,12 @@ def _active_word_states(event: CaptionEvent, style: CaptionStyle) -> list[tuple[
     words = event.word_timings
     static = [(event.start, event.end, _event_text(event, style))]
     if not style.active_emphasis or len(words) < 2:
+        return static
+    if not bidi.active_emphasis_safe(event.text):
+        # Per-token override blocks move RTL/mixed words in the installed
+        # renderer, so highlighting would corrupt reading order. The static
+        # phrase state is the truthful fallback; the reason is recorded by
+        # ``aggregate_reason_codes``.
         return static
     if len(words) != len(event.text.split(" ")):
         return static
@@ -327,14 +328,26 @@ def write_ass_asset(
     return written, digest
 
 
-def aggregate_reason_codes(plan: CaptionPlan) -> tuple[str, ...]:
-    """Return the deterministic union of plan reason codes and neutralizations."""
+def aggregate_reason_codes(plan: CaptionPlan, style: CaptionStyle | None = None) -> tuple[str, ...]:
+    """Return the deterministic union of plan reason codes and neutralizations.
+
+    When ``style`` requests active emphasis, an event whose script cannot safely
+    carry per-token overrides records ``ACTIVE_EMPHASIS_UNSAFE_BIDI``: the
+    serializer fell back to the static phrase state rather than reordering words.
+    """
 
     reasons = set(plan.reason_codes)
     for event in plan.events:
         for line in _event_lines(event):
             _, found = escape_ass_text_with_evidence(line)
             reasons.update(found)
+        if (
+            style is not None
+            and style.active_emphasis
+            and len(event.word_timings) >= 2
+            and not bidi.active_emphasis_safe(event.text)
+        ):
+            reasons.add(PlanReasonCode.ACTIVE_EMPHASIS_UNSAFE_BIDI.value)
     return tuple(sorted(reasons))
 
 

@@ -67,7 +67,7 @@ def build_plan_set_input_payload(
     provider_mode: str,
     provider_identity: Mapping[str, object],
 ) -> dict[str, object]:
-    return {
+    payload: dict[str, object] = {
         "candidate": {
             "id": inputs.candidate_id,
             "key": inputs.candidate_key,
@@ -131,6 +131,14 @@ def build_plan_set_input_payload(
             "identity": dict(provider_identity),
         },
     }
+    if inputs.has_operator_request:
+        payload["operator_request"] = {
+            "version": inputs.operator_request_version,
+            "source_start": inputs.approved_source_start,
+            "source_end": inputs.approved_source_end,
+            "editorial_intent": inputs.editorial_intent,
+        }
+    return payload
 
 
 def build_plan_set_output_payload(

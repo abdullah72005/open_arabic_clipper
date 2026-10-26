@@ -74,7 +74,8 @@ Closed plan-level reason codes include `CONTRACT_NOT_CURRENT`,
 `CONTRACT_NOT_EXECUTABLE`, `NO_BOUND_SOURCE_SPANS`, `SOURCE_MEDIA_UNAVAILABLE`,
 `ANALYSIS_SCOPE_EXCEEDED`, `DETECTOR_UNAVAILABLE`, `CAPTION_EVIDENCE_MISSING`,
 `CAPTION_COLLISION_UNRESOLVED`, `BIDI_CONTROL_NEUTRALIZED`,
-`TRACKS_RESET_AT_CUT`, and `FALLBACK_APPLIED`; framing, caption, and overlay
+`ACTIVE_EMPHASIS_UNSAFE_BIDI`, `TRACKS_RESET_AT_CUT`, and `FALLBACK_APPLIED`;
+framing, caption, and overlay
 modules add their own bounded closed evidence codes.
 
 ## Bounded analysis
@@ -166,7 +167,18 @@ Every emitted crop is a clamped 9:16 window represented by a compact normalized
 - a per-scene keyframe cap of 40 is enforced by removing the keyframe with the
   smallest local path delta and marking the path `KEYFRAMES_SIMPLIFIED`;
 - tracked samples are capped at 240 stored per scene by proportional decimation
-  while persistence always counts all associated samples.
+  while persistence always counts all associated samples;
+- **final containment gate.** After smoothing, rate limits, keyframe capping and
+  simplification, `build_scene` interpolates the emitted path (matching Stage
+  5.2's smoothstep) at every keyframe, interpolation midpoint and contemporaneous
+  subject sample. If a preserved subject box is not inside the crop, or subject
+  evidence is unreliable, the scene degrades to `BACKGROUND_FILL` with
+  `CROP_LOSES_SUBJECT` and `SUBJECT_NOT_PRESERVED_IN_CROP`. An in-bounds crop is
+  not sufficient evidence that the face is still visible. A leading, trailing
+  or interior interval without subject evidence within the configured detection
+  hold (default 1.0 s) also fails the proof; recentering is not evidence of
+  visibility. Only complete coverage, or a gap no longer than the hold at an
+  edge/between observations, can keep a crop.
 
 ## Caption architecture
 
@@ -237,57 +249,37 @@ block-relative `timeline_hint`; no global timeline is frozen.
 - Caption text is stored in **canonical logical Unicode order**: the exact
   source word tokens joined by single spaces, with no reordering, replacement,
   or injected direction controls. That canonical text is what the plan,
-  fingerprint, handoff, and evidence always carry; visual order is never written
-  back upstream.
-- **Renderer reality (measured).** The deployed libass build does not reorder
-  mixed-direction text: pure Arabic renders in logical left-to-right order, and
-  Unicode paragraph marks / isolates (`RLM`/`LRM`/`RLI`/`FSI`) and the ffmpeg
-  `ass` filter `shaping=complex` option have no effect on ordering. Delegating
-  BiDi to the renderer therefore produced visually reversed Arabic and a
-  wrong-direction second line.
-- **Derived-asset BiDi (`bidi.py`).** Because the renderer cannot be relied on,
-  the *derived* ASS asset carries the visual order itself. `bidi.py` is a pure,
-  network-free application of the Unicode Bidirectional Algorithm at run level:
-  it classifies each token (`RTL`/`LTR`/neutral/number), resolves neutrals to the
-  surrounding run, and reorders whole runs for the paragraph base direction
-  (right-to-left for an RTL paragraph, left-to-right for LTR; tokens inside an
-  RTL run are reversed, LTR runs keep their order). Characters inside a token
-  are never reversed, so Arabic shaping (HarfBuzz) and letters keep canonical
-  order. The base direction is computed once per event from the first strong
-  character, so every line of a chunk shares one direction and a line starting
-  with Latin can no longer flip the sentence.
-- **Run-aware wrapping.** `wrap_text` treats a contiguous LTR run such as
-  `content creator` as a single wrapping unit and moves it to the next line
-  instead of splitting it when it fits; a run wider than a full line falls back
-  to bounded per-token splitting. Caption segmentation applies the same units
-  (and still honours punctuation and pause boundaries), so a Latin phrase is not
-  split across chunks either.
-- **Structural invariant for dynamic emphasis.** The static render and every
-  active-word state use exactly the same per-token override scaffolding
-  (`{\c<color>}token{\c<primary>}` around every token, same line breaks, same
-  token order); only the active token's color value differs. The static path and
-  the dynamic path share one builder, so the active word can never change the
-  derived visual order, line breaks, or block position. (An earlier revision
-  applied the derived visual order only on the static path and emitted canonical
-  logical order on the dynamic path, which made highlighting a Latin word flip
-  the surrounding Arabic run.)
-- **Proof.** `tests/test_stage51_bidi_order.py` pins the intended human visual
-  reading order for the mixed fixtures as explicit left-to-right token
-  sequences. `tests/test_stage51_bidi_render.py` then renders each fixture
-  through the real libass `ass` filter with the active word accented in turn,
-  recovers each word's on-screen position from the accent centroid, groups by
-  rendered line, and asserts the rendered per-line order equals the intended
-  order — not logical-text equality. It also asserts the `content creator` run
-  stays contiguous and internally ordered. The same suite proves dynamic
-  active-word emphasis: block bounding box stationary, a no-op-color render
-  pixel-identical to the plain static render (override tags cause no reflow,
-  reorder, or reshaping), and the accent present in every state and advancing
-  between states. The tests skip only when ffmpeg, the libass `ass` filter, or a
-  usable installed font is genuinely absent; the project Docker test image
-  provides all three.
+  fingerprint, handoff, and evidence always carry.
+- **Ownership contract:** the derived ASS asset carries **logical** Unicode
+  text. The deployed libass/FriBidi/HarfBuzz runtime owns the Unicode
+  Bidirectional Algorithm and reorders logical runs itself. Writing a manual
+  visual permutation into the ASS as well makes libass reorder an
+  already-reordered line; that double application produced the reversed Arabic
+  captions in the failed Stage 6 acceptance MP4 (`ألماص قوي كتير` instead of
+  `كتير قوي ألماص`, and `كتير طلباتهم` instead of `طلباتهم كتير`).
+- `bidi.py` remains a pure, network-free helper for paragraph direction,
+  deterministic line wrapping, and active-emphasis safety. Its
+  `visual_order`/`visual_tokens` helpers are wrapping/diagnostic utilities only;
+  they are never written into the deployed ASS.
+- **Active-word emphasis.** Per-token ASS color override blocks change run
+  segmentation for RTL/mixed scripts in the installed renderer and move words.
+  Active emphasis therefore executes only when `bidi.active_emphasis_safe`
+  proves a single-direction LTR script. For RTL/mixed scripts the event degrades
+  to the static phrase state and the plan records
+  `ACTIVE_EMPHASIS_UNSAFE_BIDI`; active highlighting is not claimed repaired for
+  those scripts. Production default remains static (`active_emphasis=false`).
+- **Proof.** `tests/test_stage51_bidi_order.py` and
+  `tests/test_stage51_bidi_render.py` render the actual acceptance lines
+  (`كتير قوي ألماص` and `طلباتهم كتير`) through the real libass `ass` filter.
+  The tests assert the production static raster is pixel-identical to an
+  independent test-local logical ASS reference, differs from the old manual
+  permutation, and recovers word positions from isolated-word rasters matched
+  against the full line before comparing them to hand-written reading orders.
+  A static/emphasis-off MP4 encode check confirms the encoded frame preserves
+  that order. RTL active emphasis is asserted to degrade to one static state;
+  known-safe LTR emphasis still advances per word without reflow.
 - Frontend `<bdi>` handling is unrelated to video subtitles and does not solve
-  subtitle rendering; Stage 5.0 explicitly requires real ASS/libass validation
-  in Stage 5.1, which these tests provide.
+  subtitle rendering.
 
 ## ASS escaping and safety
 
@@ -555,10 +547,10 @@ constraints shown; see `.env.example` for the comments.
 - policy `stage5.1-v1`
 - schema `stage5.1-schema-v1`
 - fingerprint `1`
-- framing policy `stage5.1-framing-v1`
+- framing policy `stage5.1-framing-v3`
 - caption layout policy `stage5.1-caption-layout-v4`
-- ASS policy `stage5.1-ass-v5`
-- caption BiDi policy `stage5.1-caption-bidi-v2`
+- ASS policy `stage5.1-ass-v6`
+- caption BiDi policy `stage5.1-caption-bidi-v3`
 - background fill policy `stage5.1-background-fill-v1`
 - safe-zone profile `shorts-reels-safe-zone-v1`
 - output geometry `1080 x 1920` (9:16; `SHORTS_1080X1920` is the Stage 5.0
@@ -600,9 +592,17 @@ center crop. No test makes a live provider, network, TTS, or final-render call.
 
 A scene that has face detections but no track meeting the persistence threshold
 now uses `BACKGROUND_FILL` (keeping every subject visible); `CENTER_FALLBACK` is
-reserved for zero-detection/no-evidence scenes and invalid geometry. FFmpeg
-input seeking (`-ss` before `-i`) was verified byte-identical to output seeking
-at 66/68/80 s on the AV1 validation source, so seeking is not a limitation.
+reserved for zero-detection/no-evidence scenes and invalid geometry.
+
+**Sampling provenance caveat (open).** The sampler labels `fps`-filter outputs
+`span_start + index / effective_fps`. That label is not proof of the exact input
+frame selected near a cut: a bounded replay showed the fps-filter frame at
+584.16 s differs from the exact input-seek frame at 584.16 s on the AV1
+acceptance source. The failed run retained no per-sample frame digest, and its
+saved right-hand two-shot boxes repeat identically through 585.16 s while a
+fresh current-checkout replay already shows the close-up at 584.16 s. No
+detector/cache/decoder explanation is asserted; per-sample decode identity and
+digest capture are required before claiming full sampling remediation.
 
 Known limitations: preview rendering has no API/CLI entry point. Stage 5.2 and
 Stage 6 are

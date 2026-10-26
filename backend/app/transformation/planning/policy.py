@@ -19,15 +19,33 @@ from app.core.enums import (
     TransformationStrategyType,
 )
 
-# v8 Arabic multi-token closure: bounded Arabic selection grammar covers
-# multi-token identities (for example "اختر محمد رمضان راوياً").
-POLICY_VERSION = "stage4.1-v9"
-SCHEMA_VERSION = "stage4.1-schema-v9"
-VALIDATION_VERSION = "stage4.1-validation-v11"
+# v16 authored-suggestion classification independence: the shared contract makes
+# clear that its four entries are claim categories, not substantive value kinds,
+# so an authored source-linked suggestion uses the strategy's permitted
+# substantive value kind (AUTHORED_THESIS for SOURCE_AS_EVIDENCE) rather than
+# requiring USEFUL_TAKEAWAY. v15 shared semantic-claim contract: planning
+# distinguishes source-established claims, source-grounded interpretation,
+# authored source-linked suggestions, and external verification claims;
+# draft_line is untrusted and unsupported causal/effect/motive promises are
+# rejected. v14 strategy-bound provider schema:
+# the hosted response schema restricts each requested strategy's substantive
+# value kinds to its authoritative subset and SDK/application value-kind
+# rejections carry bounded actual/allowed evidence. v12 producer/validator
+# selection-agreement correction: WORD_SELECTION is
+# advertised only when word coverage is sufficient, and insufficient nonempty
+# word evidence uses the existing full-window fallback instead of advertising a
+# word span the validator rejects. v11 producer feasibility/diagnostics
+# alignment (mandatory feasibility follows validator selection/endpoint
+# semantics and parser rejections are retained as bounded diagnostics), v10
+# producer-contract alignment, and v8 Arabic multi-token closure remain in
+# force.
+POLICY_VERSION = "stage4.1-v16"
+SCHEMA_VERSION = "stage4.1-schema-v13"
+VALIDATION_VERSION = "stage4.1-validation-v16"
 INPUT_FINGERPRINT_VERSION = "2"
 OUTPUT_FINGERPRINT_VERSION = "2"
 PLAN_FINGERPRINT_VERSION = "2"
-PROVIDER_INPUT_FINGERPRINT_VERSION = "1"
+PROVIDER_INPUT_FINGERPRINT_VERSION = "2"
 
 # Official Gemini model documentation was checked 2026-09-14. See
 # docs/STAGE_4_1_OPERATIONS.md for the exact links.

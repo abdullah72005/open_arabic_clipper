@@ -8,6 +8,7 @@ in the environment can never trigger live work.
 from __future__ import annotations
 
 import itertools
+import uuid
 from collections.abc import Sequence
 from typing import Any
 
@@ -266,6 +267,7 @@ def build_words(
 def seed_stage41(
     session: Any,
     *,
+    candidate_id: str | None = None,
     content_type: ContentType = ContentType.INTERVIEW_INSIGHT,
     strategy_type: TransformationStrategyType = TransformationStrategyType.SOURCE_AS_EVIDENCE,
     external: ExternalFactRequirement = ExternalFactRequirement.NOT_REQUIRED,
@@ -275,10 +277,16 @@ def seed_stage41(
     value_kind: SubstantiveValueKind = SubstantiveValueKind.SOURCE_AS_EVIDENCE,
     dialect_profile: str | None = "EGYPTIAN",
     transcript: str = TRANSCRIPT,
+    transcript_duration: float = 90.0,
     refined: tuple[float, float] = (20.5, 44.5),
+    candidate_start: float = 20.0,
+    candidate_end: float = 45.0,
     words: list[dict[str, object]] | None = None,
     second_strategy: tuple[TransformationStrategyType, str] | None = None,
     settings: FakeStage41Settings | None = None,
+    hook_index: int | None = None,
+    payoff_index: int | None = None,
+    source_segments: list[dict[str, object]] | None = None,
 ) -> tuple[Any, Any, Any, Any, list[Any]]:
     """Create a source/candidate/refinement plus a current Stage 4.0 analysis."""
 
@@ -317,21 +325,28 @@ def seed_stage41(
             normalized_text=transcript,
             corrected_text=transcript,
             final_text=transcript,
-            segments=[
-                {"start": 0.0, "end": 20.0, "text": "Intro"},
-                {"start": 20.0, "end": 45.0, "text": transcript, "corrected_text": transcript},
-                {"start": 45.0, "end": 90.0, "text": "Outro"},
+            segments=source_segments
+            or [
+                {"start": 0.0, "end": candidate_start, "text": "Intro"},
+                {
+                    "start": candidate_start,
+                    "end": candidate_end,
+                    "text": transcript,
+                    "corrected_text": transcript,
+                },
+                {"start": candidate_end, "end": transcript_duration, "text": "Outro"},
             ],
-            duration=90.0,
+            duration=transcript_duration,
             language="ar",
         )
     )
     candidate = ClipCandidate(
+        **({"id": uuid.UUID(candidate_id)} if candidate_id is not None else {}),
         source_video_id=source.id,
         candidate_key=f"stage41-candidate-{seed_index}",
         disposition=CandidateDisposition.CANDIDATE,
-        start_time=20.0,
-        end_time=45.0,
+        start_time=candidate_start,
+        end_time=candidate_end,
         start_segment_index=1,
         end_segment_index=1,
         segment_indexes=[1],
@@ -358,10 +373,10 @@ def seed_stage41(
         clip_candidate_id=candidate.id,
         priority=RefinementPriority.CANDIDATE,
         status=RefinementStatus.CANDIDATE_REFINED,
-        coarse_start=20.0,
-        coarse_end=45.0,
-        context_start=15.0,
-        context_end=50.0,
+        coarse_start=candidate_start,
+        coarse_end=candidate_end,
+        context_start=max(0.0, candidate_start - 5.0),
+        context_end=candidate_end + 5.0,
         refined_start=refined[0],
         refined_end=refined[1],
         automatic_transcript=transcript,
@@ -397,8 +412,8 @@ def seed_stage41(
         },
         source_moment={
             "structure": "CLAIM",
-            "hook_index": None,
-            "payoff_index": None,
+            "hook_index": hook_index,
+            "payoff_index": payoff_index,
             "duration": refined[1] - refined[0],
             "moment_density": 0.65,
             "evidence": ["content_type"],
@@ -476,14 +491,20 @@ def run_planning(
     provider: object | None = None,
     *,
     mode: SemanticProviderMode = SemanticProviderMode.ADAPTIVE,
+    operator_request: object | None = None,
 ) -> Any:
     """Run one planning executor pass over a seed and return the refreshed plan set."""
 
     from app.transformation.planning.executor import TransformationPlanningExecutor
     from app.transformation.planning.queue import get_or_create_plan_set
+    from app.transformation.planning.request import normalize_operator_request
 
     _source, candidate, _refinement, analysis, _strategies = seed
     plan_set = get_or_create_plan_set(session, candidate, analysis)
+    request = normalize_operator_request(operator_request)  # type: ignore[arg-type]
+    if request is not None:
+        plan_set.operator_request = request.as_dict()
+        session.flush()
     executor = TransformationPlanningExecutor(
         session=session,
         settings=settings,

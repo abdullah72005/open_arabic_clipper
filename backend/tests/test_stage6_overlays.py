@@ -19,7 +19,7 @@ def _timeline(*segments: TimelineSegment) -> AuthoredTimeline:
         output_duration=7.0,
         output_frame_count=210,
         output_sample_count=336000,
-        schema_version="stage6-timeline-v1",
+        schema_version="stage6-timeline-v2",
     )
 
 
@@ -82,10 +82,19 @@ def test_authored_ass_flags_overlong_text() -> None:
         )
     )
     result = build_authored_ass(timeline, play_res_x=1080, play_res_y=1920)
-    assert any(finding.get("dimension") == "authored_readability" for finding in result.findings)
+    assert any(
+        finding.get("dimension") == "VISUAL_CAPTION_READABILITY"
+        and finding.get("level") == "FAIL"
+        and "AUTHORED_TEXT_REQUIRES_SHORTENING" in finding.get("reason_codes", [])
+        for finding in result.findings
+    )
+    # Complete copy is preserved; the card is refused rather than silently
+    # truncated to fit three lines.
+    visible = result.data.decode("utf-8")
+    assert visible.count("word") == 40
 
 
-def test_annotation_uses_top_alignment() -> None:
+def test_annotation_without_a_free_zone_is_a_centred_standalone_card() -> None:
     timeline = _timeline(
         TimelineSegment(
             segment_id="s1",
@@ -97,4 +106,8 @@ def test_annotation_uses_top_alignment() -> None:
         )
     )
     result = build_authored_ass(timeline, play_res_x=1080, play_res_y=1920)
-    assert "{\\an8}" in result.data.decode("utf-8")
+    text = result.data.decode("utf-8")
+    assert "{\\an5\\pos(" in text
+    # Centred inside the shared safe area, not the 10% bottom-inset/48px card.
+    assert "{\\an8}" not in text
+    assert "Style: Card,Noto Sans Arabic,88," in text

@@ -45,9 +45,7 @@ _PROFILE = "MP4_H264_AAC_1080X1920_V1"
 # A genuinely additive (source-grounded inference) authored line, accepted by the
 # fake critique below. Test fixture copy only; product acceptance uses real
 # authorized source speech and the actual persisted production route.
-_ANNOTATION_COPY = (
-    "That drop looks milder once you control for which teams already promoted heavily."
-)
+_ANNOTATION_COPY = "The drop looks smaller with promotion."
 
 
 def _stream_probe(_path: Any, _settings: Any) -> SourceStreamFacts:

@@ -238,7 +238,9 @@
   envelope per candidate) and `transformation_plans` (one stable row per
   `(plan_set, strategy_candidate)`), plus a `TRANSFORMATION_PLANNING` job kind
   and a nullable `processing_jobs.transformation_plan_set_id` FK. Planning
-  policy/schema/validation versions are `stage4.1-v2`. A read-only
+  policy/schema/validation versions are `stage4.1-v12`; producer feasibility
+  advertises `WORD_SELECTION` only with sufficient word coverage and otherwise
+  uses the validated `FULL_WINDOW` fallback. A read-only
   Stage 4.2 handoff exposes exact ordered blocks, hero span, narration semantics,
   verification dependencies, and Stage 4.0 risk. Stage 4.2 governance and Stage
   4.3 deterministic final-plan selection are implemented separately; the

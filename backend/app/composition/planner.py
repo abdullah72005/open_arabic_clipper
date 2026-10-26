@@ -44,6 +44,7 @@ from app.composition.ass import (
     serialize_ass,
     write_ass_asset,
 )
+from app.composition.bidi import active_emphasis_safe
 from app.composition.captions import CaptionPlan, SceneFaceBox, build_caption_plan
 from app.composition.detector import FaceDetector
 from app.composition.fingerprints import (
@@ -343,6 +344,13 @@ def _build(
     )
 
     reasons: set[str] = set(caption_plan.reason_codes)
+    if style.active_emphasis and any(
+        len(event.word_timings) >= 2 and not active_emphasis_safe(event.text)
+        for event in caption_plan.events
+    ):
+        # Highlighting degraded to the static phrase state because per-token
+        # overrides would reorder RTL/mixed words in the installed renderer.
+        reasons.add(PlanReasonCode.ACTIVE_EMPHASIS_UNSAFE_BIDI.value)
     for composition_scene in scenes:
         reasons.update(composition_scene.framing.evidence)
     if not detector_ready:

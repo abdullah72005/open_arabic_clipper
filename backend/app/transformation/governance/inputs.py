@@ -167,7 +167,13 @@ def build_governance_inputs(
 
     try:
         planning = build_planning_inputs(
-            session, candidate, analysis, refinement, settings, stage41_config
+            session,
+            candidate,
+            analysis,
+            refinement,
+            settings,
+            stage41_config,
+            plan_set.operator_request,
         )
     except PlanningInputError as error:
         raise GovernanceInputError(str(error)) from error
@@ -222,4 +228,10 @@ def build_governance_inputs(
         target_context=planning.planning_context,
         plans=plans,
         mandatory_evidence=dict(planning.mandatory_evidence),
+        operator_request_version=planning.operator_request_version,
+        approved_source_start=planning.approved_source_start,
+        approved_source_end=planning.approved_source_end,
+        editorial_intent=planning.editorial_intent,
+        selectable_start=planning.selectable_start,
+        selectable_end=planning.selectable_end,
     )

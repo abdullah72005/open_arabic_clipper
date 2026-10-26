@@ -25,6 +25,7 @@ from app.core.enums import (
     SubstantiveValueFinding,
     UnsupportedClaimFinding,
 )
+from app.core.semantic_contract import SEMANTIC_CLAIM_CONTRACT
 from app.transformation.governance.policy import (
     ACCEPTED_PROVIDER_FINDING_CODES,
     GOVERNOR_SCHEMA_VERSION,
@@ -73,14 +74,33 @@ GOVERNANCE_SYSTEM_INSTRUCTION = (
     "voice, or speaker identity, and never suggest detection evasion. Judge plan "
     "intent, not final script naturalness. Preserve the source speaker's meaning: "
     "flag distortion, decontextualization, sarcasm treated literally, speculation "
-    "presented as fact, false attribution, and fake hooks. Report substantive value "
-    "only for genuine context, explanation, inference, comparison, counterpoint, "
-    "synthesis, verification/correction, authored thesis, useful takeaway, or "
-    "source-as-evidence framing; presentation-only changes such as captions, crop, "
-    "zoom, borders, music, B-roll, filters, or speed receive zero credit. Narration "
-    'NONE is valid. Return strict JSON: {"critiques": [...]} with exactly one item '
-    "per requested plan, echoing its plan_id and plan_output_fingerprint, using only "
-    "the closed values defined by the schema."
+    "presented as fact, false attribution, and fake hooks. Each plan separates the "
+    "rendered selected evidence (the SOURCE_EXCERPT text the audience actually "
+    "receives) from nonrendered context (refined transcript, surrounding context, "
+    "summaries). Judge whether the rendered selected evidence plus the plan's "
+    "authored value actually conveys the promised idea. A minimum duration or a "
+    "hook match is NOT context sufficiency: if the promised explanation needs "
+    "material that is only in nonrendered context, report fidelity/retention as "
+    "inadequate even when the selected words are accurate. Do not treat a copied "
+    "required_context string as evidence that it appears in the output. Report "
+    "substantive value only for genuine context, explanation, inference, comparison, "
+    "counterpoint, synthesis, verification/correction, authored thesis, useful "
+    "takeaway, or source-as-evidence framing; presentation-only changes such as "
+    "captions, crop, zoom, borders, music, B-roll, filters, or speed receive zero "
+    'credit. Narration NONE is valid. Return strict JSON: {"critiques": [...]} with '
+    "exactly one item per requested plan, echoing its plan_id and "
+    "plan_output_fingerprint, using only the closed values defined by the schema. "
+    + SEMANTIC_CLAIM_CONTRACT
+    + " Review unsupported promises already present in semantic_intent and "
+    "draft_line, not only hypothetical final script wording. A causal remedy, "
+    "psychological mechanism, invented motive, or proven-effectiveness claim is "
+    "not acceptable merely because it sounds useful or is prefixed with a "
+    "suggestion marker. An explicitly authored source-linked suggestion may be "
+    "acceptable only when it is concrete, relevant to the rendered evidence, not "
+    "attributed to the speaker, and does not claim efficacy. Generic advice, "
+    "concealed factual claims, invented motives, and paraphrase remain failures. "
+    "Do not approve a plan merely because a later writer could fix it; keep the "
+    "distinction between reviewing plan intent and approving final script wording."
 )
 
 GOVERNANCE_OUTPUT_SCHEMA: dict[str, object] = {
@@ -204,9 +224,13 @@ class GovernanceRequest:
     originality_risk: str
     plans: tuple[dict[str, object], ...]
     priority: str = GOVERNANCE_PRIORITY
+    operator_source_start: float | None = None
+    operator_source_end: float | None = None
+    operator_editorial_intent: str | None = None
+    operator_request_version: str = ""
 
     def to_payload(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "plan_set_id": self.plan_set_id,
             "candidate_id": self.candidate_id,
             "content_type": self.content_type,
@@ -222,10 +246,44 @@ class GovernanceRequest:
             "originality_risk": self.originality_risk,
             "plans": [dict(plan) for plan in self.plans],
             "priority": self.priority,
+            "evidence_scope": {
+                "rendered": ("Only each plan's SOURCE_EXCERPT spans are rendered to the audience."),
+                "nonrendered": [
+                    "refined_transcript",
+                    "context_text",
+                    "idea_summary",
+                    "topic_summary",
+                ],
+                "content_sufficiency_requirement": (
+                    "Judge whether the rendered selected evidence plus the authored "
+                    "value conveys the promised idea. Nonrendered context may explain "
+                    "what is missing but never proves the audience receives it."
+                ),
+            },
         }
+        if (
+            self.operator_request_version
+            or self.operator_source_start is not None
+            or self.operator_source_end is not None
+            or self.operator_editorial_intent
+        ):
+            payload["operator_direction"] = {
+                "role": "OPERATOR_DIRECTION_NOT_SOURCE_EVIDENCE",
+                "version": self.operator_request_version,
+                "approved_source_start": self.operator_source_start,
+                "approved_source_end": self.operator_source_end,
+                "editorial_intent": self.operator_editorial_intent,
+            }
+        return payload
 
 
 def _plan_payload(plan: PlanEvidence) -> dict[str, object]:
+    rendered = [
+        str(block.get("source_text", "") or "")
+        for block in plan.blocks
+        if str(block.get("block_type", "")) == "SOURCE_EXCERPT"
+        and str(block.get("source_text", "") or "").strip()
+    ]
     return {
         "plan_id": plan.plan_id,
         "plan_output_fingerprint": plan.plan_output_fingerprint,
@@ -238,6 +296,10 @@ def _plan_payload(plan: PlanEvidence) -> dict[str, object]:
         "stage40_risk": dict(plan.stage40_risk),
         "preservation_constraints": list(plan.preservation_constraints),
         "original_value_kinds": list(plan.original_value_kinds),
+        # Rendered evidence the audience actually receives, distinct from the
+        # nonrendered transcript/context below.
+        "selected_evidence": rendered,
+        "required_context_is_not_rendered_evidence": True,
     }
 
 
@@ -257,6 +319,10 @@ def build_governance_request(inputs: GovernanceInputs, config: Stage42Config) ->
         rights_risk=inputs.rights_risk,
         originality_risk=inputs.originality_risk,
         plans=tuple(_plan_payload(plan) for plan in inputs.plans),
+        operator_source_start=inputs.approved_source_start,
+        operator_source_end=inputs.approved_source_end,
+        operator_editorial_intent=inputs.editorial_intent,
+        operator_request_version=inputs.operator_request_version,
     )
 
 

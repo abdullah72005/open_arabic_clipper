@@ -164,6 +164,9 @@ def test_stage_4_1_migration_is_reversible_and_preserves_stage_1_to_4_0_data() -
         assert "transformation_plan_set_id" in {
             column["name"] for column in inspector.get_columns("processing_jobs")
         }
+        assert "operator_request" in {
+            column["name"] for column in inspector.get_columns("transformation_plan_sets")
+        }
 
         command.downgrade(config, "20260914_0014")
 

@@ -23,6 +23,7 @@ from app.core.enums import (
     TransformationIntensity,
     TransformationStrategyType,
 )
+from app.core.semantic_contract import unverified_semantic_claim_reason
 from app.transformation.grounding import (
     GROUNDING_DECLARATION_MALFORMED,
     validate_source_grounding,
@@ -166,6 +167,9 @@ class ValidationResult:
     plan: ValidatedPlan | None
     reasons: tuple[str, ...] = ()
     explicit_no_plan: bool = False
+    # Bounded structured detail for contract rejections (for example the actual
+    # and allowed substantive value kinds). Never raw provider payloads.
+    rejection_details: tuple[Mapping[str, object], ...] = ()
 
 
 def _tokens(text: str) -> list[str]:
@@ -469,7 +473,12 @@ def resolve_source_span(
     if duration <= 0:
         return None, REJECT_INVALID_SPAN
     if block.use_full_window:
-        start, end = inputs.refined_start, inputs.refined_end
+        if inputs.has_operator_window:
+            # A scoped request is only satisfiable by an explicit in-window word
+            # selection. Never substitute the whole refined window or the whole
+            # approved window for a provider's missing selection.
+            return None, REJECT_INVALID_SPAN
+        start, end = inputs.planning_start, inputs.planning_end
         text = inputs.transcript
         return SpanResolution(start, end, text, None, None), None
     if block.word_start_index is None or block.word_end_index is None:
@@ -483,10 +492,10 @@ def resolve_source_span(
     selected = inputs.words[start_index : end_index + 1]
     start = selected[0].start
     end = selected[-1].end
-    tolerance = 0.75
+    tolerance = 0.0 if inputs.has_operator_window else 0.75
     if end <= start:
         return None, REJECT_INVALID_SPAN
-    if start < inputs.refined_start - tolerance or end > inputs.refined_end + tolerance:
+    if start < inputs.planning_start - tolerance or end > inputs.planning_end + tolerance:
         return None, REJECT_INVALID_SPAN
     text = " ".join(word.text for word in selected)
     return SpanResolution(start, end, text, start_index, end_index), None
@@ -510,7 +519,7 @@ def _resolve_block(
             return None, error or REJECT_INVALID_SPAN
         role = raw.source_role or SourceExcerptRole.SUPPORT
         duration = max(0.0, span.end - span.start)
-        planning_words = ()
+        planning_words: tuple[dict[str, object], ...] = ()
         if span.word_start_index is not None and span.word_end_index is not None:
             planning_words = tuple(
                 word.as_dict()
@@ -585,6 +594,8 @@ def _validate_substantive_block(
     inputs: PlanningInputs,
     strategy_type: TransformationStrategyType,
     config: Stage41Config,
+    *,
+    evidence_text: str = "",
 ) -> str | None:
     if block.block_type is PlanBlockType.TRANSITION:
         return None
@@ -608,6 +619,11 @@ def _validate_substantive_block(
         return REJECT_PARAPHRASE
     if _has_marker(combined, VERIFIED_CLAIM_MARKERS):
         return REJECT_UNSUPPORTED_FACT
+    if not block.dependency_ids:
+        intent_issue = unverified_semantic_claim_reason(intent, evidence_text)
+        draft_issue = unverified_semantic_claim_reason(draft, evidence_text)
+        if intent_issue is not None or draft_issue is not None:
+            return REJECT_UNSUPPORTED_FACT
     if any(marker in intent.casefold() for marker in GENERIC_VALUE_MARKERS) and not why:
         return REJECT_EMPTY_INTENT
     allowed = strategy_value_kinds(strategy_type)
@@ -626,6 +642,32 @@ def _validate_substantive_block(
         ):
             return REJECT_PARAPHRASE
     return None
+
+
+def _value_kind_rejection(
+    block: PlanBlock,
+    raw: PlanProviderBlock | None,
+    strategy: Mapping[str, object],
+    strategy_type: TransformationStrategyType,
+) -> dict[str, object]:
+    """Bounded, non-secret evidence for an application validation rejection."""
+
+    allowed = [item.value for item in strategy_value_kinds(strategy_type)]
+    actual: str | None
+    if block.substantive_value_kind is not None:
+        actual = block.substantive_value_kind.value
+    else:
+        actual = raw.substantive_value_kind_raw if raw is not None else None
+    return {
+        "origin": "APPLICATION_VALIDATION",
+        "code": REJECT_VALUE_KIND_MISMATCH,
+        "strategy_id": str(strategy.get("id", "")),
+        "strategy_key": str(strategy.get("strategy_key", "")),
+        "block_index": block.index,
+        "field": "substantive_value_kind",
+        "actual_value": actual[:80] if isinstance(actual, str) else actual,
+        "allowed_values": allowed,
+    }
 
 
 def _resolve_narration(
@@ -742,9 +784,10 @@ def validate_provider_plan(
         return ValidationResult(plan=None, reasons=(REJECT_HERO_PLACEMENT,))
     if hero.source_start is None or hero.source_end is None or hero.source_start >= hero.source_end:
         return ValidationResult(plan=None, reasons=(REJECT_INVALID_SPAN,))
+    hero_tolerance = 0.0 if inputs.has_operator_window else 0.75
     if (
-        hero.source_start < inputs.refined_start - 0.75
-        or hero.source_end > inputs.refined_end + 0.75
+        hero.source_start < inputs.planning_start - hero_tolerance
+        or hero.source_end > inputs.planning_end + hero_tolerance
     ):
         return ValidationResult(plan=None, reasons=(REJECT_INVALID_SPAN,))
 
@@ -833,10 +876,29 @@ def validate_provider_plan(
         return ValidationResult(plan=None, reasons=mandatory_reasons)
 
     substantive = [b for b in blocks if b.is_substantive]
+    evidence_text = " ".join(
+        str(source.source_text or "")
+        for source in source_blocks
+        if str(source.source_text or "").strip()
+    )
     for block in substantive:
-        error = _validate_substantive_block(block, inputs, strategy_type, config)
+        error = _validate_substantive_block(
+            block,
+            inputs,
+            strategy_type,
+            config,
+            evidence_text=evidence_text,
+        )
         if error is not None:
-            return ValidationResult(plan=None, reasons=(error,))
+            details: tuple[Mapping[str, object], ...] = ()
+            if error == REJECT_VALUE_KIND_MISMATCH:
+                raw = raw_blocks[block.index] if 0 <= block.index < len(raw_blocks) else None
+                details = (_value_kind_rejection(block, raw, strategy, strategy_type),)
+            return ValidationResult(
+                plan=None,
+                reasons=(error,),
+                rejection_details=details,
+            )
 
     if not substantive and not _verification_blocks(blocks):
         return ValidationResult(plan=None, reasons=(REJECT_NO_VALUE,))

@@ -48,9 +48,7 @@ from app.models import ClipMaterialization, ProcessingJob
 from app.models.render_execution import RenderExecution
 from app.render.execution.executor import build_render_execution_executor
 
-_ANNOTATION_COPY = (
-    "That drop looks milder once you control for which teams already promoted heavily."
-)
+_ANNOTATION_COPY = "Promotion rates fell after teams changed."
 
 _TERMINAL = {JobStatus.SUCCEEDED, JobStatus.FAILED, JobStatus.CANCELLED}
 

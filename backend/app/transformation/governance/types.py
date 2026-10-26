@@ -148,10 +148,30 @@ class GovernanceInputs:
     target_context: PlanningContext
     plans: tuple[PlanEvidence, ...]
     mandatory_evidence: Mapping[str, object] = field(default_factory=dict)
+    operator_request_version: str = ""
+    approved_source_start: float | None = None
+    approved_source_end: float | None = None
+    editorial_intent: str | None = None
+    selectable_start: float | None = None
+    selectable_end: float | None = None
+
+    @property
+    def has_operator_window(self) -> bool:
+        return self.approved_source_start is not None and self.approved_source_end is not None
+
+    @property
+    def has_operator_request(self) -> bool:
+        return (
+            bool(self.operator_request_version)
+            or self.has_operator_window
+            or bool(self.editorial_intent)
+        )
 
     @property
     def duration(self) -> float:
-        return max(0.0, self.refined_end - self.refined_start)
+        start = self.selectable_start if self.selectable_start is not None else self.refined_start
+        end = self.selectable_end if self.selectable_end is not None else self.refined_end
+        return max(0.0, end - start)
 
 
 @dataclass(frozen=True)

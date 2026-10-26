@@ -23,9 +23,17 @@ from app.models import (
     TransformationStrategyCandidate,
 )
 from app.transformation.handoff import build_stage4_1_handoff
-from app.transformation.hook_payoff import resolve_mandatory_evidence
+from app.transformation.hook_payoff import (
+    MANDATORY_COVERAGE_TOLERANCE_SECONDS,
+    MandatoryEvidence,
+    resolve_mandatory_evidence,
+)
 from app.transformation.inputs import build_transformation_inputs
 from app.transformation.planning.policy import Stage41Config
+from app.transformation.planning.request import (
+    OperatorPlanningRequest,
+    normalize_operator_request,
+)
 from app.transformation.planning.types import (
     PlanningContext,
     PlanningInputs,
@@ -107,6 +115,127 @@ def _selectable_window_words(
     return tuple(selected)
 
 
+_BOUND_EPSILON = 1e-6
+
+
+def _operator_window_words(
+    raw: Sequence[object], source_start: float, source_end: float
+) -> tuple[Mapping[str, object], ...]:
+    """Offer only words wholly inside the explicit operator window."""
+
+    selected: list[Mapping[str, object]] = []
+    for item in raw:
+        if not isinstance(item, Mapping):
+            continue
+        start = item.get("start")
+        end = item.get("end")
+        if isinstance(start, bool) or not isinstance(start, (int, float)):
+            continue
+        if isinstance(end, bool) or not isinstance(end, (int, float)):
+            continue
+        if (
+            float(start) >= source_start - _BOUND_EPSILON
+            and float(end) <= source_end + _BOUND_EPSILON
+        ):
+            selected.append(item)
+    return tuple(selected)
+
+
+def _source_evidence_bounds(
+    raw_words: Sequence[Mapping[str, object]],
+    source_segments: Sequence[Mapping[str, object]],
+) -> tuple[float, float] | None:
+    starts: list[float] = []
+    ends: list[float] = []
+    for item in (*raw_words, *source_segments):
+        start = item.get("start")
+        end = item.get("end")
+        if isinstance(start, bool) or not isinstance(start, (int, float)):
+            continue
+        if isinstance(end, bool) or not isinstance(end, (int, float)):
+            continue
+        starts.append(float(start))
+        ends.append(float(end))
+    if not starts or not ends:
+        return None
+    return min(starts), max(ends)
+
+
+def _mandatory_segments(
+    mandatory: MandatoryEvidence,
+) -> tuple[tuple[str, tuple[int, float, float] | None, str | None], ...]:
+    return (
+        ("hook", mandatory.hook_segment, mandatory.hook_error),
+        ("payoff", mandatory.payoff_segment, mandatory.payoff_error),
+    )
+
+
+def _validate_operator_window(
+    request: OperatorPlanningRequest,
+    raw_words: Sequence[Mapping[str, object]],
+    source_segments: Sequence[Mapping[str, object]],
+    mandatory: MandatoryEvidence,
+) -> None:
+    """Reject a request whose window cannot preserve the mandatory evidence."""
+
+    if not request.has_window:
+        return
+    assert request.source_start is not None and request.source_end is not None
+    bounds = _source_evidence_bounds(raw_words, source_segments)
+    if bounds is None:
+        raise PlanningInputError("OPERATOR_WINDOW_HAS_NO_SOURCE_EVIDENCE")
+    if (
+        request.source_start < bounds[0] - _BOUND_EPSILON
+        or request.source_end > bounds[1] + _BOUND_EPSILON
+    ):
+        raise PlanningInputError("OPERATOR_WINDOW_OUT_OF_SOURCE_BOUNDS")
+    for label, segment, error in _mandatory_segments(mandatory):
+        if error == "MALFORMED":
+            raise PlanningInputError(f"{label.upper()}_EVIDENCE_MALFORMED")
+        if error == "UNRESOLVED":
+            raise PlanningInputError(f"{label.upper()}_EVIDENCE_UNRESOLVED")
+        if segment is None:
+            continue
+        if (
+            segment[1] < request.source_start - _BOUND_EPSILON
+            or segment[2] > request.source_end + _BOUND_EPSILON
+        ):
+            raise PlanningInputError(f"{label.upper()}_OUTSIDE_APPROVED_WINDOW")
+
+
+def _window_can_cover(words: Sequence[WordEvidence], start: float, end: float) -> bool:
+    tolerance = MANDATORY_COVERAGE_TOLERANCE_SECONDS
+    start_indexes = [
+        index
+        for index, word in enumerate(words)
+        if word.start <= start + tolerance and word.end >= start - tolerance
+    ]
+    end_indexes = [
+        index
+        for index, word in enumerate(words)
+        if word.start <= end + tolerance and word.end >= end - tolerance
+    ]
+    if not start_indexes or not end_indexes:
+        return False
+    return min(start_indexes) <= max(end_indexes)
+
+
+def _require_operator_window_coverage(
+    request: OperatorPlanningRequest,
+    words: Sequence[WordEvidence],
+    mandatory: MandatoryEvidence,
+) -> None:
+    if not request.has_window:
+        return
+    if not words:
+        raise PlanningInputError("OPERATOR_WINDOW_HAS_NO_WORD_EVIDENCE")
+    for label, segment, _error in _mandatory_segments(mandatory):
+        if segment is None:
+            continue
+        if not _window_can_cover(words, segment[1], segment[2]):
+            raise PlanningInputError(f"{label.upper()}_NOT_COVERABLE_WITHIN_APPROVED_WINDOW")
+
+
 def build_planning_inputs(
     session: object,
     candidate: ClipCandidate,
@@ -114,6 +243,7 @@ def build_planning_inputs(
     refinement: CandidateRefinement,
     settings: Settings,
     config: Stage41Config,
+    operator_request: OperatorPlanningRequest | Mapping[str, object] | None = None,
 ) -> PlanningInputs:
     """Assemble bounded, output-relevant Stage 4.1 inputs or raise."""
 
@@ -153,12 +283,28 @@ def build_planning_inputs(
         source_segments,
     )
 
+    request = normalize_operator_request(operator_request)
     raw_words = tuple(
         item for item in (refinement.word_timestamps or []) if isinstance(item, Mapping)
     )
-    raw_words = _selectable_window_words(raw_words, stage40.effective_start, stage40.effective_end)
+    if request is not None and request.has_window:
+        assert request.source_start is not None and request.source_end is not None
+        _validate_operator_window(request, raw_words, source_segments, mandatory)
+        raw_words = _operator_window_words(raw_words, request.source_start, request.source_end)
+        selectable_start = request.source_start
+        selectable_end = request.source_end
+    else:
+        raw_words = _selectable_window_words(
+            raw_words, stage40.effective_start, stage40.effective_end
+        )
+        selectable_start = stage40.effective_start
+        selectable_end = stage40.effective_end
     words, _has_words = _bounded_words(raw_words, config)
-    coverage = _coverage_sufficient(words, stage40.effective_start, stage40.effective_end)
+    coverage = _coverage_sufficient(words, selectable_start, selectable_end)
+    if request is not None and request.has_window:
+        _require_operator_window_coverage(request, words, mandatory)
+        if not coverage:
+            raise PlanningInputError("OPERATOR_WINDOW_WORD_COVERAGE_INSUFFICIENT")
 
     strategies: list[Mapping[str, object]] = []
     for row in recommended:
@@ -234,6 +380,12 @@ def build_planning_inputs(
         refinement_status=refinement.status.value,
         refinement_output_fingerprint=refinement.output_fingerprint or "",
         mandatory_evidence=mandatory.as_dict(),
+        operator_request_version=request.version if request is not None else "",
+        approved_source_start=(request.source_start if request is not None else None),
+        approved_source_end=request.source_end if request is not None else None,
+        editorial_intent=request.editorial_intent if request is not None else None,
+        selectable_start=selectable_start,
+        selectable_end=selectable_end,
     )
 
 

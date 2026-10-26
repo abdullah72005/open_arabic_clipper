@@ -222,6 +222,7 @@ def seed_selection_fixture(
     rights_risk: Any = None,
     originality_risk: Any = None,
     rights_status: Any = None,
+    operator_request: Any = None,
 ) -> SelectionFixture:
     settings = settings or FakeGovernanceSettings()
     second = (
@@ -323,6 +324,7 @@ def seed_selection_fixture(
         seed,
         FakePlanningProvider(provider_plans),
         mode=SemanticProviderMode.ADAPTIVE,
+        operator_request=operator_request,
     )
     plans = [row for row in list_plans(session, plan_set.id) if row.is_current]
     assert len(plans) == len(result_specs), (len(plans), len(result_specs))

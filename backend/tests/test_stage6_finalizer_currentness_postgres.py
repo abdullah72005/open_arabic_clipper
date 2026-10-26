@@ -58,9 +58,7 @@ pytestmark = pytest.mark.skipif(
 
 _DATABASE = f"clipfactory_stage6_cur_{uuid.uuid4().hex[:12]}"
 _REVIEWABLE = {"READY_FOR_HUMAN_REVIEW", "MATERIALIZED_WITH_CAUTION"}
-_ANNOTATION_COPY = (
-    "That drop looks milder once you control for which teams already promoted heavily."
-)
+_ANNOTATION_COPY = "Promotion rates fell after teams changed."
 
 
 def _admin_url() -> str:
@@ -285,9 +283,7 @@ def test_change_during_rendering_supersedes_at_finalization(
     assert _job_status(engine, job_id) is not JobStatus.RUNNING
 
 
-def test_change_immediately_before_assessment_supersedes(
-    engine: Engine, monkeypatch: Any
-) -> None:
+def test_change_immediately_before_assessment_supersedes(engine: Engine, monkeypatch: Any) -> None:
     envelope_id = _prepare(engine, monkeypatch)
     _attach_render(engine, envelope_id)
     # Change the selected plan content from a second session right before assess.
@@ -537,7 +533,6 @@ def test_unchanged_publication_with_production_session_reaches_review_ready(
     assert envelope.publication_ready is False
 
 
-
 def _autocommit_connection(engine: Engine) -> Any:
     return engine.connect().execution_options(isolation_level="AUTOCOMMIT")
 
@@ -560,10 +555,7 @@ def _wait_for_lock_waiter(engine: Engine, holder_xid: int, *, timeout: float = 1
     try:
         while time.monotonic() < deadline:
             waiting = connection.execute(
-                text(
-                    "SELECT count(*) FROM pg_locks "
-                    "WHERE NOT granted AND transactionid = :xid"
-                ),
+                text("SELECT count(*) FROM pg_locks WHERE NOT granted AND transactionid = :xid"),
                 {"xid": holder_xid},
             ).scalar()
             if waiting and int(waiting) > 0:
@@ -777,7 +769,6 @@ def test_publication_and_queue_share_lock_order_without_deadlock(
     assert "result" in queue_outcome
 
 
-
 def _materialization_job_count(engine: Engine, envelope_id: uuid.UUID) -> int:
     from sqlalchemy import func
 
@@ -811,9 +802,7 @@ def test_resume_refuses_superseded_final_clip_without_new_work(
     )
 
     monkeypatch.setattr(queue_module, "_dispatch", lambda *args, **kwargs: None)
-    monkeypatch.setattr(
-        "app.workers.tasks.run_materialization_job.delay", lambda *a, **k: None
-    )
+    monkeypatch.setattr("app.workers.tasks.run_materialization_job.delay", lambda *a, **k: None)
     envelope_id = _prepare(engine, monkeypatch)
     with Session(engine) as session:
         cancel_materialization_by_id(session, envelope_id)

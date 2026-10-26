@@ -86,12 +86,25 @@ class _WorkingTrack:
                 score=detection.score,
             )
         )
-        self.box = (detection.x, detection.y, detection.w, detection.h)
+        self.box = (detection.x, detection.y, detection.x + detection.w, detection.y + detection.h)
         self.gap = 0
 
 
 def _detection_box(detection: FaceDetection) -> Box:
-    return (detection.x, detection.y, detection.w, detection.h)
+    """Convert the detector's (x, y, w, h) box to the internal edge convention.
+
+    Every geometry helper below consumes ``(x1, y1, x2, y2)``. Mixing the stored
+    ``(x, y, w, h)`` fields with edge-interpreting IoU/centroid/area code made a
+    box's self-IoU zero and mis-measured association jumps; the conversion lives
+    here so there is exactly one convention.
+    """
+
+    return (
+        detection.x,
+        detection.y,
+        detection.x + detection.w,
+        detection.y + detection.h,
+    )
 
 
 def _association_key(detection_box: Box, track_box: Box) -> tuple[float, float, float]:
@@ -104,7 +117,8 @@ def _association_key(detection_box: Box, track_box: Box) -> tuple[float, float, 
 def _acceptable(detection_box: Box, track_box: Box) -> bool:
     if _iou(detection_box, track_box) > 0.0:
         return True
-    return _centroid_distance(detection_box, track_box) <= max(track_box[2], track_box[3])
+    diameter = max(track_box[2] - track_box[0], track_box[3] - track_box[1])
+    return _centroid_distance(detection_box, track_box) <= diameter
 
 
 def _uniform_indices(count: int, keep: int) -> list[int]:

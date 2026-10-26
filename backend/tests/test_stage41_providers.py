@@ -183,7 +183,23 @@ def test_gemini_schema_rejects_unconstrained_block_type() -> None:
 
     with pytest.raises(ValidationError):
         _GeminiBlock(block_type="original_value")
-    assert _GeminiBlock(block_type="SOURCE_EXCERPT").block_type == "SOURCE_EXCERPT"
+    assert _GeminiBlock(**_minimal_gemini_block()).model_dump()["block_type"] == "SOURCE_EXCERPT"
+
+
+def _minimal_gemini_block() -> dict[str, object]:
+    """Explicit required-field convention: the hosted schema requires these."""
+
+    return {
+        "block_type": "SOURCE_EXCERPT",
+        "purpose": "hero",
+        "estimated_duration": 1.0,
+        "preservation_constraints": [],
+        "dependency_ids": [],
+        "semantic_intent": "",
+        "why_unavailable": "",
+        "grounding_refs": [],
+        "dependent_block_ids": [],
+    }
 
 
 def test_planning_instruction_requires_why_unavailable() -> None:

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import cast
 from urllib.request import Request, urlopen
 
@@ -22,6 +22,7 @@ from app.transcription.reconstruction.providers import (
 )
 from app.transformation.planning.policy import SCHEMA_VERSION
 from app.transformation.planning.providers import (
+    PLANNING_SCHEMA_BINDING_VERSION,
     PLANNING_SYSTEM_INSTRUCTION,
     PlanningProviderError,
     PlanningRequest,
@@ -74,6 +75,7 @@ class LocalPlanningProvider:
             "digest": self._digest,
             "prompt_hash": planning_prompt_hash(),
             "schema_version": SCHEMA_VERSION,
+            "schema_binding_version": PLANNING_SCHEMA_BINDING_VERSION,
             "temperature": self._temperature,
             "max_output_tokens": self._output_tokens,
         }
@@ -104,7 +106,11 @@ class LocalPlanningProvider:
             ],
         }
         content = self._call(body)
-        return parse_plan_results(content, requests)
+        return parse_plan_results(
+            content,
+            requests,
+            response_evidence=_local_response_evidence(content),
+        )
 
     def _call(self, body: dict[str, object]) -> dict[str, object]:
         encoded = json.dumps(body, ensure_ascii=False).encode()
@@ -134,6 +140,17 @@ class LocalPlanningProvider:
         if not isinstance(result, dict):
             raise PlanningProviderError(ProviderErrorCategory.MALFORMED_OUTPUT.value)
         return result
+
+
+def _local_response_evidence(content: Mapping[str, object]) -> dict[str, object]:
+    encoded = json.dumps(content, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    plans = content.get("plans")
+    return {
+        "content_digest": hashlib.sha256(encoded).hexdigest(),
+        "content_bytes": len(encoded),
+        "truncated": False,
+        "returned_plan_count": len(plans) if isinstance(plans, list) else 0,
+    }
 
 
 def _request_bytes(

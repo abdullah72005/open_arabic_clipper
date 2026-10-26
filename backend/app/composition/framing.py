@@ -38,6 +38,7 @@ from app.composition.types import (
     FaceTrack,
     FramingDecision,
     Scene,
+    TrackSample,
 )
 
 _TARGET_ASPECT = 9.0 / 16.0
@@ -962,6 +963,114 @@ def build_crop_keyframes(
     )
 
 
+def _interpolated_target(
+    keyframes: Sequence[CropKeyframe], source_time: float
+) -> _CropTarget | None:
+    """Mimic Stage 5.2's smoothstep interpolation for a containment check."""
+
+    if not keyframes:
+        return None
+    if source_time <= keyframes[0].source_time:
+        first = keyframes[0]
+        return _CropTarget(first.center_x, first.center_y, first.height_fraction)
+    if source_time >= keyframes[-1].source_time:
+        last = keyframes[-1]
+        return _CropTarget(last.center_x, last.center_y, last.height_fraction)
+    for earlier, later in zip(keyframes, keyframes[1:]):
+        if earlier.source_time <= source_time <= later.source_time:
+            span = later.source_time - earlier.source_time
+            progress = (
+                0.0 if span <= _EDGE_EPSILON else ((source_time - earlier.source_time) / span)
+            )
+            eased = progress * progress * (3.0 - 2.0 * progress)
+            return _CropTarget(
+                earlier.center_x + (later.center_x - earlier.center_x) * eased,
+                earlier.center_y + (later.center_y - earlier.center_y) * eased,
+                earlier.height_fraction + (later.height_fraction - earlier.height_fraction) * eased,
+            )
+    return None
+
+
+def _path_preserves_subjects(
+    *,
+    keyframes: Sequence[CropKeyframe],
+    tracks: Sequence[FaceTrack],
+    scene_start: float,
+    scene_end: float,
+    config: Stage51Config,
+    geometry: DisplayGeometry,
+) -> bool:
+    """Prove the final smoothed/interpolated crop still contains its subjects.
+
+    In-bounds geometry is insufficient: the old tracked path could clamp to a
+    valid crop that no longer covered the face. Each keyframe, interpolation
+    midpoint, and contemporaneous subject sample must keep every preserved
+    subject box inside the crop; a detection gap longer than the hold window is
+    unproven and therefore unsafe.
+    """
+
+    if len(keyframes) < 2:
+        return False
+    samples = sorted(
+        (sample for track in tracks for sample in track.samples),
+        key=lambda sample: (sample.source_time, sample.cx, sample.cy),
+    )
+    if not samples:
+        return False
+    # Detection evidence must cover the scene (up to the permitted hold at each
+    # edge) and must not contain an interior gap longer than the hold. A longer
+    # gap leaves an interval with no contemporaneous subject observation, which
+    # recentering cannot prove safe.
+    hold = config.detection_hold_seconds()
+    if samples[0].source_time - scene_start > hold + _EDGE_EPSILON:
+        return False
+    if scene_end - samples[-1].source_time > hold + _EDGE_EPSILON:
+        return False
+    for earlier, later in zip(samples, samples[1:]):
+        if later.source_time - earlier.source_time > hold + _EDGE_EPSILON:
+            return False
+    times: set[float] = {keyframe.source_time for keyframe in keyframes}
+    for earlier, later in zip(keyframes, keyframes[1:]):
+        times.add((earlier.source_time + later.source_time) / 2.0)
+    for sample in samples:
+        if scene_start - _EDGE_EPSILON <= sample.source_time <= scene_end + _EDGE_EPSILON:
+            times.add(sample.source_time)
+
+    for source_time in sorted(times):
+        target = _interpolated_target(keyframes, source_time)
+        if target is None:
+            return False
+        observed: list[TrackSample] = []
+        for track in tracks:
+            nearest = min(
+                track.samples,
+                key=lambda sample: abs(sample.source_time - source_time),
+                default=None,
+            )
+            if nearest is None:
+                return False
+            if abs(nearest.source_time - source_time) <= hold + _EDGE_EPSILON:
+                observed.append(nearest)
+        if not observed:
+            # No subject evidence within the permitted hold: recentering is not
+            # proof that the speaker remains visible. An unobserved interval can
+            # never certify containment, so the scene must use the full-source
+            # fallback instead of a valid-looking crop.
+            return False
+        if len(observed) < len(tracks):
+            return False
+        for nearest in observed:
+            box = (
+                nearest.cx - nearest.w / 2.0,
+                nearest.cy - nearest.h / 2.0,
+                nearest.w,
+                nearest.h,
+            )
+            if not _box_contained(target, box, geometry):
+                return False
+    return True
+
+
 def build_scene(
     *,
     scene_index: int,
@@ -996,6 +1105,49 @@ def build_scene(
         geometry=geometry,
         is_hero=is_hero,
     )
+    if mode_value in {
+        FramingMode.TRACKED_CROP.value,
+        FramingMode.STATIC_CROP.value,
+        FramingMode.MULTI_SUBJECT_FIT.value,
+    }:
+        persistent = persistent_tracks(tracks, config)
+        subjects = (
+            persistent[:1] if mode_value != FramingMode.MULTI_SUBJECT_FIT.value else persistent
+        )
+        if not _path_preserves_subjects(
+            keyframes=keyframes,
+            tracks=subjects,
+            scene_start=min(scene_start, scene_end),
+            scene_end=max(scene_start, scene_end),
+            config=config,
+            geometry=geometry,
+        ):
+            # Safe tracking could not be demonstrated; keep every subject visible
+            # with the existing conservative full-source fallback rather than
+            # shipping a valid-looking crop that loses the face.
+            fallback = FramingDecision(
+                mode=FramingMode.BACKGROUND_FILL.value,
+                evidence=(
+                    *decision.evidence,
+                    FramingEvidence.CROP_LOSES_SUBJECT.value,
+                    *hero_evidence,
+                ),
+                fallback_parameters={
+                    "reason": "SUBJECT_NOT_PRESERVED_IN_CROP",
+                    "requested_mode": mode_value,
+                },
+                protected=is_hero,
+            )
+            decision = fallback
+            keyframes = build_crop_keyframes(
+                mode=FramingMode.BACKGROUND_FILL.value,
+                scene_start=scene_start,
+                scene_end=scene_end,
+                tracks=tracks,
+                config=config,
+                geometry=geometry,
+                is_hero=is_hero,
+            )
     return Scene(
         scene_index=scene_index,
         block_index=block_index,

@@ -12,8 +12,10 @@ import hashlib
 import json
 import math
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
-from typing import Protocol, cast
+from dataclasses import dataclass, field
+from typing import Literal, Protocol, Union, cast
+
+from pydantic import BaseModel, Field, create_model
 
 from app.candidates.providers import ProviderErrorCategory  # noqa: F401  (re-exported)
 from app.core.enums import (
@@ -24,7 +26,16 @@ from app.core.enums import (
     SourceExcerptRole,
     SubstantiveValueKind,
 )
-from app.transformation.planning.policy import SCHEMA_VERSION
+from app.core.semantic_contract import SEMANTIC_CLAIM_CONTRACT
+from app.transformation.hook_payoff import (
+    MANDATORY_COVERAGE_TOLERANCE_SECONDS,
+    spans_cover_endpoints,
+)
+from app.transformation.planning.policy import (
+    SCHEMA_VERSION,
+    is_strict_hero_window,
+    strategy_value_kinds,
+)
 from app.transformation.planning.types import (
     NarrationRequirement,
     PlanningInputs,
@@ -43,118 +54,422 @@ _NARRATION_NEEDS = [item.value for item in NarrationNeed]
 _NARRATION_PURPOSES = [item.value for item in NarrationPurpose]
 _DELIVERY = [item.value for item in DeliveryIntent]
 
+_BlockTypeLiteral = Literal[
+    "SOURCE_EXCERPT",
+    "ORIGINAL_VALUE",
+    "TRANSITION",
+    "TEXTUAL_ANNOTATION",
+    "FACT_VERIFICATION_PLACEHOLDER",
+]
+_SourceRoleLiteral = Literal["HERO", "HOOK", "PAYOFF", "SUPPORT"]
+_ValueKindLiteral = Literal[
+    "MISSING_CONTEXT",
+    "INFERENCE",
+    "EXPLANATION",
+    "COMPARISON",
+    "COUNTERPOINT",
+    "VERIFICATION_CORRECTION",
+    "SYNTHESIS",
+    "AUTHORED_THESIS",
+    "USEFUL_TAKEAWAY",
+    "SOURCE_AS_EVIDENCE",
+]
+_DeliveryIntentLiteral = Literal["ON_SCREEN_TEXT", "NARRATION", "FLEXIBLE"]
+_NarrationNeedLiteral = Literal["NONE", "OPTIONAL", "RECOMMENDED", "REQUIRED"]
+_NarrationPurposeLiteral = Literal[
+    "CONTEXT",
+    "ANALYSIS",
+    "COUNTERPOINT",
+    "EXPLANATION",
+    "TAKEAWAY",
+    "HOOK",
+    "TRANSITION",
+]
+
+
+class PlanningNarrationSchema(BaseModel):
+    """Narration is a semantic requirement, never a TTS/voice/render decision."""
+
+    need: _NarrationNeedLiteral = Field(
+        description="NONE unless narration is genuinely necessary for the plan."
+    )
+    purposes: list[_NarrationPurposeLiteral] = Field(
+        description="Closed narration purposes. Provide an empty list when need is NONE."
+    )
+    language: str | None = Field(
+        default=None, description="Output language policy; never the source dialect."
+    )
+    register_intent: str | None = Field(
+        default=None, description="Register intent for any narration wording."
+    )
+    estimated_duration: float = Field(
+        description="Positive estimated narration seconds; 0.0 when need is NONE."
+    )
+    placement_block_index: int | None = Field(
+        default=None, description="Block index where narration should be placed."
+    )
+    max_source_interruption_seconds: float = 0.0
+    overlaps_source_audio: bool = False
+    replaces_silence: bool = False
+    essential: bool = Field(
+        default=False,
+        description="True only when removing narration would make the plan invalid.",
+    )
+    verification_dependency_ids: list[str] = Field(
+        description="Claim ids from FACT_VERIFICATION_PLACEHOLDER blocks that narration uses."
+    )
+
+
+class PlanningBlockSchema(BaseModel):
+    """One plan block. Conditional requirements are stated in descriptions."""
+
+    block_type: _BlockTypeLiteral = Field(
+        description=(
+            "SOURCE_EXCERPT, ORIGINAL_VALUE, TRANSITION, TEXTUAL_ANNOTATION, or "
+            "FACT_VERIFICATION_PLACEHOLDER. Unknown values are rejected."
+        )
+    )
+    purpose: str = Field(description="Short purpose of this block.")
+    estimated_duration: float = Field(
+        description="Non-negative estimated seconds contributed by this block."
+    )
+    interrupts_source: bool = Field(
+        default=False, description="True only when this block interrupts source audio."
+    )
+    preservation_constraints: list[str] = Field(
+        description="Explicit source-preservation constraints for this block."
+    )
+    dependency_ids: list[str] = Field(
+        description=(
+            "Claim ids from FACT_VERIFICATION_PLACEHOLDER blocks that this block "
+            "depends on. Empty when the block has no external dependency."
+        )
+    )
+    source_role: _SourceRoleLiteral | None = Field(
+        default=None,
+        description=(
+            "SOURCE_EXCERPT only. Exactly one excerpt is HERO and it must be block 0 "
+            "or block 1. HERO/HOOK/PAYOFF/SUPPORT labels alone never prove mandatory "
+            "hook/payoff coverage."
+        ),
+    )
+    word_start_index: int | None = Field(
+        default=None,
+        description=(
+            "SOURCE_EXCERPT only. First inclusive zero-based planning-word index from "
+            "the provided words list. These are planning indexes, not FINAL_CLIP indexes."
+        ),
+    )
+    word_end_index: int | None = Field(
+        default=None,
+        description=(
+            "SOURCE_EXCERPT only. Last inclusive planning-word index; must be >= "
+            "word_start_index and inside the offered words."
+        ),
+    )
+    use_full_window: bool = Field(
+        default=False,
+        description="Only when word evidence is unavailable: select the whole refined window.",
+    )
+    continuity_rationale: str | None = None
+    substantive_value_kind: _ValueKindLiteral | None = Field(
+        default=None,
+        description=(
+            "ORIGINAL_VALUE/TEXTUAL_ANNOTATION only. Must be one of "
+            "strategy_constraints.allowed_value_kinds."
+        ),
+    )
+    semantic_intent: str = Field(
+        description=(
+            "Required for ORIGINAL_VALUE/TEXTUAL_ANNOTATION: the specific value the "
+            "viewer gains beyond the selected source excerpt. Empty string otherwise."
+        )
+    )
+    why_unavailable: str = Field(
+        description=(
+            "Required for ORIGINAL_VALUE/TEXTUAL_ANNOTATION: why the selected source "
+            "excerpt alone does not already provide that value. Empty string otherwise."
+        )
+    )
+    grounding_refs: list[str] = Field(
+        description=(
+            "Required non-empty for every ORIGINAL_VALUE/TEXTUAL_ANNOTATION unless a "
+            "genuine FACT_VERIFICATION_PLACEHOLDER dependency covers it. Every supplied "
+            "declaration must resolve against the selected SOURCE_EXCERPT evidence. "
+            "Grammar: 'block:N' where N is the zero-based index of a SOURCE_EXCERPT in "
+            "the complete returned blocks array; 'words:N-M' with inclusive planning-word "
+            "indexes offered in the words list; 'source:A-B' with absolute seconds covered "
+            "exactly by selected evidence; or a plain quote equal to an entire selected "
+            "SOURCE_EXCERPT text after strip/casefold. A bare decimal such as 793.32 is a "
+            "quote, not a timestamp. A substring of an excerpt is not a valid quote. Do not "
+            "use object references or final_clip."
+        )
+    )
+    delivery_intent: _DeliveryIntentLiteral | None = Field(
+        default=None,
+        description="ON_SCREEN_TEXT, NARRATION, or FLEXIBLE. Must agree with narration.need.",
+    )
+    draft_line: str | None = Field(
+        default=None,
+        description=(
+            "Optional short drafted wording. Any number in it must already appear in the "
+            "source transcript; otherwise provide a verification placeholder dependency."
+        ),
+    )
+    claim_dependency: str | None = Field(
+        default=None,
+        description="FACT_VERIFICATION_PLACEHOLDER only: bounded claim id.",
+    )
+    verification_rationale: str | None = None
+    intended_use: str | None = None
+    must_verify_before_execution: bool = Field(
+        default=False,
+        description="FACT_VERIFICATION_PLACEHOLDER only: must be true.",
+    )
+    dependent_block_ids: list[int] = Field(
+        description=(
+            "FACT_VERIFICATION_PLACEHOLDER only: zero-based indexes of the substantive "
+            "blocks that depend on this claim. Empty for other block types."
+        )
+    )
+
+
+class PlanningPlanSchema(BaseModel):
+    """One plan for exactly one requested strategy identity."""
+
+    strategy_id: str = Field(description="Exact requested strategy_id.")
+    strategy_key: str = Field(description="Exact requested strategy_key.")
+    confidence: float = Field(description="Planner confidence between 0.0 and 1.0.")
+    no_valid_plan: bool = Field(
+        description=(
+            "True only when no valid plan can be produced. Then blocks must be empty and "
+            "no_valid_reason must be a short bounded reason."
+        )
+    )
+    no_valid_reason: str = Field(
+        description="Short reason when no_valid_plan is true; empty string otherwise."
+    )
+    planner_notes: str = Field(description="Short bounded notes; never a script or status.")
+    preservation_constraints: list[str] = Field(
+        description="Plan-level source-preservation constraints."
+    )
+    blocks: list[PlanningBlockSchema] = Field(
+        description=(
+            "Ordered blocks. A valid plan has at least one SOURCE_EXCERPT and exactly one "
+            "HERO at block 0 or 1. Selected SOURCE_EXCERPT spans must cover every resolved "
+            "mandatory hook/payoff segment endpoint. Nonoverlapping chronological excerpts."
+        )
+    )
+    narration: PlanningNarrationSchema = Field(
+        description="Narration semantic requirement. Use need=NONE when not needed."
+    )
+
+
+class PlanningOutputSchema(BaseModel):
+    """Authoritative hosted structured-output schema for Stage 4.1 planning."""
+
+    plans: list[PlanningPlanSchema] = Field(
+        description="Exactly one plan per requested strategy; no unrequested identities."
+    )
+
+
+# One authoritative contract: the same Pydantic model Google receives and the
+# schema hashed into provider/prompt identity. A separate documentary schema is
+# deliberately not permitted.
+PLANNING_OUTPUT_SCHEMA: dict[str, object] = PlanningOutputSchema.model_json_schema()
+
+# The static schema above is the canonical superset vocabulary. The hosted
+# provider receives a batch-bound derivation whose per-strategy plan variants
+# restrict `substantive_value_kind` to that strategy's authoritative allowed
+# subset. The binding version participates in the prompt identity so a change
+# to this derivation invalidates affected caches.
+PLANNING_SCHEMA_BINDING_VERSION = "stage4.1-strategy-bound-schema-v1"
+
+_PLAN_DESCRIPTION = "Exactly one plan per requested strategy; no unrequested identities."
+_BLOCK_DESCRIPTION = (
+    "Ordered blocks. A valid plan has at least one SOURCE_EXCERPT and exactly one "
+    "HERO at block 0 or 1. Selected SOURCE_EXCERPT spans must cover every resolved "
+    "mandatory hook/payoff segment endpoint. Nonoverlapping chronological excerpts."
+)
+_VALUE_KIND_DESCRIPTION = (
+    "ORIGINAL_VALUE/TEXTUAL_ANNOTATION only. Must be one of this strategy's "
+    "authorized substantive value kinds."
+)
+
+
+def _request_value_kinds(request: PlanningRequest) -> tuple[str, ...]:
+    from app.core.enums import TransformationStrategyType
+
+    try:
+        strategy_type = TransformationStrategyType(str(request.strategy_type))
+    except ValueError:
+        return ()
+    return tuple(item.value for item in strategy_value_kinds(strategy_type))
+
+
+def _value_kind_field_type(allowed: tuple[str, ...]) -> object:
+    if not allowed:
+        # No substantive kind is authorized for an unknown strategy type.
+        return type(None)
+    return Literal[tuple(allowed)] | None  # type: ignore[valid-type]
+
+
+def build_planning_output_schema(
+    requests: Sequence[PlanningRequest],
+) -> type[BaseModel]:
+    """Bind the hosted response schema to the exact requested strategies.
+
+    Each requested strategy gets a plan variant whose `strategy_id` and
+    `strategy_key` are constants and whose block `substantive_value_kind` enum is
+    that strategy's authoritative allowed subset. A mixed batch therefore
+    enforces every strategy's own contract in one serialized schema and still
+    uses exactly one provider call per tier.
+    """
+
+    variants: list[type[BaseModel]] = []
+    seen: set[tuple[str, str, tuple[str, ...]]] = set()
+    for request in requests:
+        allowed = _request_value_kinds(request)
+        signature = (request.strategy_id, request.strategy_key, allowed)
+        if signature in seen:
+            continue
+        seen.add(signature)
+        digest = hashlib.sha256(
+            "|".join((request.strategy_id, request.strategy_key, ",".join(allowed))).encode()
+        ).hexdigest()[:12]
+        block_model = create_model(
+            f"PlanningBlockSchema_{digest}",
+            __base__=PlanningBlockSchema,
+            substantive_value_kind=(
+                _value_kind_field_type(allowed),
+                Field(default=None, description=_VALUE_KIND_DESCRIPTION),
+            ),
+        )
+        plan_model = create_model(
+            f"PlanningPlanSchema_{digest}",
+            __base__=PlanningPlanSchema,
+            strategy_id=(
+                Literal[request.strategy_id],  # type: ignore[valid-type]
+                Field(description="Exact requested strategy_id."),
+            ),
+            strategy_key=(
+                Literal[request.strategy_key],  # type: ignore[valid-type]
+                Field(description="Exact requested strategy_key."),
+            ),
+            blocks=(list[block_model], Field(description=_BLOCK_DESCRIPTION)),
+        )
+        variants.append(plan_model)
+    if not variants:
+        return PlanningOutputSchema
+    items: object
+    if len(variants) == 1:
+        items = variants[0]
+    else:
+        items = Union[tuple(variants)]  # type: ignore[arg-type]
+    return create_model(
+        "PlanningOutputSchema",
+        plans=(list[items], Field(description=_PLAN_DESCRIPTION)),  # type: ignore[valid-type]
+    )
+
+
+def planning_output_schema_digest(requests: Sequence[PlanningRequest]) -> str:
+    """Stable digest of the exact serialized schema sent for a batch."""
+
+    schema = build_planning_output_schema(requests).model_json_schema()
+    return hashlib.sha256(json.dumps(schema, sort_keys=True).encode("utf-8")).hexdigest()
+
 
 PLANNING_SYSTEM_INSTRUCTION = (
     "You produce concrete structured transformation plans for one short Arabic "
-    "source moment, one plan per requested Stage 4.0 strategy. "
-    "Return only the strict JSON schema. Each plan identifies the exact requested "
-    "strategy_id and strategy_key. "
-    "You never invent source timestamps or quotes: select source spans by the "
-    "provided word indexes, or use the full refined window when word evidence is "
-    "unavailable. "
-    "Every valid plan has at least one source excerpt and exactly one hero source "
-    "excerpt placed as block 0 or block 1. Do not delay the source behind a long "
-    "preamble. "
-    "Every original-value block must state what the viewer learns that the source "
-    "excerpt alone did not provide, as a specific, source-grounded semantic intent "
-    "in semantic_intent, and must set why_unavailable to a short statement of why "
-    "the source excerpt alone does not already provide that value. "
-    "No long generic introductions, no paraphrase presented as originality, no "
-    "fabricated facts, numbers, names, or quotes, no rewritten source speech, no "
-    "source dialect shifting, no publication-ready full scripts, no voice/provider/"
-    "model selection, no frame-level rendering instructions, no final-plan "
-    "approval, and no platform-detection evasion. "
-    "If a plan depends on an external fact, emit a FACT_VERIFICATION_PLACEHOLDER "
-    "that names what must be verified and marks must_verify_before_execution=true; "
-    "do not supply the supposed fact and do not research it. Dependent content must "
-    "reference the requirement: list the integer block indexes of the dependent "
-    "substantive blocks in dependent_block_ids, and list the placeholder's "
-    "claim_dependency value in those blocks' dependency_ids (or in the narration "
-    "verification_dependency_ids when narration delivers the dependent content). "
-    "Narration is optional: use NONE unless narration is genuinely necessary. "
-    "Never cause a plan to be required solely because narration was removed. "
-    "Do not select a TTS provider, TTS model, or voice; do not give frame-level "
-    "rendering instructions; do not propose mirroring, pitch shifting, speed "
-    "tricks, watermark removal, or any platform-detection evasion. "
-    "If a strategy cannot produce a valid substantive plan, set no_valid_plan=true "
-    "with a short bounded reason instead of emitting filler."
+    "source moment, exactly one plan per requested Stage 4.0 strategy. "
+    "Return only the strict JSON schema. Each plan must repeat the exact requested "
+    "strategy_id and strategy_key; never invent, rename, or omit a requested identity. "
+    "If a strategy cannot produce a valid substantive plan, set no_valid_plan=true, "
+    "leave blocks empty, and give a short bounded no_valid_reason. Use the "
+    "no_valid_plan shape only for a genuine decline, never for malformed output. "
+    "A valid plan has at least one SOURCE_EXCERPT and exactly one HERO source excerpt "
+    "placed as block 0 or block 1. Do not delay the source behind a long preamble. "
+    "SOURCE_EXCERPT selection uses only the provided planning-word indexes: "
+    "word_start_index and word_end_index are inclusive zero-based planning indexes from "
+    "the words list. Never invent timestamps or source text. Selected excerpts must be "
+    "chronological, nonoverlapping, and at least min_source_excerpt_seconds long. "
+    "Every selected excerpt must stay inside the selectable window in "
+    "source_selection. Never treat planning indexes as FINAL_CLIP indexes. "
+    "When operator_direction provides approved_source_start and approved_source_end, "
+    "those bounds are authoritative: every selected excerpt must stay fully inside that "
+    "window with no tolerance, and a FULL_WINDOW selection is invalid. Treat "
+    "editorial_intent as "
+    "operator direction only, never as source evidence, approved copy, or a guaranteed "
+    "strategy; do not invent psychology or unsupported factual claims from it. "
+    "Read mandatory_evidence. Each of hook and payoff reports state ABSENT, RESOLVED, "
+    "MALFORMED, or UNRESOLVED, plus the authoritative source segment index and absolute "
+    "bounds. If state is RESOLVED, the union of selected SOURCE_EXCERPT spans must cover "
+    "both the segment start and end (within the stated tolerance). Role labels such as "
+    "HERO, HOOK, PAYOFF, or SUPPORT do not prove coverage. A null payoff does not waive "
+    "a hook. If a declared hook or payoff is MALFORMED or UNRESOLVED, decline with "
+    "no_valid_plan rather than guessing. For a RESOLVED segment, mandatory_coverage_feasible "
+    "states whether a supported source selection can preserve both endpoints; "
+    "supported_selection reports the method (WORD_SELECTION or FULL_WINDOW) and the "
+    "selectable planning-word range. When word evidence is insufficient, the supported "
+    "full-window fallback is a valid selection. Decline with no_valid_plan only when "
+    "mandatory_coverage_feasible is false. covered_by_offered_words is descriptive word "
+    "mapping only; a false value does not require declining when a supported selection "
+    "covers the segment. "
+    "Every ORIGINAL_VALUE and TEXTUAL_ANNOTATION requires at least one grounding "
+    "declaration in grounding_refs, except a genuine two-way external-verification "
+    "linkage. Every supplied declaration must resolve against the selected "
+    "SOURCE_EXCERPT evidence; one valid declaration never excuses another invalid one. "
+    "The grounding grammar is: block:N identifies the zero-based index N in the complete "
+    "returned blocks array and N must be a SOURCE_EXCERPT; words:N-M uses inclusive "
+    "planning-word indexes and every index must belong to a selected SOURCE_EXCERPT; "
+    "source:A-B uses absolute seconds and the whole range must be covered by selected "
+    "evidence; a plain quote must equal an entire selected SOURCE_EXCERPT text after "
+    "strip and casefold. A bare decimal such as 793.32 is a quote declaration, not a "
+    "timestamp. A transcript substring is not a whole-excerpt quote. Do not use object "
+    "references, final_clip, or unselected context. context_text and suggested_hook_copy "
+    "are nonselectable guidance, never evidence. "
+    "Choose substantive_value_kind only from strategy_constraints.allowed_value_kinds. "
+    "Use an additive value kind: state what the viewer learns that the selected excerpt "
+    "alone did not provide in semantic_intent, and state why the excerpt alone does not "
+    "provide it in why_unavailable. The promised value must be conveyed by the selected "
+    "SOURCE_EXCERPT evidence together with the authored block: refined_transcript, "
+    "context_text, suggested_hook_copy and summaries are NONRENDERED context. They may "
+    "explain what is missing but cannot substantiate a promise the audience will not "
+    "receive. If fulfilling the idea requires surrounding material, either include that "
+    "material in a selected excerpt through the authoritative word/source-span contract "
+    "or decline the plan; do not promise an explanation the selected excerpt cannot "
+    "support, and never treat required_context as timestamp authority. No generic "
+    "filler, no paraphrase-only restatement, no dialect-to-standard rewording disguised "
+    "as explanation, no fabricated psychological mechanism or motive, no fabricated "
+    "facts, numbers, names, or quotes, no rewritten source speech, no source dialect "
+    "shifting, no publication-ready full scripts, no voice/provider/model selection, no "
+    "frame-level rendering instructions, no final-plan approval, and no "
+    "platform-detection evasion. "
+    "If a plan depends on an external fact, emit a FACT_VERIFICATION_PLACEHOLDER with "
+    "claim_dependency and must_verify_before_execution=true; do not supply the supposed "
+    "fact and do not research it. List the integer block indexes of the dependent "
+    "substantive blocks in dependent_block_ids and that claim id in those blocks' "
+    "dependency_ids (or in narration verification_dependency_ids when narration delivers "
+    "the dependent content). Linkage is bidirectional. "
+    "Narration is optional: use need=NONE unless narration is genuinely necessary. If "
+    "narration.need is NONE, no block may set delivery_intent=NARRATION. Never make a "
+    "plan invalid only because optional narration was removed. Do not select a TTS "
+    "provider, model, or voice. "
+    + SEMANTIC_CLAIM_CONTRACT
+    + " Every substantive block must align semantic_intent, why_unavailable, "
+    "substantive_value_kind, and draft_line with the shared claim contract. An "
+    "authored suggestion is a claim category, not a substantive value kind: choose a "
+    "substantive_value_kind allowed by strategy_constraints.allowed_value_kinds (for "
+    "SOURCE_AS_EVIDENCE that is AUTHORED_THESIS) and describe a concrete source-linked "
+    "action without claiming the speaker recommended it or that it works, prevents, "
+    "treats, or guarantees any outcome. Never promise a "
+    "psychological mechanism, motive, causal remedy, or proven effectiveness that "
+    "the rendered selected evidence does not establish. draft_line is untrusted "
+    "drafting material, never approved final copy, and it must not smuggle a claim "
+    "the intent cannot justify. If the intended value requires an external fact or "
+    "causal claim, emit a FACT_VERIFICATION_PLACEHOLDER; otherwise decline or use a "
+    "source-grounded interpretation."
 )
-
-PLANNING_OUTPUT_SCHEMA: dict[str, object] = {
-    "type": "object",
-    "properties": {
-        "plans": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "strategy_id": {"type": "string"},
-                    "strategy_key": {"type": "string"},
-                    "confidence": {"type": "number"},
-                    "no_valid_plan": {"type": "boolean"},
-                    "no_valid_reason": {"type": "string"},
-                    "planner_notes": {"type": "string"},
-                    "preservation_constraints": {"type": "array"},
-                    "blocks": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "block_type": {"type": "string", "enum": _BLOCK_TYPES},
-                                "purpose": {"type": "string"},
-                                "estimated_duration": {"type": "number"},
-                                "interrupts_source": {"type": "boolean"},
-                                "preservation_constraints": {"type": "array"},
-                                "dependency_ids": {"type": "array"},
-                                "source_role": {"type": "string", "enum": _SOURCE_ROLES},
-                                "word_start_index": {"type": "integer"},
-                                "word_end_index": {"type": "integer"},
-                                "use_full_window": {"type": "boolean"},
-                                "continuity_rationale": {"type": "string"},
-                                "substantive_value_kind": {
-                                    "type": "string",
-                                    "enum": _VALUE_KINDS,
-                                },
-                                "semantic_intent": {"type": "string"},
-                                "why_unavailable": {"type": "string"},
-                                "grounding_refs": {"type": "array"},
-                                "delivery_intent": {"type": "string", "enum": _DELIVERY},
-                                "draft_line": {"type": "string"},
-                                "claim_dependency": {"type": "string"},
-                                "verification_rationale": {"type": "string"},
-                                "intended_use": {"type": "string"},
-                                "must_verify_before_execution": {"type": "boolean"},
-                                "dependent_block_ids": {
-                                    "type": "array",
-                                    "items": {"type": "integer"},
-                                },
-                            },
-                            "required": ["block_type"],
-                        },
-                    },
-                    "narration": {
-                        "type": "object",
-                        "properties": {
-                            "need": {"type": "string", "enum": _NARRATION_NEEDS},
-                            "purposes": {"type": "array"},
-                            "language": {"type": "string"},
-                            "register": {"type": "string"},
-                            "estimated_duration": {"type": "number"},
-                            "placement_block_index": {"type": "integer"},
-                            "max_source_interruption_seconds": {"type": "number"},
-                            "overlaps_source_audio": {"type": "boolean"},
-                            "replaces_silence": {"type": "boolean"},
-                            "essential": {"type": "boolean"},
-                            "verification_dependency_ids": {"type": "array"},
-                        },
-                    },
-                },
-                "required": ["strategy_id", "strategy_key"],
-            },
-        }
-    },
-    "required": ["plans"],
-}
 
 _BOUNDED_NOTES = 600
 _BOUNDED_FIELD = 800
@@ -163,9 +478,11 @@ _BOUNDED_LIST = 12
 
 def planning_prompt_hash() -> str:
     return hashlib.sha256(
-        (PLANNING_SYSTEM_INSTRUCTION + json.dumps(PLANNING_OUTPUT_SCHEMA, sort_keys=True)).encode(
-            "utf-8"
-        )
+        (
+            PLANNING_SYSTEM_INSTRUCTION
+            + PLANNING_SCHEMA_BINDING_VERSION
+            + json.dumps(PLANNING_OUTPUT_SCHEMA, sort_keys=True)
+        ).encode("utf-8")
     ).hexdigest()
 
 
@@ -202,9 +519,17 @@ class PlanningRequest:
     hooks: tuple[str, ...]
     words: tuple[dict[str, object], ...]
     priority: str = PLANNING_PRIORITY
+    mandatory_evidence: Mapping[str, object] = field(default_factory=dict)
+    source_selection: Mapping[str, object] = field(default_factory=dict)
+    strategy_constraints: Mapping[str, object] = field(default_factory=dict)
+    nonselectable_context: Mapping[str, object] = field(default_factory=dict)
+    operator_source_start: float | None = None
+    operator_source_end: float | None = None
+    operator_editorial_intent: str | None = None
+    operator_request_version: str = ""
 
     def to_payload(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "strategy_id": self.strategy_id,
             "strategy_key": self.strategy_key,
             "strategy_type": self.strategy_type,
@@ -231,19 +556,52 @@ class PlanningRequest:
             "context_text": self.context_text,
             "idea_summary": self.idea_summary,
             "topic_summary": self.topic_summary,
-            "hooks": list(self.hooks),
             "words": list(self.words),
             "priority": self.priority,
+            "mandatory_evidence": dict(self.mandatory_evidence),
+            "source_selection": dict(self.source_selection),
+            "strategy_constraints": dict(self.strategy_constraints),
+            "nonselectable_context": dict(self.nonselectable_context),
         }
+        if (
+            self.operator_request_version
+            or self.operator_source_start is not None
+            or self.operator_source_end is not None
+            or self.operator_editorial_intent
+        ):
+            payload["operator_direction"] = {
+                "role": "OPERATOR_DIRECTION_NOT_SOURCE_EVIDENCE",
+                "version": self.operator_request_version,
+                "approved_source_start": self.operator_source_start,
+                "approved_source_end": self.operator_source_end,
+                "editorial_intent": self.operator_editorial_intent,
+                "constraints": [
+                    "Every SOURCE_EXCERPT must be fully inside the approved source window.",
+                    "Do not treat operator direction as source evidence, approved copy, "
+                    "or a guaranteed strategy.",
+                    "Do not invent psychology or unsupported factual claims.",
+                ],
+            }
+        return payload
 
 
 class PlanningProviderError(Exception):
     """Sanitized provider failure that never carries credentials or transcript data."""
 
-    def __init__(self, category: str, detail: str = "") -> None:
+    def __init__(
+        self,
+        category: str,
+        detail: str = "",
+        *,
+        rejections: Sequence[Mapping[str, object]] = (),
+        response_evidence: Mapping[str, object] | None = None,
+    ) -> None:
         super().__init__(f"transformation_planning_{category}")
         self.category = category
         self.detail = detail
+        # Bounded structured rejection evidence for SDK/schema failures.
+        self.rejections = tuple(dict(item) for item in rejections)
+        self.response_evidence = dict(response_evidence or {})
 
 
 class PlanningProvider(Protocol):
@@ -279,6 +637,7 @@ class DeterministicPlanningProvider:
             "model": None,
             "prompt_hash": planning_prompt_hash(),
             "schema_version": SCHEMA_VERSION,
+            "schema_binding_version": PLANNING_SCHEMA_BINDING_VERSION,
             "temperature": 0.0,
         }
 
@@ -294,6 +653,11 @@ def build_planning_request(
     max_blocks = int(getattr(config, "max_blocks_per_plan", 8))
     strict_cap = float(getattr(config, "strict_authored_before_hero_seconds", 1.5))
     words = tuple(word.as_dict() for word in inputs.words)
+    strict_hero = is_strict_hero_window(
+        inputs.source_moment_structure,
+        inputs.duration,
+        float(inputs.stage3_risk.get("moment_density_score", 0.0) or 0.0),
+    )
     return PlanningRequest(
         strategy_id=str(strategy.get("id", "")),
         strategy_key=str(strategy.get("strategy_key", "")),
@@ -324,8 +688,8 @@ def build_planning_request(
         refined_transcript=inputs.transcript[
             : int(getattr(config, "provider_max_input_characters", 12000))
         ],
-        refined_start=inputs.refined_start,
-        refined_end=inputs.refined_end,
+        refined_start=inputs.planning_start,
+        refined_end=inputs.planning_end,
         context_text=" ".join(inputs.context_segments),
         idea_summary=inputs.idea_summary,
         topic_summary=inputs.topic_summary,
@@ -333,7 +697,365 @@ def build_planning_request(
             str(hook.get("text", "")) for hook in inputs.hooks if isinstance(hook, Mapping)
         ),
         words=words,
+        operator_source_start=inputs.approved_source_start,
+        operator_source_end=inputs.approved_source_end,
+        operator_editorial_intent=inputs.editorial_intent,
+        operator_request_version=inputs.operator_request_version,
+        mandatory_evidence=_mandatory_request_evidence(inputs, config, words),
+        source_selection=_source_selection_payload(inputs, config, words, strict_hero, strict_cap),
+        strategy_constraints=_strategy_constraints_payload(strategy),
+        nonselectable_context={
+            "context_text": " ".join(inputs.context_segments),
+            "suggested_hook_copy": [
+                str(hook.get("text", ""))
+                for hook in inputs.hooks
+                if isinstance(hook, Mapping) and str(hook.get("text", "")).strip()
+            ],
+            "idea_summary": inputs.idea_summary,
+            "topic_summary": inputs.topic_summary,
+            "note": (
+                "Nonselectable guidance only. Never cite context_text, refined_transcript, "
+                "or suggested hook copy as source evidence. Transcript/context content "
+                "outside the selectable window is nonselectable."
+            ),
+        },
     )
+
+
+def _word_bounds(word: Mapping[str, object]) -> tuple[float, float] | None:
+    start = word.get("start")
+    end = word.get("end")
+    if isinstance(start, bool) or not isinstance(start, (int, float)):
+        return None
+    if isinstance(end, bool) or not isinstance(end, (int, float)):
+        return None
+    if float(end) < float(start):
+        return None
+    return float(start), float(end)
+
+
+def _planning_word_identity(
+    words: Sequence[dict[str, object]], start: float, end: float
+) -> dict[str, object]:
+    """Descriptive mapping of a mandatory segment onto offered planning words.
+
+    This is word overlap only. It is deliberately not the feasibility decision;
+    mandatory coverage may still be satisfiable by a supported word selection
+    when an endpoint falls in an inter-word gap, or by the supported full-window
+    fallback when word evidence is insufficient.
+    """
+
+    overlapping = [
+        word
+        for word in words
+        if (bounds := _word_bounds(word)) is not None and bounds[1] > start and bounds[0] < end
+    ]
+    start_in_word = any(
+        bounds[0] <= start <= bounds[1]
+        for word in words
+        if (bounds := _word_bounds(word)) is not None
+    )
+    end_in_word = any(
+        bounds[0] <= end <= bounds[1]
+        for word in words
+        if (bounds := _word_bounds(word)) is not None
+    )
+    if not overlapping:
+        return {
+            "planning_word_start_index": None,
+            "planning_word_end_index": None,
+            "planning_word_count": 0,
+            "overlaps_offered_words": False,
+            "start_endpoint_in_word": bool(start_in_word),
+            "end_endpoint_in_word": bool(end_in_word),
+            "covered_by_offered_words": False,
+        }
+    return {
+        "planning_word_start_index": int(overlapping[0]["index"]),
+        "planning_word_end_index": int(overlapping[-1]["index"]),
+        "planning_word_count": len(overlapping),
+        "overlaps_offered_words": True,
+        "start_endpoint_in_word": bool(start_in_word),
+        "end_endpoint_in_word": bool(end_in_word),
+        "covered_by_offered_words": bool(start_in_word and end_in_word),
+    }
+
+
+def _selection_bounds(inputs: PlanningInputs) -> tuple[float, float]:
+    return inputs.planning_start, inputs.planning_end
+
+
+def _selection_tolerance(inputs: PlanningInputs) -> float:
+    # An explicit operator window never gains tolerance; legacy refined-window
+    # behavior keeps its existing compatibility tolerance.
+    return 0.0 if inputs.has_operator_window else MANDATORY_COVERAGE_TOLERANCE_SECONDS
+
+
+def _supported_selection(
+    words: Sequence[dict[str, object]],
+    start: float,
+    end: float,
+    inputs: PlanningInputs,
+    config: object,
+) -> dict[str, object] | None:
+    """Whether an allowed source selection can preserve both mandatory endpoints.
+
+    Uses the same resolution and endpoint-coverage semantics as validation: a
+    contiguous planning-word range resolves to ``[first.start, last.end]`` and
+    both endpoints must fall within the authoritative coverage tolerance. Only
+    when word evidence is insufficient may the documented full-window fallback
+    be offered. An explicit operator window disables that fallback and tolerance.
+    """
+
+    tolerance = _selection_tolerance(inputs)
+    window_start, window_end = _selection_bounds(inputs)
+    if inputs.word_coverage_sufficient:
+        indexes: list[int] = []
+        for index, word in enumerate(words):
+            bounds = _word_bounds(word)
+            if bounds is None:
+                continue
+            if bounds[1] >= start - tolerance and bounds[0] <= end + tolerance:
+                indexes.append(index)
+        if indexes:
+            low, high = indexes[0], indexes[-1]
+            minimum = max(0.0, float(getattr(config, "min_source_excerpt_seconds", 0.4)))
+            # Grow the range only when a minimum-duration excerpt is required.
+            while high - low + 1 < len(words):
+                low_bounds = _word_bounds(words[low])
+                high_bounds = _word_bounds(words[high])
+                if low_bounds is None or high_bounds is None:
+                    break
+                if (high_bounds[1] - low_bounds[0]) + 1e-9 >= minimum:
+                    break
+                if low > 0:
+                    low -= 1
+                elif high + 1 < len(words):
+                    high += 1
+                else:
+                    break
+            low_bounds = _word_bounds(words[low])
+            high_bounds = _word_bounds(words[high])
+            if low_bounds is not None and high_bounds is not None:
+                span = (low_bounds[0], high_bounds[1])
+                if (
+                    span[1] > span[0]
+                    and span[0] >= window_start - tolerance
+                    and span[1] <= window_end + tolerance
+                    and spans_cover_endpoints([span], start, end, tolerance=tolerance)
+                ):
+                    return {
+                        "method": "WORD_SELECTION",
+                        "planning_word_start_index": low,
+                        "planning_word_end_index": high,
+                        "planning_word_count": high - low + 1,
+                        "source_start": round(span[0], 6),
+                        "source_end": round(span[1], 6),
+                    }
+    if not inputs.word_coverage_sufficient and not inputs.has_operator_window:
+        full = (window_start, window_end)
+        if full[1] > full[0] and spans_cover_endpoints([full], start, end, tolerance=tolerance):
+            return {
+                "method": "FULL_WINDOW",
+                "planning_word_start_index": None,
+                "planning_word_end_index": None,
+                "planning_word_count": 0,
+                "source_start": round(full[0], 6),
+                "source_end": round(full[1], 6),
+            }
+    return None
+
+
+def _mandatory_side(
+    data: Mapping[str, object],
+    key: str,
+    words: Sequence[dict[str, object]],
+    inputs: PlanningInputs,
+    config: object,
+) -> dict[str, object]:
+    declared = bool(data.get(f"{key}_declared"))
+    segment = data.get(f"{key}_segment")
+    error = data.get(f"{key}_error")
+    if not declared:
+        state = "ABSENT"
+    elif error == "MALFORMED":
+        state = "MALFORMED"
+    elif error == "UNRESOLVED" or not isinstance(segment, Mapping):
+        state = "UNRESOLVED"
+    else:
+        state = "RESOLVED"
+    payload: dict[str, object] = {
+        "state": state,
+        "declared": declared,
+        "required": state == "RESOLVED" or state in {"MALFORMED", "UNRESOLVED"},
+        "segment_index": None,
+        "source_start": None,
+        "source_end": None,
+        "planning_word_start_index": None,
+        "planning_word_end_index": None,
+        "planning_word_count": 0,
+        "overlaps_offered_words": False,
+        "start_endpoint_in_word": False,
+        "end_endpoint_in_word": False,
+        "covered_by_offered_words": False,
+        "mandatory_coverage_feasible": False,
+        "supported_selection": {"method": "NONE"},
+    }
+    if isinstance(segment, Mapping):
+        start = segment.get("start")
+        end = segment.get("end")
+        index = segment.get("index")
+        if (
+            isinstance(start, (int, float))
+            and not isinstance(start, bool)
+            and isinstance(end, (int, float))
+            and not isinstance(end, bool)
+            and isinstance(index, int)
+            and not isinstance(index, bool)
+        ):
+            payload.update(
+                {
+                    "segment_index": int(index),
+                    "source_start": float(start),
+                    "source_end": float(end),
+                    **_planning_word_identity(words, float(start), float(end)),
+                }
+            )
+            selection = _supported_selection(words, float(start), float(end), inputs, config)
+            payload["mandatory_coverage_feasible"] = selection is not None
+            payload["supported_selection"] = selection or {"method": "NONE"}
+    return payload
+
+
+def _mandatory_request_evidence(
+    inputs: PlanningInputs, config: object, words: Sequence[dict[str, object]]
+) -> dict[str, object]:
+    source = dict(inputs.mandatory_evidence)
+    hook = _mandatory_side(source, "hook", words, inputs, config)
+    payoff = _mandatory_side(source, "payoff", words, inputs, config)
+    return {
+        "contract_version": source.get("contract_version"),
+        "source_id": source.get("source_id") or inputs.source_id,
+        "hook": hook,
+        "payoff": payoff,
+        "coverage_tolerance_seconds": MANDATORY_COVERAGE_TOLERANCE_SECONDS,
+        "coverage_requirement": (
+            "A resolved hook/payoff segment is satisfied only when the union of selected "
+            "SOURCE_EXCERPT spans covers both its start and end within the stated tolerance. "
+            "Role labels do not satisfy it, and a null payoff never waives a hook. "
+            "mandatory_coverage_feasible reports whether a supported word selection or the "
+            "supported full-window fallback can preserve both endpoints; "
+            "covered_by_offered_words is descriptive mapping only."
+        ),
+    }
+
+
+def _source_selection_payload(
+    inputs: PlanningInputs,
+    config: object,
+    words: Sequence[dict[str, object]],
+    strict_hero: bool,
+    strict_cap: float,
+) -> dict[str, object]:
+    authored_cap = float(
+        getattr(
+            config,
+            "strict_authored_before_hero_seconds"
+            if strict_hero
+            else "max_authored_before_hero_seconds",
+            1.5,
+        )
+    )
+    elapsed_cap = float(
+        getattr(
+            config,
+            "strict_elapsed_before_hero_seconds"
+            if strict_hero
+            else "max_elapsed_before_hero_seconds",
+            1.5,
+        )
+    )
+    window_start, window_end = _selection_bounds(inputs)
+    tolerance = _selection_tolerance(inputs)
+    return {
+        "word_index_scope": (
+            "Inclusive, zero-based planning-word indexes after filtering and capping. "
+            "They are not source segment positions and not FINAL_CLIP word indexes."
+        ),
+        "word_range_rule": (
+            "words:N-M uses inclusive planning-word indexes; every index must belong to a "
+            "selected SOURCE_EXCERPT. Bare decimals are quote declarations, not timestamps."
+        ),
+        "words_offered": len(words),
+        "first_planning_word": dict(words[0]) if words else None,
+        "last_planning_word": dict(words[-1]) if words else None,
+        "word_coverage_sufficient": inputs.word_coverage_sufficient,
+        "refined_start": window_start,
+        "refined_end": window_end,
+        "selectable_window_start": round(window_start - tolerance, 6),
+        "selectable_window_end": round(window_end + tolerance, 6),
+        "approved_source_start": inputs.approved_source_start,
+        "approved_source_end": inputs.approved_source_end,
+        "operator_window_is_authoritative": inputs.has_operator_window,
+        "selection_rule": (
+            "Every SOURCE_EXCERPT must be fully inside the approved source window; "
+            "existing boundary tolerance does not expand operator authorization."
+            if inputs.has_operator_window
+            else "Select only within the bounded refined window."
+        ),
+        "min_source_excerpt_seconds": float(getattr(config, "min_source_excerpt_seconds", 0.4)),
+        "max_blocks": int(getattr(config, "max_blocks_per_plan", 8)),
+        "max_plan_duration_seconds": float(getattr(config, "max_plan_duration_seconds", 180.0)),
+        "hero_rule": "Exactly one HERO at block 0 or block 1.",
+        "strict_hero_cap_seconds": strict_cap,
+        "hero_cap_seconds": strict_cap
+        if strict_hero
+        else float(getattr(config, "max_authored_before_hero_seconds", 3.0)),
+        "elapsed_before_hero_cap_seconds": elapsed_cap,
+        "authored_before_hero_cap_seconds": authored_cap,
+        "evidence_scope": {
+            "rendered_on_selection": (
+                "Only the selected SOURCE_EXCERPT spans are rendered to the audience."
+            ),
+            "nonrendered": [
+                "refined_transcript",
+                "context_text",
+                "suggested_hook_copy",
+                "idea_summary",
+                "topic_summary",
+            ],
+            "content_sufficiency_requirement": (
+                "The selected excerpt plus the authored value must convey the promised "
+                "idea; nonrendered context cannot prove the audience receives it. "
+                "required_context is descriptive, never timestamp authority."
+            ),
+            "operator_scope": (
+                "Only offered words inside the approved source window are selectable. "
+                "Any transcript or context outside it is nonselectable guidance."
+                if inputs.has_operator_window
+                else "Only offered words inside the bounded refined window are selectable."
+            ),
+        },
+    }
+
+
+def _strategy_constraints_payload(strategy: Mapping[str, object]) -> dict[str, object]:
+    from app.core.enums import TransformationStrategyType
+
+    try:
+        strategy_type = TransformationStrategyType(str(strategy.get("strategy_type")))
+        allowed = tuple(item.value for item in strategy_value_kinds(strategy_type))
+    except ValueError:
+        allowed = ()
+    return {
+        "strategy_type": strategy.get("strategy_type"),
+        "offered_value_kind": strategy.get("substantive_value_kind"),
+        "allowed_value_kinds": list(allowed),
+        "external_verification_requirement": strategy.get(
+            "external_verification_requirement", "NOT_REQUIRED"
+        ),
+        "source_moment_role": strategy.get("source_moment_role"),
+    }
 
 
 def _code_switch_tokens(code_switch: Mapping[str, object]) -> tuple[str, ...]:
@@ -451,6 +1173,7 @@ def _parse_block(entry: Mapping[str, object]) -> PlanProviderBlock | None:
     grounding_refs, grounding_refs_invalid, grounding_refs_errors = _parse_grounding_refs(
         entry.get("grounding_refs")
     )
+    raw_value_kind = entry.get("substantive_value_kind")
     return PlanProviderBlock(
         block_type=block_type,  # type: ignore[arg-type]
         purpose=_bounded_text(entry.get("purpose"), _BOUNDED_FIELD),
@@ -464,9 +1187,13 @@ def _parse_block(entry: Mapping[str, object]) -> PlanProviderBlock | None:
         use_full_window=bool(entry.get("use_full_window", False)),
         continuity_rationale=_bounded_text(entry.get("continuity_rationale"), _BOUNDED_FIELD),
         substantive_value_kind=_enum(entry.get("substantive_value_kind"), SubstantiveValueKind),  # type: ignore[arg-type]
+        substantive_value_kind_raw=(
+            str(raw_value_kind)[:_BOUNDED_FIELD] if raw_value_kind is not None else None
+        ),
         semantic_intent=_bounded_text(entry.get("semantic_intent"), _BOUNDED_FIELD),
         why_unavailable=_bounded_text(entry.get("why_unavailable"), _BOUNDED_FIELD),
         grounding_refs=grounding_refs,
+        grounding_refs_present="grounding_refs" in entry,
         grounding_refs_invalid=grounding_refs_invalid,
         grounding_refs_errors=grounding_refs_errors,
         delivery_intent=_enum(entry.get("delivery_intent"), DeliveryIntent),  # type: ignore[arg-type]
@@ -516,14 +1243,64 @@ def _parse_narration(value: object) -> NarrationRequirement:
     )
 
 
+def _bounded_identity(value: object) -> tuple[str | None, int | None, str]:
+    """Safe structural identity evidence: digest, length, and type name."""
+
+    if not isinstance(value, str):
+        return None, None, type(value).__name__
+    return hashlib.sha256(value.encode("utf-8")).hexdigest(), len(value), "str"
+
+
+def _rejection(
+    code: str,
+    *,
+    entry_index: int | None = None,
+    block_index: int | None = None,
+    **extra: object,
+) -> dict[str, object]:
+    payload: dict[str, object] = {"code": code}
+    if entry_index is not None:
+        payload["entry_index"] = entry_index
+    if block_index is not None:
+        payload["block_index"] = block_index
+    payload.update(extra)
+    return payload
+
+
+def _response_evidence_with_parser_context(
+    content: Mapping[str, object],
+    supplied: Mapping[str, object] | None,
+    unmatched: Sequence[Mapping[str, object]],
+) -> dict[str, object]:
+    evidence = dict(supplied or {})
+    if "content_digest" not in evidence or "content_bytes" not in evidence:
+        encoded = json.dumps(content, ensure_ascii=False, sort_keys=True, default=str).encode(
+            "utf-8"
+        )
+        evidence.setdefault("content_digest", hashlib.sha256(encoded).hexdigest())
+        evidence.setdefault("content_bytes", len(encoded))
+    entries = content.get("plans")
+    evidence.setdefault("returned_plan_count", len(entries) if isinstance(entries, list) else 0)
+    evidence.setdefault("truncated", False)
+    evidence["unmatched_entry_count"] = len(unmatched)
+    evidence["unmatched_entries"] = [dict(item) for item in list(unmatched)[:8]]
+    return evidence
+
+
 def parse_plan_results(
     content: Mapping[str, object],
     requests: Sequence[PlanningRequest],
+    *,
+    response_evidence: Mapping[str, object] | None = None,
+    schema_rejections: Sequence[Mapping[str, object]] = (),
 ) -> dict[str, PlanProviderResult]:
-    """Strictly parse provider plans, isolating malformed items.
+    """Strictly parse provider plans and retain bounded rejection evidence.
 
-    Unknown, duplicate, stale, or mismatched strategy identities are dropped.
-    One malformed item never invalidates accepted siblings.
+    Unknown, duplicate, stale, or mismatched strategy identities are dropped
+    from executable results. Their bounded parser evidence is retained even when
+    no plan was collected, so a caller can distinguish a true omission from a
+    mismatched, unknown, duplicate, or malformed entry. One malformed item never
+    invalidates an accepted sibling.
     """
 
     entries = content.get("plans")
@@ -531,28 +1308,109 @@ def parse_plan_results(
         raise PlanningProviderError(ProviderErrorCategory.MALFORMED_OUTPUT.value)
     requested = {request.strategy_key: request for request in requests}
     collected: dict[str, list[PlanProviderPlan]] = {}
+    rejections: dict[str, list[dict[str, object]]] = {key: [] for key in requested}
+    unmatched: list[dict[str, object]] = []
     seen: set[str] = set()
-    for entry in entries:
+    recognized_requested_entry = False
+    for entry_index, entry in enumerate(entries[:256]):
         if not isinstance(entry, Mapping):
+            unmatched.append(
+                _rejection(
+                    "MALFORMED_ENTRY",
+                    entry_index=entry_index,
+                    actual_type=type(entry).__name__,
+                )
+            )
             continue
         key = entry.get("strategy_key")
         if not isinstance(key, str) or key not in requested:
+            key_digest, key_characters, _key_type = _bounded_identity(key)
+            id_digest, id_characters, _id_type = _bounded_identity(entry.get("strategy_id"))
+            unmatched.append(
+                _rejection(
+                    "UNKNOWN_STRATEGY_KEY" if isinstance(key, str) else "MALFORMED_STRATEGY_KEY",
+                    entry_index=entry_index,
+                    strategy_key_digest=key_digest,
+                    strategy_key_characters=key_characters,
+                    strategy_id_digest=id_digest,
+                    strategy_id_characters=id_characters,
+                )
+            )
             continue
+        recognized_requested_entry = True
         request = requested[key]
         if entry.get("strategy_id") != request.strategy_id:
+            id_digest, id_characters, _id_type = _bounded_identity(entry.get("strategy_id"))
+            rejections[key].append(
+                _rejection(
+                    "STRATEGY_ID_MISMATCH",
+                    entry_index=entry_index,
+                    requested_strategy_id=request.strategy_id,
+                    requested_strategy_key=request.strategy_key,
+                    returned_strategy_id_digest=id_digest,
+                    returned_strategy_id_characters=id_characters,
+                )
+            )
             continue
         if key in seen:
+            rejections[key].append(
+                _rejection(
+                    "DUPLICATE_STRATEGY_KEY",
+                    entry_index=entry_index,
+                    requested_strategy_id=request.strategy_id,
+                    requested_strategy_key=request.strategy_key,
+                )
+            )
             continue
         seen.add(key)
         blocks: list[PlanProviderBlock] = []
         raw_blocks = entry.get("blocks")
         if isinstance(raw_blocks, list):
-            for item in raw_blocks:
+            for block_index, item in enumerate(raw_blocks[:256]):
                 if not isinstance(item, Mapping):
+                    rejections[key].append(
+                        _rejection(
+                            "MALFORMED_BLOCK_ENTRY",
+                            entry_index=entry_index,
+                            block_index=block_index,
+                            actual_type=type(item).__name__,
+                        )
+                    )
+                    continue
+                if _enum(item.get("block_type"), PlanBlockType) is None:
+                    type_digest, type_characters, _type_name = _bounded_identity(
+                        item.get("block_type")
+                    )
+                    rejections[key].append(
+                        _rejection(
+                            "UNKNOWN_BLOCK_TYPE",
+                            entry_index=entry_index,
+                            block_index=block_index,
+                            block_type_digest=type_digest,
+                            block_type_characters=type_characters,
+                        )
+                    )
                     continue
                 parsed = _parse_block(item)
-                if parsed is not None:
-                    blocks.append(parsed)
+                if parsed is None:
+                    rejections[key].append(
+                        _rejection(
+                            "MALFORMED_BLOCK_ENTRY",
+                            entry_index=entry_index,
+                            block_index=block_index,
+                        )
+                    )
+                    continue
+                blocks.append(parsed)
+        else:
+            rejections[key].append(
+                _rejection(
+                    "MALFORMED_BLOCKS_CONTAINER",
+                    entry_index=entry_index,
+                    requested_strategy_id=request.strategy_id,
+                    requested_strategy_key=request.strategy_key,
+                )
+            )
         plan = PlanProviderPlan(
             strategy_id=request.strategy_id,
             strategy_key=key,
@@ -565,10 +1423,41 @@ def parse_plan_results(
             planner_notes=_bounded_text(entry.get("planner_notes"), _BOUNDED_NOTES),
         )
         collected.setdefault(key, []).append(plan)
-    return {
-        key: PlanProviderResult(plans=tuple(plans), confidence=plans[0].confidence)
-        for key, plans in collected.items()
-    }
+    if not recognized_requested_entry and unmatched and requested:
+        # The response contained no requested identity at all. Keep this
+        # response-level rejection visible for every requested strategy without
+        # inventing a placeholder plan or attaching it as a key-specific match.
+        unmatched_codes = {str(item.get("code")) for item in unmatched}
+        shared_code = (
+            "MALFORMED_ENTRY" if unmatched_codes <= {"MALFORMED_ENTRY"} else "UNKNOWN_STRATEGY_KEY"
+        )
+        shared = _rejection(
+            shared_code,
+            scope="RESPONSE",
+            unmatched_entry_count=len(unmatched),
+        )
+        for key in requested:
+            rejections[key].append(dict(shared))
+    evidence = _response_evidence_with_parser_context(content, response_evidence, unmatched)
+    parsed_results: dict[str, PlanProviderResult] = {}
+    for key in requested:
+        plans = tuple(collected.get(key, ()))
+        candidate_rejections = tuple(rejections.get(key, ()))
+        candidate_schema_rejections = tuple(
+            dict(item)
+            for item in list(schema_rejections)[:8]
+            if item.get("strategy_key") in (None, key)
+        )
+        if not plans and not candidate_rejections and not candidate_schema_rejections:
+            continue
+        parsed_results[key] = PlanProviderResult(
+            plans=plans,
+            confidence=plans[0].confidence if plans else 0.0,
+            response_evidence=dict(evidence),
+            rejections=candidate_rejections,
+            schema_rejections=candidate_schema_rejections,
+        )
+    return parsed_results
 
 
 def serialize_provider_result(result: PlanProviderResult) -> dict[str, object]:
@@ -608,9 +1497,11 @@ def _block_payload(block: PlanProviderBlock) -> dict[str, object]:
         "substantive_value_kind": (
             block.substantive_value_kind.value if block.substantive_value_kind else None
         ),
+        "substantive_value_kind_raw": block.substantive_value_kind_raw,
         "semantic_intent": block.semantic_intent,
         "why_unavailable": block.why_unavailable,
         "grounding_refs": list(block.grounding_refs),
+        "grounding_refs_present": block.grounding_refs_present,
         "delivery_intent": block.delivery_intent.value if block.delivery_intent else None,
         "draft_line": block.draft_line,
         "claim_dependency": block.claim_dependency,

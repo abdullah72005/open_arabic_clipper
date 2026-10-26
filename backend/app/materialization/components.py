@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -41,6 +41,7 @@ from app.materialization.providers import (
     BlockCritique,
     CritiqueRequest,
     CritiqueResult,
+    CritiqueTarget,
     MaterializationCritiqueProvider,
     MaterializationProviderError,
     MaterializationScript,
@@ -112,6 +113,10 @@ _raised_attempt_status = raised_attempt_status
 #: (ambiguous transport loss) is unresolved uncertainty: a later ordinary
 #: recovery/redelivery must never silently invoke the provider again.
 _UNCERTAIN_UNRESOLVED_REASON = "PROVIDER_UNCERTAIN_UNRESOLVED"
+#: Version of the bounded critique request/evidence binding persisted with each
+#: accepted critique checkpoint. A checkpoint without it predates request binding
+#: and can never authorize a new generation.
+_CRITIQUE_EVIDENCE_VERSION = "stage6-critique-request-v1"
 
 
 def script_dependency_inputs(
@@ -400,6 +405,10 @@ def _writing_result_to_dict(result: WritingResult) -> dict[str, object]:
         "notes": result.notes,
         "deferred": bool(result.deferred),
         "reason_code": result.reason_code,
+        "revalidation_reasons": [
+            {"index": int(index), "reason": str(reason)}
+            for index, reason in result.revalidation_reasons.items()
+        ],
     }
 
 
@@ -414,19 +423,35 @@ def _writing_result_from_dict(data: Mapping[str, object]) -> WritingResult:
                     copies[index] = str(item.get("copy", ""))
     identity = data.get("provider_identity")
     reason_code = data.get("reason_code")
+    revalidation: dict[int, str] = {}
+    raw_revalidation = data.get("revalidation_reasons")
+    if isinstance(raw_revalidation, list):
+        for item in raw_revalidation:
+            if not isinstance(item, Mapping):
+                continue
+            index = item.get("index")
+            reason = item.get("reason")
+            if isinstance(index, int) and not isinstance(index, bool) and isinstance(reason, str):
+                revalidation[index] = reason
     return WritingResult(
         copies=copies,
         provider_identity=dict(identity) if isinstance(identity, Mapping) else {},
         notes=str(data.get("notes", "")),
         deferred=bool(data.get("deferred", False)),
         reason_code=reason_code if isinstance(reason_code, str) else None,
+        revalidation_reasons=revalidation,
     )
 
 
 def _critique_result_to_dict(result: CritiqueResult) -> dict[str, object]:
     return {
+        # Persist booleans only alongside complete categorical evidence. A bare
+        # positive boolean is not authoritative and must not survive a checkpoint
+        # as if it were.
         "accepted": [
-            {"index": int(index), "value": bool(value)} for index, value in result.accepted.items()
+            {"index": int(index), "value": bool(value)}
+            for index, value in result.accepted.items()
+            if index in result.blocks
         ],
         "blocks": [block.as_dict() for block in result.blocks.values()],
         "provider_identity": dict(result.provider_identity),
@@ -453,14 +478,24 @@ def _critique_result_from_dict(data: Mapping[str, object]) -> CritiqueResult:
                 block = BlockCritique.from_dict(item)
                 if block.block_index >= 0:
                     blocks[block.block_index] = block
+    # A legacy/malformed boolean-only entry has no complete categorical
+    # evidence. Drop it and defer truthfully so replay can never synthesize
+    # approval or resend the provider request.
+    boolean_only = [index for index in accepted if index not in blocks]
+    for index in boolean_only:
+        del accepted[index]
     identity = data.get("provider_identity")
     reason_code = data.get("reason_code")
     return CritiqueResult(
         accepted=accepted,
         provider_identity=dict(identity) if isinstance(identity, Mapping) else {},
         notes=str(data.get("notes", "")),
-        deferred=bool(data.get("deferred", False)),
-        reason_code=reason_code if isinstance(reason_code, str) else None,
+        deferred=bool(data.get("deferred", False)) or bool(boolean_only),
+        reason_code=(
+            reason_code
+            if isinstance(reason_code, str)
+            else ("MALFORMED_CRITIQUE_EVIDENCE" if boolean_only else None)
+        ),
         blocks=blocks,
     )
 
@@ -508,6 +543,51 @@ def _script_checkpoint(gateway: DurableRequestGateway) -> Mapping[str, object]:
     return entry if isinstance(entry, Mapping) else {}
 
 
+def _critique_request_fingerprint(request: CritiqueRequest) -> str:
+    """Fingerprint the exact bounded critique request a judgment reviewed."""
+
+    return stable_digest(
+        {
+            "component": "SCRIPT.CRITIQUE.REQUEST",
+            "evidence_version": _CRITIQUE_EVIDENCE_VERSION,
+            "request": request.as_dict(),
+        }
+    )
+
+
+def _reviewed_targets_payload(request: CritiqueRequest) -> list[dict[str, object]]:
+    """Snapshot the bounded target facts exactly as the provider saw them."""
+
+    return [target.as_dict() for target in request.targets]
+
+
+def critique_request_fingerprint(
+    reviewed_targets: Sequence[Mapping[str, object]],
+    source_context: Mapping[str, object],
+) -> str | None:
+    """Recompute the exact bounded critique request fingerprint for a replay.
+
+    The persisted target snapshots must be canonical (no missing/extra keys) so a
+    replayed judgment is bound to the precise facts the provider reviewed. Returns
+    ``None`` when the snapshot is malformed.
+    """
+
+    targets: list[CritiqueTarget] = []
+    for data in reviewed_targets:
+        target = CritiqueTarget.from_dict(data)
+        if target is None or dict(data) != target.as_dict():
+            return None
+        targets.append(target)
+    request = CritiqueRequest(targets=tuple(targets), source_context=dict(source_context))
+    return _critique_request_fingerprint(request)
+
+
+def parse_critique_result(response: Mapping[str, object]) -> CritiqueResult:
+    """Parse a persisted critique response with legacy/malformed deferral."""
+
+    return _critique_result_from_dict(response)
+
+
 # --- checkpointing provider decorators --------------------------------------
 
 
@@ -541,9 +621,14 @@ class CheckpointedWritingProvider:
         hosted = self._provider.provider_name != "deterministic"
 
         def on_response(result: Any) -> Mapping[str, object] | None:
-            if not isinstance(result, WritingResult) or result.deferred:
+            if (
+                not isinstance(result, WritingResult)
+                or result.deferred
+                or result.revalidation_reasons
+            ):
                 # Deferred/rejected output is never reusable: record the status
-                # truthfully without an accepted response so a later run retries.
+                # truthfully without an accepted response so a later run retries
+                # (or the upstream plan is revalidated before any new call).
                 return {
                     "dependency_fingerprint": self._dep,
                     "status": "DEFERRED",
@@ -570,6 +655,10 @@ class CheckpointedWritingProvider:
         if isinstance(response, WritingResult) and response.deferred:
             # Preserve the provider's truthful delivery reason (e.g. UNCERTAIN),
             # never collapsing it into a generic deferral.
+            return response
+        if isinstance(response, WritingResult) and response.revalidation_reasons:
+            # Preserve the writer's structured upstream refusal while keeping it
+            # out of the reusable accepted-writing checkpoint.
             return response
         if status != "RESPONDED" or response is None:
             self.deferred_reason = "DEFERRED_PROVIDER"
@@ -614,6 +703,7 @@ class CheckpointedCritiqueProvider:
         self._gateway = gateway
         self._dep = dependency_fingerprint
         self.reused = False
+        self.deferred_reason: str | None = None
 
     def available(self) -> bool:
         return bool(self._provider.available())
@@ -622,8 +712,15 @@ class CheckpointedCritiqueProvider:
         return dict(self._provider.runtime_identity())
 
     def critique(self, request: CritiqueRequest) -> CritiqueResult:
-        stored = self._stored_critique()
+        request_fingerprint = _critique_request_fingerprint(request)
+        stored = self._stored_critique(request_fingerprint)
         if stored is not None:
+            if stored.deferred:
+                # A stored judgment exists but cannot be re-used for this exact
+                # request (or predates binding). Defer truthfully; never relabel
+                # it with current facts and never resend automatically.
+                self.deferred_reason = stored.reason_code
+                return stored
             self.reused = True
             return stored
 
@@ -638,6 +735,8 @@ class CheckpointedCritiqueProvider:
                 "status": "PENDING",
                 "critique": {
                     "dependency_fingerprint": self._dep,
+                    "request_fingerprint": request_fingerprint,
+                    "reviewed_targets": _reviewed_targets_payload(request),
                     "response": _critique_result_to_dict(result),
                 },
             }
@@ -665,7 +764,7 @@ class CheckpointedCritiqueProvider:
         assert isinstance(result, CritiqueResult)
         return result
 
-    def _stored_critique(self) -> CritiqueResult | None:
+    def _stored_critique(self, request_fingerprint: str) -> CritiqueResult | None:
         critique = _script_checkpoint(self._gateway).get("critique")
         if not isinstance(critique, Mapping):
             return None
@@ -673,8 +772,39 @@ class CheckpointedCritiqueProvider:
             return None
         response = critique.get("response")
         if not isinstance(response, Mapping):
+            # Deferred/absent responses are not reusable; an ordinary later run
+            # may invoke the provider under the existing budget rules.
             return None
-        return _critique_result_from_dict(response)
+        stored_request = critique.get("request_fingerprint")
+        if stored_request != request_fingerprint:
+            # A response produced for different facts (or an older unbound
+            # checkpoint) must never be presented as a judgment of this request.
+            return CritiqueResult(
+                accepted={},
+                provider_identity=self._provider.runtime_identity(),
+                deferred=True,
+                reason_code=(
+                    "CRITIQUE_CHECKPOINT_UNBOUND"
+                    if not isinstance(stored_request, str)
+                    else "CRITIQUE_CHECKPOINT_REQUEST_MISMATCH"
+                ),
+            )
+        result = _critique_result_from_dict(response)
+        if result.deferred:
+            # Malformed/legacy positive evidence defers without a resend.
+            return result
+        reviewed: dict[int, Mapping[str, object]] = {}
+        raw_targets = critique.get("reviewed_targets")
+        if isinstance(raw_targets, list):
+            for item in raw_targets:
+                if not isinstance(item, Mapping):
+                    continue
+                index = item.get("block_index")
+                if isinstance(index, int) and not isinstance(index, bool):
+                    reviewed[index] = dict(item)
+        if reviewed:
+            result = replace(result, reviewed_targets=reviewed)
+        return result
 
     def release(self) -> None:
         return None
@@ -834,9 +964,7 @@ class CheckpointedNarrationSynthesizer:
         validation = chunk.get("validation")
         return dict(validation) if isinstance(validation, Mapping) else None
 
-    def _record_validation(
-        self, chunk_id: str, dep: str, validation: Mapping[str, object]
-    ) -> None:
+    def _record_validation(self, chunk_id: str, dep: str, validation: Mapping[str, object]) -> None:
         from app.models import ClipMaterialization
 
         session = self._gateway.context.session

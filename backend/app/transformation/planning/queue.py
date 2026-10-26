@@ -10,6 +10,7 @@ execution uses. Plan-set creation and active-job claiming are concurrency-safe.
 from __future__ import annotations
 
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 from sqlalchemy import select, update
@@ -28,6 +29,12 @@ from app.models import (
 from app.transformation.handoff import build_stage4_1_handoff
 from app.transformation.inputs import resolve_effective_refinement
 from app.transformation.planning.executor import build_transformation_planning_executor
+from app.transformation.planning.request import (
+    OperatorPlanningRequest,
+    OperatorRequestError,
+    normalize_operator_request,
+    parse_operator_request,
+)
 from app.transformation.queue import list_strategies
 
 _VALID_DISPOSITIONS = {
@@ -182,13 +189,59 @@ def _matches_cache(
     return bool(current) and current == plan_set.input_fingerprint
 
 
+def _resolve_request(
+    operator_request: OperatorPlanningRequest | Mapping[str, object] | None,
+    operator_source_start: float | None,
+    operator_source_end: float | None,
+    editorial_intent: str | None,
+) -> OperatorPlanningRequest | None:
+    if operator_request is not None and (
+        operator_source_start is not None
+        or operator_source_end is not None
+        or editorial_intent is not None
+    ):
+        raise PlanningQueueError(
+            "provide either operator_request or individual operator options, not both"
+        )
+    try:
+        if operator_request is not None:
+            return normalize_operator_request(operator_request)
+        return parse_operator_request(
+            source_start=operator_source_start,
+            source_end=operator_source_end,
+            editorial_intent=editorial_intent,
+        )
+    except OperatorRequestError as error:
+        raise PlanningQueueError(str(error)) from error
+
+
+def _set_operator_request(
+    plan_set: TransformationPlanSet, request: OperatorPlanningRequest | None
+) -> None:
+    if request is None:
+        return
+    payload = request.as_dict()
+    if dict(plan_set.operator_request or {}) != payload:
+        plan_set.operator_request = payload
+
+
 def queue_transformation_planning(
     session: Session,
     candidate: ClipCandidate,
     analysis: TransformationEligibilityAnalysis,
     *,
     force: bool = False,
+    operator_source_start: float | None = None,
+    operator_source_end: float | None = None,
+    editorial_intent: str | None = None,
+    operator_request: OperatorPlanningRequest | Mapping[str, object] | None = None,
 ) -> PlanningQueueOutcome:
+    request = _resolve_request(
+        operator_request,
+        operator_source_start,
+        operator_source_end,
+        editorial_intent,
+    )
     settings = get_settings()
     plan_set = get_or_create_plan_set(session, candidate, analysis)
     for _attempt in range(2):
@@ -198,6 +251,7 @@ def queue_transformation_planning(
         if plan_set.active_job_id is not None:
             _clear_stale_claim(session, plan_set)
             continue
+        _set_operator_request(plan_set, request)
         if not force and _matches_cache(session, plan_set, settings):
             return PlanningQueueOutcome(
                 plan_set_id=plan_set.id,

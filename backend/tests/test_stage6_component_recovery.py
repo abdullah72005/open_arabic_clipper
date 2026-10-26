@@ -33,6 +33,9 @@ from app.materialization.components import (
 from app.materialization.fingerprints import stable_digest
 from app.materialization.policy import DEFAULT_CONFIG
 from app.materialization.providers import (
+    CRITIQUE_DIMENSIONS,
+    BlockCritique,
+    CritiqueDimensionFinding,
     CritiqueRequest,
     CritiqueResult,
     WritingRequest,
@@ -110,6 +113,39 @@ class InspectingWritingProvider(ScriptedWritingProvider):
         return WritingResult(copies=dict(self._copies), provider_identity=self.runtime_identity())
 
 
+def accepting_critique_result(
+    request: CritiqueRequest, identity: Mapping[str, object]
+) -> CritiqueResult:
+    """Complete fake categorical evidence for durable-path tests.
+
+    The production normalizer no longer promotes a bare boolean into findings,
+    so test adapters must supply the same complete contract a real provider does.
+    """
+
+    blocks: dict[int, BlockCritique] = {}
+    for target in request.targets:
+        findings = tuple(
+            CritiqueDimensionFinding(
+                dimension,
+                "PASS",
+                copy_quote=target.copy if dimension == "INTENT_FULFILLMENT" else "",
+                grounding_refs=(
+                    target.offered_grounding_refs[:1] if dimension == "INTENT_FULFILLMENT" else ()
+                ),
+                added_relation=(
+                    "Test critique accepted the supplied relation."
+                    if dimension == "INTENT_FULFILLMENT"
+                    else ""
+                ),
+            )
+            for dimension in CRITIQUE_DIMENSIONS
+        )
+        blocks[target.block_index] = BlockCritique(
+            block_index=target.block_index, findings=findings
+        )
+    return CritiqueResult(accepted={}, blocks=blocks, provider_identity=dict(identity))
+
+
 class AcceptingCritiqueProvider:
     provider_name = "accepting-critique"
 
@@ -127,7 +163,7 @@ class AcceptingCritiqueProvider:
         self.calls.append(request)
         if self._fail_first and len(self.calls) == 1:
             raise RuntimeError("simulated crash during critique")
-        return CritiqueResult(accepted={1: True}, provider_identity=self.runtime_identity())
+        return accepting_critique_result(request, self.runtime_identity())
 
     def release(self) -> None:
         return None
@@ -204,9 +240,7 @@ def component_fixture(
     session.flush()
     envelope.active_job_id = job.id
     session.commit()
-    owner = claim_materialization(
-        session, envelope.id, job.id, expected_job_claim_version=1
-    )
+    owner = claim_materialization(session, envelope.id, job.id, expected_job_claim_version=1)
     assert owner is not None
     session.commit()
     try:
@@ -408,9 +442,7 @@ def test_accepted_synthesis_is_reused_on_resume(component_fixture: Any) -> None:
     session.flush()
     envelope.active_job_id = job.id
     session.commit()
-    owner = claim_materialization(
-        session, envelope.id, job.id, expected_job_claim_version=1
-    )
+    owner = claim_materialization(session, envelope.id, job.id, expected_job_claim_version=1)
     assert owner is not None
 
     writing = ScriptedWritingProvider()

@@ -256,9 +256,13 @@ class PlanProviderBlock:
     use_full_window: bool = False
     continuity_rationale: str | None = None
     substantive_value_kind: SubstantiveValueKind | None = None
+    # Bounded raw value retained when the provider supplies an unknown kind so
+    # rejection diagnostics can report the actual value without raw payloads.
+    substantive_value_kind_raw: str | None = None
     semantic_intent: str | None = None
     why_unavailable: str | None = None
     grounding_refs: tuple[str, ...] = ()
+    grounding_refs_present: bool = False
     grounding_refs_invalid: bool = False
     grounding_refs_errors: tuple[str, ...] = ()
     delivery_intent: DeliveryIntent | None = None
@@ -295,6 +299,14 @@ class PlanProviderResult:
     plans: tuple[PlanProviderPlan, ...] = ()
     notes: str = ""
     confidence: float = 0.0
+    # Bounded, non-executable response context for rejection diagnostics.
+    # Never raw provider text or transcript content.
+    response_evidence: Mapping[str, object] = field(default_factory=dict)
+    # Bounded parser rejections for this requested identity. These are recorded
+    # even when no plan was collected, and never make a rejected entry reusable.
+    rejections: tuple[Mapping[str, object], ...] = ()
+    # Bounded SDK/schema parse rejections (distinct from application validation).
+    schema_rejections: tuple[Mapping[str, object], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -381,6 +393,9 @@ class StrategyAttempt:
     reasons: tuple[str, ...] = ()
     provider_input_fingerprint: str = ""
     checkpoint: Mapping[str, object] | None = None
+    # Bounded operator diagnostics for a rejected/deferred attempt. Kept
+    # separate from executable plan blocks and reusable accepted checkpoints.
+    diagnostics: Mapping[str, object] | None = None
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -390,6 +405,7 @@ class StrategyAttempt:
             "reasons": list(self.reasons),
             "provider_input_fingerprint": self.provider_input_fingerprint,
             "checkpoint": dict(self.checkpoint) if self.checkpoint is not None else None,
+            "diagnostics": dict(self.diagnostics) if self.diagnostics is not None else None,
         }
 
 
@@ -456,10 +472,39 @@ class PlanningInputs:
     refinement_status: str
     refinement_output_fingerprint: str
     mandatory_evidence: Mapping[str, object] = field(default_factory=dict)
+    # Optional operator-approved planning scope. The source window is
+    # authoritative for selectable evidence; editorial intent is direction,
+    # never source evidence or accepted copy.
+    operator_request_version: str = ""
+    approved_source_start: float | None = None
+    approved_source_end: float | None = None
+    editorial_intent: str | None = None
+    selectable_start: float | None = None
+    selectable_end: float | None = None
+
+    @property
+    def has_operator_window(self) -> bool:
+        return self.approved_source_start is not None and self.approved_source_end is not None
+
+    @property
+    def has_operator_request(self) -> bool:
+        return (
+            bool(self.operator_request_version)
+            or self.has_operator_window
+            or bool(self.editorial_intent)
+        )
+
+    @property
+    def planning_start(self) -> float:
+        return self.selectable_start if self.selectable_start is not None else self.refined_start
+
+    @property
+    def planning_end(self) -> float:
+        return self.selectable_end if self.selectable_end is not None else self.refined_end
 
     @property
     def duration(self) -> float:
-        return max(0.0, self.refined_end - self.refined_start)
+        return max(0.0, self.planning_end - self.planning_start)
 
 
 def word_evidence_from_mapping(item: Mapping[str, object], index: int) -> WordEvidence | None:

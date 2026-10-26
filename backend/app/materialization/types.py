@@ -264,6 +264,8 @@ class TimelineSegment:
     asset_id: str | None = None
     transition: str = "CUT"
     is_hero: bool = False
+    delivery: str = ""
+    delivery_rationale: str = ""
 
     @property
     def output_duration(self) -> float:
@@ -285,6 +287,8 @@ class TimelineSegment:
             "asset_id": self.asset_id,
             "transition": self.transition,
             "is_hero": self.is_hero,
+            "delivery": self.delivery,
+            "delivery_rationale": self.delivery_rationale,
         }
 
 

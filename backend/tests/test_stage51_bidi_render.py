@@ -26,7 +26,7 @@ import numpy.typing as npt
 import pytest
 
 from app.composition.ass import serialize_ass
-from app.composition.bidi import paragraph_direction, visual_tokens
+from app.composition.bidi import active_emphasis_safe, paragraph_direction, visual_tokens
 from app.composition.captions import (
     CaptionPlan,
     _spans_for_max_width,
@@ -444,6 +444,15 @@ def test_real_libass_dynamic_highlight_moves_without_reflow_or_reshaping(
     event = max(plan.events, key=lambda candidate: len(candidate.word_timings))
     if len(event.word_timings) < 2:
         pytest.skip("fixture produced no multi-word caption event")
+    if not active_emphasis_safe(event.text):
+        # Per-token override blocks reorder RTL/mixed words in the installed
+        # libass; the serializer must degrade to one static phrase state.
+        static_plan = CaptionStyle(font_family=FONT_FAMILY)
+        static_ass = serialize_ass(plan, static_plan, _safe_zone()).decode("utf-8")
+        dialogues = _dialogue_payloads(static_ass)
+        assert dialogues
+        assert all("\\c&H0000FFFF" not in dialogue for dialogue in dialogues)
+        return
 
     bounds = [event.start, *[word.start for word in event.word_timings[1:]], event.end]
     midpoints = [
@@ -553,103 +562,212 @@ def _logical_line_tokens(event: CaptionEvent) -> tuple[list[str], list[list[str]
     return tokens, [tokens]
 
 
-@pytest.mark.parametrize("text", [case[0] for case in VISUAL_FIXTURES])  # type: ignore[untyped-decorator]
-def test_real_libass_visual_order_matches_intended_reading(text: str, tmp_path: Path) -> None:
-    """Recover the rendered word order from the active-word accent positions.
+#: Explicitly known reading order (visual left-to-right) for fixtures whose
+#: glyphs are fully distinguishable. These are hand-written review anchors, not
+#: derived from the implementation.
+KNOWN_VISUAL_ORDER: dict[str, str] = {
+    "كتير قوي ألماص": "ألماص قوي كتير",
+    "طلباتهم كتير": "كتير طلباتهم",
+}
 
-    Each canonical word becomes active in turn; the accent's horizontal centroid
-    gives its real on-screen position. Words are grouped by rendered line and the
-    per-line rendered order is asserted against the intended visual order (the
-    pure BiDi unit tests pin that order against explicit reading sequences). This
-    proves libass renders the derived order as written and keeps the English run
-    contiguous -- neither of which logical-text equality can prove.
+
+def _trimmed_column_profile(mask: "npt.NDArray[np.bool_]") -> "npt.NDArray[np.float64] | None":
+    profile = mask.sum(axis=0).astype(np.float64)
+    xs = np.nonzero(profile)[0]
+    if len(xs) == 0:
+        return None
+    return profile[int(xs.min()) : int(xs.max()) + 1]
+
+
+def _locate_word_center(
+    line_mask: "npt.NDArray[np.bool_]", word_mask: "npt.NDArray[np.bool_]"
+) -> float:
+    line = line_mask.sum(axis=0).astype(np.float64)
+    word = word_mask.sum(axis=0).astype(np.float64)
+    xs = np.nonzero(word)[0]
+    assert len(xs) > 0
+    word = word[int(xs.min()) : int(xs.max()) + 1]
+    best_offset = 0
+    best_score = -1.0
+    word_energy = float((word * word).sum())
+    for offset in range(0, len(line) - len(word) + 1):
+        segment = line[offset : offset + len(word)]
+        denominator = float(np.sqrt((segment * segment).sum() * word_energy))
+        score = float((segment * word).sum() / denominator) if denominator else 0.0
+        if score > best_score:
+            best_score = score
+            best_offset = offset
+    return best_offset + len(word) / 2.0
+
+
+@pytest.mark.parametrize(  # type: ignore[untyped-decorator]
+    ("text", "expected"), sorted(KNOWN_VISUAL_ORDER.items())
+)
+def test_static_logical_emission_has_known_reading_order(
+    text: str, expected: str, tmp_path: Path
+) -> None:
+    """Static captions emit logical text; libass owns the reading order.
+
+    The production render must be pixel-identical to an independent test-local
+    ASS document that writes the same logical text with no token overrides. The
+    old manual permutation (what the failed acceptance MP4 contained) must
+    render differently. Word positions are recovered from isolated-word rasters
+    matched against the full line, then compared to a hand-written reading order.
     """
 
     style = CaptionStyle(font_family=FONT_FAMILY)
     plan = _single_event_plan(text, style)
-    event = plan.events[0]
     ass_bytes = serialize_ass(plan, style, _safe_zone())
-    bounds = [event.start, *[word.start for word in event.word_timings[1:]], event.end]
+    production = tmp_path / "production.png"
+    _render_png(ass_bytes, production)
 
-    centroids: dict[int, tuple[float, float]] = {}
-    for index, word in enumerate(event.word_timings):
+    reference = tmp_path / "reference.png"
+    _render_png(_naive_ass_document(text), reference)
+    assert np.array_equal(_rgb(production.read_bytes()), _rgb(reference.read_bytes()))
+
+    base = paragraph_direction(text)
+    manual_text = " ".join(visual_tokens(text.split(" "), base))
+    manual = tmp_path / "manual.png"
+    _render_png(_naive_ass_document(manual_text), manual)
+    assert not np.array_equal(_rgb(production.read_bytes()), _rgb(manual.read_bytes()))
+
+    line_mask = _ink_mask(production.read_bytes())
+    centers: list[tuple[float, str]] = []
+    for token in text.split(" "):
+        word_plan = _single_event_plan(token, style)
+        word_ass = serialize_ass(word_plan, style, _safe_zone())
+        word_png = tmp_path / f"word-{len(centers)}.png"
+        _render_png(word_ass, word_png)
+        word_mask = _ink_mask(word_png.read_bytes())
+        centers.append((_locate_word_center(line_mask, word_mask), token))
+
+    rendered = [token for _, token in sorted(centers)]
+    assert rendered == expected.split(" ")
+
+
+def test_rtl_active_emphasis_degrades_to_one_static_phrase_state(tmp_path: Path) -> None:
+    """RTL/mixed scripts must not receive per-token color overrides.
+
+    The installed libass moves words when RTL runs are split by override blocks
+    (confirmed on the failed production asset), so active emphasis degrades to a
+    single static phrase state. The rendered static frame is also verified,
+    rather than trusting the serializer's own token list.
+    """
+
+    text = "كتير قوي ألماص"
+    style = CaptionStyle(font_family=FONT_FAMILY, active_emphasis=True)
+    plan = _single_event_plan(text, style)
+    dialogues = _dialogue_payloads(serialize_ass(plan, style, _safe_zone()).decode("utf-8"))
+
+    assert len(dialogues) == 1
+    assert "\\c&H0000FFFF" not in dialogues[0]
+    assert " ".join(_visible_text(dialogues[0]).split(" ")) == text
+
+    png = tmp_path / "rtl-static.png"
+    _render_png(serialize_ass(plan, style, _safe_zone()), png)
+    assert _ink_stats(png.read_bytes())[0] > 0
+
+
+def test_ltr_active_emphasis_keeps_stable_per_word_geometry(tmp_path: Path) -> None:
+    """Known-safe LTR scripts retain working active emphasis without reflow."""
+
+    text = "hello distinct words"
+    style = CaptionStyle(font_family=FONT_FAMILY, active_emphasis=True)
+    plan = _single_event_plan(text, style)
+    event = plan.events[0]
+    bounds = [event.start, *[word.start for word in event.word_timings[1:]], event.end]
+    ass_bytes = serialize_ass(plan, style, _safe_zone())
+
+    boxes: list[tuple[int, int, int, int] | None] = []
+    for index, _word in enumerate(event.word_timings):
         midpoint = (bounds[index] + bounds[index + 1]) / 2.0
         png = tmp_path / f"state-{index}.png"
         _render_png_at(ass_bytes, midpoint, png)
         accent = _accent_mask(png.read_bytes())
-        assert bool(accent.any()), f"no rendered accent for word {word.text!r}"
-        ys, xs = np.nonzero(accent)
-        centroids[index] = (float(xs.mean()), float(ys.mean()))
+        assert bool(accent.any())
+        boxes.append(_mask_bbox(_ink_mask(png.read_bytes())))
 
-    base = paragraph_direction(text)
-    tokens, lines = _logical_line_tokens(event)
-    line_of: dict[int, int] = {}
-    cursor = 0
-    for line_index, line in enumerate(lines):
-        for _ in line:
-            line_of[cursor] = line_index
-            cursor += 1
-
-    for line_index, line in enumerate(lines):
-        indexes = [index for index in range(len(tokens)) if line_of[index] == line_index]
-        ys = [centroids[index][1] for index in indexes]
-        assert max(ys) - min(ys) < 40, f"line {line_index} words are not on one rendered line"
-        rendered = [tokens[index] for index in sorted(indexes, key=lambda i: centroids[i][0])]
-        assert rendered == visual_tokens(line, base)
-
-    # A contiguous Latin phrase must stay contiguous and internally ordered.
-    if "content creator" in tokens:
-        content = tokens.index("content")
-        creator = tokens.index("creator")
-        assert centroids[content][0] < centroids[creator][0]
-        assert abs(centroids[content][1] - centroids[creator][1]) < 40
+    reference = boxes[0]
+    assert reference is not None
+    for box in boxes:
+        assert box is not None
+        assert all(abs(box[edge] - reference[edge]) <= 2 for edge in range(4))
 
 
-def test_dynamic_states_have_identical_bidi_scaffolding(tmp_path: Path) -> None:
-    """Every active-word state must render identical geometry.
+def _render_mp4_frame(ass_text: str, destination: Path, seconds: float = 0.32) -> None:
+    """Encode the ASS through libx264 and decode one representative frame."""
 
-    Rendering each state with the accent color neutralized to the primary color
-    removes the only intended difference. Those neutralized rasters must be
-    pixel-identical to each other and to the static render. The accented render
-    may differ from its neutralized twin only inside the active word's own pixel
-    region. This is a raster comparison, not a text/string comparison.
-    """
+    ass_path = destination.with_suffix(".ass")
+    ass_path.write_text(ass_text, encoding="utf-8")
+    mp4 = destination.with_suffix(".mp4")
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            f"color=c=black:s={WIDTH}x{HEIGHT}:r=25:d=2",
+            "-vf",
+            f"ass={ass_path}",
+            "-an",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-crf",
+            "18",
+            str(mp4),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-v",
+            "error",
+            "-ss",
+            f"{seconds:.3f}",
+            "-i",
+            str(mp4),
+            "-frames:v",
+            "1",
+            str(destination),
+        ],
+        check=True,
+        capture_output=True,
+    )
 
-    text = "أنا كنت content creator لمدة سنتين"
+
+@pytest.mark.parametrize(  # type: ignore[untyped-decorator]
+    "text", ["كتير قوي ألماص", "طلباتهم كتير"]
+)
+def test_encoded_mp4_preserves_static_logical_order(text: str, tmp_path: Path) -> None:
     style = CaptionStyle(font_family=FONT_FAMILY)
     plan = _single_event_plan(text, style)
-    event = plan.events[0]
-    bounds = [event.start, *[word.start for word in event.word_timings[1:]], event.end]
+    ass_text = serialize_ass(plan, style, _safe_zone()).decode("utf-8")
 
-    neutral_style = CaptionStyle(font_family=FONT_FAMILY, active_color=CaptionStyle().primary_color)
-    static_ass = serialize_ass(
-        plan, CaptionStyle(font_family=FONT_FAMILY, active_emphasis=False), _safe_zone()
-    )
-    neutral_ass = serialize_ass(plan, neutral_style, _safe_zone())
-    accent_ass = serialize_ass(plan, style, _safe_zone())
+    png = tmp_path / "png.png"
+    _render_png(serialize_ass(plan, style, _safe_zone()), png)
+    mp4_frame = tmp_path / "mp4.png"
+    _render_mp4_frame(ass_text, mp4_frame)
 
-    neutral_rasters: list["npt.NDArray[np.int32]"] = []
-    for index in range(len(event.word_timings)):
-        midpoint = (bounds[index] + bounds[index + 1]) / 2.0
-        neutral_png = tmp_path / f"neutral-{index}.png"
-        static_png = tmp_path / f"static-{index}.png"
-        accent_png = tmp_path / f"accent-{index}.png"
-        _render_png_at(neutral_ass, midpoint, neutral_png)
-        _render_png_at(static_ass, midpoint, static_png)
-        _render_png_at(accent_ass, midpoint, accent_png)
+    fixed_png = _rgb(png.read_bytes())
+    encoded = _rgb(mp4_frame.read_bytes())
 
-        neutral = _rgb(neutral_png.read_bytes())
-        assert np.array_equal(neutral, _rgb(static_png.read_bytes()))
-        neutral_rasters.append(neutral)
+    base = paragraph_direction(text)
+    old_text = " ".join(visual_tokens(text.split(" "), base))
+    old_frame = tmp_path / "old.png"
+    _render_mp4_frame(_naive_ass_document(old_text).decode("utf-8"), old_frame)
+    old_png = _rgb(old_frame.read_bytes())
 
-        accent = _rgb(accent_png.read_bytes())
-        accent_mask = _accent_mask(accent_png.read_bytes())
-        assert bool(accent_mask.any())
-        # Geometry/order must be stable: the ink bounding box is identical to the
-        # neutralized render and the accent is localized to the active word.
-        assert _mask_bbox(neutral.max(axis=2) > 30) == _mask_bbox(accent.max(axis=2) > 30)
-        ys, xs = np.nonzero(accent_mask)
-        assert xs.max() - xs.min() < 700
-
-    for raster in neutral_rasters[1:]:
-        assert np.array_equal(raster, neutral_rasters[0])
+    # Lossy encoding changes pixels; the encoded layout must still be much closer
+    # to the logical reference than to the old manual permutation.
+    to_logical = float(np.abs(encoded - fixed_png).mean())
+    to_manual = float(np.abs(encoded - old_png).mean())
+    assert to_logical < to_manual
+    assert to_logical < 20.0

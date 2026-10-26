@@ -28,7 +28,11 @@ from app.transformation.planning.policy import (  # noqa: F401  (re-exported mar
     VOICE_SELECTION_CONTEXT_MARKERS,
 )
 
-# v5: protected meaning-changing semantic operators (negation, exclusivity,
+# v12: authored-suggestion classification is independent of substantive value
+# kind; the shared contract's four entries are claim categories, so an authored
+# source-linked suggestion uses the strategy's permitted value kind rather than
+# requiring USEFUL_TAKEAWAY. v5: protected meaning-changing semantic operators
+# (negation, exclusivity,
 # modality, certainty, obligation) survive stopword/presentation filtering and
 # must match between a claim and its cited wording before deterministic support;
 # apostrophe contractions are expanded and Arabic punctuation is normalized for
@@ -44,9 +48,9 @@ from app.transformation.planning.policy import (  # noqa: F401  (re-exported mar
 # value, retention, coherence, narration where relevant, unsupported-claim) must
 # carry a known positive finding; any UNKNOWN/concerning dimension defers
 # governance and cannot produce a selectable approval.
-GOVERNOR_POLICY_VERSION = "stage4.2-v9"
+GOVERNOR_POLICY_VERSION = "stage4.2-v12"
 GOVERNOR_SCHEMA_VERSION = "stage4.2-schema-v1"
-GOVERNOR_VALIDATION_VERSION = "stage4.2-validation-v11"
+GOVERNOR_VALIDATION_VERSION = "stage4.2-validation-v14"
 INPUT_FINGERPRINT_VERSION = "2"
 OUTPUT_FINGERPRINT_VERSION = "1"
 PLAN_GOVERNANCE_FINGERPRINT_VERSION = "1"
