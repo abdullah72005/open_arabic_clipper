@@ -12,6 +12,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 
 from app.pipeline.fingerprints import canonical_fingerprint
+from app.refinement.display import DISPLAY_PROJECTION_POLICY_VERSION
 from app.render.policy import (
     RENDER_CONTRACT_FINGERPRINT_VERSION,
     RENDER_CONTRACT_POLICY_VERSION,
@@ -167,6 +168,9 @@ def build_caption_source_payload(
     dialect_confidence: float,
     code_switch_evidence: Mapping[str, object],
     final_refinement_output_fingerprint: str,
+    display_projection_policy_version: str = DISPLAY_PROJECTION_POLICY_VERSION,
+    display_projection_status: str = "UNCHANGED",
+    display_projection_reason: str | None = None,
 ) -> dict[str, object]:
     return {
         "final_transcript": final_transcript,
@@ -175,6 +179,9 @@ def build_caption_source_payload(
         "dialect_confidence": dialect_confidence,
         "code_switch_evidence": dict(code_switch_evidence),
         "final_refinement_output_fingerprint": final_refinement_output_fingerprint,
+        "display_projection_policy_version": display_projection_policy_version,
+        "display_projection_status": display_projection_status,
+        "display_projection_reason": display_projection_reason,
     }
 
 

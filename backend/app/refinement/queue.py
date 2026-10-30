@@ -16,8 +16,15 @@ from app.core.enums import (
 )
 from app.models import CandidateRefinement, ClipCandidate, ProcessingJob, SourceVideo
 from app.refinement.executor import build_candidate_refinement_executor
-from app.refinement.service import evaluate_timing_alignment
-from app.refinement.types import WordTimestamp, priority_is_stage35
+from app.refinement.scope import (
+    final_clip_scope_refused,
+    is_structural_scope_span,
+)
+from app.refinement.service import (
+    compose_refinement_output_fingerprint,
+    evaluate_timing_alignment,
+)
+from app.refinement.types import priority_is_stage35
 from app.services.storage import StorageService
 
 _VALID_DISPOSITIONS = {
@@ -25,6 +32,7 @@ _VALID_DISPOSITIONS = {
     CandidateDisposition.CANDIDATE_NEEDS_REFINEMENT,
 }
 _ACTIVE_STATUSES = {JobStatus.QUEUED, JobStatus.RUNNING}
+_MANUAL_ALIGNMENT_SPAN_ID = "manual-display-alignment"
 
 
 class Stage35QueueError(ValueError):
@@ -238,11 +246,22 @@ def apply_manual_transcript(
         raise Stage35QueueError("manual transcript must not be empty")
     refinement.manual_transcript = cleaned
     refinement.final_transcript = cleaned
+    spans = [
+        dict(span)
+        for span in (refinement.unresolved_spans or [])
+        if isinstance(span, dict) and span.get("span_id") != _MANUAL_ALIGNMENT_SPAN_ID
+    ]
     pending_critical = False
-    for span in refinement.unresolved_spans or []:
-        if not isinstance(span, dict):
-            continue
+    for span in spans:
         span_id = str(span.get("span_id", ""))
+        if is_structural_scope_span(span_id):
+            # Invalid selected timing is a structural refusal, not an operator
+            # ambiguity. Keep the manual text but leave the span unresolved even
+            # if a resolution string was supplied.
+            span["resolution_state"] = "UNRESOLVED"
+            span["operator_resolution"] = None
+            pending_critical = True
+            continue
         if resolutions and span_id in resolutions:
             span["resolution_state"] = "RESOLVED"
             span["operator_resolution"] = resolutions[span_id]
@@ -251,20 +270,36 @@ def apply_manual_transcript(
             pending_critical = True
     # A final row is ready only when the manual text can be safely aligned to
     # the existing audio-backed timing evidence; unrelated text stays in review.
-    words = [
-        WordTimestamp(
-            text=str(item.get("text", "")),
-            start=float(item.get("start", 0.0)),
-            end=float(item.get("end", 0.0)),
-        )
-        for item in (refinement.word_timestamps or [])
-        if isinstance(item, dict)
-    ]
-    aligned, _reason = evaluate_timing_alignment(
-        cleaned, refinement.automatic_transcript or "", words
+    raw_words = refinement.word_timestamps or []
+    aligned, alignment_reason = evaluate_timing_alignment(
+        cleaned, refinement.automatic_transcript or "", raw_words
     )
-    if pending_critical or (
-        refinement.priority is RefinementPriority.FINAL_CLIP and not (words and aligned)
+    if refinement.priority is RefinementPriority.FINAL_CLIP and not aligned:
+        spans.append(
+            {
+                "span_id": _MANUAL_ALIGNMENT_SPAN_ID,
+                "start": refinement.refined_start,
+                "end": refinement.refined_end,
+                "context": cleaned[:200],
+                "readings": [],
+                "evidence_fingerprints": [],
+                "providers": ["operator"],
+                "confidence": 0.0,
+                "reason": alignment_reason or "manual_transcript_cannot_be_aligned_safely",
+                "entity_type": None,
+                "meaning_critical": True,
+                "resolution_state": "UNRESOLVED",
+            }
+        )
+    refinement.unresolved_spans = spans
+    scope_refused = (
+        refinement.priority is RefinementPriority.FINAL_CLIP
+        and final_clip_scope_refused(refinement.provider_evidence)
+    )
+    if (
+        pending_critical
+        or scope_refused
+        or (refinement.priority is RefinementPriority.FINAL_CLIP and not (raw_words and aligned))
     ):
         refinement.status = _review_status(refinement)
     else:
@@ -273,6 +308,23 @@ def apply_manual_transcript(
         "CANDIDATE_REFINED",
         "FINAL_TRANSCRIPT_READY",
     }
+    scope = (refinement.provider_evidence or {}).get("final_clip_view")
+    scope_fingerprint = scope.get("fingerprint") if isinstance(scope, dict) else None
+    if isinstance(scope_fingerprint, str) and scope_fingerprint and refinement.input_fingerprint:
+        # Manual text changes the effective authoritative clip view, so dependent
+        # plans/contracts must be rebuilt rather than reused under the old scope.
+        refinement.output_fingerprint = compose_refinement_output_fingerprint(
+            input_fingerprint=refinement.input_fingerprint,
+            priority=refinement.priority,
+            status=refinement.status.value,
+            final_text=refinement.final_transcript or "",
+            refined_start=float(refinement.refined_start or 0.0),
+            refined_end=float(refinement.refined_end or 0.0),
+            unresolved_ids=[
+                str(span.get("span_id", "")) for span in spans if isinstance(span, dict)
+            ],
+            final_clip_scope_fingerprint=scope_fingerprint,
+        )
     session.commit()
     session.refresh(refinement)
     return refinement

@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 from app.core.enums import StrategyDisposition
 from app.core.settings import get_settings
 from app.models import CandidateRefinement, ClipCandidate
+from app.refinement.scope import final_clip_scope_refused
 from app.transformation.executor import build_transformation_executor
 from app.transformation.queue import (
     get_analysis_for_candidate,
@@ -136,6 +137,9 @@ def build_stage4_1_handoff(
     refinement = (
         session.get(CandidateRefinement, analysis.refinement_id) if analysis.refinement_id else None
     )
+    scope_refused = bool(
+        refinement is not None and final_clip_scope_refused(refinement.provider_evidence)
+    )
     if refinement is not None:
         base["selected_refinement"] = {
             "id": str(refinement.id),
@@ -184,12 +188,16 @@ def build_stage4_1_handoff(
     stale, current = _staleness(session, candidate, analysis)
     base["stale"] = stale
     base["current"] = current
+    base["scope_refused"] = scope_refused
     base["ready_for_stage4_1"] = bool(
-        current
+        not scope_refused
+        and current
         and not stale
         and analysis.execution_status.value == "COMPLETE"
         and bool(recommended)
     )
+    if scope_refused:
+        base["reason"] = "FINAL_CLIP_SCOPE_REFUSED"
     return base
 
 

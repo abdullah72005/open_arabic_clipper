@@ -9,7 +9,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.candidates.fingerprints import novelty_corpus_digest
-from app.candidates.novelty import NoveltyItem, idea_signature, topic_signature
+from app.candidates.novelty import NoveltyItem
+from app.candidates.persistence import apply_candidate_fields
 from app.candidates.policy import (
     DEFAULT_CONFIG,
     POLICY_VERSION,
@@ -25,6 +26,11 @@ from app.candidates.providers import (
     SemanticProviderError,
     semantic_prompt_hash,
 )
+from app.candidates.registration import (
+    operator_draft_matches_window,
+    operator_identity_is_current,
+    operator_selection_marker,
+)
 from app.candidates.service import (
     CandidateAnalysisService,
     build_input_fingerprint_payload,
@@ -38,6 +44,7 @@ from app.core.enums import (
 )
 from app.models import (
     AudioAnalysis,
+    AudioArtifact,
     CandidateAnalysis,
     ClipCandidate,
     ProcessingJob,
@@ -336,6 +343,12 @@ class CandidateAnalysisExecutor:
     ) -> StageExecutionResult:
         if self._job_cancelled():
             raise CandidateAnalysisCancelled("candidate analysis cancelled before commit")
+        locked_source = self._session.scalar(
+            select(SourceVideo).where(SourceVideo.id == source.id).with_for_update()
+        )
+        if locked_source is None:
+            raise StageExecutionError("source disappeared before candidate persistence")
+        source = locked_source
         analysis = self._session.scalar(
             select(CandidateAnalysis).where(CandidateAnalysis.source_video_id == source.id)
         )
@@ -360,17 +373,58 @@ class CandidateAnalysisExecutor:
                 select(ClipCandidate).where(ClipCandidate.source_video_id == source.id)
             )
         }
+        audio = self._session.scalar(
+            select(AudioArtifact).where(AudioArtifact.source_video_id == source.id)
+        )
+        operator_rows = {
+            key: row for key, row in existing.items() if operator_selection_marker(row) is not None
+        }
+        operator_preserved = 0
+        operator_staled = 0
+        for row in operator_rows.values():
+            if operator_identity_is_current(row, source, transcript, audio):
+                if row.is_current:
+                    operator_preserved += 1
+                continue
+            if row.is_current:
+                row.is_current = False
+                operator_staled += 1
+
         emitted: set[str] = set()
+        applied = 0
+        suppressed_matched = 0
+        suppressed_collided = 0
         for draft in outcome.candidates:
             emitted.add(draft.candidate_key)
             row = existing.get(draft.candidate_key)
+            if row is not None and operator_selection_marker(row) is not None:
+                if operator_draft_matches_window(row, draft):
+                    suppressed_matched += 1
+                else:
+                    suppressed_collided += 1
+                continue
             if row is None:
                 row = ClipCandidate(source_video_id=source.id, candidate_key=draft.candidate_key)
                 self._session.add(row)
             self._apply_draft(row, draft, analysis, input_fingerprint)
+            applied += 1
         for key, row in existing.items():
-            if key not in emitted:
-                row.is_current = False
+            if key in emitted:
+                continue
+            if operator_selection_marker(row) is not None:
+                continue
+            row.is_current = False
+
+        analysis.metrics = {
+            **dict(outcome.metrics),
+            "operator_rows_preserved": operator_preserved,
+            "operator_rows_staled_raw_identity": operator_staled,
+            "operator_same_key_drafts_matched": suppressed_matched,
+            "operator_same_key_drafts_collided": suppressed_collided,
+            "automatic_drafts_suppressed": suppressed_matched + suppressed_collided,
+            "automatic_candidates_applied": applied,
+            "persistence_scope": "automatic_drafts_excluding_operator_owned",
+        }
         self._session.commit()
         self._session.refresh(analysis)
         return StageExecutionResult(outcome.output_fingerprint, analysis)
@@ -382,49 +436,9 @@ class CandidateAnalysisExecutor:
         analysis: CandidateAnalysis,
         input_fingerprint: str,
     ) -> None:
-        proposal = draft.proposal
-        scores = draft.scores
         row.candidate_analysis_id = analysis.id
         row.is_current = True
-        row.disposition = draft.disposition
-        row.start_time = proposal.start_time
-        row.end_time = proposal.end_time
-        row.start_segment_index = proposal.start_segment_index
-        row.end_segment_index = proposal.end_segment_index
-        row.segment_indexes = list(proposal.segment_indexes)
-        row.transcript_excerpt = draft.transcript_excerpt
-        row.evidence_snapshot = dict(draft.evidence_snapshot)
-        row.primary_content_type = draft.content.primary
-        row.secondary_content_types = [item.value for item in draft.content.secondary]
-        row.clip_score = scores.clip_score
-        row.short_form_score = scores.short_form_score
-        row.moment_density_score = scores.moment_density_score
-        row.boredom_risk_score = scores.boredom_risk_score
-        row.ending_quality_score = scores.ending_quality_score
-        row.loopability_score = scores.loopability_score
-        row.engagement_confidence = scores.engagement_confidence
-        row.transcript_confidence = scores.transcript_confidence
-        row.audio_confidence = scores.audio_confidence
-        row.boundary_confidence = scores.boundary_confidence
-        row.uncertainty_severity = scores.uncertainty_severity
-        row.idea_novelty_score = scores.idea_novelty_score
-        row.topic_novelty_score = scores.topic_novelty_score
-        row.recent_semantic_similarity_risk = scores.recent_semantic_similarity_risk
-        row.refinement_reasons = [reason.value for reason in draft.refinement_reasons]
-        row.refinement_evidence = dict(draft.refinement_evidence)
-        row.provenance_snapshot = dict(draft.provenance_snapshot)
-        row.rights_risk = draft.rights_risk
-        row.originality_risk = draft.originality_risk
-        row.dialect_profile = draft.dialect_profile
-        row.dialect_confidence = draft.dialect_confidence
-        row.code_switch_suspected = draft.code_switch_suspected
-        row.hooks = [hook.as_dict() for hook in draft.hooks]
-        row.idea_summary = draft.idea_summary
-        row.topic_summary = draft.topic_summary
-        row.idea_signature = idea_signature(draft.idea_summary or draft.transcript_excerpt)
-        row.topic_signature = topic_signature(draft.topic_summary or draft.transcript_excerpt)
-        row.provider_input_fingerprint = draft.provider_input_fingerprint
-        row.provider_evidence = dict(draft.provider_evidence)
+        apply_candidate_fields(row, draft)
         row.analysis_fingerprint = canonical_fingerprint(
             "candidate-analysis-record",
             POLICY_VERSION,

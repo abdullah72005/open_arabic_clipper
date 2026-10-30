@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
@@ -356,6 +357,11 @@ def test_manual_endpoint_rejects_unrelated_final_text(api) -> None:
     )
     assert unrelated.status_code == 200
     assert unrelated.json()["status"] == "NEEDS_MANUAL_TRANSCRIPT_REVIEW"
+    assert unrelated.json()["final_transcript"] == "كلام مختلف تماما وغير مرتبط"
+    assert any(
+        span.get("span_id") == "manual-display-alignment" and span.get("reason")
+        for span in unrelated.json()["unresolved_spans"]
+    )
 
     aligned = client.post(
         f"/api/refinements/{refinement_id}/manual",
@@ -363,3 +369,73 @@ def test_manual_endpoint_rejects_unrelated_final_text(api) -> None:
     )
     assert aligned.status_code == 200
     assert aligned.json()["status"] == "FINAL_TRANSCRIPT_READY"
+
+
+def test_manual_endpoint_refuses_malformed_raw_word_evidence(api, dispatched) -> None:
+    client, factory = api
+    valid = [
+        {"index": 0, "text": "rates", "start": 10.0, "end": 10.4},
+        {"index": 1, "text": "fell", "start": 10.4, "end": 10.8},
+        {"index": 2, "text": "sharply.", "start": 10.8, "end": 11.2},
+    ]
+    cases = [
+        (
+            "missing_times",
+            [{"text": token} for token in ["rates", "fell", "sharply."]],
+            "manual_transcript_invalid_word_timing",
+        ),
+        (
+            "duplicate_indexes",
+            [{**word, "index": 0} for word in valid],
+            "manual_transcript_invalid_word_evidence",
+        ),
+        (
+            "null_time",
+            [{**word, "start": None} if index == 0 else word for index, word in enumerate(valid)],
+            "manual_transcript_invalid_word_timing",
+        ),
+    ]
+    for _label, raw_words, expected_reason in cases:
+        _source_id, candidate_id = _make_source(factory)
+        with factory() as session:
+            candidate = session.get(ClipCandidate, candidate_id)
+            assert candidate is not None
+            row = CandidateRefinement(
+                source_video_id=candidate.source_video_id,
+                clip_candidate_id=candidate.id,
+                priority=RefinementPriority.FINAL_CLIP,
+                status=RefinementStatus.NEEDS_MANUAL_TRANSCRIPT_REVIEW,
+                coarse_start=10.0,
+                coarse_end=16.0,
+                context_start=5.0,
+                context_end=21.0,
+                automatic_transcript="rates fell sharply.",
+                final_transcript="rates fell sharply.",
+                quality_level="FINAL_CLIP",
+                word_timestamps=copy.deepcopy(raw_words),
+            )
+            session.add(row)
+            session.commit()
+            refinement_id = row.id
+
+        response = client.post(
+            f"/api/refinements/{refinement_id}/manual",
+            json={"text": "rates fell slightly.", "resolutions": {}},
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["status"] == "NEEDS_MANUAL_TRANSCRIPT_REVIEW"
+        assert body["manual_transcript"] == "rates fell slightly."
+        assert body["final_transcript"] == "rates fell slightly."
+        assert body["word_timestamps"] == raw_words
+        reasons = [
+            span.get("reason")
+            for span in body["unresolved_spans"]
+            if span.get("span_id") == "manual-display-alignment"
+        ]
+        assert reasons == [expected_reason]
+        with factory() as session:
+            persisted = session.get(CandidateRefinement, refinement_id)
+            assert persisted is not None
+            assert persisted.word_timestamps == raw_words
+    assert dispatched == []

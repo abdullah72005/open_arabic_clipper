@@ -13,6 +13,10 @@ from uuid import UUID
 import typer
 
 from app.candidates.novelty import NoveltyItem
+from app.candidates.registration import (
+    CandidateRegistrationError,
+    register_operator_candidate,
+)
 from app.candidates.service import CandidateAnalysisService
 from app.composition.geometry import FFprobeDisplayProbe
 from app.composition.handoff import build_stage5_2_handoff
@@ -47,6 +51,12 @@ from app.models import (
     Transcript,
     TransformationPlanSelection,
 )
+from app.refinement.continuation import (
+    ContinuationConfigurationError,
+    ContinuationError,
+    run_guarded_continuation,
+)
+from app.refinement.executor import build_local_identity
 from app.refinement.handoff import build_stage4_handoff
 from app.refinement.queue import (
     Stage35QueueError,
@@ -54,6 +64,11 @@ from app.refinement.queue import (
     queue_candidate_batch,
     queue_candidate_refinement,
     validate_candidate_for_refinement,
+)
+from app.refinement.recovery import (
+    LocalObservationRecoveryError,
+    LocalObservationRecoveryService,
+    load_expectation_manifest,
 )
 from app.render.execution.policy import DEFAULT_DELIVERY_PROFILE_KEY
 from app.render.execution.queue import RenderQueueError, queue_render_execution
@@ -326,6 +341,46 @@ def candidate_analysis(
     typer.echo(str(_queue_candidate_analysis(source_id, force=force)))
 
 
+@app.command("candidate-register-window")
+def candidate_register_window(
+    source_id: UUID,
+    start: float = typer.Option(..., "--start"),
+    end: float = typer.Option(..., "--end"),
+    reason: str = typer.Option(..., "--reason"),
+) -> None:
+    """Register one operator-selected immutable source window without execution."""
+
+    with create_session_factory()() as session:
+        try:
+            result = register_operator_candidate(session, source_id, start, end, reason)
+            session.commit()
+        except CandidateRegistrationError as error:
+            session.rollback()
+            raise typer.BadParameter(str(error)) from error
+    candidate = result.candidate
+    typer.echo(
+        json.dumps(
+            {
+                "candidate_id": str(candidate.id),
+                "candidate_key": candidate.candidate_key,
+                "start_time": candidate.start_time,
+                "end_time": candidate.end_time,
+                "start_segment_index": candidate.start_segment_index,
+                "end_segment_index": candidate.end_segment_index,
+                "segment_indexes": list(candidate.segment_indexes),
+                "created": result.created,
+                "ownership": result.ownership,
+                "disposition": (
+                    candidate.disposition.value
+                    if hasattr(candidate.disposition, "value")
+                    else str(candidate.disposition)
+                ),
+            },
+            ensure_ascii=False,
+        )
+    )
+
+
 @app.command("candidates")
 def candidates(
     source_id: UUID,
@@ -478,6 +533,121 @@ def candidate_handoff(candidate_id: UUID) -> None:
         if handoff is None:
             raise typer.BadParameter("candidate does not exist")
     typer.echo(json.dumps(handoff, ensure_ascii=False, default=str))
+
+
+@app.command("candidate-recovery")
+def candidate_recovery(
+    expectation: Path = typer.Option(
+        ...,
+        "--expectation",
+        help="Path to the bounded JSON expectation manifest.",
+    ),
+    apply: bool = typer.Option(
+        False,
+        "--apply/--preview",
+        help="Admit the checkpoint (writes) or validate/preview only.",
+    ),
+    require_reuse: bool = typer.Option(
+        False,
+        "--require-reuse",
+        help="Exit non-zero unless the admitted checkpoint is reusable without a model call.",
+    ),
+) -> None:
+    """Validate or admit one pinned local decoder observation. No model calls."""
+
+    try:
+        parsed = load_expectation_manifest(expectation)
+    except LocalObservationRecoveryError as error:
+        typer.echo(json.dumps({"error": error.code, "message": str(error)}, ensure_ascii=False))
+        raise typer.Exit(code=1) from error
+    settings = get_settings()
+    storage = StorageService(settings.storage_root)
+
+    def options_for(priority: RefinementPriority):  # type: ignore[no-untyped-def]
+        return settings.targeted_transcription_options(priority.value)
+
+    local_identity = build_local_identity(options_for, settings)
+    with create_session_factory()() as session:
+        service = LocalObservationRecoveryService(
+            session=session,
+            storage=storage,
+            options_for=options_for,
+            local_identity=local_identity,
+            config=settings.stage35_config(),
+        )
+        try:
+            if apply:
+                result = service.apply(parsed)
+                session.commit()
+                payload = result.as_dict()
+            else:
+                payload = service.preview(parsed).as_dict()
+        except LocalObservationRecoveryError as error:
+            session.rollback()
+            typer.echo(json.dumps({"error": error.code, "message": str(error)}, ensure_ascii=False))
+            raise typer.Exit(code=1) from error
+    typer.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str))
+    reuse_ready = payload.get("reuse_ready")
+    if reuse_ready is None and isinstance(payload.get("preview"), dict):
+        reuse_ready = payload["preview"].get("reuse_ready")
+    if require_reuse and not reuse_ready:
+        typer.echo(
+            json.dumps(
+                {
+                    "error": "reuse_not_ready",
+                    "message": "checkpoint is not reusable without a model call",
+                },
+                ensure_ascii=False,
+            )
+        )
+        raise typer.Exit(code=2)
+
+
+@app.command("candidate-recovery-continue")
+def candidate_recovery_continue(
+    expectation: Path = typer.Option(
+        ...,
+        "--expectation",
+        help="Path to the bounded JSON expectation manifest.",
+    ),
+) -> None:
+    """Run one pinned FINAL_CLIP continuation with a deny-only ASR guard."""
+
+    try:
+        parsed = load_expectation_manifest(expectation)
+    except LocalObservationRecoveryError as error:
+        typer.echo(json.dumps({"error": error.code, "message": str(error)}, ensure_ascii=False))
+        raise typer.Exit(code=1) from error
+    settings = get_settings()
+    storage = StorageService(settings.storage_root)
+    with create_session_factory()() as session:
+        try:
+            result = run_guarded_continuation(session, storage, settings, parsed)
+        except ContinuationConfigurationError as error:
+            session.rollback()
+            typer.echo(
+                json.dumps(
+                    {
+                        "error": "continuation_configuration",
+                        "code": error.code,
+                        "message": str(error),
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            raise typer.Exit(code=2) from error
+        except ContinuationError as error:
+            session.rollback()
+            typer.echo(
+                json.dumps(
+                    {"error": "continuation_failed", "code": error.code, "message": str(error)},
+                    ensure_ascii=False,
+                )
+            )
+            raise typer.Exit(code=1) from error
+    typer.echo(json.dumps(result.as_dict(), ensure_ascii=False, sort_keys=True, default=str))
+    if not result.succeeded:
+        raise typer.Exit(code=1)
 
 
 @app.command("transformation-analyze")
@@ -1638,8 +1808,9 @@ def stage6_tts_audition(
         admit=admit,
         on_rate_limited=on_rate_limited,
     )
-    exported = export_tts_audition(settings, [sample.as_dict() for sample in result.samples],
-                                   output_root=output_root)
+    exported = export_tts_audition(
+        settings, [sample.as_dict() for sample in result.samples], output_root=output_root
+    )
     payload = result.as_dict()
     payload["export"] = exported
     if not key_value:

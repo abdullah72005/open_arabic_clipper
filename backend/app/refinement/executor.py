@@ -8,6 +8,8 @@ accepted checkpoints, and releases owned providers on every exit path.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from dataclasses import asdict
 from time import monotonic
 
 from sqlalchemy import select
@@ -25,6 +27,7 @@ from app.refinement.policy import DEFAULT_CONFIG, REFINEMENT_SCHEMA_VERSION, Sta
 from app.refinement.service import CandidateRefinementService, RefinementError
 from app.refinement.types import RefinementOutcome, priority_is_stage35
 from app.services.storage import StorageService
+from app.transcription.service import TranscriptionOptions
 
 _READY_STATUSES = {
     RefinementStatus.CANDIDATE_REFINED,
@@ -261,6 +264,27 @@ class CandidateRefinementExecutor:
                     pass
 
 
+def build_local_identity(
+    options_for: Callable[[RefinementPriority], TranscriptionOptions],
+    settings: object,
+) -> dict[str, object]:
+    """Build the stable local-decoder identity used by reuse checks."""
+
+    return {
+        "provider": "faster-whisper",
+        "model": getattr(settings, "whisper_model", None),
+        "device": getattr(settings, "whisper_device", None),
+        "condition_on_previous_text": False,
+        "vad_filter": False,
+        "candidate_beam_size": getattr(settings, "refinement_candidate_beam_size", 5),
+        "final_beam_size": getattr(settings, "refinement_final_beam_size", 8),
+        "decoder_options": {
+            "CANDIDATE": asdict(options_for(RefinementPriority.CANDIDATE)),
+            "FINAL_CLIP": asdict(options_for(RefinementPriority.FINAL_CLIP)),
+        },
+    }
+
+
 def build_candidate_refinement_executor(
     session: Session,
     storage: StorageService,
@@ -297,15 +321,7 @@ def build_candidate_refinement_executor(
         except Exception:
             qwen = None
 
-    local_identity = {
-        "provider": "faster-whisper",
-        "model": getattr(settings, "whisper_model", None),
-        "device": getattr(settings, "whisper_device", None),
-        "condition_on_previous_text": False,
-        "vad_filter": False,
-        "candidate_beam_size": getattr(settings, "refinement_candidate_beam_size", 5),
-        "final_beam_size": getattr(settings, "refinement_final_beam_size", 8),
-    }
+    local_identity = build_local_identity(options_for, settings)
     return CandidateRefinementExecutor(
         session=session,
         storage=storage,

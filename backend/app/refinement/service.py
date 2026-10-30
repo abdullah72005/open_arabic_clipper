@@ -14,8 +14,8 @@ import hashlib
 import math
 import re
 import threading
-from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +37,7 @@ from app.models import (
 )
 from app.refinement.audio_window import CandidateAudioWindowService
 from app.refinement.boundary import BoundarySignals, refine_boundaries
+from app.refinement.display import project_display_text
 from app.refinement.entities import compare_entity_sets, extract_entities
 from app.refinement.evidence import (
     choose_final_transcript,
@@ -53,13 +54,21 @@ from app.refinement.hosted import HostedProviderError
 from app.refinement.policy import (
     CONSENSUS_POLICY_VERSION,
     DEFAULT_CONFIG,
+    FINAL_CLIP_SCOPE_POLICY_VERSION,
     REFINEMENT_POLICY_VERSION,
     REFINEMENT_SCHEMA_VERSION,
     REFINEMENT_VALIDATION_VERSION,
     Stage35Config,
 )
+from app.refinement.scope import (
+    FINAL_CLIP_SCOPE_SPAN_ID,
+    FinalClipView,
+    ScopeRefusal,
+    derive_final_clip_view,
+)
 from app.refinement.types import (
     AdjudicationRequest,
+    BoundaryResult,
     EntityMention,
     EvidenceRecord,
     RefinementAudioWindow,
@@ -75,9 +84,11 @@ from app.refinement.types import (
 )
 from app.services.storage import StorageCategory, StorageService
 from app.transcription.dialect import extract_protected_tokens
+from app.transcription.service import TranscriptionOptions
 
 _MIN_TEXT = 1e-6
 _TOKEN_BOUNDARY = r"A-Za-z0-9\u0600-\u06FF\u0660-\u0669\u06F0-\u06F9"
+_DECODER_OPTION_FIELDS = tuple(field.name for field in fields(TranscriptionOptions))
 
 
 class RefinementError(RuntimeError):
@@ -114,7 +125,9 @@ def _apply_entity_reading(base: str, readings: Sequence[str], selected: str) -> 
 
 
 def evaluate_timing_alignment(
-    manual: str | None, automatic: str, words: Sequence[WordTimestamp]
+    manual: str | None,
+    automatic: str,
+    words: Sequence[WordTimestamp | Mapping[str, object]],
 ) -> tuple[bool, str | None]:
     """Shared manual-vs-automatic timing-alignment gate.
 
@@ -128,17 +141,40 @@ def evaluate_timing_alignment(
         return False, "manual_transcript_without_timing_evidence"
     if not words:
         return False, "manual_transcript_without_word_timestamps"
-    from app.transcription.arabic import normalize_for_comparison
-
-    manual_tokens = normalize_for_comparison(manual).split()
-    automatic_tokens = normalize_for_comparison(automatic).split()
-    if not automatic_tokens:
-        return False, "manual_transcript_without_timing_evidence"
-    overlap = len(set(manual_tokens) & set(automatic_tokens))
-    ratio = overlap / max(1, len(set(manual_tokens)))
-    if ratio < 0.3:
-        return False, "manual_transcript_cannot_be_aligned_safely"
+    projection = project_display_text(
+        manual,
+        [word.as_dict if isinstance(word, WordTimestamp) else word for word in words],
+    )
+    if not projection.supported:
+        return False, projection.reason or "manual_transcript_cannot_be_aligned_safely"
     return True, None
+
+
+def compose_refinement_output_fingerprint(
+    *,
+    input_fingerprint: str,
+    priority: RefinementPriority,
+    status: str,
+    final_text: str,
+    refined_start: float,
+    refined_end: float,
+    unresolved_ids: Sequence[str],
+    final_clip_scope_fingerprint: str = "",
+) -> str:
+    """Compose the durable output identity, including any scoped clip view."""
+
+    payload: dict[str, object] = {
+        "input_fingerprint": input_fingerprint,
+        "priority": priority.value,
+        "status": status,
+        "final_transcript": final_text,
+        "refined_start": round(refined_start, 6),
+        "refined_end": round(refined_end, 6),
+        "unresolved": list(unresolved_ids),
+    }
+    if final_clip_scope_fingerprint:
+        payload["final_clip_scope"] = final_clip_scope_fingerprint
+    return refinement_output_fingerprint(payload)
 
 
 @dataclass
@@ -181,6 +217,59 @@ def _segment_words(segment: dict[str, object]) -> tuple[WordTimestamp, ...]:
                 start=float(start),  # type: ignore[arg-type]
                 end=float(end),  # type: ignore[arg-type]
                 probability=float(probability) if _finite(probability) else None,  # type: ignore[arg-type]
+            )
+        )
+    return tuple(words)
+
+
+def _checkpoint_float(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) else None
+
+
+def _option_value_matches(stored: object, expected: object) -> bool:
+    """Compare persisted option values, tolerating JSON tuple/list round-trips."""
+
+    if isinstance(stored, bool) or isinstance(expected, bool):
+        return stored is expected
+    if isinstance(stored, (tuple, list)) or isinstance(expected, (tuple, list)):
+        if not isinstance(stored, (tuple, list)) or not isinstance(expected, (tuple, list)):
+            return False
+        return len(stored) == len(expected) and all(
+            _option_value_matches(item, wanted)
+            for item, wanted in zip(stored, expected, strict=True)
+        )
+    if isinstance(stored, (int, float)) and isinstance(expected, (int, float)):
+        return float(stored) == float(expected)
+    return stored == expected
+
+
+def _checkpoint_words(value: object) -> tuple[WordTimestamp, ...] | None:
+    if not isinstance(value, list):
+        return None
+    words: list[WordTimestamp] = []
+    for item in value:
+        if not isinstance(item, dict):
+            return None
+        text = item.get("text")
+        start = _checkpoint_float(item.get("start"))
+        end = _checkpoint_float(item.get("end"))
+        if not isinstance(text, str) or not text.strip() or start is None or end is None:
+            return None
+        if end <= start:
+            return None
+        probability = item.get("probability")
+        probability_value = None if probability is None else _checkpoint_float(probability)
+        if probability is not None and probability_value is None:
+            return None
+        words.append(
+            WordTimestamp(
+                text=text,
+                start=start,
+                end=end,
+                probability=probability_value,
             )
         )
     return tuple(words)
@@ -314,6 +403,13 @@ class CandidateRefinementService:
             )
         return payload
 
+    def seed_bounds(
+        self, candidate: ClipCandidate, priority: RefinementPriority
+    ) -> tuple[float, float]:
+        """Expose the durable coarse seed used for a refinement request."""
+
+        return self._seed_bounds(candidate, priority)
+
     def input_fingerprint(self, candidate: ClipCandidate, priority: RefinementPriority) -> str:
         if not priority_is_stage35(priority):
             raise RefinementConfigurationError("Stage 3.5 only supports CANDIDATE/FINAL_CLIP")
@@ -363,6 +459,11 @@ class CandidateRefinementService:
                 "schema_version": REFINEMENT_SCHEMA_VERSION,
                 "validation_version": REFINEMENT_VALIDATION_VERSION,
                 "consensus_version": CONSENSUS_POLICY_VERSION,
+                "final_clip_scope_policy_version": (
+                    FINAL_CLIP_SCOPE_POLICY_VERSION
+                    if priority is RefinementPriority.FINAL_CLIP
+                    else None
+                ),
             }
         )
 
@@ -499,26 +600,6 @@ class CandidateRefinementService:
         automatic = adjudicated_text or base_text
         manual = prior.manual_transcript if prior is not None else None
         operator_segment_text = region.operator_text
-        final_text = choose_final_transcript(
-            manual=manual,
-            adjudicated=adjudicated_text,
-            operator_segment_text=operator_segment_text,
-            consensus=consensus_text or None,
-            automatic=automatic or None,
-            stage27_text=region.stage27_text or None,
-            stage25_text=region.stage25_text or None,
-            raw_text=region.raw_text or None,
-        )
-
-        entities, unresolved = self._entities_and_ambiguity(
-            final_text=final_text,
-            region=region,
-            audio_records=audio_records,
-            priority=priority,
-            adjudication_spans=adjudication_spans,
-            handled_ambiguities=handled_ambiguities,
-            provider_degraded=provider_degraded,
-        )
 
         word_timestamps = self._choose_words(local_record)
         boundary = refine_boundaries(
@@ -538,20 +619,90 @@ class CandidateRefinementService:
             "boundary", boundary.as_dict()
         )
 
+        scope = (
+            self._final_clip_scope(local_record, window, boundary)
+            if priority is RefinementPriority.FINAL_CLIP
+            else None
+        )
+        scoped_view = scope if isinstance(scope, FinalClipView) else None
+
+        if scoped_view is not None:
+            # The authoritative automatic rung is the validated clip view. Full
+            # context consensus/adjudication cannot be silently reinterpreted as
+            # clip text; manual/operator text still wins but must project.
+            final_text = choose_final_transcript(
+                manual=manual,
+                adjudicated=None,
+                operator_segment_text=operator_segment_text,
+                consensus=None,
+                automatic=scoped_view.text,
+                stage27_text=None,
+                stage25_text=None,
+                raw_text=None,
+            )
+            word_timestamps = tuple(word.as_timestamp() for word in scoped_view.words)
+            if final_text.strip() == scoped_view.text:
+                timing_aligned, timing_reason = True, None
+            else:
+                timing_aligned, timing_reason = self._timing_alignment(
+                    final_text, scoped_view.text, word_timestamps
+                )
+        else:
+            final_text = choose_final_transcript(
+                manual=manual,
+                adjudicated=adjudicated_text,
+                operator_segment_text=operator_segment_text,
+                consensus=consensus_text or None,
+                automatic=automatic or None,
+                stage27_text=region.stage27_text or None,
+                stage25_text=region.stage25_text or None,
+                raw_text=region.raw_text or None,
+            )
+            timing_aligned, timing_reason = self._timing_alignment(
+                manual, automatic, word_timestamps
+            )
+
+        entities, unresolved = self._entities_and_ambiguity(
+            final_text=final_text,
+            region=region,
+            audio_records=audio_records,
+            priority=priority,
+            adjudication_spans=adjudication_spans,
+            handled_ambiguities=handled_ambiguities,
+            provider_degraded=provider_degraded,
+        )
+        if isinstance(scope, ScopeRefusal):
+            unresolved = unresolved + (
+                UnresolvedSpan(
+                    span_id=FINAL_CLIP_SCOPE_SPAN_ID,
+                    start=boundary.start,
+                    end=boundary.end,
+                    context=(final_text or "")[: self._config.max_context_characters],
+                    readings=(),
+                    evidence_fingerprints=(
+                        local_record.fingerprint if local_record is not None else "",
+                    ),
+                    providers=("faster-whisper",),
+                    confidence=0.0,
+                    reason=scope.reason,
+                    entity_type=None,
+                    meaning_critical=True,
+                ),
+            )
+
         omitted_english = self._omitted_english(index_text, automatic)
         if omitted_english:
             ctx.bump("code_switch_recoveries")
             ctx.routing_evidence["code_switch_recovered"] = list(omitted_english)
 
         meaning_critical = any(span.meaning_critical for span in unresolved)
-        timing_aligned, timing_reason = self._timing_alignment(manual, automatic, word_timestamps)
         if not timing_aligned:
             unresolved = unresolved + (
                 UnresolvedSpan(
                     span_id="timing-alignment",
                     start=boundary.start,
                     end=boundary.end,
-                    context=manual or "",
+                    context=manual or final_text or "",
                     readings=(automatic,) if automatic else (),
                     evidence_fingerprints=(),
                     providers=("operator",),
@@ -561,6 +712,7 @@ class CandidateRefinementService:
                     meaning_critical=priority is RefinementPriority.FINAL_CLIP,
                 ),
             )
+            meaning_critical = any(span.meaning_critical for span in unresolved)
 
         status = self._status(
             priority=priority,
@@ -572,6 +724,7 @@ class CandidateRefinementService:
             provider_degraded=provider_degraded,
             consensus_confidence=consensus_confidence,
             timing_aligned=timing_aligned,
+            scope_refused=isinstance(scope, ScopeRefusal),
         )
         confidence = self._confidence(
             priority=priority,
@@ -586,19 +739,18 @@ class CandidateRefinementService:
             and not any(span.meaning_critical for span in unresolved)
         )
         input_fingerprint = self.input_fingerprint(candidate, priority)
-        output_fingerprint = refinement_output_fingerprint(
-            {
-                "input_fingerprint": input_fingerprint,
-                "priority": priority.value,
-                "status": status,
-                "final_transcript": final_text,
-                "refined_start": round(boundary.start, 6),
-                "refined_end": round(boundary.end, 6),
-                "unresolved": [span.span_id for span in unresolved],
-            }
+        output_fingerprint = compose_refinement_output_fingerprint(
+            input_fingerprint=input_fingerprint,
+            priority=priority,
+            status=status,
+            final_text=final_text,
+            refined_start=boundary.start,
+            refined_end=boundary.end,
+            unresolved_ids=[span.span_id for span in unresolved],
+            final_clip_scope_fingerprint=scope.fingerprint if scope is not None else "",
         )
         transcript_evidence = dedupe_evidence(evidence, limit=self._config.max_evidence_records)
-        provider_evidence = {
+        provider_evidence: dict[str, object] = {
             "local_asr_accepted": bool(
                 local_record and local_record.state is EvidenceState.ACCEPTED
             ),
@@ -607,6 +759,8 @@ class CandidateRefinementService:
             "provider_degraded": provider_degraded,
             "routing_mode": self._routing_mode,
         }
+        if scope is not None:
+            provider_evidence["final_clip_view"] = scope.envelope()
         return RefinementOutcome(
             source_id=str(source.id),
             candidate_id=str(candidate.id),
@@ -837,6 +991,19 @@ class CandidateRefinementService:
             ctx.bump("component_reuse")
             ctx.component_fingerprints["local_asr"] = reused.fingerprint
             return reused, None
+        context_terms = self._context_terms(region, index_text)
+        observation_reuse = self._reuse_rejected_local_observations(
+            prior,
+            audio_component,
+            priority,
+            force,
+            window=window,
+            context_terms=context_terms,
+        )
+        if observation_reuse is not None:
+            ctx.bump("component_reuse")
+            ctx.component_fingerprints["local_asr"] = observation_reuse.fingerprint
+            return observation_reuse, None
         cancel_event = threading.Event()
         self._check_cancelled()
         try:
@@ -846,7 +1013,7 @@ class CandidateRefinementService:
                 context_end=window.context_end,
                 priority=priority,
                 cancel_event=cancel_event,
-                context_terms=self._context_terms(region, index_text),
+                context_terms=context_terms,
             )
         except RefinementCancelled:
             raise
@@ -865,6 +1032,18 @@ class CandidateRefinementService:
         )
         if result.rejected_reason:
             accepted, reason = False, result.rejected_reason
+        entity_metadata: dict[str, object] = {}
+        if result.rejected_detail is not None:
+            entity_metadata["timestamp_diagnostic"] = result.rejected_detail
+        if result.raw_word_observations:
+            entity_metadata["raw_word_observations"] = list(result.raw_word_observations)
+            entity_metadata["raw_word_record_count"] = result.raw_word_record_count
+            entity_metadata["raw_word_observations_complete"] = (
+                result.raw_word_observations_complete
+            )
+            entity_metadata["raw_word_observations_fingerprint"] = (
+                result.raw_word_observations_fingerprint
+            )
         return (
             EvidenceRecord(
                 kind=EvidenceKind.TARGETED_LOCAL_ASR,
@@ -880,6 +1059,7 @@ class CandidateRefinementService:
                 state=EvidenceState.ACCEPTED if accepted else EvidenceState.REJECTED,
                 word_timestamps=result.word_timestamps,
                 reason=reason,
+                entity_metadata=entity_metadata,
             ),
             None,
         )
@@ -899,29 +1079,299 @@ class CandidateRefinementService:
         fingerprint = fingerprints.get("local_asr")
         if not isinstance(fingerprint, str) or not fingerprint:
             return None
-        if not prior.automatic_transcript.strip():
+
+        local_records = [
+            item
+            for item in prior.transcript_evidence or []
+            if isinstance(item, dict) and item.get("kind") == EvidenceKind.TARGETED_LOCAL_ASR.value
+        ]
+        if len(local_records) != 1:
+            return None
+        record = local_records[0]
+        if record.get("state") != EvidenceState.ACCEPTED.value:
+            return None
+        if record.get("fingerprint") != fingerprint:
+            return None
+
+        transcript = record.get("transcript")
+        provider = record.get("provider")
+        model = record.get("model")
+        settings = record.get("settings")
+        confidence = _checkpoint_float(record.get("confidence"))
+        window_start = _checkpoint_float(record.get("window_start"))
+        window_end = _checkpoint_float(record.get("window_end"))
+        words = _checkpoint_words(record.get("word_timestamps"))
+        entity_metadata = record.get("entity_metadata", {})
+        code_switch_tokens = record.get("code_switch_tokens", [])
+        if (
+            not isinstance(transcript, str)
+            or not transcript.strip()
+            or not isinstance(provider, str)
+            or not provider.strip()
+            or (model is not None and not isinstance(model, str))
+            or not isinstance(settings, dict)
+            or confidence is None
+            or not 0.0 <= confidence <= 1.0
+            or window_start is None
+            or window_end is None
+            or window_end <= window_start
+            or abs(window_start - float(prior.context_start)) > _MIN_TEXT
+            or abs(window_end - float(prior.context_end)) > _MIN_TEXT
+            or words is None
+            or not isinstance(entity_metadata, dict)
+            or not isinstance(code_switch_tokens, list)
+            or not all(isinstance(token, str) for token in code_switch_tokens)
+        ):
+            return None
+
+        return EvidenceRecord(
+            kind=EvidenceKind.TARGETED_LOCAL_ASR,
+            fingerprint=fingerprint,
+            provider=provider,
+            model=model,
+            settings=dict(settings),
+            window_start=window_start,
+            window_end=window_end,
+            transcript=transcript,
+            confidence=confidence,
+            state=EvidenceState.ACCEPTED,
+            word_timestamps=words,
+            entity_metadata=dict(entity_metadata),
+            code_switch_tokens=tuple(code_switch_tokens),
+        )
+
+    def _reuse_rejected_local_observations(
+        self,
+        prior: CandidateRefinement | None,
+        audio_component: str,
+        priority: RefinementPriority,
+        force: bool,
+        *,
+        window: RefinementAudioWindow,
+        context_terms: Sequence[str],
+    ) -> EvidenceRecord | None:
+        """Reuse complete raw observations without promoting rejected evidence.
+
+        R3's accepted-checkpoint path is unchanged. This FINAL_CLIP-only path
+        restores the original rejected context record as *observations* so
+        deterministic scope validation can run again; it never changes the
+        record to ACCEPTED and refuses legacy rows that lack complete raw
+        observations. Reuse also requires the stored observation's decoder and
+        context dependencies to match the current request exactly.
+        """
+
+        if priority is not RefinementPriority.FINAL_CLIP:
+            return None
+        if prior is None or force or prior.quality_level != priority.value:
+            return None
+        fingerprints = prior.component_fingerprints or {}
+        if fingerprints.get("audio_extraction") != audio_component:
+            return None
+        fingerprint = fingerprints.get("local_asr")
+        if not isinstance(fingerprint, str) or not fingerprint:
+            return None
+        local_records = [
+            item
+            for item in prior.transcript_evidence or []
+            if isinstance(item, dict) and item.get("kind") == EvidenceKind.TARGETED_LOCAL_ASR.value
+        ]
+        if len(local_records) != 1:
+            return None
+        record = local_records[0]
+        if record.get("state") != EvidenceState.REJECTED.value:
+            return None
+        if record.get("fingerprint") != fingerprint:
+            return None
+        if not self._rejected_observation_identity_matches(
+            record, priority=priority, window=window, context_terms=context_terms
+        ):
+            return None
+        entity_metadata = record.get("entity_metadata")
+        if not isinstance(entity_metadata, dict):
+            return None
+        observations = entity_metadata.get("raw_word_observations")
+        record_count = entity_metadata.get("raw_word_record_count")
+        complete = entity_metadata.get("raw_word_observations_complete")
+        observation_fingerprint = entity_metadata.get("raw_word_observations_fingerprint")
+        if (
+            not isinstance(observations, list)
+            or not observations
+            or not all(isinstance(item, dict) for item in observations)
+            or isinstance(record_count, bool)
+            or not isinstance(record_count, int)
+            or record_count <= 0
+            or complete is not True
+            or not isinstance(observation_fingerprint, str)
+            or not observation_fingerprint
+        ):
+            return None
+        transcript = record.get("transcript")
+        provider = record.get("provider")
+        model = record.get("model")
+        settings = record.get("settings")
+        confidence = _checkpoint_float(record.get("confidence"))
+        window_start = _checkpoint_float(record.get("window_start"))
+        window_end = _checkpoint_float(record.get("window_end"))
+        words = _checkpoint_words(record.get("word_timestamps"))
+        if (
+            not isinstance(transcript, str)
+            or not transcript.strip()
+            or not isinstance(provider, str)
+            or not provider.strip()
+            or (model is not None and not isinstance(model, str))
+            or not isinstance(settings, dict)
+            or confidence is None
+            or not 0.0 <= confidence <= 1.0
+            or window_start is None
+            or window_end is None
+            or window_end <= window_start
+            or abs(window_start - float(prior.context_start)) > _MIN_TEXT
+            or abs(window_end - float(prior.context_end)) > _MIN_TEXT
+            or words is None
+        ):
             return None
         return EvidenceRecord(
             kind=EvidenceKind.TARGETED_LOCAL_ASR,
             fingerprint=fingerprint,
-            provider="faster-whisper",
-            model=None,
-            settings={},
-            window_start=prior.context_start,
-            window_end=prior.context_end,
-            transcript=prior.automatic_transcript,
-            confidence=prior.confidence,
-            state=EvidenceState.ACCEPTED,
-            word_timestamps=tuple(
-                WordTimestamp(
-                    text=str(item.get("text", "")),
-                    start=float(item.get("start", 0.0)),
-                    end=float(item.get("end", 0.0)),
-                    probability=item.get("probability"),
-                )
-                for item in prior.word_timestamps or []
-                if isinstance(item, dict)
+            provider=provider,
+            model=model,
+            settings=dict(settings),
+            window_start=window_start,
+            window_end=window_end,
+            transcript=transcript,
+            confidence=confidence,
+            state=EvidenceState.REJECTED,
+            word_timestamps=words,
+            reason=record.get("reason") if isinstance(record.get("reason"), str) else None,
+            entity_metadata=dict(entity_metadata),
+        )
+
+    def local_observation_reuse_ready(
+        self,
+        prior: CandidateRefinement | None,
+        *,
+        audio_component: str,
+        priority: RefinementPriority,
+        window: RefinementAudioWindow,
+        context_terms: Sequence[str],
+    ) -> bool:
+        """Read-only preflight for rejected-observation reuse; never calls a model."""
+
+        return (
+            self._reuse_rejected_local_observations(
+                prior,
+                audio_component,
+                priority,
+                False,
+                window=window,
+                context_terms=context_terms,
+            )
+            is not None
+        )
+
+    def _rejected_observation_identity_matches(
+        self,
+        record: dict[str, object],
+        *,
+        priority: RefinementPriority,
+        window: RefinementAudioWindow,
+        context_terms: Sequence[str],
+    ) -> bool:
+        """True only when stored observations match the current local request.
+
+        A record matching its own stored fingerprint proves it was not corrupted;
+        it does not prove the current executor asked for the same decoder options
+        or bounded context. The complete effective ``TranscriptionOptions``
+        identity supplied by the production factory is compared field by field,
+        including compute/fallback precision and temperature. Missing identity
+        information is never treated as a match. A mismatch falls through to the
+        normal fresh backbone path instead of relabelling old observations under
+        a new input identity.
+        """
+
+        identity = self._local_identity or {}
+        provider = identity.get("provider")
+        model = identity.get("model")
+        if not isinstance(provider, str) or provider != record.get("provider"):
+            return False
+        if not isinstance(model, str) or model != record.get("model"):
+            return False
+        settings = record.get("settings")
+        if not isinstance(settings, dict):
+            return False
+        legacy_device = identity.get("device")
+        if legacy_device is not None and settings.get("device") != legacy_device:
+            return False
+        beam = identity.get(
+            "final_beam_size"
+            if priority is RefinementPriority.FINAL_CLIP
+            else "candidate_beam_size"
+        )
+        if beam is not None and not _option_value_matches(settings.get("beam_size"), beam):
+            return False
+        decoder_options = identity.get("decoder_options")
+        if not isinstance(decoder_options, Mapping):
+            return False
+        expected_options = decoder_options.get(priority.value)
+        if not isinstance(expected_options, Mapping):
+            return False
+        hint = " ".join(term.strip() for term in context_terms if term and term.strip()) or None
+        for field_name in _DECODER_OPTION_FIELDS:
+            if field_name not in settings or field_name not in expected_options:
+                return False
+            expected_value = expected_options[field_name]
+            if field_name == "hotwords" and hint is not None:
+                expected_value = hint
+            if not _option_value_matches(settings[field_name], expected_value):
+                return False
+        stored_start = _checkpoint_float(settings.get("context_start"))
+        stored_end = _checkpoint_float(settings.get("context_end"))
+        if stored_start is None:
+            stored_start = _checkpoint_float(record.get("window_start"))
+        if stored_end is None:
+            stored_end = _checkpoint_float(record.get("window_end"))
+        if stored_start is None or stored_end is None:
+            return False
+        return (
+            abs(stored_start - window.context_start) <= _MIN_TEXT
+            and abs(stored_end - window.context_end) <= _MIN_TEXT
+        )
+
+    def _final_clip_scope(
+        self,
+        local_record: EvidenceRecord | None,
+        window: RefinementAudioWindow,
+        boundary: BoundaryResult,
+    ) -> FinalClipView | ScopeRefusal | None:
+        """Derive the executable clip view from complete raw observations."""
+
+        if local_record is None:
+            return None
+        metadata = local_record.entity_metadata or {}
+        raw_observations = metadata.get("raw_word_observations")
+        if not isinstance(raw_observations, list) or not raw_observations:
+            # Legacy rows preserve only the filtered words and first diagnostic.
+            return None
+        records = [item for item in raw_observations if isinstance(item, dict)]
+        record_count = metadata.get("raw_word_record_count")
+        complete = metadata.get("raw_word_observations_complete")
+        observation_fingerprint = metadata.get("raw_word_observations_fingerprint")
+        return derive_final_clip_view(
+            raw_observations=records,
+            record_count=(
+                record_count
+                if isinstance(record_count, int) and not isinstance(record_count, bool)
+                else 0
             ),
+            observations_complete=complete is True and len(records) == len(raw_observations),
+            observation_fingerprint=(
+                observation_fingerprint if isinstance(observation_fingerprint, str) else ""
+            ),
+            transcript=local_record.transcript,
+            context_start=window.context_start,
+            context_end=window.context_end,
+            clip_start=boundary.start,
+            clip_end=boundary.end,
         )
 
     # ------------------------------------------------------------------
@@ -1318,8 +1768,14 @@ class CandidateRefinementService:
         provider_degraded: bool,
         consensus_confidence: float,
         timing_aligned: bool,
+        scope_refused: bool = False,
     ) -> str:
         local_accepted = local_record is not None and local_record.state is EvidenceState.ACCEPTED
+        if priority is RefinementPriority.FINAL_CLIP and scope_refused:
+            # A scoped timing refusal is structural evidence about the audio, not
+            # an ambiguity that operator wording can resolve. Aligned manual text
+            # cannot become final-ready while the selected view is rejected.
+            return "NEEDS_MANUAL_TRANSCRIPT_REVIEW"
         if manual and manual.strip() and timing_aligned:
             return (
                 "FINAL_TRANSCRIPT_READY"
@@ -1391,12 +1847,7 @@ class CandidateRefinementService:
         )
 
     def _context_terms(self, region: _Region, index_text: str) -> tuple[str, ...]:
-        terms = extract_protected_tokens(index_text)
-        return tuple(
-            term
-            for term in terms
-            if any(character.isascii() and character.isalpha() for character in term)
-        )[:8]
+        return source_evidenced_context_terms(index_text)
 
     def _choose_words(self, local_record: EvidenceRecord | None) -> tuple[WordTimestamp, ...]:
         if local_record is not None and local_record.word_timestamps:
@@ -1458,6 +1909,17 @@ class CandidateRefinementService:
 
 class _Degraded:
     """Marker type returned when optional hosted work was skipped or failed."""
+
+
+def source_evidenced_context_terms(index_text: str) -> tuple[str, ...]:
+    """Bounded ASCII-letter hotwords already present in the source region."""
+
+    terms = extract_protected_tokens(index_text)
+    return tuple(
+        term
+        for term in terms
+        if any(character.isascii() and character.isalpha() for character in term)
+    )[:8]
 
 
 def candidate_region_text(transcript: Transcript, start: float, end: float) -> str:

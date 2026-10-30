@@ -4,6 +4,10 @@ This module reuses the existing :class:`WhisperEngine` rather than adding a
 second Whisper implementation. It acquires the shared heavy-model lease around
 the actual transcription call, converts clip-relative word timestamps into
 source time, and rejects any word that falls outside the requested window.
+
+The pure conversion below is shared by the live engine and by the operator-only
+recovery path so a stored decoder observation is validated with exactly the
+production conversion and fingerprint logic.
 """
 
 from __future__ import annotations
@@ -18,6 +22,8 @@ from typing import Any
 
 from app.core.enums import RefinementPriority
 from app.refinement.fingerprints import component_fingerprint
+from app.refinement.policy import MAX_RAW_WORD_OBSERVATIONS
+from app.refinement.scope import raw_observation_fingerprint
 from app.refinement.types import TargetASRResult, WordTimestamp
 from app.runtime.heavy_model_lease import NoopHeavyModelLeaseFactory
 from app.transcription.engine import TranscriptionResult, WhisperEngine
@@ -28,6 +34,106 @@ _TIMESTAMP_EPSILON = 1e-6
 
 class TargetedASRError(RuntimeError):
     """Targeted local ASR could not produce valid bounded evidence."""
+
+
+def effective_transcription_options(
+    options: TranscriptionOptions, context_terms: Sequence[str]
+) -> TranscriptionOptions:
+    """Fold source-evidenced terms into a copied hotword hint, if any."""
+
+    hint = " ".join(term.strip() for term in context_terms if term and term.strip())
+    if not hint:
+        return options
+    try:
+        return replace(options, hotwords=hint)
+    except (TypeError, ValueError):
+        return options
+
+
+def convert_transcription_result(
+    result: TranscriptionResult,
+    *,
+    effective_options: TranscriptionOptions,
+    context_start: float,
+    context_end: float,
+    context_terms: Sequence[str] = (),
+) -> TargetASRResult:
+    """Convert one raw decoder result into bounded source-time evidence.
+
+    This is the single production conversion used after ``WhisperEngine``
+    returns. It never loads a model and never invents timestamps; invalid
+    records are preserved as observations and the first rejection reason is
+    reported. The resulting fingerprint binds the effective decoder options,
+    the bounded context, the source-evidenced hotword hint, the raw transcript
+    and the complete raw observation identity.
+    """
+
+    if (
+        not (math.isfinite(context_start) and math.isfinite(context_end))
+        or context_start < 0
+        or context_end <= context_start
+    ):
+        raise TargetedASRError("context bounds are invalid for targeted ASR")
+
+    (
+        words,
+        rejected_reason,
+        rejected_detail,
+        observations,
+        record_count,
+        complete,
+        observation_fingerprint,
+    ) = _source_time_words(result, context_start=context_start, context_end=context_end)
+    transcript = result.raw_text or ""
+    if not transcript.strip() and rejected_reason is None:
+        rejected_reason = "empty transcript"
+
+    probabilities = [word.probability for word in words if word.probability is not None]
+    confidence = sum(probabilities) / len(probabilities) if probabilities else 0.0
+    transcript_hash = hashlib.sha256(transcript.encode("utf-8")).hexdigest()
+    fingerprint = component_fingerprint(
+        "local-asr",
+        {
+            "model": effective_options.model,
+            "device": effective_options.device,
+            "compute_type": effective_options.compute_type,
+            "beam_size": effective_options.beam_size,
+            "language": result.language,
+            "context_start": round(float(context_start), 6),
+            "context_end": round(float(context_end), 6),
+            "context_terms": tuple(context_terms),
+            "transcript_hash": transcript_hash,
+            "raw_word_observations": observation_fingerprint,
+        },
+    )
+    settings: dict[str, object] = {
+        **asdict(effective_options),
+        "context_start": round(float(context_start), 6),
+        "context_end": round(float(context_end), 6),
+    }
+    return TargetASRResult(
+        provider="faster-whisper",
+        model=effective_options.model,
+        language=result.language,
+        language_probability=result.language_probability,
+        transcript=transcript,
+        word_timestamps=tuple(words),
+        confidence=confidence,
+        runtime_identity={
+            "model": effective_options.model,
+            "device": effective_options.device,
+            "compute_type": effective_options.compute_type,
+            "beam_size": effective_options.beam_size,
+        },
+        fingerprint=fingerprint,
+        settings=settings,
+        rejected_reason=rejected_reason,
+        rejected_detail=rejected_detail,
+        raw_word_observations=observations,
+        raw_word_record_count=record_count,
+        raw_word_observations_complete=complete,
+        raw_word_observations_fingerprint=observation_fingerprint,
+    )
 
 
 class TargetedASREngine:
@@ -73,7 +179,7 @@ class TargetedASREngine:
             raise TargetedASRError("context bounds are invalid for targeted ASR")
 
         options = self._options_for(priority)
-        effective_options = self._with_context_terms(options, context_terms)
+        effective_options = effective_transcription_options(options, context_terms)
 
         ownership_lost = False
         with self._lease_factory.acquire(purpose="targeted-asr") as lease:
@@ -84,95 +190,205 @@ class TargetedASREngine:
         if ownership_lost:
             raise TargetedASRError("heavy-model lease was lost during targeted ASR")
 
-        words, rejected_reason = self._source_time_words(
-            result, context_start=context_start, context_end=context_end
-        )
-        transcript = result.raw_text or ""
-        if not transcript.strip() and rejected_reason is None:
-            rejected_reason = "empty transcript"
-
-        probabilities = [word.probability for word in words if word.probability is not None]
-        confidence = sum(probabilities) / len(probabilities) if probabilities else 0.0
-        transcript_hash = hashlib.sha256(transcript.encode("utf-8")).hexdigest()
-        fingerprint = component_fingerprint(
-            "local-asr",
-            {
-                "model": effective_options.model,
-                "device": effective_options.device,
-                "compute_type": effective_options.compute_type,
-                "beam_size": effective_options.beam_size,
-                "language": result.language,
-                "context_start": round(float(context_start), 6),
-                "context_end": round(float(context_end), 6),
-                "context_terms": tuple(context_terms),
-                "transcript_hash": transcript_hash,
-            },
-        )
-        settings: dict[str, object] = {
-            **asdict(effective_options),
-            "context_start": round(float(context_start), 6),
-            "context_end": round(float(context_end), 6),
-        }
-        return TargetASRResult(
-            provider="faster-whisper",
-            model=effective_options.model,
-            language=result.language,
-            language_probability=result.language_probability,
-            transcript=transcript,
-            word_timestamps=tuple(words),
-            confidence=confidence,
-            runtime_identity={
-                "model": effective_options.model,
-                "device": effective_options.device,
-                "compute_type": effective_options.compute_type,
-                "beam_size": effective_options.beam_size,
-            },
-            fingerprint=fingerprint,
-            settings=settings,
-            rejected_reason=rejected_reason,
+        return convert_transcription_result(
+            result,
+            effective_options=effective_options,
+            context_start=context_start,
+            context_end=context_end,
+            context_terms=context_terms,
         )
 
-    def _with_context_terms(
-        self, options: TranscriptionOptions, context_terms: Sequence[str]
-    ) -> TranscriptionOptions:
-        hint = " ".join(term.strip() for term in context_terms if term and term.strip())
-        if not hint:
-            return options
+
+def _source_time_words(
+    result: TranscriptionResult,
+    *,
+    context_start: float,
+    context_end: float,
+) -> tuple[
+    list[WordTimestamp],
+    str | None,
+    dict[str, object] | None,
+    tuple[dict[str, object], ...],
+    int,
+    bool,
+    str,
+]:
+    words: list[WordTimestamp] = []
+    rejected_reason: str | None = None
+    rejected_detail: dict[str, object] | None = None
+    observations: list[dict[str, object]] = []
+    raw_records = list(getattr(result, "word_segments", None) or [])
+    for record_index, raw in enumerate(raw_records):
+        relative_start = raw.get("start") if isinstance(raw, dict) else None
+        relative_end = raw.get("end") if isinstance(raw, dict) else None
+        raw_text = raw.get("word", "") if isinstance(raw, dict) else ""
+        raw_probability = raw.get("probability") if isinstance(raw, dict) else None
+        start: float | None = None
+        end: float | None = None
         try:
-            return replace(options, hotwords=hint)
-        except (TypeError, ValueError):
-            return options
-
-    def _source_time_words(
-        self,
-        result: TranscriptionResult,
-        *,
-        context_start: float,
-        context_end: float,
-    ) -> tuple[list[WordTimestamp], str | None]:
-        words: list[WordTimestamp] = []
-        rejected_reason: str | None = None
-        for raw in getattr(result, "word_segments", None) or []:
-            try:
-                start = float(raw["start"]) + context_start
-                end = float(raw["end"]) + context_start
-                text = str(raw.get("word", ""))
-                probability = raw.get("probability")
-            except (KeyError, TypeError, ValueError):
-                rejected_reason = "malformed word timestamp"
-                continue
-            if not (math.isfinite(start) and math.isfinite(end)):
-                rejected_reason = "non-finite word timestamp"
-                continue
-            if not (context_start <= start < end <= context_end + _TIMESTAMP_EPSILON):
-                rejected_reason = "word timestamp outside requested window"
-                continue
-            words.append(
-                WordTimestamp(
-                    text=text,
-                    start=start,
-                    end=end,
-                    probability=float(probability) if probability is not None else None,
+            start = float(raw["start"]) + context_start  # type: ignore[index]
+            end = float(raw["end"]) + context_start  # type: ignore[index]
+            text = str(raw.get("word", ""))  # type: ignore[union-attr]
+            probability = raw.get("probability")  # type: ignore[union-attr]
+        except (KeyError, TypeError, ValueError):
+            observations.append(
+                _observation(
+                    record_index=record_index,
+                    text=raw_text,
+                    relative_start=relative_start,
+                    relative_end=relative_end,
+                    source_start=None,
+                    source_end=None,
+                    probability=raw_probability,
                 )
             )
-        return words, rejected_reason
+            if rejected_detail is None:
+                rejected_reason = "malformed word timestamp"
+                rejected_detail = _timestamp_diagnostic(
+                    reason=rejected_reason,
+                    record_index=record_index,
+                    relative_start=relative_start,
+                    relative_end=relative_end,
+                    source_start=None,
+                    source_end=None,
+                    context_start=context_start,
+                    context_end=context_end,
+                )
+            continue
+        observations.append(
+            _observation(
+                record_index=record_index,
+                text=text,
+                relative_start=relative_start,
+                relative_end=relative_end,
+                source_start=start,
+                source_end=end,
+                probability=probability,
+            )
+        )
+        if not (math.isfinite(start) and math.isfinite(end)):
+            if rejected_detail is None:
+                rejected_reason = "non-finite word timestamp"
+                rejected_detail = _timestamp_diagnostic(
+                    reason=rejected_reason,
+                    record_index=record_index,
+                    relative_start=relative_start,
+                    relative_end=relative_end,
+                    source_start=start,
+                    source_end=end,
+                    context_start=context_start,
+                    context_end=context_end,
+                )
+            continue
+        if end <= start:
+            if rejected_detail is None:
+                rejected_reason = "nonpositive word duration"
+                rejected_detail = _timestamp_diagnostic(
+                    reason=rejected_reason,
+                    record_index=record_index,
+                    relative_start=relative_start,
+                    relative_end=relative_end,
+                    source_start=start,
+                    source_end=end,
+                    context_start=context_start,
+                    context_end=context_end,
+                )
+            continue
+        if not (context_start <= start < end <= context_end + _TIMESTAMP_EPSILON):
+            if rejected_detail is None:
+                rejected_reason = "word timestamp outside requested window"
+                rejected_detail = _timestamp_diagnostic(
+                    reason=rejected_reason,
+                    record_index=record_index,
+                    relative_start=relative_start,
+                    relative_end=relative_end,
+                    source_start=start,
+                    source_end=end,
+                    context_start=context_start,
+                    context_end=context_end,
+                )
+            continue
+        words.append(
+            WordTimestamp(
+                text=text,
+                start=start,
+                end=end,
+                probability=float(probability) if probability is not None else None,
+            )
+        )
+    complete = len(observations) <= MAX_RAW_WORD_OBSERVATIONS
+    bounded = tuple(observations[:MAX_RAW_WORD_OBSERVATIONS])
+    observation_fingerprint = raw_observation_fingerprint(
+        raw_observations=bounded,
+        record_count=len(raw_records),
+        observations_complete=complete,
+        context_start=context_start,
+        context_end=context_end,
+    )
+    return (
+        words,
+        rejected_reason,
+        rejected_detail,
+        bounded,
+        len(raw_records),
+        complete,
+        observation_fingerprint,
+    )
+
+
+def _observation(
+    *,
+    record_index: int,
+    text: object,
+    relative_start: object,
+    relative_end: object,
+    source_start: float | None,
+    source_end: float | None,
+    probability: object,
+) -> dict[str, object]:
+    return {
+        "record_index": record_index,
+        "text": str(text),
+        "relative_start": _bounded_number(relative_start),
+        "relative_end": _bounded_number(relative_end),
+        "source_start": _bounded_number(source_start),
+        "source_end": _bounded_number(source_end),
+        "probability": _bounded_number(probability),
+    }
+
+
+def _timestamp_diagnostic(
+    *,
+    reason: str,
+    record_index: int,
+    relative_start: object,
+    relative_end: object,
+    source_start: float | None,
+    source_end: float | None,
+    context_start: float,
+    context_end: float,
+) -> dict[str, object]:
+    return {
+        "reason": reason,
+        "record_index": record_index,
+        "relative_start": _bounded_number(relative_start),
+        "relative_end": _bounded_number(relative_end),
+        "source_start": _bounded_number(source_start),
+        "source_end": _bounded_number(source_end),
+        "context_start": context_start,
+        "context_end": context_end,
+    }
+
+
+def _bounded_number(value: object) -> object:
+    """Keep an original numeric value, or a short string when it is not finite."""
+
+    if value is None:
+        return None
+    try:
+        number = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return str(value)[:32]
+    if not math.isfinite(number):
+        return str(number)
+    return number

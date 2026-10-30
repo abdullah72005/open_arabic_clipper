@@ -14,6 +14,12 @@ from sqlalchemy.orm import Session
 
 from app.core.enums import ContentType, RefinementPriority, RefinementStatus
 from app.models import CandidateRefinement, ClipCandidate, SourceVideo, Transcript
+from app.refinement.display import resolve_effective_display
+from app.refinement.scope import (
+    FINAL_CLIP_SCOPE_STATE_ACCEPTED,
+    final_clip_scope_refused,
+    final_clip_scope_state,
+)
 from app.transformation.policy import Stage40Config
 from app.transformation.types import TransformationInputs
 
@@ -79,8 +85,47 @@ def _usable(row: CandidateRefinement, *, final_ready: bool) -> bool:
     if not (row.final_transcript or "").strip():
         return False
     if final_ready:
+        # An optimistic ready status cannot outrank an explicit structural scope
+        # refusal; manual wording cannot supply missing positive-duration timing.
+        if final_clip_scope_refused(row.provider_evidence):
+            return False
         return status in _FINAL_READY
     return status in _CANDIDATE_USABLE
+
+
+def _effective_final_view(
+    refinement: CandidateRefinement,
+) -> tuple[str, tuple[Mapping[str, object], ...]]:
+    """Return the authoritative final text and its effective timed words.
+
+    Raw audio-backed words are never rewritten. For an accepted scoped FINAL_CLIP
+    manual row the same bounded display projection used by captions is applied
+    here so planning source selection cannot quote the superseded spelling.
+    Unsupported projection refuses instead of falling back to those raw words.
+    """
+
+    raw_sequence = tuple(refinement.word_timestamps or [])
+    raw_words = tuple(item for item in raw_sequence if isinstance(item, Mapping))
+    transcript = (refinement.final_transcript or "").strip()
+    manual = (refinement.manual_transcript or "").strip()
+    # Only the scoped FINAL_CLIP view (which carries an accepted clip envelope)
+    # has a canonical effective word mapping. Legacy rows keep their prior
+    # behavior; Stage 5 already refuses unsupported legacy display projections.
+    if (
+        refinement.priority is not RefinementPriority.FINAL_CLIP
+        or not manual
+        or final_clip_scope_state(refinement.provider_evidence) != FINAL_CLIP_SCOPE_STATE_ACCEPTED
+    ):
+        return transcript, raw_words
+    # Validate the complete stored sequence before dropping or reindexing any
+    # record; a malformed raw item must refuse the whole view, not be filtered
+    # into a narrower set that planning could quote while captions refuse it.
+    projection = resolve_effective_display(transcript, raw_sequence)
+    if not projection.supported:
+        raise TransformationInputError(
+            "final clip manual transcript cannot be aligned to word timing evidence"
+        )
+    return projection.final_text, tuple(dict(word) for word in projection.words)
 
 
 def _segment_text(segment: Mapping[str, object]) -> str:
@@ -121,6 +166,10 @@ def build_transformation_inputs(
     refinement: CandidateRefinement,
     config: Stage40Config,
 ) -> TransformationInputs:
+    if refinement.priority is RefinementPriority.FINAL_CLIP and final_clip_scope_refused(
+        refinement.provider_evidence
+    ):
+        raise TransformationInputError("final clip scope evidence was refused")
     source = session.get(SourceVideo, candidate.source_video_id)
     if source is None:
         raise TransformationInputError("source is missing for candidate")
@@ -137,6 +186,7 @@ def build_transformation_inputs(
         config,
     )
     code_switch = dict(refinement.code_switch_evidence or {})
+    effective_transcript, effective_words = _effective_final_view(refinement)
     return TransformationInputs(
         candidate_id=str(candidate.id),
         candidate_key=candidate.candidate_key,
@@ -150,12 +200,10 @@ def build_transformation_inputs(
         coarse_end=float(candidate.end_time),
         refined_start=refinement.refined_start,
         refined_end=refinement.refined_end,
-        transcript=(refinement.final_transcript or "").strip()[: config.max_context_characters],
+        transcript=effective_transcript[: config.max_context_characters],
         transcript_confidence=float(refinement.confidence),
         refinement_confidence=float(refinement.confidence),
-        word_timestamps=tuple(
-            item for item in (refinement.word_timestamps or []) if isinstance(item, Mapping)
-        ),
+        word_timestamps=effective_words,
         unresolved_spans=tuple(
             item for item in (refinement.unresolved_spans or []) if isinstance(item, Mapping)
         ),

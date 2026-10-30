@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import subprocess
 import wave
 from pathlib import Path
@@ -388,6 +389,82 @@ def test_targeted_asr_drops_out_of_window_words() -> None:
     assert len(targeted.word_timestamps) == 1
     assert targeted.word_timestamps[0].text == "مرحبا"
     assert targeted.rejected_reason is not None
+
+
+def test_targeted_asr_accepts_positive_context_words_outside_coarse_bounds() -> None:
+    from app.refinement.asr import TargetedASREngine
+
+    result = _result(
+        [
+            {"start": 0.2, "end": 0.4, "word": "قبل", "probability": 0.8},
+            {"start": 1.8, "end": 1.99, "word": "بعد", "probability": 0.9},
+        ]
+    )
+    engine = TargetedASREngine(options_for=_options_for, engine=FakeASREngine(result))
+
+    targeted = engine.transcribe(
+        Path("window.wav"),
+        context_start=100.0,
+        context_end=102.0,
+        priority=RefinementPriority.CANDIDATE,
+    )
+
+    assert targeted.rejected_reason is None
+    assert targeted.rejected_detail is None
+    assert [word.text for word in targeted.word_timestamps] == ["قبل", "بعد"]
+    assert [word.start for word in targeted.word_timestamps] == [100.2, 101.8]
+
+
+def test_targeted_asr_distinguishes_invalid_timestamp_shapes() -> None:
+    from app.refinement.asr import TargetedASREngine
+
+    cases = [
+        (
+            {"start": 1.0, "end": 1.0, "word": "zero"},
+            "nonpositive word duration",
+            (1.0, 1.0),
+            (101.0, 101.0),
+        ),
+        (
+            {"start": 1.6, "end": 1.2, "word": "reversed"},
+            "nonpositive word duration",
+            (1.6, 1.2),
+            (101.6, 101.2),
+        ),
+        (
+            {"start": math.nan, "end": 1.2, "word": "nonfinite"},
+            "non-finite word timestamp",
+            ("nan", 1.2),
+            ("nan", 101.2),
+        ),
+        (
+            {"start": 2.1, "end": 2.3, "word": "escape"},
+            "word timestamp outside requested window",
+            (2.1, 2.3),
+            (102.1, 102.3),
+        ),
+    ]
+
+    for raw, reason, relative, source in cases:
+        engine = TargetedASREngine(options_for=_options_for, engine=FakeASREngine(_result([raw])))
+        targeted = engine.transcribe(
+            Path("window.wav"),
+            context_start=100.0,
+            context_end=102.0,
+            priority=RefinementPriority.CANDIDATE,
+        )
+
+        assert targeted.rejected_reason == reason
+        assert targeted.rejected_detail is not None
+        assert targeted.rejected_detail["reason"] == reason
+        assert targeted.rejected_detail["record_index"] == 0
+        assert targeted.rejected_detail["relative_start"] == relative[0]
+        assert targeted.rejected_detail["relative_end"] == relative[1]
+        assert targeted.rejected_detail["source_start"] == source[0]
+        assert targeted.rejected_detail["source_end"] == source[1]
+        assert targeted.rejected_detail["context_start"] == 100.0
+        assert targeted.rejected_detail["context_end"] == 102.0
+        assert targeted.word_timestamps == ()
 
 
 class CountingLease:
