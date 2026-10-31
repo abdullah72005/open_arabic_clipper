@@ -284,9 +284,9 @@ def build_planning_inputs(
     )
 
     request = normalize_operator_request(operator_request)
-    raw_words = tuple(
-        item for item in (refinement.word_timestamps or []) if isinstance(item, Mapping)
-    )
+    # Consume the same effective word view as Stage 4.0/captions instead of
+    # rereading raw refinement words that may still carry a superseded spelling.
+    raw_words = tuple(item for item in (stage40.word_timestamps or ()) if isinstance(item, Mapping))
     if request is not None and request.has_window:
         assert request.source_start is not None and request.source_end is not None
         _validate_operator_window(request, raw_words, source_segments, mandatory)

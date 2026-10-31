@@ -102,11 +102,53 @@ Defaults:
 
 All local word/segment times begin relative to the extracted audio and are
 converted **once** to source time by adding `context_start`, then validated
-(`context_start <= word.start < word.end <= context_end`). Stage 3.5 never
+(`context_start <= word.start < word.end <= context_end`). Zero/non-positive
+duration, non-finite values, and a genuine context escape are rejected
+separately; a rejected record retains a bounded diagnostic (reason, record index,
+original relative/source bounds, and context bounds) in its evidence JSON
+without changing the original values or widening the window. Stage 3.5 never
 rewrites the source `Transcript.raw_text`, immutable raw segments, or Stage 2
 word timestamps. Context/hotword terms may be passed only when already evidenced
 by the source transcript/operator input; suspected missing English is never
 invented as a prompt.
+
+## FINAL_CLIP context versus selected evidence
+
+`FINAL_CLIP` observes the whole extraction context but only the settled refined
+clip bounds are executable. The producer persists the complete bounded raw word
+observation (all original records, including invalid ones) in the context
+`TARGETED_LOCAL_ASR` evidence. The context record keeps its original validation
+state; in the known zero-duration-outside-clip fixture it remains `REJECTED`.
+
+A pure, versioned helper (`app/refinement/scope.py`) derives a separately
+validated clip-only view from those observations at the actual refined bounds.
+The one new nonblocking context case is a finite zero-duration record whose point
+is inside the extraction context and strictly outside the clip. It is recorded
+as context-only invalid evidence and never becomes a caption word. All of these
+still refuse: zero duration inside or on a clip boundary; reversed, non-finite,
+malformed, source-mapping-inconsistent or unknown-location timing; a context
+escape; a selected word that crosses the clip edge; missing or incomplete raw
+observations; unaccounted transcript text; and ambiguous tokenization.
+
+For new scoped `FINAL_CLIP` outcomes, `final_transcript` and `word_timestamps`
+are the accepted clip view, with a canonical ordered clip index and the separate
+parent raw-record index. The full context automatic text is still preserved in
+`automatic_transcript` and in the context evidence record. The view envelope is
+persisted at `provider_evidence["final_clip_view"]` with exact context/clip
+bounds, parent observation fingerprint, raw-to-clip mapping, clip text/words,
+policy/validation state, reason, and policy/view fingerprints. The output
+fingerprint binds the scope view, so changed bounds, raw observations, scope
+policy or manual text invalidate downstream planning/caption artifacts.
+
+Manual and source-segment operator text remain authoritative. They are projected
+against the same canonical clip words through the existing bounded display
+policy; unsupported text is preserved verbatim and the row stays in review. No
+ASR draft is substituted over it. Legacy rows that retain only the first
+timestamp diagnostic and a filtered word list are **not** retroactively upgraded:
+they require a supported rebuild and remain reviewable. There is no general
+multi-token alignment in this correction, and a valid selected view alone is not
+`FINAL_TRANSCRIPT_READY`; confidence, consensus, ambiguity and manual-authority
+gates still apply. Human verification of the spoken wording remains required.
 
 ## Evidence, consensus, and acceptance
 
@@ -266,9 +308,13 @@ top-level fingerprints always differ.
 
 Per-component checkpoints exist for audio extraction, local ASR, hosted
 transcription, adjudication, accepted consensus, and boundary result. A rerun
-reuses a component only when its exact dependency fingerprint matches. Accepted
-hosted/local/adjudication work survives retry, restart, cancellation, and
-transient outage; a provider outage never overwrites previously accepted
+reuses a component only when its exact dependency fingerprint matches. Local
+checkpoint reuse requires the matching persisted `TARGETED_LOCAL_ASR` record in
+`ACCEPTED` state; a rejected, missing, malformed, or mismatched record is never
+promoted to accepted, and reuse preserves that record's own transcript, words,
+window, model/settings, and confidence rather than aggregate final fields.
+Accepted hosted/local/adjudication work survives retry, restart, cancellation,
+and transient outage; a provider outage never overwrites previously accepted
 evidence. Degraded runs remain non-cache-eligible so normal retries reconsider
 only unfinished work. Queueing is idempotent: a matching ready/cache-eligible
 result returns without a job or provider call; matching queued/running work
@@ -299,10 +345,21 @@ IDs/providers, confidence, reason, entity type, meaning-critical flag, and
 resolution state/operator resolution. `POST /api/refinements/{id}/manual`
 submits authoritative corrected text and explicitly resolves named ambiguity IDs;
 submitting text does not silently clear every unresolved span. Manual text always
-wins on rerun. If an operator edit cannot be aligned safely to existing timings,
-the edit is retained but timing alignment is marked unresolved, and a final row
-is ready only after the strict transcript/timing requirements pass. No review UI
-is built in Stage 3.5.
+wins on rerun. For scoped `FINAL_CLIP` rows this projection runs over the
+canonical clip view, not the full context word sequence. Final readiness uses
+one deterministic display projection over the existing ordered timed words:
+unchanged text and exactly one isolated one-token replacement are supported,
+retaining that word's original index/start/end. An interior replacement needs
+unchanged immediate neighbours; an edge replacement needs two unchanged adjacent
+tokens on its available side. Insertions, deletions, reordering, multiple or
+unanchored replacements, ambiguous tokenization, and missing/invalid/nonmonotonic
+timing are refused. Stored word records are validated as-is: missing or null
+bounds are not defaulted to zero, explicit indices are not discarded, and
+malformed records are not filtered out. The manual text is retained and the row
+stays `NEEDS_MANUAL_TRANSCRIPT_REVIEW` with an actionable
+`manual-display-alignment` unresolved span; it never falls back to ASR copy.
+Changing manual text also changes the scoped output fingerprint so dependent
+plans/contracts must be rebuilt. No review UI is built in Stage 3.5.
 
 ## Stage 4 handoff
 
@@ -340,7 +397,111 @@ API:
 
 CLI: `python -m app.cli candidate-refine CANDIDATE_ID [--priority ...]`,
 `candidate-refine-batch SOURCE_ID [--limit N]`, `candidate-refinements
-CANDIDATE_ID`, `candidate-handoff CANDIDATE_ID`.
+CANDIDATE_ID`, `candidate-handoff CANDIDATE_ID`,
+`candidate-recovery --expectation MANIFEST.json [--apply] [--require-reuse]`.
+
+## Local observation recovery
+
+`candidate-recovery` is an operator-only, offline path that admits one already
+captured, hash-pinned local faster-whisper observation as a raw `FINAL_CLIP`
+checkpoint. It is not a capture framework, migration, or new job platform. It
+never loads a model, constructs a provider, dispatches a job, or writes final
+clip text.
+
+Preview is the default and writes nothing. `--apply` revalidates under the
+source/refinement locks, writes a uniquely named audit snapshot under
+`storage/temporary/diagnostics/recovery-admissions/`, and replaces only the
+`TARGETED_LOCAL_ASR` checkpoint plus its `audio_extraction`/`local_asr`
+component fingerprints and recovery provenance. It keeps the context evidence
+`REJECTED`, leaves manual/final text, word timestamps, jobs, source lifecycle and
+publishing approvals untouched, and never marks the row ready or cache eligible.
+Repeated identical apply is a no-op.
+
+The expectation manifest pins the bundle path (storage-relative), source/
+candidate/refinement/original-job identities, coarse/context/refined bounds,
+candidate key, raw-span fingerprint, source/context-WAV/three-bundle-file
+hashes, and the approved 67-token text hash. Validation is independent of
+assertions made by the bundle: it recomputes the operator raw-span identity,
+hashes the current source media and context WAV, and compares the captured
+decoder options and source-evidenced hotwords with the current production
+`FINAL_CLIP` contract. Any mismatch refuses before mutation.
+
+The 2026-10-28 selected-window bundle is pinned as:
+
+```json
+{
+  "bundle_relative_path": "diagnostics/local-recovery-b3fcfc05-20261028T044442Z-5edff6f75ef1",
+  "source_id": "cafc529e-b0d8-401b-b439-2721a57de73c",
+  "candidate_id": "b3fcfc05-638a-49f6-89f2-cdab89291871",
+  "refinement_id": "b2ee68f5-1ec1-40c8-a9b0-3fb5b1d7c345",
+  "original_job_id": "fc9ded35-74b0-46ab-b3d0-bee91b38e37c",
+  "coarse_start": 384.28,
+  "coarse_end": 408.66,
+  "context_start": 376.28,
+  "context_end": 416.66,
+  "refined_start": 384.29999999999995,
+  "refined_end": 408.67999999999995,
+  "candidate_key": "9ebcd6855ab02d1017b5f7e7e45ae1948a2d4623363339c5bce4fcaf3f96fd3e",
+  "raw_span_fingerprint": "60c630dc55c1e7d41b6024c45effb2d245e79e7182ccd7a4fd9cc66be929e4b7",
+  "source_sha256": "77043cae0ceb6d15c27a73ea16842503e3e8e56044bc28a284772305ac63f706",
+  "audio_sha256": "7ea64c4ac920a1ce8e308d02bdad7c32a119361617fdc8c537cb8a2ce1bce96e",
+  "decoder_result_sha256": "d3c4a3090b1f820b96b0bef19f1994b1123f9912270088f14b4f749c39b82fbc",
+  "result_sha256": "db4e7193e70357971c29510f5b9d11962073b1d88f57461df01c89ef8aeaf466",
+  "prior_evidence_sha256": "c78633884b7a0bb96683178395c269af818c0a83be5cbfd4344f32654f15994e",
+  "approved_text_sha256": "6cc761f9da32f3469c0cd0eca1554fd3a59fd47bf6afc7e088ce5332e74c7f9e",
+  "approved_token_count": 67,
+  "raw_word_record_count": 107,
+  "expected_rejection_reason": "nonpositive word duration",
+  "context_only_invalid_record_indexes": [105]
+}
+```
+
+Required environment for this bundle: `large-v3-turbo`, CPU, compute type
+`auto`, CPU compute type `int8`, final beam 8, temperature
+`0,0.2,0.4,0.6,0.8,1.0`, `local_only` routing, local Qwen disabled, and no
+Gemini key. The source region must still yield no source-evidenced hotword hint;
+otherwise the decoder/context contract check refuses.
+
+Operational sequence (only after independent code review and authorization):
+
+1. `python -m app.cli candidate-recovery --expectation MANIFEST.json` (preview;
+   require `derived_view.state=ACCEPTED`, `approved_text_matches=true`,
+   `writes=0`, and `reuse_ready_after_apply=true`).
+2. `python -m app.cli candidate-recovery --expectation MANIFEST.json --apply`
+   (require `applied=true` and a snapshot path).
+3. `python -m app.cli candidate-recovery --expectation MANIFEST.json
+   --require-reuse` (necessary read-only preflight; exit 0 and
+   `reuse_ready=true` are required before dispatch). This checks the current
+   checkpoint only; it is **not** the runtime guard and does not constrain the
+   later job.
+4. Run the one-shot guarded continuation:
+
+   ```bash
+   python -m app.cli candidate-recovery-continue --expectation MANIFEST.json
+   ```
+
+   This captures the normal queue dispatch and executes exactly one
+   `CANDIDATE_REFINEMENT` job for the pinned candidate/refinement, `FINAL_CLIP`,
+   `force=false`, in this process with no broker/backlog consumer. The
+   production factory still owns the decoder/input identity, and the normal task
+   still owns job claim, failure/cancellation and cleanup. A process-local
+   deny-only ASR collaborator is installed on the task's executor factory: if
+   accepted/rejected observation reuse misses, it raises before any Whisper or
+   hosted provider work. It never returns a fake transcript.
+
+   The command fails closed unless
+   `CLIPFACTORY_REFINEMENT_ROUTING_MODE=local_only`,
+   `CLIPFACTORY_LOCAL_QWEN_ENABLED=false`, and no Gemini key is configured.
+   Success requires `succeeded=true`, `denial_calls=0`,
+   `metrics.component_reuse=1`, and no `metrics.local_asr_runs`. A reuse miss
+   after a successful preflight fails the job with `denial_calls=1`; do not
+   proceed to manual submission or assume a retry is free.
+5. Submit the exact approved 67-token text through the existing manual endpoint,
+   then run the existing readiness/currentness and Stage 4/caption checks.
+
+Admission is recovery evidence, not a model run and not consensus. It does not
+set `FINAL_TRANSCRIPT_READY`, `cache_eligible`, manual text, or publishing
+approval.
 
 ## Configuration
 

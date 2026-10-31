@@ -28,15 +28,19 @@ class WordTimestamp:
     start: float
     end: float
     probability: float | None = None
+    parent_record_index: int | None = None
 
     @property
     def as_dict(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "text": self.text,
             "start": self.start,
             "end": self.end,
             "probability": self.probability,
         }
+        if self.parent_record_index is not None:
+            payload["parent_record_index"] = self.parent_record_index
+        return payload
 
 
 @dataclass(frozen=True)
@@ -181,6 +185,11 @@ class TargetASRResult:
     fingerprint: str = ""
     settings: dict[str, object] = field(default_factory=dict)
     rejected_reason: str | None = None
+    rejected_detail: dict[str, object] | None = None
+    raw_word_observations: tuple[dict[str, object], ...] = ()
+    raw_word_record_count: int = 0
+    raw_word_observations_complete: bool = True
+    raw_word_observations_fingerprint: str = ""
 
 
 @dataclass(frozen=True)

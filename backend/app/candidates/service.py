@@ -78,6 +78,76 @@ _TRANSFORMATION_RIGHTS = {
 }
 
 
+def _candidate_evidence_snapshot(
+    proposal: Proposal,
+    segments: Sequence[Mapping[str, object]],
+    uncertainty: UncertaintyEvidence,
+) -> dict[str, object]:
+    return {
+        "boundary_reason": proposal.boundary_reason,
+        "start_segment_index": proposal.start_segment_index,
+        "end_segment_index": proposal.end_segment_index,
+        "segment_count": len(proposal.segment_indexes),
+        "span_start": proposal.span_start,
+        "span_end": proposal.span_end,
+        "low_confidence_spans": list(uncertainty.low_confidence_spans[:20]),
+        "unresolved_segment_indexes": list(uncertainty.unresolved_segment_indexes[:50]),
+        "protected_tokens": list(uncertainty.protected_tokens[:20]),
+        "code_switch_tokens": list(uncertainty.code_switch_tokens[:20]),
+        "low_confidence_word_span_ratio": uncertainty.low_confidence_word_span_ratio,
+        "unresolved_ratio": uncertainty.unresolved_ratio,
+    }
+
+
+def build_candidate_draft(
+    proposal: Proposal,
+    segments: Sequence[Mapping[str, object]],
+    *,
+    source_id: str,
+    rights_status: RightsStatus,
+    media_origin: MediaOriginType,
+    dialect_profile: str | None,
+    dialect_confidence: float,
+    provenance_metadata: Mapping[str, object],
+    config: Stage3Config = DEFAULT_CONFIG,
+) -> CandidateDraft:
+    """Build one truthful deterministic candidate draft from existing helpers."""
+
+    classification = classify_content(proposal.text, config=config)
+    uncertainty = compute_uncertainty(proposal, segments, config=config)
+    scores = compute_scores(proposal, segments, classification, uncertainty, config=config)
+    rights_risk, originality = derive_risks(rights_status, media_origin)
+    draft = CandidateDraft(
+        candidate_key=candidate_key(
+            source_id=source_id,
+            start_segment_index=proposal.start_segment_index,
+            end_segment_index=proposal.end_segment_index,
+            span_start=proposal.span_start,
+            span_end=proposal.span_end,
+        ),
+        proposal=proposal,
+        content=classification,
+        scores=scores,
+        disposition=CandidateDisposition.DO_NOT_CLIP,
+        hooks=generate_hooks(proposal, segments, config=config),
+        provenance_snapshot={
+            "rights_status": rights_status.value,
+            "media_origin": media_origin.value,
+            "metadata_keys": sorted(str(key) for key in provenance_metadata),
+        },
+        rights_risk=rights_risk,
+        originality_risk=originality,
+        dialect_profile=dialect_profile,
+        dialect_confidence=dialect_confidence,
+        code_switch_suspected=bool(uncertainty.code_switch_tokens),
+        transcript_excerpt=proposal.text[: config.max_excerpt_characters],
+        evidence_snapshot=_candidate_evidence_snapshot(proposal, segments, uncertainty),
+    )
+    draft.idea_summary = proposal.text[:280]
+    draft.topic_summary = " ".join(proposal.text.split()[:20])[:200]
+    return draft
+
+
 def derive_risks(
     rights_status: RightsStatus, media_origin: MediaOriginType
 ) -> tuple[RightsRisk, OriginalityRisk]:
@@ -211,41 +281,17 @@ class CandidateAnalysisService:
         dialect_confidence: float,
         provenance_metadata: Mapping[str, object],
     ) -> CandidateDraft:
-        classification = classify_content(proposal.text, config=self._config)
-        uncertainty = compute_uncertainty(proposal, segments, config=self._config)
-        scores = compute_scores(
-            proposal, segments, classification, uncertainty, config=self._config
-        )
-        rights_risk, originality = derive_risks(rights_status, media_origin)
-        draft = CandidateDraft(
-            candidate_key=candidate_key(
-                source_id=source_id,
-                start_segment_index=proposal.start_segment_index,
-                end_segment_index=proposal.end_segment_index,
-                span_start=proposal.span_start,
-                span_end=proposal.span_end,
-            ),
-            proposal=proposal,
-            content=classification,
-            scores=scores,
-            disposition=CandidateDisposition.DO_NOT_CLIP,
-            hooks=generate_hooks(proposal, segments, config=self._config),
-            provenance_snapshot={
-                "rights_status": rights_status.value,
-                "media_origin": media_origin.value,
-                "metadata_keys": sorted(str(key) for key in provenance_metadata),
-            },
-            rights_risk=rights_risk,
-            originality_risk=originality,
+        return build_candidate_draft(
+            proposal,
+            segments,
+            source_id=source_id,
+            rights_status=rights_status,
+            media_origin=media_origin,
             dialect_profile=dialect_profile,
             dialect_confidence=dialect_confidence,
-            code_switch_suspected=bool(uncertainty.code_switch_tokens),
-            transcript_excerpt=proposal.text[: self._config.max_excerpt_characters],
-            evidence_snapshot=self._evidence_snapshot(proposal, segments, uncertainty),
+            provenance_metadata=provenance_metadata,
+            config=self._config,
         )
-        draft.idea_summary = proposal.text[:280]
-        draft.topic_summary = " ".join(proposal.text.split()[:20])[:200]
-        return draft
 
     def _apply_novelty(
         self, drafts: list[CandidateDraft], historical_corpus: Sequence[NoveltyItem]
@@ -768,27 +814,6 @@ class CandidateAnalysisService:
             "topic_signature": topic_signature(draft.topic_summary or draft.transcript_excerpt),
             "provider_evidence": _stable_value(draft.provider_evidence),
             "provider_input_fingerprint": draft.provider_input_fingerprint,
-        }
-
-    def _evidence_snapshot(
-        self,
-        proposal: Proposal,
-        segments: Sequence[Mapping[str, object]],
-        uncertainty: UncertaintyEvidence,
-    ) -> dict[str, object]:
-        return {
-            "boundary_reason": proposal.boundary_reason,
-            "start_segment_index": proposal.start_segment_index,
-            "end_segment_index": proposal.end_segment_index,
-            "segment_count": len(proposal.segment_indexes),
-            "span_start": proposal.span_start,
-            "span_end": proposal.span_end,
-            "low_confidence_spans": list(uncertainty.low_confidence_spans[:20]),
-            "unresolved_segment_indexes": list(uncertainty.unresolved_segment_indexes[:50]),
-            "protected_tokens": list(uncertainty.protected_tokens[:20]),
-            "code_switch_tokens": list(uncertainty.code_switch_tokens[:20]),
-            "low_confidence_word_span_ratio": uncertainty.low_confidence_word_span_ratio,
-            "unresolved_ratio": uncertainty.unresolved_ratio,
         }
 
     def _context(

@@ -39,6 +39,11 @@ from app.models import (
     RenderContract,
     TransformationPlan,
 )
+from app.refinement.display import (
+    DISPLAY_PROJECTION_POLICY_VERSION,
+    DisplayProjection,
+    project_display_text,
+)
 from app.render.binding import build_bound_spans
 from app.render.compatibility import evaluate_compatibility
 from app.render.fingerprints import (
@@ -62,6 +67,7 @@ from app.render.policy import (
     EXECUTABLE_STATUSES,
     FINAL_CLIP_REFINEMENT_REQUIRED,
     INVALID_SOURCE_BINDING,
+    MANUAL_TRANSCRIPT_DISPLAY_ALIGNMENT_UNRESOLVED,
     MATERIALIZATION_REQUIRED,
     NARRATION_MATERIALIZATION_REQUIRED,
     NO_SELECTED_PLAN,
@@ -387,15 +393,24 @@ def _run_preflight(
             started=started,
         )
 
+    _caption_text, _caption_words, projection = _caption_display(final_row)
+    if projection is not None and not projection.supported:
+        # A legacy optimistic-ready row (or a manual edit retained outside the
+        # manual endpoint) must not silently fall back to the ASR spelling.
+        return _finalize(
+            session,
+            candidate,
+            gathered,
+            identity_payload,
+            config,
+            status=FINAL_CLIP_REFINEMENT_REQUIRED,
+            reasons=[MANUAL_TRANSCRIPT_DISPLAY_ALIGNMENT_UNRESOLVED],
+            outcome=None,
+            compatibility=None,
+            started=started,
+        )
     final = _final_evidence(final_row)
-    caption_payload = build_caption_source_payload(
-        final_transcript=final.final_transcript,
-        word_timestamps=final_row.word_timestamps or [],
-        dialect_profile=final.dialect_profile,
-        dialect_confidence=final.dialect_confidence,
-        code_switch_evidence=final.code_switch_evidence,
-        final_refinement_output_fingerprint=final.output_fingerprint,
-    )
+    caption_payload = _caption_source_payload(final_row)
     caption_fp = caption_source_fingerprint(caption_payload)
 
     planning_identity = _planning_identity(selection, gathered.planning_refinement)
@@ -1013,6 +1028,7 @@ def _contract_payload(
     selected_plan: TransformationPlan,
 ) -> dict[str, object]:
     selection = gathered.selection
+    caption_text, caption_words, projection = _caption_display(final_row)
     final = _final_evidence(final_row)
     facts_payload = facts.as_dict() if facts is not None else {}
     source_language = _source_language(candidate)
@@ -1131,14 +1147,23 @@ def _contract_payload(
         "quality_level": final.quality_level,
         "status": final.status,
         "output_fingerprint": final.output_fingerprint,
-        "transcript_text": final.final_transcript,
-        "word_timestamps": [word.as_dict() for word in final.words],
+        "transcript_text": caption_text,
+        "word_timestamps": caption_words,
+        "manual_transcript": final_row.manual_transcript,
+        "display_projection": {
+            "policy_version": DISPLAY_PROJECTION_POLICY_VERSION,
+            "status": projection.status if projection is not None else "UNCHANGED",
+            "corrected_token_index": (
+                projection.corrected_token_index if projection is not None else None
+            ),
+            "reason": projection.reason if projection is not None else None,
+        },
         "language": caption_language,
         "dialect_profile": final.dialect_profile,
         "dialect_confidence": final.dialect_confidence,
         "code_switch_evidence": dict(final.code_switch_evidence),
         "entity_evidence": [dict(item) for item in final.entity_evidence],
-        "protected_tokens": _protected_tokens(final.final_transcript),
+        "protected_tokens": _protected_tokens(caption_text),
         "logical_order_preserved": True,
         "caption_source_fingerprint": caption_fingerprint,
         "rendered_assets": None,
@@ -1613,19 +1638,69 @@ def _input_fingerprint(
     )
 
 
+def _preserved_caption_words(words: Sequence[object]) -> list[dict[str, object]]:
+    preserved: list[dict[str, object]] = []
+    for word in words:
+        if isinstance(word, Mapping):
+            preserved.append(dict(word))
+        else:
+            preserved.append({"invalid_word": word})
+    return preserved
+
+
+def _caption_display(
+    final_row: CandidateRefinement,
+) -> tuple[str, list[dict[str, object]], DisplayProjection | None]:
+    """Derive caption display text from the live final row.
+
+    A non-manual row keeps the existing automated final text and raw word
+    evidence. A manual row is projected only through the bounded, pure display
+    policy; unsupported projections retain the manual text and expose the
+    refusal so callers can block executable readiness.
+    """
+
+    manual = (final_row.manual_transcript or "").strip()
+    if not manual:
+        final = _final_evidence(final_row)
+        return final.final_transcript, [word.as_dict() for word in final.words], None
+    # Validate the complete original sequence before _final_evidence can drop or
+    # reindex malformed records. A bad record must refuse the whole sequence.
+    raw_words = list(final_row.word_timestamps or [])
+    projection = project_display_text(manual, raw_words)
+    if projection.supported:
+        return projection.final_text, [dict(word) for word in projection.words], projection
+    return projection.final_text, _preserved_caption_words(raw_words), projection
+
+
+def _caption_source_payload(final_row: CandidateRefinement) -> dict[str, object]:
+    caption_text, caption_words, projection = _caption_display(final_row)
+    final = _final_evidence(final_row)
+    if projection is None:
+        return build_caption_source_payload(
+            final_transcript=caption_text,
+            word_timestamps=caption_words,
+            dialect_profile=final.dialect_profile,
+            dialect_confidence=final.dialect_confidence,
+            code_switch_evidence=final.code_switch_evidence,
+            final_refinement_output_fingerprint=final.output_fingerprint,
+        )
+    return build_caption_source_payload(
+        final_transcript=caption_text,
+        word_timestamps=caption_words,
+        dialect_profile=final.dialect_profile,
+        dialect_confidence=final.dialect_confidence,
+        code_switch_evidence=final.code_switch_evidence,
+        final_refinement_output_fingerprint=final.output_fingerprint,
+        display_projection_policy_version=DISPLAY_PROJECTION_POLICY_VERSION,
+        display_projection_status=projection.status,
+        display_projection_reason=projection.reason,
+    )
+
+
 def _caption_source_fingerprint(final_row: CandidateRefinement) -> str:
     """Recompute the caption-source fingerprint from the live FINAL_CLIP row."""
 
-    return caption_source_fingerprint(
-        build_caption_source_payload(
-            final_transcript=final_row.final_transcript or "",
-            word_timestamps=final_row.word_timestamps or [],
-            dialect_profile=final_row.dialect_profile,
-            dialect_confidence=float(final_row.dialect_confidence or 0.0),
-            code_switch_evidence=dict(final_row.code_switch_evidence or {}),
-            final_refinement_output_fingerprint=final_row.output_fingerprint or "",
-        )
-    )
+    return caption_source_fingerprint(_caption_source_payload(final_row))
 
 
 def _verification_flags(governance: Mapping[str, object]) -> tuple[str, bool]:
